@@ -128,11 +128,17 @@ class TraceLogger:
     enabled = False
     logs: list = []
     _max_logs = 10000
+    _invocation_id = 0
 
     @classmethod
     def enable(cls):
         cls.enabled = True
         cls.logs = []
+        cls._invocation_id = 0
+
+    @classmethod
+    def begin_invocation(cls):
+        cls._invocation_id += 1
 
     @classmethod
     def disable(cls):
@@ -220,6 +226,7 @@ class TraceLogger:
             "line": caller_line,
             "file": caller_file,
             "code": caller_code,
+            "invocation": cls._invocation_id,
             "inputs": {},
             "output": None,
         }
@@ -255,42 +262,121 @@ class TraceLogger:
     @classmethod
     def format(cls, max_lines=200, pid_filter=None) -> str:
         """
-        格式化 trace 日志为可读字符串。
-        pid_filter: 只显示指定 pid, 如 (0,0,0). None 显示全部。
+        格式化 trace 日志, 同一 pid 下同一行号的重复调用聚合显示。
+
+        聚合规则:
+          - 同一 pid 内连续或非连续出现的同一 (line, api) 调用合并
+          - 只展开前 2 次和最后 1 次的详细信息
+          - 中间用 "... repeated N more times" 压缩
+          - 汇总所有调用的输入输出 range
+          - 单次调用的行不聚合, 正常展示
         """
-        lines = [f"=== Trace Log ({len(cls.logs)} entries) ==="]
+        # 按 pid 过滤
+        filtered = [e for e in cls.logs
+                    if pid_filter is None or e["pid"] == tuple(pid_filter)]
+
+        if not filtered:
+            return "=== Trace Log (0 entries) ==="
+
+        total = len(filtered)
+        lines = [f"=== Trace Log ({total} entries, aggregated) ==="]
+
+        # 按 pid 分组, 保持 pid 出现顺序
+        pid_groups = {}
+        for entry in filtered:
+            pid = entry["pid"]
+            if pid not in pid_groups:
+                pid_groups[pid] = []
+            pid_groups[pid].append(entry)
 
         count = 0
-        for entry in cls.logs:
-            if pid_filter is not None and entry["pid"] != tuple(pid_filter):
-                continue
+        for pid, entries in pid_groups.items():
+            pid_str = ",".join(str(p) for p in pid)
+
+            # 按 (line, api) 全局分组, 同时记录首次出现的顺序
+            seen_order = []     # 保持首次出现顺序
+            group_map = {}      # key -> [entries]
+            for entry in entries:
+                key = (entry.get("line"), entry["api"])
+                if key not in group_map:
+                    group_map[key] = []
+                    seen_order.append(key)
+                group_map[key].append(entry)
+
+            for key in seen_order:
+                if count >= max_lines:
+                    lines.append(f"  ... truncated")
+                    break
+
+                grp_entries = group_map[key]
+                line_num, api_name = key
+                line_info = f"L{line_num}" if line_num else "L?"
+                n = len(grp_entries)
+
+                if n == 1:
+                    # 单次调用, 正常展示
+                    e = grp_entries[0]
+                    in_str = ", ".join(cls._format_summary(s) for s in e["inputs"].values())
+                    out_str = cls._format_summary(e["output"]) if e["output"] else "void"
+                    code_suffix = ""
+                    if e.get("code"):
+                        code_text = e["code"].strip()
+                        if len(code_text) > 60: code_text = code_text[:57] + "..."
+                        code_suffix = f"  # {code_text}"
+                    lines.append(f"  [pid=({pid_str})] {line_info}: tl.{api_name}({in_str}) -> {out_str}{code_suffix}")
+                    count += 1
+                else:
+                    # 聚合: 汇总 + 展开前2次和最后1次
+                    code_suffix = ""
+                    if grp_entries[0].get("code"):
+                        code_text = grp_entries[0]["code"].strip()
+                        if len(code_text) > 60: code_text = code_text[:57] + "..."
+                        code_suffix = f"  # {code_text}"
+
+                    # 汇总所有调用的输出 range
+                    all_out_mins = []
+                    all_out_maxs = []
+                    all_flags = set()
+                    for e in grp_entries:
+                        out = e.get("output")
+                        if isinstance(out, dict):
+                            if "min" in out and out["min"] is not None:
+                                all_out_mins.append(out["min"])
+                                all_out_maxs.append(out["max"])
+                            if "flags" in out:
+                                all_flags.update(out["flags"])
+
+                    range_str = ""
+                    if all_out_mins:
+                        range_str = f", overall_range=[{min(all_out_mins):.4g}, {max(all_out_maxs):.4g}]"
+                    flag_str = f" !! {','.join(sorted(all_flags))}" if all_flags else ""
+
+                    lines.append(f"  [pid=({pid_str})] {line_info}: tl.{api_name}() x{n} calls{range_str}{flag_str}{code_suffix}")
+                    count += 1
+
+                    # 展开前 2 次
+                    show_entries = grp_entries[:2]
+                    for i, e in enumerate(show_entries):
+                        in_str = ", ".join(cls._format_summary(s) for s in e["inputs"].values())
+                        out_str = cls._format_summary(e["output"]) if e["output"] else "void"
+                        lines.append(f"    call[{i}]: ({in_str}) -> {out_str}")
+                        count += 1
+
+                    # 中间省略
+                    if n > 3:
+                        lines.append(f"    ... {n - 3} more calls ...")
+                        count += 1
+
+                    # 展开最后 1 次
+                    if n > 2:
+                        e = grp_entries[-1]
+                        in_str = ", ".join(cls._format_summary(s) for s in e["inputs"].values())
+                        out_str = cls._format_summary(e["output"]) if e["output"] else "void"
+                        lines.append(f"    call[{n-1}]: ({in_str}) -> {out_str}")
+                        count += 1
+
             if count >= max_lines:
-                lines.append(f"  ... truncated ({len(cls.logs) - count} more entries)")
                 break
-
-            pid_str = ",".join(str(p) for p in entry["pid"])
-
-            # 行号前缀
-            line_info = f"L{entry['line']}" if entry.get("line") else "L?"
-
-            in_parts = [cls._format_summary(s) for s in entry["inputs"].values()]
-            in_str = ", ".join(in_parts)
-
-            if entry["output"] is not None:
-                out_str = cls._format_summary(entry["output"])
-            else:
-                out_str = "void"
-
-            # 附加源代码片段 (如果有)
-            code_suffix = ""
-            if entry.get("code"):
-                code_text = entry["code"].strip()
-                if len(code_text) > 60:
-                    code_text = code_text[:57] + "..."
-                code_suffix = f"  # {code_text}"
-
-            lines.append(f"  [pid=({pid_str})] {line_info}: tl.{entry['api']}({in_str}) -> {out_str}{code_suffix}")
-            count += 1
 
         lines.append(f"=== End Trace ===")
         return "\n".join(lines)
@@ -331,6 +417,39 @@ class TraceLogger:
                         "line": line, "code": code,
                     })
         return summary
+
+    @classmethod
+    def get_flags_summary_deduped(cls) -> str:
+        groups = {}
+        for entry in cls.logs:
+            line = entry.get("line")
+            api = entry["api"]
+            pid = entry["pid"]
+            for name, s in entry.get("inputs", {}).items():
+                if isinstance(s, dict) and "flags" in s:
+                    for f in s["flags"]:
+                        cat = f.split("(")[0]
+                        key = (line, api, "input", name, cat)
+                        g = groups.setdefault(key, {"count": 0, "pids": set(), "sample_flag": f, "code": entry.get("code", "")})
+                        g["count"] += 1
+                        g["pids"].add(pid)
+            out = entry.get("output")
+            if isinstance(out, dict) and "flags" in out:
+                for f in out["flags"]:
+                    cat = f.split("(")[0]
+                    key = (line, api, "output", "result", cat)
+                    g = groups.setdefault(key, {"count": 0, "pids": set(), "sample_flag": f, "code": entry.get("code", "")})
+                    g["count"] += 1
+                    g["pids"].add(pid)
+        if not groups:
+            return ""
+        lines = []
+        for (line, api, section, tensor, cat), g in sorted(groups.items(), key=lambda x: (x[0][0] or 0)):
+            code_hint = f"  # {g['code'].strip()[:50]}" if g.get("code") else ""
+            lines.append(
+                f"L{line}: tl.{api}() {section}.{tensor} -> {g['sample_flag']}"
+                f"  ({g['count']}x across {len(g['pids'])} pids){code_hint}")
+        return "\n".join(lines)
 
 
 # ============================================================
@@ -442,12 +561,42 @@ class xarray(np.ndarray):
 class EmulatorError(Exception):
     def __init__(self, api_name: str, message: str, details: dict = None):
         self.api_name = api_name
+        self.message = message
         self.details = details or {}
+        self.source_line = None
+        self.source_file = None
+        self.source_code = None
+        stack = traceback.extract_stack()
+        for frame in reversed(stack):
+            if 'common' in frame.filename and '__init__' in frame.filename:
+                continue
+            self.source_file = frame.filename
+            self.source_line = frame.lineno
+            self.source_code = frame.line
+            break
         full_msg = f"\n[Triton Emulator Error] in tl.{api_name}():\n  {message}\n"
+        if self.source_line:
+            full_msg += f"  at: L{self.source_line}: {self.source_code}\n"
         if details:
             for k, v in details.items():
                 full_msg += f"  {k}: {v}\n"
         super().__init__(full_msg)
+
+
+class AggregatedEmulatorError(Exception):
+    def __init__(self, errors_seen: dict, total_programs: int):
+        self.errors_seen = errors_seen
+        self.total_programs = total_programs
+        lines = [f"[Triton Emulator] {len(errors_seen)} unique error(s) across {total_programs} programs:"]
+        for (src_line, api), info in errors_seen.items():
+            e = info["error"]
+            code = e.source_code.strip() if e.source_code else ""
+            lines.append(
+                f"  L{src_line}: tl.{api}() — {e.message}"
+                f"  ({info['count']}x, first at pid={info['first_pid']})")
+            if code:
+                lines.append(f"    code: {code}")
+        super().__init__("\n".join(lines))
 
 
 # ============================================================
@@ -733,26 +882,68 @@ class tl:
 # Kernel Launch
 # ============================================================
 
-def launch_kernel_1d(kernel_fn, *args, grid_size: int, **kwargs):
+def launch_kernel_1d(kernel_fn, *args, grid_size: int, collect_errors: bool = False, **kwargs):
     tl._num_programs = [grid_size, 1, 1]
+    if TraceLogger.enabled:
+        TraceLogger.begin_invocation()
+    errors_seen = {}
     for pid in range(grid_size):
         tl._program_ids = [pid, 0, 0]
-        kernel_fn(*args, **kwargs)
+        try:
+            kernel_fn(*args, **kwargs)
+        except EmulatorError as e:
+            if not collect_errors:
+                raise
+            key = (e.source_line, e.api_name)
+            if key not in errors_seen:
+                errors_seen[key] = {"count": 1, "first_pid": pid, "error": e}
+            else:
+                errors_seen[key]["count"] += 1
+    if errors_seen:
+        raise AggregatedEmulatorError(errors_seen, grid_size)
 
-def launch_kernel_2d(kernel_fn, *args, grid: Tuple[int, int], **kwargs):
+def launch_kernel_2d(kernel_fn, *args, grid: Tuple[int, int], collect_errors: bool = False, **kwargs):
     tl._num_programs = [grid[0], grid[1], 1]
+    if TraceLogger.enabled:
+        TraceLogger.begin_invocation()
+    errors_seen = {}
     for p0 in range(grid[0]):
         for p1 in range(grid[1]):
             tl._program_ids = [p0, p1, 0]
-            kernel_fn(*args, **kwargs)
+            try:
+                kernel_fn(*args, **kwargs)
+            except EmulatorError as e:
+                if not collect_errors:
+                    raise
+                key = (e.source_line, e.api_name)
+                if key not in errors_seen:
+                    errors_seen[key] = {"count": 1, "first_pid": (p0, p1), "error": e}
+                else:
+                    errors_seen[key]["count"] += 1
+    if errors_seen:
+        raise AggregatedEmulatorError(errors_seen, grid[0] * grid[1])
 
-def launch_kernel_3d(kernel_fn, *args, grid: Tuple[int, int, int], **kwargs):
+def launch_kernel_3d(kernel_fn, *args, grid: Tuple[int, int, int], collect_errors: bool = False, **kwargs):
     tl._num_programs = [grid[0], grid[1], grid[2]]
+    if TraceLogger.enabled:
+        TraceLogger.begin_invocation()
+    errors_seen = {}
     for p0 in range(grid[0]):
         for p1 in range(grid[1]):
             for p2 in range(grid[2]):
                 tl._program_ids = [p0, p1, p2]
-                kernel_fn(*args, **kwargs)
+                try:
+                    kernel_fn(*args, **kwargs)
+                except EmulatorError as e:
+                    if not collect_errors:
+                        raise
+                    key = (e.source_line, e.api_name)
+                    if key not in errors_seen:
+                        errors_seen[key] = {"count": 1, "first_pid": (p0, p1, p2), "error": e}
+                    else:
+                        errors_seen[key]["count"] += 1
+    if errors_seen:
+        raise AggregatedEmulatorError(errors_seen, grid[0] * grid[1] * grid[2])
 
 
 # ============================================================
@@ -798,23 +989,63 @@ def verify(emulator_out, reference_out, op_name="unknown", rtol=1e-3, atol=1e-5)
             f"sample reference[:5]={ref.ravel()[:5].tolist()}"
         )
 
-        # 附加 trace 异常摘要
+        # 附加 trace 异常摘要 (去重版)
         if TraceLogger.enabled and TraceLogger.logs:
-            flags = TraceLogger.get_flags_summary()
-            if flags:
-                flag_lines = []
-                for flag_name, occs in flags.items():
-                    flag_lines.append(f"  {flag_name}: {len(occs)} occurrences")
-                    for o in occs[:5]:
-                        line_str = f"L{o['line']}" if o.get('line') else "L?"
-                        code_str = f"  # {o['code'].strip()}" if o.get('code') else ""
-                        flag_lines.append(
-                            f"    {line_str}: pid={o['pid']} tl.{o['api']}() {o['section']}.{o['tensor']} -> {o['flag']}{code_str}")
-                    if len(occs) > 5:
-                        flag_lines.append(f"    ... and {len(occs)-5} more")
-                report["error_msg"] += "\n\nTrace anomalies detected:\n" + "\n".join(flag_lines)
+            deduped = TraceLogger.get_flags_summary_deduped()
+            if deduped:
+                report["error_msg"] += "\n\nTrace anomalies (deduplicated):\n" + deduped
             report["trace"] = TraceLogger.format(max_lines=100)
 
     status = "PASS" if passed else "FAIL"
     print(f"  [{status}] {op_name}: max_abs={max_abs:.2e}, max_rel={max_rel:.2e}, shape={emu.shape}")
     return report
+
+
+# ============================================================
+# run_with_feedback: LLM 自动生成循环的顶层接口
+# ============================================================
+
+def _format_error_feedback(e) -> str:
+    if isinstance(e, AggregatedEmulatorError):
+        return str(e)
+    parts = [f"ERROR tl.{e.api_name}(): {e.message}"]
+    if e.source_line:
+        code = e.source_code.strip() if e.source_code else ""
+        parts.append(f"  at L{e.source_line}: {code}")
+    if e.details:
+        for k, v in e.details.items():
+            parts.append(f"  {k}: {v}")
+    return "\n".join(parts)
+
+
+def run_with_feedback(emulate_fn, reference_fn, op_name="unknown",
+                      rtol=1e-3, atol=1e-5) -> dict:
+    """
+    运行 emulator 并产出精简去重的错误反馈。
+    返回: {"passed": bool, "feedback": str, "details": dict}
+    """
+    TraceLogger.enable()
+    try:
+        emu_out = emulate_fn()
+    except (EmulatorError, AggregatedEmulatorError) as e:
+        feedback = _format_error_feedback(e)
+        TraceLogger.disable()
+        return {"passed": False, "feedback": feedback, "details": {"exception": e}}
+
+    ref_out = reference_fn()
+    report = verify(emu_out, ref_out, op_name, rtol=rtol, atol=atol)
+
+    feedback = ""
+    if not report["passed"]:
+        parts = [
+            f"FAIL {op_name}: max_abs_err={report['max_abs_error']:.2e}, "
+            f"max_rel_err={report['max_rel_error']:.2e}"
+        ]
+        deduped = TraceLogger.get_flags_summary_deduped()
+        if deduped:
+            parts.append("Anomalies:")
+            parts.append(deduped)
+        feedback = "\n".join(parts)
+
+    TraceLogger.disable()
+    return {"passed": report["passed"], "feedback": feedback, "details": report}

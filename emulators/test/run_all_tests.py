@@ -1,7 +1,8 @@
 """
 全量 Emulator 自测
 ===================
-运行: python run_all_tests.py
+运行: python emulators/test/run_all_tests.py
+      或 python emulators/run_all_tests.py (redirect)
 """
 
 import numpy as np
@@ -9,6 +10,7 @@ np.random.seed(42)
 
 import sys, os, importlib
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 print("╔" + "═" * 58 + "╗")
 print("║   Triton CPU Emulator - All Atomic Ops Self-Test         ║")

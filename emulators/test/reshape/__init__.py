@@ -12,7 +12,7 @@ Reshape 不涉及数据搬运, 只是改变 stride/shape 元信息。
 
 import numpy as np
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from common import tl, xarray, launch_kernel_1d, verify, EmulatorError
 
 

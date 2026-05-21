@@ -7,7 +7,7 @@ Grid:   1D, 每个 program 处理一行
 
 import numpy as np
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from common import tl, xarray, launch_kernel_1d, verify, EmulatorError
 
 

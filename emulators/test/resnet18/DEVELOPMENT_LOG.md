@@ -131,11 +131,9 @@ This is a **real developer mistake that the emulator caught exactly at the right
 
 ### Issues & Suggestions
 
-#### 1. `tl.sum` / `tl.max` keepdims=True behavior (Low severity)
+#### 1. `tl.sum` / `tl.max` keepdims=True behavior (Low severity, design choice)
 
-The emulator uses `keepdims=True` for all reductions, which differs from real Triton. This is documented in the skill but still causes surprises. In my kernels, I worked around it by treating reduction outputs as `(1,)` shaped and using `np.array([offset])` for stores. This works but is a mental overhead.
-
-**Suggestion:** Consider adding a `tl.sum(x, axis=0, keepdims=False)` option, or documenting the `(1,)` pattern more prominently in examples.
+The emulator uses `keepdims=True` for all reductions. This is a deliberate design choice to maintain shape consistency: reduction outputs are `(1,)`, which naturally aligns with `tl.store`'s `(1,)` offsets and `tl.zeros((1,))` accumulators. Numerical results are equivalent. Kernels use `np.array([offset])` for single-element stores, which works cleanly with this convention.
 
 #### 2. `tl.maximum` broadcasting surprise (Medium severity)
 

@@ -63,3 +63,18 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## Project Knowledge
+
+These files contain project context. Read on demand (not auto-loaded):
+
+| File | When to Read |
+|------|-------------|
+| `docs/project_knowledge/project_overview.md` | Understanding project structure, checking implemented operators |
+| `docs/project_knowledge/test_conventions.md` | Developing new operators, writing tests |
+| `docs/project_knowledge/triton_gen_skill.md` | Using /triton-gen or extending the skill |
+| `docs/project_knowledge/emulator_improvements_done.md` | Debugging emulator error feedback |
+| `docs/project_knowledge/emulator_error_coverage.md` | Assessing emulator capabilities and blind spots |
+| `docs/project_knowledge/emulator_next_steps.md` | Planning future improvements |
+| `docs/project_knowledge/emulator_to_triton_conversion.md` | Converting emulator kernels to real Triton for NPU deployment |
+| `docs/emulator_observations/` | Debugging operators, analyzing precision/error issues |

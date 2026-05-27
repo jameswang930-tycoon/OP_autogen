@@ -11,13 +11,18 @@ OP_autogen/
 ├── emulators/
 │   ├── common/                # 公共基础设施（Triton API 打桩 + 验证工具）
 │   │   └── __init__.py
-│   ├── test/                  # 新开发的算子测试用例（ResNet18 等复杂模型）
+│   ├── test/                  # 新开发的算子测试用例
 │   │   ├── conv2d_resnet/     # 通用 Conv2d：支持 stride + padding
 │   │   ├── batchnorm2d/       # BatchNorm2d (eval mode)
 │   │   ├── maxpool2d/         # MaxPool2d：stride + padding
 │   │   ├── adaptive_avgpool2d/# 全局自适应平均池化
 │   │   ├── resnet18/          # ResNet18 集成测试（BasicBlock + Stem）
-│   │   └── ...
+│   │   ├── resnet34/          # ResNet34 集成测试 [3,4,6,3]
+│   │   ├── gcn_spmm/          # 图算子：稀疏矩阵-稠密矩阵乘法
+│   │   ├── gcn/               # GCN 集成测试（SpMM + matmul）
+│   │   ├── conv1d/            # 1D 卷积（stride + padding）
+│   │   ├── attention-relu/    # 缩放点积注意力 + ReLU
+│   │   └── run_all_tests.py   # 全量自测入口
 │   ├── add/                   # 逐元素加法 (element-wise add)
 │   ├── matmul/                # 矩阵乘法 (2D tiled matmul)
 │   ├── transpose/             # 矩阵转置 (2D transpose)
@@ -26,10 +31,14 @@ OP_autogen/
 │   ├── softmax/               # 行级数值稳定 softmax
 │   ├── rmsnorm/               # Root Mean Square Layer Normalization
 │   ├── addrmsnormgamma/       # 融合算子：Add + RMSNorm + Gamma
-│   ├── attention-relu/        # 缩放点积注意力 + ReLU 激活（替代 softmax）
-│   └── run_all_tests.py       # 全量自测入口
-├── docs/                      # 设计文档
-│   └── resnet18_conv_dev_plan.md  # ResNet18 卷积层开发计划
+│   ├── conv1d/                # 1D 卷积（基础版）
+│   ├── conv2d/                # 2D 卷积（基础版，无 stride/padding）
+│   └── run_all_tests.py       # 基础算子自测入口
+├── models/                    # 模型文件和 shape 注册表（不提交 git）
+├── docs/
+│   ├── dev_plan/              # 开发计划
+│   ├── emulator_observations/ # emulator 观察（误差、精度、API、实现模式）
+│   └── project_knowledge/     # 项目知识索引
 ├── .claude/
 │   └── commands/
 │       └── triton-gen.md      # triton-gen skill：自动算子生成/调试
@@ -94,15 +103,20 @@ cd emulators && python -c "from test.resnet18 import test; test()"
 | `conv1d` | 1D 卷积 | 1D |
 | `conv2d` | 简单 2D 卷积（无 stride/padding） | 1D |
 
-### ResNet18 测试用例（emulators/test/）
+### 集成测试用例（emulators/test/）
 
 | 算子 | 说明 | Grid | 设计文档 |
 |---|---|---|---|
-| `conv2d_resnet` | 通用 Conv2d：stride + padding + bias | 1D | [resnet18_conv_dev_plan](../docs/resnet18_conv_dev_plan.md) |
+| `conv2d_resnet` | 通用 Conv2d：stride + padding + bias | 1D | [dev_plan](docs/dev_plan/resnet18_conv_dev_plan.md) |
 | `batchnorm2d` | BatchNorm2d (eval mode) | 1D | - |
 | `maxpool2d` | MaxPool2d：stride + padding | 1D | - |
 | `adaptive_avgpool2d` | 全局自适应平均池化 `(N,C,H,W) -> (N,C,1,1)` | 1D | - |
-| `resnet18` | 集成测试：Stem + BasicBlock + chain | - | [开发日志](test/resnet18/DEVELOPMENT_LOG.md) |
+| `conv1d` | 1D 卷积（stride + padding） | 1D | - |
+| `attention-relu` | 缩放点积注意力 + ReLU | 2D | - |
+| `resnet18` | 集成测试：Stem + BasicBlock + chain | - | [开发日志](emulators/test/resnet18/DEVELOPMENT_LOG.md) |
+| `resnet34` | 集成测试 [3,4,6,3]：7 个测试全部 PASS | - | - |
+| `gcn_spmm` | 图稀疏矩阵乘法（CSR 格式） | 1D | - |
+| `gcn` | GCN 集成：SpMM + matmul | - | - |
 
 ### ResNet18 验证结果
 
@@ -118,10 +132,13 @@ cd emulators && python -c "from test.resnet18 import test; test()"
 
 ## triton-gen Skill
 
-使用 `/triton-gen` 指令可以自动生成或修复 Triton kernel：
+使用 `/triton-gen` 指令可以自动生成或修复 Triton kernel，支持 5 种输入类型：
 
-- **生成模式**：输入算子描述（如 "layernorm" 或 "y = x * sigmoid(x)"）→ 生成完整算子模块
-- **修复模式**：输入文件路径或 "fix/debug/repair" 关键字 → 基于 emulator 错误反馈修复 kernel
+- **自然语言** — 算子描述（如 "layernorm" 或 "y = x * sigmoid(x)"）
+- **PyTorch 模型** — `nn.Module` 或 `.pt`/`.pth` 文件
+- **ONNX 模型** — `.onnx` 文件，解析计算图提取算子语义
+- **基线 Triton kernel** — `@triton.jit` 装饰的已有 kernel
+- **固定 Shape** — 模型名（如 "resnet18"）或 `[B,C,H,W]` 标注
 
 Skill 文件：[.claude/commands/triton-gen.md](.claude/commands/triton-gen.md)
 
@@ -137,3 +154,6 @@ Skill 文件：[.claude/commands/triton-gen.md](.claude/commands/triton-gen.md)
 ## 开发记录
 
 - 2026-05-21：ResNet18 卷积层开发完成，验证了 emulator 对复杂算子的支撑能力 [详细日志](emulators/test/resnet18/DEVELOPMENT_LOG.md)
+- 2026-05-27：ResNet34 集成测试 7/7 PASS，GCN 图算子（SpMM + matmul）3/3 PASS
+- 2026-05-27：triton-gen skill 精简至 ~100 行，支持 5 种输入类型
+- 2026-05-27：项目知识迁移至 `docs/project_knowledge/`，emulator 观察记录至 `docs/emulator_observations/`

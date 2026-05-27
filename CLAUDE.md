@@ -76,4 +76,5 @@ These files contain project context. Read on demand (not auto-loaded):
 | `docs/project_knowledge/emulator_improvements_done.md` | Debugging emulator error feedback |
 | `docs/project_knowledge/emulator_error_coverage.md` | Assessing emulator capabilities and blind spots |
 | `docs/project_knowledge/emulator_next_steps.md` | Planning future improvements |
+| `docs/project_knowledge/emulator_to_triton_conversion.md` | Converting emulator kernels to real Triton for NPU deployment |
 | `docs/emulator_observations/` | Debugging operators, analyzing precision/error issues |

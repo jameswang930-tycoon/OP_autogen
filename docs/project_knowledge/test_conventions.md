@@ -1,40 +1,40 @@
 # Test Conventions
 
-## 目录策略
+## Directory Strategy
 
-- `emulators/` 根目录 — 基础算子（add、matmul 等），作为 API 稳定性参考
-- `emulators/test/` — 新开发的复杂场景算子（ResNet 集成、GCN 等）
+- `emulators/` root — basic operators (add, matmul, etc.), serves as API stability reference
+- `emulators/test/` — complex scenario operators (ResNet integration, GCN, etc.)
 
-新算子开发统一使用 `emulators/test/<op>/`。
+All new operator development goes into `emulators/test/<op>/`.
 
-## Import 路径
+## Import Paths
 
 ```python
-# emulators/test/<op>/__init__.py 的标准头部：
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))  # → emulators/（加载 common）
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))          # → emulators/test/（加载兄弟算子）
+# Standard header in emulators/test/<op>/__init__.py:
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))  # -> emulators/ (loads common)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))          # -> emulators/test/ (loads sibling ops)
 
-# 加载 common:
+# Load common:
 from common import tl, launch_kernel_1d, verify, ...
 
-# 加载兄弟算子:
+# Load sibling operator:
 from test.matmul import emulate_matmul
 from test.relu import emulate_relu
 ```
 
-## 测试运行
+## Running Tests
 
 ```bash
-# 单个算子:
+# Single operator:
 cd emulators && python3 -c "from test.<op> import test; test()"
 
-# 全量:
+# All tests:
 cd emulators && python3 test/run_all_tests.py
 
-# 需要 torch 的 reference:
+# With torch reference (needs .venv):
 ../.venv/bin/python3 -c "from test.<op> import test; test()"
 ```
 
-## 算子注册
+## Operator Registration
 
-新算子通过后在 `emulators/test/run_all_tests.py` 中添加 import 和调用。
+After an operator passes all tests, add its import and call to `emulators/test/run_all_tests.py`.

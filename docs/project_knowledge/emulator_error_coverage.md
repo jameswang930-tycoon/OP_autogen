@@ -1,29 +1,29 @@
 # Emulator Error Coverage
 
-## 评分
+## Scoring
 
-| 维度 | 评分 |
-|------|------|
-| 行号定位 | ★★★★☆ traceback 精确可靠，缺 column 信息 |
-| 运行时错误检测 | ★★★★★ load/store/dot 核心 API 全覆盖 |
-| 数值异常感知 | ★★★★☆ NaN/Inf/Zero flag 实用，无 root cause |
-| 多 program 去重 | ★★★★★ |
-| 竞争/并发语义 | ★☆☆☆☆ CPU 串行无法暴露 store race |
-| Triton API 完整度 | ★★★☆☆ 常用够用，2D block ptr/scan/sort 缺失 |
-| LLM 可读性 | ★★★★★ |
+| Dimension | Score |
+|-----------|-------|
+| Line number localization | 4/5 — traceback is reliable, lacks column info |
+| Runtime error detection | 5/5 — full coverage of load/store/dot core APIs |
+| Numeric anomaly awareness | 4/5 — NaN/Inf/Zero flags practical, no root cause |
+| Multi-program dedup | 5/5 |
+| Race / concurrency semantics | 1/5 — CPU serial execution cannot expose store races |
+| Triton API completeness | 3/5 — common APIs sufficient, 2D block ptr/scan/sort missing |
+| LLM readability | 5/5 |
 
-## 高风险盲区（P0）
+## High-risk blind spots (P0)
 
-1. **store 写重叠** — 多 pid 写同一位置，CPU 串行完全静默
-2. **grid 覆盖率不足** — emulator 不检查 grid 是否覆盖全量数据
-3. **静默数值错误**（~30-40%） — stride 互换/pid 解码/索引公式错误
+1. **Store write overlap** — multiple pids writing to the same address is completely silent under serial execution
+2. **Grid coverage gaps** — emulator does not check whether grid covers all data elements
+3. **Silent numerical errors** (~30-40%) — stride swap, pid decode errors, wrong index formulas
 
-## 常见语义差异（P1）
+## Common semantic differences (P1)
 
-- constexpr power-of-2 不校验
-- bfloat16 映射为 float32 精度被提升
-- atomic_add CPU 串行无法暴露竞争
+- constexpr power-of-2 not validated
+- bfloat16 mapped to float32 (precision promoted)
+- atomic_add serial execution cannot expose races
 
-## 完全不覆盖的 API
+## Completely uncovered APIs
 
-tl.make_block_ptr/advance、2D offsets、scan、histogram/sort、extern_elementwise、Pipeline、warp-level primitives。
+tl.make_block_ptr/advance, 2D offsets, scan, histogram/sort, extern_elementwise, Pipeline, warp-level primitives.

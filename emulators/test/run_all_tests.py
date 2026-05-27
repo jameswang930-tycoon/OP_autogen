@@ -40,6 +40,17 @@ test_conv2d()
 test_conv1d()
 test_attention_relu()
 
+# Integration tests
+print("\n" + "=" * 60)
+print(" Integration Tests")
+print("=" * 60)
+
+from test.resnet18 import test as test_resnet18
+from test.resnet34 import test as test_resnet34
+
+test_resnet18()
+test_resnet34()
+
 print("=" * 60)
 print(" All emulator tests completed.")
 print("=" * 60)

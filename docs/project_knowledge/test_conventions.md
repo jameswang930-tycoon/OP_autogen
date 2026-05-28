@@ -35,6 +35,14 @@ cd emulators && python3 test/run_all_tests.py
 ../.venv/bin/python3 -c "from test.<op> import test; test()"
 ```
 
+## Weight Policy
+
+Kernel correctness tests use **random weights**, not pretrained weights.
+
+- Triton kernel output vs PyTorch reference output must use the **same weight dict within one test run**.
+- No cross-environment weight reuse, no pretrained model download, no torchvision dependency.
+- Random weights cover all computation paths equally well. The goal is verifying operator correctness, not end-to-end inference accuracy.
+
 ## Operator Registration
 
 After an operator passes all tests, add its import and call to `emulators/test/run_all_tests.py`.

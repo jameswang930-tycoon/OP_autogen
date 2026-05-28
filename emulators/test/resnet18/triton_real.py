@@ -452,86 +452,17 @@ def resnet18_forward(x, weights):
 
 
 # ================================================================
-#  Weight Loading
+#  Weight Generation
 # ================================================================
 
-def load_resnet18_weights(device='cuda', pretrained=True):
-    """
-    Load ResNet18 weights as a flat dict.
-
-    Args:
-        device: 'cuda' or NPU device string
-        pretrained: if True, load ImageNet pretrained weights (requires torchvision)
-
-    Returns:
-        dict[str, torch.Tensor] — keys match torchvision ResNet18 state_dict
-    """
-    import torchvision
-    model = torchvision.models.resnet18(weights='IMAGENET1K_V1' if pretrained else None)
-    model.eval()
-    return {k: v.to(device) for k, v in model.state_dict().items()}
-
-
-# ================================================================
-#  Test
-# ================================================================
-
-def test():
-    import sys
-
-    print("=" * 70)
-    print(" ResNet18 Real Triton Test")
-    print("=" * 70)
-
-    device = 'cuda'
-    B = 1
-
-    # Load weights
-    try:
-        weights = load_resnet18_weights(device, pretrained=True)
-        print("[OK] Loaded pretrained ResNet18 weights")
-    except Exception as e:
-        print(f"[WARN] Could not load pretrained weights: {e}")
-        print("       Using random weights — shape check only")
-        torch.manual_seed(42)
-        weights = _random_resnet18_weights(device)
-
-    # Forward pass
-    x = torch.randn(B, 3, 224, 224, device=device, dtype=torch.float32)
-    print(f"\nInput:  {list(x.shape)}")
-
-    with torch.no_grad():
-        out = resnet18_forward(x, weights)
-    print(f"Output: {list(out.shape)}")
-
-    assert out.shape == (B, 1000), f"Expected [{B}, 1000], got {list(out.shape)}"
-    print(f"\n[PASS] Output shape = [{B}, 1000]")
-
-    # Numerical verification against PyTorch reference
-    try:
-        import torchvision
-        ref_model = torchvision.models.resnet18(weights='IMAGENET1K_V1').to(device).eval()
-        with torch.no_grad():
-            ref_out = ref_model(x)
-        diff = (out - ref_out).abs().max().item()
-        print(f"\nMax diff vs PyTorch reference: {diff:.6f}")
-        status = "PASS" if diff < 0.5 else "FAIL"
-        print(f"[{status}] Numerical check (tol=0.5)")
-    except Exception as e:
-        print(f"\n[SKIP] PyTorch reference comparison: {e}")
-
-    print("=" * 70)
-
-
-def _random_resnet18_weights(device):
-    """Generate random ResNet18 weight dict for shape testing."""
-    torch.manual_seed(42)
+def make_resnet18_weights(device='cuda'):
+    """Generate random ResNet18 weight dict. Same weights for Triton + PyTorch reference."""
     w = {}
     w['conv1.weight'] = torch.randn(64, 3, 7, 7, device=device) * 0.01
-    w['bn1.running_mean'] = torch.zeros(64, device=device)
-    w['bn1.running_var']  = torch.ones(64, device=device)
-    w['bn1.weight']       = torch.ones(64, device=device)
-    w['bn1.bias']         = torch.zeros(64, device=device)
+    for name in ['running_mean', 'running_var', 'weight', 'bias']:
+        shape = (64,)
+        init = torch.zeros if name in ('running_mean', 'bias') else torch.ones
+        w[f'bn1.{name}'] = init(shape, device=device)
 
     for layer_name, in_c, out_c, stride, has_ds in RESNET18_LAYERS:
         for i in range(2):
@@ -539,21 +470,108 @@ def _random_resnet18_weights(device):
             w[f'{p}conv1.weight'] = torch.randn(out_c, in_c, 3, 3, device=device) * 0.01
             w[f'{p}conv2.weight'] = torch.randn(out_c, out_c, 3, 3, device=device) * 0.01
             for bn in ['bn1', 'bn2']:
-                w[f'{p}{bn}.running_mean'] = torch.zeros(out_c, device=device)
-                w[f'{p}{bn}.running_var']  = torch.ones(out_c, device=device)
-                w[f'{p}{bn}.weight']       = torch.ones(out_c, device=device)
-                w[f'{p}{bn}.bias']         = torch.zeros(out_c, device=device)
+                for name in ['running_mean', 'running_var', 'weight', 'bias']:
+                    shape = (out_c,)
+                    init = torch.zeros if name in ('running_mean', 'bias') else torch.ones
+                    w[f'{p}{bn}.{name}'] = init(shape, device=device)
         if has_ds:
             p = f'{layer_name}.0.downsample.'
             w[f'{p}0.weight'] = torch.randn(out_c, in_c, 1, 1, device=device) * 0.01
-            w[f'{p}1.running_mean'] = torch.zeros(out_c, device=device)
-            w[f'{p}1.running_var']  = torch.ones(out_c, device=device)
-            w[f'{p}1.weight']       = torch.ones(out_c, device=device)
-            w[f'{p}1.bias']         = torch.zeros(out_c, device=device)
+            for name in ['running_mean', 'running_var', 'weight', 'bias']:
+                shape = (out_c,)
+                init = torch.zeros if name in ('running_mean', 'bias') else torch.ones
+                w[f'{p}1.{name}'] = init(shape, device=device)
 
     w['fc.weight'] = torch.randn(1000, 512, device=device) * 0.01
     w['fc.bias']   = torch.zeros(1000, device=device)
     return w
+
+
+# ================================================================
+#  Reference (PyTorch native)
+# ================================================================
+
+def _reference_resnet18_forward(x, weights):
+    """PyTorch native ResNet18 forward using the same weight dict."""
+    import torch.nn.functional as F
+
+    def ref_bn(x, prefix):
+        return F.batch_norm(x,
+                            weights[f'{prefix}running_mean'].clone(),
+                            weights[f'{prefix}running_var'].clone(),
+                            weights[f'{prefix}weight'].clone(),
+                            weights[f'{prefix}bias'].clone(),
+                            training=False)
+
+    def ref_conv(x, w_key, stride_h, stride_w, pad_h, pad_w):
+        return F.conv2d(x, weights[w_key],
+                        stride=(stride_h, stride_w), padding=(pad_h, pad_w))
+
+    def ref_block(x, p, stride=1, downsample=None):
+        identity = x
+        out = F.relu(ref_bn(ref_conv(x, f'{p}conv1.weight', stride, stride, 1, 1), f'{p}bn1.'))
+        out = ref_bn(ref_conv(out, f'{p}conv2.weight', 1, 1, 1, 1), f'{p}bn2.')
+        if downsample is not None:
+            ds_p, ds_stride = downsample
+            identity = ref_bn(ref_conv(x, f'{ds_p}0.weight', ds_stride, ds_stride, 0, 0),
+                              f'{ds_p}1.')
+        return F.relu(out + identity)
+
+    # Stem
+    out = F.relu(ref_bn(ref_conv(x, 'conv1.weight', 2, 2, 3, 3), 'bn1.'))
+    out = F.max_pool2d(out, kernel_size=3, stride=2, padding=1)
+
+    # Layers
+    for layer_name, in_c, out_c, layer_stride, has_ds in RESNET18_LAYERS:
+        for i in range(2):
+            block_stride = layer_stride if i == 0 else 1
+            ds = None
+            if has_ds and i == 0:
+                ds = (f'{layer_name}.0.downsample.', layer_stride)
+            out = ref_block(out, f'{layer_name}.{i}.', stride=block_stride, downsample=ds)
+
+    # Head
+    out = F.adaptive_avg_pool2d(out, (1, 1))
+    out = out.view(out.shape[0], -1)
+    out = F.linear(out, weights['fc.weight'], weights['fc.bias'])
+    return out
+
+
+# ================================================================
+#  Test
+# ================================================================
+
+def test():
+    print("=" * 70)
+    print(" ResNet18 Real Triton Test")
+    print("=" * 70)
+
+    device = 'cuda'
+    B = 1
+
+    torch.manual_seed(42)
+    weights = make_resnet18_weights(device)
+    x = torch.randn(B, 3, 224, 224, device=device, dtype=torch.float32)
+
+    print(f"\nInput:  {list(x.shape)}")
+
+    with torch.no_grad():
+        out = resnet18_forward(x, weights)
+    print(f"Output: {list(out.shape)}")
+
+    assert out.shape == (B, 1000), f"Expected [{B}, 1000], got {list(out.shape)}"
+    print(f"[PASS] Output shape = [{B}, 1000]")
+
+    # Compare against PyTorch reference using the SAME weights
+    with torch.no_grad():
+        ref_out = _reference_resnet18_forward(x, weights)
+
+    diff = (out - ref_out).abs().max().item()
+    print(f"\nMax diff vs PyTorch reference (same weights): {diff:.6f}")
+    status = "PASS" if diff < 0.5 else "FAIL"
+    print(f"[{status}] Numerical check (tol=0.5)")
+
+    print("=" * 70)
 
 
 if __name__ == "__main__":

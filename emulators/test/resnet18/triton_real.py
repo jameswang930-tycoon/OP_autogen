@@ -455,7 +455,7 @@ def resnet18_forward(x, weights):
 #  Weight Generation
 # ================================================================
 
-def make_resnet18_weights(device='cuda'):
+def make_resnet18_weights(device):
     """Generate random ResNet18 weight dict. Same weights for Triton + PyTorch reference."""
     w = {}
     w['conv1.weight'] = torch.randn(64, 3, 7, 7, device=device) * 0.01
@@ -541,12 +541,18 @@ def _reference_resnet18_forward(x, weights):
 #  Test
 # ================================================================
 
-def test():
-    print("=" * 70)
-    print(" ResNet18 Real Triton Test")
-    print("=" * 70)
+def test(device):
+    """
+    Run ResNet18 Triton kernel test on given device.
 
-    device = 'cuda'
+    Usage:
+      test('cuda')   # NVIDIA GPU
+      test('npu')    # NPU backend
+      test('cpu')    # CPU (if Triton supports it)
+    """
+    print("=" * 70)
+    print(f" ResNet18 Real Triton Test — device={device}")
+    print("=" * 70)
     B = 1
 
     torch.manual_seed(42)

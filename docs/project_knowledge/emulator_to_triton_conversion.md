@@ -71,8 +71,48 @@ kernel[(grid_size,)](
 
 附带变化：
 - 数据从 numpy 平铺数组（`.ravel()`）变为 torch.Tensor（直接传，stride 由 `.stride()` 获取）
-- 输出分配从 `np.zeros(...)` 变为 `torch.empty(..., device='cuda')`
+- 输出分配从 `np.zeros(...)` 变为 `torch.empty(..., device=device)`（不硬编码设备）
 - grid 计算从 `tl.cdiv()` 变为 `triton.cdiv()`
+
+## 上板验证后的编码规范
+
+以下规则来自 ResNet18 在 Triton Ascend (910B) 上板实测。emulator（numpy）允许这些写法且数学结果正确，但真实硬件编译/运行时会出问题。**在 skill 生成阶段就应遵守，而非转换阶段再修。**
+
+### 1. 累加器用 Python 标量
+
+```python
+# 错误：1 元素张量，NPU 类型推断不友好
+acc = tl.zeros((1,), dtype=tl.float32)
+
+# 正确：标量
+acc = 0.0
+```
+
+原因：numpy 不区分 `np.array([0.0])` 和 `0.0`，但 Triton IR 中它们是不同类型。每个 program 计算一个标量输出，累加器应为标量。
+
+### 2. 用 `+=` 累加
+
+```python
+# 错误：创建新对象，Ascend 后端生成不同 IR
+acc = acc + tl.sum(x_vals * w_vals)
+
+# 正确：原地累加
+acc += tl.sum(x_vals * w_vals)
+```
+
+原因：`a = a + b` 和 `a += b` 在 Python/numpy 语义不同，Triton-Ascend 编译器对两者生成不同的中间表示。
+
+### 3. 1D 归约不加 axis 参数
+
+```python
+# 错误：对 1D tensor 的冗余 axis
+acc += tl.sum(x_vals * w_vals, axis=0)
+
+# 正确：省略 axis，归约所有维度
+acc += tl.sum(x_vals * w_vals)
+```
+
+原因：1D tensor 只有一个轴，`axis=0` 是冗余的，但可能触发 Ascend 编译器不同的 lowering 路径。
 
 ## 需要新增的 kernel
 

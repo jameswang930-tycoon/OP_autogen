@@ -72,12 +72,18 @@ Create `emulators/test/<op_name>/__init__.py` with 4-part structure:
 
 **Critical gotcha**: `tl.sum`/`tl.max`/`tl.min` use `keepdims=True` in the emulator. Add `.reshape()` after reduction if needed.
 
+**NPU-compatible coding rules** (follow these so the generated kernel deploys to real hardware without rewrite):
+
+1. **Scalar accumulators** — use `0.0`, never `tl.zeros((1,), dtype=tl.float32)`. Per-program accumulators are scalars, not 1-element tensors.
+2. **In-place accumulation** — use `acc += expr`, never `acc = acc + expr`. Different IR on NPU backends.
+3. **No redundant axis on 1D reduction** — use `tl.sum(x)`, never `tl.sum(x, axis=0)`. For 1D tensors, omit axis entirely.
+
 ---
 
 ## Step 4: Run Verification
 
 ```bash
-cd "/Users/wangshunxian/operator autogen/OP_autogen/emulators" && python -c "from test.<op_name> import test; test()"
+cd emulators && python -c "from test.<op_name> import test; test()"
 ```
 
 If pass → register in `emulators/test/run_all_tests.py`. If model decomposition → continue to next operator.

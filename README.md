@@ -11,29 +11,27 @@ OP_autogen/
 ├── emulators/
 │   ├── common/                # 公共基础设施（Triton API 打桩 + 验证工具）
 │   │   └── __init__.py
-│   ├── test/                  # 新开发的算子测试用例
-│   │   ├── conv2d_resnet/     # 通用 Conv2d：支持 stride + padding
-│   │   ├── batchnorm2d/       # BatchNorm2d (eval mode)
-│   │   ├── maxpool2d/         # MaxPool2d：stride + padding
-│   │   ├── adaptive_avgpool2d/# 全局自适应平均池化
-│   │   ├── resnet18/          # ResNet18 集成测试（BasicBlock + Stem）
-│   │   ├── resnet34/          # ResNet34 集成测试 [3,4,6,3]
-│   │   ├── gcn_spmm/          # 图算子：稀疏矩阵-稠密矩阵乘法
-│   │   ├── gcn/               # GCN 集成测试（SpMM + matmul）
-│   │   ├── conv1d/            # 1D 卷积（stride + padding）
-│   │   ├── attention-relu/    # 缩放点积注意力 + ReLU
-│   │   └── run_all_tests.py   # 全量自测入口
-│   ├── add/                   # 逐元素加法 (element-wise add)
-│   ├── matmul/                # 矩阵乘法 (2D tiled matmul)
-│   ├── transpose/             # 矩阵转置 (2D transpose)
-│   ├── reshape/               # 张量 reshape（无数据搬运，仅改元信息）
-│   ├── relu/                  # ReLU / Leaky ReLU 激活
-│   ├── softmax/               # 行级数值稳定 softmax
-│   ├── rmsnorm/               # Root Mean Square Layer Normalization
-│   ├── addrmsnormgamma/       # 融合算子：Add + RMSNorm + Gamma
-│   ├── conv1d/                # 1D 卷积（基础版）
-│   ├── conv2d/                # 2D 卷积（基础版，无 stride/padding）
-│   └── run_all_tests.py       # 基础算子自测入口
+│   └── test/                  # 所有算子（基础 + 集成测试）
+│       ├── add/               # 逐元素加法
+│       ├── matmul/            # 矩阵乘法 (2D tiled)
+│       ├── transpose/         # 矩阵转置
+│       ├── reshape/           # 张量 reshape
+│       ├── relu/              # ReLU / Leaky ReLU
+│       ├── softmax/           # 行级数值稳定 softmax
+│       ├── rmsnorm/           # RMS Layer Normalization
+│       ├── addrmsnormgamma/   # 融合：Add + RMSNorm + Gamma
+│       ├── conv1d/            # 1D 卷积（stride + padding）
+│       ├── conv2d/            # 2D 卷积（基础版）
+│       ├── conv2d_resnet/     # 通用 Conv2d：stride + padding + bias
+│       ├── batchnorm2d/       # BatchNorm2d (eval mode)
+│       ├── maxpool2d/         # MaxPool2d：stride + padding
+│       ├── adaptive_avgpool2d/# 全局自适应平均池化
+│       ├── attention-relu/    # 缩放点积注意力 + ReLU
+│       ├── gcn_spmm/          # 图算子：稀疏矩阵-稠密矩阵乘法
+│       ├── gcn/               # GCN 集成测试
+│       ├── resnet18/          # ResNet18 集成测试
+│       ├── resnet34/          # ResNet34 集成测试 [3,4,6,3]
+│       └── run_all_tests.py   # 全量自测入口
 ├── models/                    # 模型文件和 shape 注册表（不提交 git）
 ├── docs/
 │   ├── dev_plan/              # 开发计划
@@ -75,10 +73,10 @@ OP_autogen/
 
 ```bash
 # 运行全部算子自测
-python emulators/run_all_tests.py
+python emulators/test/run_all_tests.py
 
 # 单独运行某个算子自测（需在 emulators 目录下）
-cd emulators && python -c "from add import test; test()"
+cd emulators && python -c "from test.add import test; test()"
 cd emulators && python -c "from test.conv2d_resnet import test; test()"
 
 # ResNet18 集成测试
@@ -87,7 +85,9 @@ cd emulators && python -c "from test.resnet18 import test; test()"
 
 ## 已支持的算子
 
-### 基础算子（emulators/）
+所有算子位于 `emulators/test/`，每个遵循 4-part 结构（kernel/emulate/reference/test）。
+
+### 基础算子
 
 | 算子 | 说明 | Grid |
 |---|---|---|
@@ -103,7 +103,7 @@ cd emulators && python -c "from test.resnet18 import test; test()"
 | `conv1d` | 1D 卷积 | 1D |
 | `conv2d` | 简单 2D 卷积（无 stride/padding） | 1D |
 
-### 集成测试用例（emulators/test/）
+### 集成测试用例
 
 | 算子 | 说明 | Grid | 设计文档 |
 |---|---|---|---|
@@ -111,8 +111,6 @@ cd emulators && python -c "from test.resnet18 import test; test()"
 | `batchnorm2d` | BatchNorm2d (eval mode) | 1D | - |
 | `maxpool2d` | MaxPool2d：stride + padding | 1D | - |
 | `adaptive_avgpool2d` | 全局自适应平均池化 `(N,C,H,W) -> (N,C,1,1)` | 1D | - |
-| `conv1d` | 1D 卷积（stride + padding） | 1D | - |
-| `attention-relu` | 缩放点积注意力 + ReLU | 2D | - |
 | `resnet18` | 集成测试：Stem + BasicBlock + chain | - | [开发日志](emulators/test/resnet18/DEVELOPMENT_LOG.md) |
 | `resnet34` | 集成测试 [3,4,6,3]：7 个测试全部 PASS | - | - |
 | `gcn_spmm` | 图稀疏矩阵乘法（CSR 格式） | 1D | - |

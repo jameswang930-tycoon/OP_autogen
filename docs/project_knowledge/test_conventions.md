@@ -2,10 +2,10 @@
 
 ## Directory Strategy
 
-- `emulators/` root — basic operators (add, matmul, etc.), serves as API stability reference
-- `emulators/test/` — complex scenario operators (ResNet integration, GCN, etc.)
+- `emulators/common/` — Triton API emulator infrastructure (tl, launch_kernel, verify, etc.)
+- `emulators/test/` — all operators (basic + integration), each as `<op>/`
 
-All new operator development goes into `emulators/test/<op>/`.
+All operator development goes into `emulators/test/<op>/`.
 
 ## Import Paths
 

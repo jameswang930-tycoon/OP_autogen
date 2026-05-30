@@ -71,8 +71,48 @@ kernel[(grid_size,)](
 
 附带变化：
 - 数据从 numpy 平铺数组（`.ravel()`）变为 torch.Tensor（直接传，stride 由 `.stride()` 获取）
-- 输出分配从 `np.zeros(...)` 变为 `torch.empty(..., device='cuda')`
+- 输出分配从 `np.zeros(...)` 变为 `torch.empty(..., device=device)`（不硬编码设备）
 - grid 计算从 `tl.cdiv()` 变为 `triton.cdiv()`
+
+## 上板验证后的编码规范
+
+以下规则来自 ResNet18 在 Triton Ascend (910B) 上板实测。emulator（numpy）允许这些写法且数学结果正确，但真实硬件编译/运行时会出问题。**在 skill 生成阶段就应遵守，而非转换阶段再修。**
+
+### 1. 累加器用 Python 标量
+
+```python
+# 错误：1 元素张量，NPU 类型推断不友好
+acc = tl.zeros((1,), dtype=tl.float32)
+
+# 正确：标量
+acc = 0.0
+```
+
+原因：numpy 不区分 `np.array([0.0])` 和 `0.0`，但 Triton IR 中它们是不同类型。每个 program 计算一个标量输出，累加器应为标量。
+
+### 2. 用 `+=` 累加
+
+```python
+# 错误：创建新对象，Ascend 后端生成不同 IR
+acc = acc + tl.sum(x_vals * w_vals)
+
+# 正确：原地累加
+acc += tl.sum(x_vals * w_vals)
+```
+
+原因：`a = a + b` 和 `a += b` 在 Python/numpy 语义不同，Triton-Ascend 编译器对两者生成不同的中间表示。
+
+### 3. 1D 归约不加 axis 参数
+
+```python
+# 错误：对 1D tensor 的冗余 axis
+acc += tl.sum(x_vals * w_vals, axis=0)
+
+# 正确：省略 axis，归约所有维度
+acc += tl.sum(x_vals * w_vals)
+```
+
+原因：1D tensor 只有一个轴，`axis=0` 是冗余的，但可能触发 Ascend 编译器不同的 lowering 路径。
 
 ## 需要新增的 kernel
 
@@ -104,6 +144,84 @@ RESNET18_LAYERS = [
     ('layer3', 128, 256, 2, True),
     ('layer4', 256, 512, 2, True),
 ]
+```
+
+## Triton Ascend (NPU) 后端约束
+
+### Grid size 限制
+
+Triton Ascend 后端要求 grid size（coreDim）不超过 UINT16_MAX（65535），超出报错：
+`coreDim=xxxx can't be greater than UINT16_MAX`。
+
+ResNet18 中 grid size 超限的 kernel（B=1, 输入 224×224）：
+
+| 算子 | 输出 shape | Grid size |
+|------|-----------|-----------|
+| stem conv2d | [1, 64, 112, 112] | 802,816 |
+| stem maxpool | [1, 64, 56, 56] | 200,704 |
+| layer1 conv2d | [1, 64, 56, 56] | 200,704 |
+| layer2 conv2d (s2) | [1, 128, 28, 28] | 100,352 |
+| layer3 conv2d (s2) | [1, 256, 14, 14] | 50,176 |
+| layer4 conv2d (s2) | [1, 512, 7, 7] | 25,088 |
+
+### 应对方案（按阶段选择）
+
+**阶段 1：跑通正确性（快速验证）**
+
+```bash
+export TRITON_ALL_BLOCKS_PARALLEL=1
+```
+
+注意：此方案会触发分批调度（grid > 物理核数时分多批执行），引入额外设备侧开销，**仅用于正确性验证，不适合性能评估**。
+
+**阶段 2：性能优化（按 NPU 核数重设计 grid）**
+
+官方推荐：grid size = 物理 aicore 数量，kernel 内部用两级 tiling 处理。
+
+```python
+import triton.runtime.driver as driver
+
+# 获取物理核数
+props = driver.active.utils.get_device_properties(device)
+num_aicore = props["num_aicore"]           # 含 tl.dot 的算子
+num_vectorcore = props["num_vectorcore"]   # 纯 vector 算子
+
+# 两级 tiling
+#   block_size = 总元素数 / 核数（核间切分）
+#   sub_block_size = 控制片上内存 ≤ 192KB（核内切分）
+block_size = total_elements // num_core
+sub_block_size = 8192  # 示例值，建议用 autotune 寻优
+```
+
+```python
+# kernel 示例：两级 tiling
+@triton.jit
+def kernel(x_ptr, out_ptr, numel, XBLOCK: tl.constexpr, XBLOCK_SUB: tl.constexpr):
+    xoffset = tl.program_id(0) * XBLOCK
+    for sub_offset in range(0, XBLOCK, XBLOCK_SUB):
+        idx = xoffset + sub_offset + tl.arange(0, XBLOCK_SUB)
+        mask = idx < numel
+        x = tl.load(x_ptr + idx, mask=mask)
+        tl.store(out_ptr + idx, result, mask=mask)
+```
+
+### 其他 NPU 约束
+
+- 内存对齐：vector 算子需 32 字节对齐，cube+vector 融合算子需 512 字节对齐
+- 片上内存：单 aicore UB ≤ 192KB（Atlas 800T/I A2），超出报 `ub overflow`
+- 2D grid 自动合并为 1D：`(4, 5)` 和 `(20,)` 等价
+- 去掉 GPU 特有逻辑：`torch.cuda.*`、CUDA stream/event、`assert x.is_cuda` 等
+
+### 设备适配
+
+kernel 和 launcher 不包含任何 CUDA 硬编码，device 由调用方通过 `torch.Tensor` 的 placement 决定：
+
+```python
+import torch_npu  # 注册 'npu' device
+device = 'npu:0'
+x = torch.randn(B, 3, 224, 224, device=device)
+weights = make_resnet18_weights(device)
+out = resnet18_forward(x, weights)
 ```
 
 ### 权重格式

@@ -17,27 +17,43 @@ print("║   Triton CPU Emulator - All Atomic Ops Self-Test         ║")
 print("╚" + "═" * 58 + "╝")
 
 from add import test as test_add
+from mul import test as test_mul
 from matmul import test as test_matmul
 from transpose import test as test_transpose
 from reshape import test as test_reshape
 from softmax import test as test_softmax
 from relu import test as test_relu
+from hardswish import test as test_hardswish
+from hardsigmoid import test as test_hardsigmoid
 from rmsnorm import test as test_rmsnorm
 from addrmsnormgamma import test as test_addrmsnormgamma
 from conv2d import test as test_conv2d
 from conv1d import test as test_conv1d
+from conv2d_resnet import test as test_conv2d_resnet
+from conv2d_depthwise import test as test_conv2d_depthwise
+from batchnorm2d import test as test_batchnorm2d
+from adaptive_avgpool2d import test as test_adaptive_avgpool2d
+from maxpool2d import test as test_maxpool2d
 test_attention_relu = importlib.import_module('attention-relu').test
 
 test_add()
+test_mul()
 test_matmul()
 test_transpose()
 test_reshape()
 test_softmax()
 test_relu()
+test_hardswish()
+test_hardsigmoid()
 test_rmsnorm()
 test_addrmsnormgamma()
 test_conv2d()
 test_conv1d()
+test_conv2d_resnet()
+test_conv2d_depthwise()
+test_batchnorm2d()
+test_adaptive_avgpool2d()
+test_maxpool2d()
 test_attention_relu()
 
 # Integration tests
@@ -47,9 +63,11 @@ print("=" * 60)
 
 from test.resnet18 import test as test_resnet18
 from test.resnet34 import test as test_resnet34
+from test.mobilenetv3_small import test as test_mobilenetv3_small
 
 test_resnet18()
 test_resnet34()
+test_mobilenetv3_small()
 
 print("=" * 60)
 print(" All emulator tests completed.")

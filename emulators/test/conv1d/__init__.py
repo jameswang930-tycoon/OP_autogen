@@ -32,7 +32,7 @@ def conv1d_kernel(
     ol = rn %  L_out
 
     window = C_in * kL
-    acc = tl.zeros((1,), dtype=tl.float32)
+    acc = 0.0
 
     for ck_start in range(0, window, BLOCK_CK):
         offs = ck_start + tl.arange(0, BLOCK_CK)
@@ -58,19 +58,15 @@ def conv1d_kernel(
         x_vals = tl.load(x_ptr, x_offsets, mask=mask_ck, other=0.0)
         w_vals = tl.load(w_ptr, w_offsets, mask=mask_ck, other=0.0)
 
-        acc = acc + tl.sum(x_vals * w_vals, axis=0)
+        acc += tl.sum(x_vals * w_vals)
 
     # Add bias
     b_val = tl.load(b_ptr, oc)
     out_val = acc + b_val
 
     # Store
-    out_offs = np.array([
-        n  * stride_outn +
-        oc * stride_outc +
-        ol * stride_outl
-    ], dtype=np.int64)
-    tl.store(out_ptr, out_offs, out_val)
+    out_off = n * stride_outn + oc * stride_outc + ol * stride_outl
+    tl.store(out_ptr, out_off, out_val)
 
 
 # ============================================================
@@ -93,7 +89,7 @@ def conv1d_kernel_bug_axis(
     ol = rn %  L_out
 
     window = C_in * kL
-    acc = tl.zeros((1,), dtype=tl.float32)
+    acc = 0.0
 
     for ck_start in range(0, window, BLOCK_CK):
         offs = ck_start + tl.arange(0, BLOCK_CK)
@@ -117,17 +113,13 @@ def conv1d_kernel_bug_axis(
         w_vals = tl.load(w_ptr, w_offsets, mask=mask_ck, other=0.0)
 
         # BUG: axis=1 越界
-        acc = acc + tl.sum(x_vals * w_vals, axis=1)
+        acc += tl.sum(x_vals * w_vals, axis=1)
 
     b_val = tl.load(b_ptr, oc)
     out_val = acc + b_val
 
-    out_offs = np.array([
-        n  * stride_outn +
-        oc * stride_outc +
-        ol * stride_outl
-    ], dtype=np.int64)
-    tl.store(out_ptr, out_offs, out_val)
+    out_off = n * stride_outn + oc * stride_outc + ol * stride_outl
+    tl.store(out_ptr, out_off, out_val)
 
 
 def conv1d_kernel_bug_kl_range(
@@ -146,7 +138,7 @@ def conv1d_kernel_bug_kl_range(
     ol = rn %  L_out
 
     window = C_in * kL
-    acc = tl.zeros((1,), dtype=tl.float32)
+    acc = 0.0
 
     for ck_start in range(0, window, BLOCK_CK):
         offs = ck_start + tl.arange(0, BLOCK_CK)
@@ -172,17 +164,13 @@ def conv1d_kernel_bug_kl_range(
         x_vals = tl.load(x_ptr, x_offsets, mask=None)
         w_vals = tl.load(w_ptr, w_offsets, mask=mask_ck, other=0.0)
 
-        acc = acc + tl.sum(x_vals * w_vals, axis=0)
+        acc += tl.sum(x_vals * w_vals)
 
     b_val = tl.load(b_ptr, oc)
     out_val = acc + b_val
 
-    out_offs = np.array([
-        n  * stride_outn +
-        oc * stride_outc +
-        ol * stride_outl
-    ], dtype=np.int64)
-    tl.store(out_ptr, out_offs, out_val)
+    out_off = n * stride_outn + oc * stride_outc + ol * stride_outl
+    tl.store(out_ptr, out_off, out_val)
 
 
 # ============================================================

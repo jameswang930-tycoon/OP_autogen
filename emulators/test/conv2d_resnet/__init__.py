@@ -37,7 +37,7 @@ def conv2d_resnet_kernel(
     ow = rn %  W_out
 
     window = C_in * kH * kW
-    acc = tl.zeros((1,), dtype=tl.float32)
+    acc = 0.0
 
     for ck_start in range(0, window, BLOCK_CK):
         offs = ck_start + tl.arange(0, BLOCK_CK)
@@ -76,7 +76,7 @@ def conv2d_resnet_kernel(
         x_vals = tl.load(x_ptr, x_offsets, mask=combined_mask, other=0.0)
         w_vals = tl.load(w_ptr, w_offsets, mask=mask_ck, other=0.0)
 
-        acc = acc + tl.sum(x_vals * w_vals, axis=0)
+        acc += tl.sum(x_vals * w_vals)
 
     # Add bias
     b_val = tl.load(b_ptr, oc)
@@ -89,7 +89,7 @@ def conv2d_resnet_kernel(
         oh * stride_outh +
         ow * stride_outw
     )
-    tl.store(out_ptr, np.array([out_offset], dtype=np.int64), out_val)
+    tl.store(out_ptr, out_offset, out_val)
 
 
 # ============================================================

@@ -43,14 +43,12 @@ x_vals = tl.load(x_ptr + x_offsets, mask=combined_mask, other=0.0)
 ### 4. tl.store 调用约定
 
 ```python
-# emulator: tl.store(base_ptr, offset, value)
-tl.store(out_ptr, np.array([out_offset], dtype=np.int64), out_val)
+# emulator: tl.store(base_ptr, offset, value) — 支持 scalar offset
+tl.store(out_ptr, out_offset, out_val)
 
 # 真实 Triton: 同 load，指针算术前移
 tl.store(out_ptr + out_offset, out_val)
 ```
-
-注意：emulator 中 `np.array([offset])` 的包裹是 emulator API 设计需要，真实 Triton 不需要。
 
 ### 5. Launch 方式
 
@@ -76,7 +74,7 @@ kernel[(grid_size,)](
 
 ## 上板验证后的编码规范
 
-以下规则来自 ResNet18 在 Triton Ascend (910B) 上板实测。emulator（numpy）允许这些写法且数学结果正确，但真实硬件编译/运行时会出问题。**在 skill 生成阶段就应遵守，而非转换阶段再修。**
+以下规则来自 ResNet18 在 Triton Ascend (910B) 上板实测。**emulator 已在基础设施层面拉齐这些规则**（`keepdims=False`、标量累加器、`+=`、无冗余 axis），生成的 kernel 天然满足 NPU 编码要求，无需转换阶段额外处理。此处保留规则说明供理解设计意图。
 
 ### 1. 累加器用 Python 标量
 
@@ -237,7 +235,7 @@ out = resnet18_forward(x, weights)
 2. 添加 `import triton; import triton.language as tl`
 3. 每个 kernel 函数前加 `@triton.jit`
 4. 全局替换 `tl.load(ptr, off,` → `tl.load(ptr + off,`
-5. 全局替换 `tl.store(ptr, off,` / `tl.store(ptr, np.array([off])` → `tl.store(ptr + off,`
+5. 全局替换 `tl.store(ptr, off,` → `tl.store(ptr + off,`
 6. 将 `emulate_xxx()` 改写为 launcher：numpy → torch tensor, `launch_kernel_Nd` → `kernel[grid]`
 7. 补写缺失的 kernel（如 add、linear）
 8. 添加 weight loader 和 test

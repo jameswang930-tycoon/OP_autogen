@@ -53,7 +53,6 @@ Multiple types can co-occur. Explicit shapes always take priority.
 - Remove `@triton.jit`
 - `tl.load(ptr + offsets, mask=...)` → `tl.load(ptr, offsets, mask=...)`
 - `kernel[grid](...)` → `launch_kernel_1d(kernel, ..., grid_size=N)`
-- **keepdims gotcha**: emulator `tl.sum/max/min` keeps dims, real Triton does not
 
 ### 2e: Fixed Shape → read `models/shapes_registry.py` for model name. Use small spatial (8-32) for unit tests, real sizes for integration.
 
@@ -70,9 +69,7 @@ Create `emulators/test/<op_name>/__init__.py` with 4-part structure:
 
 **Read `emulators/common/__init__.py`** for available `tl.*` APIs and their signatures. The source is the authoritative reference.
 
-**Critical gotcha**: `tl.sum`/`tl.max`/`tl.min` use `keepdims=True` in the emulator. Add `.reshape()` after reduction if needed.
-
-**NPU-compatible coding rules** (follow these so the generated kernel deploys to real hardware without rewrite):
+**NPU-compatible coding rules** (emulator enforces these natively, so generated kernels deploy to real hardware without rewrite):
 
 1. **Scalar accumulators** — use `0.0`, never `tl.zeros((1,), dtype=tl.float32)`. Per-program accumulators are scalars, not 1-element tensors.
 2. **In-place accumulation** — use `acc += expr`, never `acc = acc + expr`. Different IR on NPU backends.

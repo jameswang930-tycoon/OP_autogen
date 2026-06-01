@@ -31,12 +31,12 @@ def softmax_kernel(x_ptr, out_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
     row = tl.load(x_ptr, ptrs, mask=mask, other=float('-inf'))
 
     # 数值稳定: 减去行最大值
-    row_max = tl.max(row, axis=0)
+    row_max = tl.max(row)
     row_safe = row - row_max
 
     # exp 和归一化
     numerator = tl.exp(row_safe)
-    denominator = tl.sum(numerator, axis=0)
+    denominator = tl.sum(numerator)
     result = numerator / denominator
 
     tl.store(out_ptr, ptrs, result, mask=mask)

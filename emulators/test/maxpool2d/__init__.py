@@ -60,16 +60,16 @@ def maxpool2d_kernel(
     x_vals = tl.load(x_ptr, x_offsets, mask=combined_mask, other=float('-inf'))
 
     # Reduce: max over window
-    max_val = tl.max(x_vals, axis=0)
+    max_val = tl.max(x_vals)
 
-    # Store output — tl.max returns (1,) due to keepdims=True
+    # Store output
     out_offset = (
         n * stride_outn +
         c * stride_outc +
         oh * stride_outh +
         ow * stride_outw
     )
-    tl.store(out_ptr, np.array([out_offset], dtype=np.int64), max_val)
+    tl.store(out_ptr, out_offset, max_val)
 
 
 # ============================================================

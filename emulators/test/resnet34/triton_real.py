@@ -1,5 +1,5 @@
 """
-ResNet18 — Real Triton Kernels (NPU Deployable)
+ResNet34 — Real Triton Kernels (NPU Deployable)
 ================================================
 Input:  [B, 3, 224, 224]  torch.Tensor on device
 Output: [B, 1000]         torch.Tensor on device
@@ -14,10 +14,10 @@ changes are needed:
 
 Architecture:
   Stem:  conv1(7x7,s2,p3) → bn1 → relu → maxpool(3x3,s2,p1)   → [B, 64, 56, 56]
-  Layer1: 2×BasicBlock(64→64)                                    → [B, 64, 56, 56]
-  Layer2: 2×BasicBlock(64→128, stride=2)                         → [B, 128, 28, 28]
-  Layer3: 2×BasicBlock(128→256, stride=2)                        → [B, 256, 14, 14]
-  Layer4: 2×BasicBlock(256→512, stride=2)                        → [B, 512, 7, 7]
+  Layer1: 3×BasicBlock(64→64)                                    → [B, 64, 56, 56]
+  Layer2: 4×BasicBlock(64→128, stride=2)                         → [B, 128, 28, 28]
+  Layer3: 6×BasicBlock(128→256, stride=2)                        → [B, 256, 14, 14]
+  Layer4: 3×BasicBlock(256→512, stride=2)                        → [B, 512, 7, 7]
   Pool:   adaptive_avgpool2d(1,1)                                → [B, 512, 1, 1]
   FC:     linear(512→1000)                                       → [B, 1000]
 """
@@ -356,15 +356,15 @@ def triton_linear(x, weight, bias=None, BLOCK_IN=256):
 
 
 # ================================================================
-#  ResNet18 Forward
+#  ResNet34 Forward
 # ================================================================
 
-# ResNet18 layer config: (layer_name, in_c, out_c, stride, has_downsample)
-RESNET18_LAYERS = [
-    ('layer1', 64,  64,  1, False),
-    ('layer2', 64,  128, 2, True),
-    ('layer3', 128, 256, 2, True),
-    ('layer4', 256, 512, 2, True),
+# ResNet34 layer config: (layer_name, in_c, out_c, stride, has_downsample, num_blocks)
+RESNET34_LAYERS = [
+    ('layer1', 64,  64,  1, False, 3),
+    ('layer2', 64,  128, 2, True,  4),
+    ('layer3', 128, 256, 2, True,  6),
+    ('layer4', 256, 512, 2, True,  3),
 ]
 
 
@@ -380,7 +380,7 @@ def _bn_params(weights, prefix):
 
 def _basic_block(x, conv1_w, bn1, conv2_w, bn2,
                  stride=1, downsample=None):
-    """ResNet18 BasicBlock: conv1→bn1→relu→conv2→bn2 → (+identity) → relu."""
+    """ResNet BasicBlock: conv1→bn1→relu→conv2→bn2 → (+identity) → relu."""
     identity = x
 
     out = triton_conv2d(x, conv1_w, stride_h=stride, stride_w=stride, pad_h=1, pad_w=1)
@@ -402,14 +402,14 @@ def _basic_block(x, conv1_w, bn1, conv2_w, bn2,
     return out
 
 
-def resnet18_forward(x, weights):
+def resnet34_forward(x, weights):
     """
-    Full ResNet18 forward pass using Triton kernels.
+    Full ResNet34 forward pass using Triton kernels.
 
     Args:
         x: [B, 3, 224, 224] torch.Tensor on device
-        weights: dict matching torchvision ResNet18 state_dict keys
-                 (use load_resnet18_weights() to get it)
+        weights: dict matching torchvision ResNet34 state_dict keys
+                 (use make_resnet34_weights() to get it)
 
     Returns:
         [B, 1000] torch.Tensor on device
@@ -422,8 +422,8 @@ def resnet18_forward(x, weights):
     out = triton_maxpool2d(out, kH=3, kW=3, stride_h=2, stride_w=2, pad_h=1, pad_w=1)
 
     # Layers 1-4
-    for layer_name, in_c, out_c, layer_stride, has_ds in RESNET18_LAYERS:
-        for block_idx in range(2):
+    for layer_name, in_c, out_c, layer_stride, has_ds, num_blocks in RESNET34_LAYERS:
+        for block_idx in range(num_blocks):
             p = f'{layer_name}.{block_idx}.'
             block_stride = layer_stride if block_idx == 0 else 1
 
@@ -457,8 +457,8 @@ def resnet18_forward(x, weights):
 #  Weight Generation
 # ================================================================
 
-def make_resnet18_weights(device):
-    """Generate random ResNet18 weight dict. Same weights for Triton + PyTorch reference."""
+def make_resnet34_weights(device):
+    """Generate random ResNet34 weight dict. Same weights for Triton + PyTorch reference."""
     w = {}
     w['conv1.weight'] = torch.randn(64, 3, 7, 7, device=device) * 0.01
     for name in ['running_mean', 'running_var', 'weight', 'bias']:
@@ -466,8 +466,8 @@ def make_resnet18_weights(device):
         init = torch.zeros if name in ('running_mean', 'bias') else torch.ones
         w[f'bn1.{name}'] = init(shape, device=device)
 
-    for layer_name, in_c, out_c, stride, has_ds in RESNET18_LAYERS:
-        for i in range(2):
+    for layer_name, in_c, out_c, stride, has_ds, num_blocks in RESNET34_LAYERS:
+        for i in range(num_blocks):
             p = f'{layer_name}.{i}.'
             w[f'{p}conv1.weight'] = torch.randn(out_c, in_c, 3, 3, device=device) * 0.01
             w[f'{p}conv2.weight'] = torch.randn(out_c, out_c, 3, 3, device=device) * 0.01
@@ -493,8 +493,8 @@ def make_resnet18_weights(device):
 #  Reference (PyTorch native)
 # ================================================================
 
-def _reference_resnet18_forward(x, weights):
-    """PyTorch native ResNet18 forward using the same weight dict."""
+def _reference_resnet34_forward(x, weights):
+    """PyTorch native ResNet34 forward using the same weight dict."""
     import torch.nn.functional as F
 
     def ref_bn(x, prefix):
@@ -524,8 +524,8 @@ def _reference_resnet18_forward(x, weights):
     out = F.max_pool2d(out, kernel_size=3, stride=2, padding=1)
 
     # Layers
-    for layer_name, in_c, out_c, layer_stride, has_ds in RESNET18_LAYERS:
-        for i in range(2):
+    for layer_name, in_c, out_c, layer_stride, has_ds, num_blocks in RESNET34_LAYERS:
+        for i in range(num_blocks):
             block_stride = layer_stride if i == 0 else 1
             ds = None
             if has_ds and i == 0:
@@ -545,7 +545,7 @@ def _reference_resnet18_forward(x, weights):
 
 def test(device):
     """
-    Run ResNet18 Triton kernel test on given device.
+    Run ResNet34 Triton kernel test on given device.
 
     Usage:
       test('cuda')   # NVIDIA GPU
@@ -553,18 +553,18 @@ def test(device):
       test('cpu')    # CPU (if Triton supports it)
     """
     print("=" * 70)
-    print(f" ResNet18 Real Triton Test — device={device}")
+    print(f" ResNet34 Real Triton Test — device={device}")
     print("=" * 70)
     B = 1
 
     torch.manual_seed(42)
-    weights = make_resnet18_weights(device)
+    weights = make_resnet34_weights(device)
     x = torch.randn(B, 3, 224, 224, device=device, dtype=torch.float32)
 
     print(f"\nInput:  {list(x.shape)}")
 
     with torch.no_grad():
-        out = resnet18_forward(x, weights)
+        out = resnet34_forward(x, weights)
     print(f"Output: {list(out.shape)}")
 
     assert out.shape == (B, 1000), f"Expected [{B}, 1000], got {list(out.shape)}"
@@ -572,7 +572,7 @@ def test(device):
 
     # Compare against PyTorch reference using the SAME weights
     with torch.no_grad():
-        ref_out = _reference_resnet18_forward(x, weights)
+        ref_out = _reference_resnet34_forward(x, weights)
 
     diff = (out - ref_out).abs().max().item()
     print(f"\nMax diff vs PyTorch reference (same weights): {diff:.6f}")

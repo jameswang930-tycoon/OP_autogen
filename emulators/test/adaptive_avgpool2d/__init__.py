@@ -26,7 +26,7 @@ def adaptive_avgpool2d_kernel(
     c = pid %  C
 
     total = H * W
-    acc = tl.zeros((1,), dtype=tl.float32)
+    acc = 0.0
 
     for hw_start in range(0, total, BLOCK_HW):
         offs_hw = hw_start + tl.arange(0, BLOCK_HW)
@@ -43,12 +43,12 @@ def adaptive_avgpool2d_kernel(
         )
 
         vals = tl.load(x_ptr, x_offsets, mask=mask_hw, other=0.0)
-        acc = acc + tl.sum(vals, axis=0)
+        acc += tl.sum(vals)
 
     avg = acc / total
 
     # Store to output[n, c] at flat position pid
-    tl.store(out_ptr, np.array([pid], dtype=np.int64), avg)
+    tl.store(out_ptr, pid, avg)
 
 
 # ============================================================

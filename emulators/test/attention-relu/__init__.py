@@ -60,7 +60,7 @@ def attention_relu_kernel(
         k_vec = tl.load(k_ptr, k_offsets, mask=tl.arange(0, BLOCK_D) < d_k, other=0.0)
 
         # 点积: sum(q_row * k_vec) → scalar [1]
-        score = tl.sum(q_row * k_vec, axis=0)
+        score = tl.sum(q_row * k_vec)
         score_scaled = score / scale
 
         # ReLU — 替代 softmax! 负相关性直接置零
@@ -71,7 +71,7 @@ def attention_relu_kernel(
         v_vec = tl.load(v_ptr, v_offsets, mask=tl.arange(0, BLOCK_D) < d_v, other=0.0)
 
         # 加权累加: acc += attn_weight * v_vec
-        acc = acc + attn_weight * v_vec
+        acc += attn_weight * v_vec
 
     # 写出结果行: [d_v]
     out_offsets = row_idx * stride_os + tl.arange(0, BLOCK_D) * stride_od

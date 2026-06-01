@@ -56,7 +56,7 @@ def add_rmsnorm_gamma_kernel(
 
     # Step 2: RMSNorm
     sq = residual_new * residual_new
-    mean_sq = tl.sum(sq, axis=0) / n_cols
+    mean_sq = tl.sum(sq) / n_cols
     rrms = 1.0 / tl.sqrt(mean_sq + eps)
     normed = residual_new * rrms
 
@@ -87,7 +87,7 @@ def add_rmsnorm_gamma_kernel_simple(
     hidden = x + residual
 
     sq = hidden * hidden
-    mean_sq = tl.sum(sq, axis=0) / n_cols
+    mean_sq = tl.sum(sq) / n_cols
     rrms = 1.0 / tl.sqrt(mean_sq + eps)
     normed = hidden * rrms
 

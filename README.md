@@ -142,7 +142,7 @@ Skill 文件：[.claude/commands/triton-gen.md](.claude/commands/triton-gen.md)
 
 ## 重要设计约束
 
-1. **`tl.sum` / `tl.max` / `tl.min` 使用 `keepdims=True`** -- 输出形状保留 reduced dimension，数值等价，且与 `tl.store` 的 `(1,)` offsets 天然对齐
+1. **`tl.sum` / `tl.max` / `tl.min` 返回标量** -- 与真实 Triton 行为一致（`keepdims=False`），单 program 输出的累加器用 `0.0`，`tl.store` 支持标量 offset
 2. **指针传递两种约定**：
    - Pointer style：kernel 用 `ptr + offset` → 调用前用 `wrap_ptr()` 包装
    - Emulator style：kernel 用 `tl.load(base_array, offsets)` → 直接传递 numpy 数组
@@ -155,3 +155,4 @@ Skill 文件：[.claude/commands/triton-gen.md](.claude/commands/triton-gen.md)
 - 2026-05-27：ResNet34 集成测试 7/7 PASS，GCN 图算子（SpMM + matmul）3/3 PASS
 - 2026-05-27：triton-gen skill 精简至 ~100 行，支持 5 种输入类型
 - 2026-05-27：项目知识迁移至 `docs/project_knowledge/`，emulator 观察记录至 `docs/emulator_observations/`
+- 2026-06-01：emulator 拉齐真实 Triton 行为（`keepdims=False`、标量累加器、标量 store），生成的 kernel 无需 NPU 编码适配

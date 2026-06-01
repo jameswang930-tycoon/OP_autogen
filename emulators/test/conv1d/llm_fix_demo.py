@@ -128,7 +128,7 @@ def conv1d_v1_buggy(
     ol     = rn  %  L_out
 
     window = C_in * kL
-    acc    = tl.zeros((1,), dtype=tl.float32)
+    acc    = 0.0
 
     for ck_start in range(0, window, BLOCK_CK):
         offs    = ck_start + tl.arange(0, BLOCK_CK)
@@ -141,12 +141,11 @@ def conv1d_v1_buggy(
 
         x_vals = tl.load(x_ptr, x_offsets)                          # BUG-2: 无 mask
         w_vals = tl.load(w_ptr, w_offsets, mask=mask_ck, other=0.0)
-        acc    = acc + tl.sum(x_vals * w_vals, axis=1)               # BUG-1: axis=1
+        acc    += tl.sum(x_vals * w_vals, axis=1)                    # BUG-1: axis=1
 
     b_val    = tl.load(b_ptr, oc)
-    out_offs = np.array([n * stride_outn + oc * stride_outc + ol * stride_outl],
-                        dtype=np.int64)
-    tl.store(out_ptr, out_offs, acc + b_val)
+    out_off = n * stride_outn + oc * stride_outc + ol * stride_outl
+    tl.store(out_ptr, out_off, acc + b_val)
 
 
 # ============================================================
@@ -187,7 +186,7 @@ def conv1d_v2_wrong_bias(
     ol     = rn  %  L_out
 
     window = C_in * kL
-    acc    = tl.zeros((1,), dtype=tl.float32)
+    acc    = 0.0
 
     for ck_start in range(0, window, BLOCK_CK):
         offs    = ck_start + tl.arange(0, BLOCK_CK)
@@ -200,12 +199,11 @@ def conv1d_v2_wrong_bias(
 
         x_vals = tl.load(x_ptr, x_offsets, mask=mask_ck, other=0.0)  # FIXED: mask 加上
         w_vals = tl.load(w_ptr, w_offsets, mask=mask_ck, other=0.0)
-        acc    = acc + tl.sum(x_vals * w_vals, axis=0)                # FIXED: axis=0
+        acc    += tl.sum(x_vals * w_vals)                              # FIXED: no axis
 
     b_val    = tl.load(b_ptr, n)                                       # BUG-3: 应为 oc
-    out_offs = np.array([n * stride_outn + oc * stride_outc + ol * stride_outl],
-                        dtype=np.int64)
-    tl.store(out_ptr, out_offs, acc + b_val)
+    out_off = n * stride_outn + oc * stride_outc + ol * stride_outl
+    tl.store(out_ptr, out_off, acc + b_val)
 
 
 # ============================================================
@@ -241,7 +239,7 @@ def conv1d_v3_correct(
     ol     = rn  %  L_out
 
     window = C_in * kL
-    acc    = tl.zeros((1,), dtype=tl.float32)
+    acc    = 0.0
 
     for ck_start in range(0, window, BLOCK_CK):
         offs    = ck_start + tl.arange(0, BLOCK_CK)
@@ -254,12 +252,11 @@ def conv1d_v3_correct(
 
         x_vals = tl.load(x_ptr, x_offsets, mask=mask_ck, other=0.0)
         w_vals = tl.load(w_ptr, w_offsets, mask=mask_ck, other=0.0)
-        acc    = acc + tl.sum(x_vals * w_vals, axis=0)
+        acc    += tl.sum(x_vals * w_vals)
 
     b_val    = tl.load(b_ptr, oc)                                      # FIXED: oc
-    out_offs = np.array([n * stride_outn + oc * stride_outc + ol * stride_outl],
-                        dtype=np.int64)
-    tl.store(out_ptr, out_offs, acc + b_val)
+    out_off = n * stride_outn + oc * stride_outc + ol * stride_outl
+    tl.store(out_ptr, out_off, acc + b_val)
 
 
 # ============================================================

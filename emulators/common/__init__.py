@@ -722,6 +722,12 @@ class tl:
                 {"hint": "Use tl.store(base_ptr, offsets, values, mask=...)"})
 
         offsets = np.asarray(offsets, dtype=np.int64)
+        # Scalar store: both offset and value are scalars (0-d)
+        if offsets.ndim == 0 and values_np.ndim == 0:
+            idx = int(np.clip(offsets, 0, len(base_data) - 1))
+            TraceLogger.log("store", {"offsets": offsets, "values": values_np})
+            base_data[idx] = values_np
+            return
         if values_np.shape != offsets.shape:
             raise EmulatorError("store", f"values shape {values_np.shape} != offsets shape {offsets.shape}")
         safe = np.clip(offsets, 0, len(base_data) - 1)
@@ -823,7 +829,7 @@ class tl:
         x_np = np.asarray(x)
         if axis >= x_np.ndim:
             raise EmulatorError("sum", f"axis={axis} OOR for ndim={x_np.ndim}", {"shape": x_np.shape})
-        r = xarray(np.sum(x_np, axis=axis, keepdims=True), in_fast_mem=True)
+        r = xarray(np.sum(x_np, axis=axis, keepdims=False), in_fast_mem=True)
         TraceLogger.log("sum", {"x": x, "axis": axis}, r)
         return r
 
@@ -832,7 +838,7 @@ class tl:
         x_np = np.asarray(x)
         if axis >= x_np.ndim:
             raise EmulatorError("max", f"axis={axis} OOR for ndim={x_np.ndim}", {"shape": x_np.shape})
-        r = xarray(np.max(x_np, axis=axis, keepdims=True), in_fast_mem=True)
+        r = xarray(np.max(x_np, axis=axis, keepdims=False), in_fast_mem=True)
         TraceLogger.log("max", {"x": x, "axis": axis}, r)
         return r
 
@@ -841,7 +847,7 @@ class tl:
         x_np = np.asarray(x)
         if axis >= x_np.ndim:
             raise EmulatorError("min", f"axis={axis} OOR for ndim={x_np.ndim}", {"shape": x_np.shape})
-        r = xarray(np.min(x_np, axis=axis, keepdims=True), in_fast_mem=True)
+        r = xarray(np.min(x_np, axis=axis, keepdims=False), in_fast_mem=True)
         TraceLogger.log("min", {"x": x, "axis": axis}, r)
         return r
 

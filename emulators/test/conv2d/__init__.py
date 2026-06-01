@@ -34,7 +34,7 @@ def conv2d_kernel(
     ow = rn %  W_out
 
     window = C_in * kH * kW
-    acc = tl.zeros((1,), dtype=tl.float32)
+    acc = 0.0
 
     for ck_start in range(0, window, BLOCK_CK):
         offs = ck_start + tl.arange(0, BLOCK_CK)
@@ -64,20 +64,15 @@ def conv2d_kernel(
         x_vals = tl.load(x_ptr, x_offsets, mask=mask_ck, other=0.0)
         w_vals = tl.load(w_ptr, w_offsets, mask=mask_ck, other=0.0)
 
-        acc = acc + tl.sum(x_vals * w_vals, axis=0)
+        acc += tl.sum(x_vals * w_vals)
 
     # Add bias
     b_val = tl.load(b_ptr, oc)
     out_val = acc + b_val
 
     # Store to output
-    out_offs = np.array([
-        n  * stride_outn +
-        oc * stride_outc +
-        oh * stride_outh +
-        ow * stride_outw
-    ], dtype=np.int64)
-    tl.store(out_ptr, out_offs, out_val)
+    out_off = n * stride_outn + oc * stride_outc + oh * stride_outh + ow * stride_outw
+    tl.store(out_ptr, out_off, out_val)
 
 
 # ============================================================
@@ -103,7 +98,7 @@ def conv2d_kernel_bug_axis(
     ow = rn %  W_out
 
     window = C_in * kH * kW
-    acc = tl.zeros((1,), dtype=tl.float32)
+    acc = 0.0
 
     for ck_start in range(0, window, BLOCK_CK):
         offs = ck_start + tl.arange(0, BLOCK_CK)
@@ -131,18 +126,13 @@ def conv2d_kernel_bug_axis(
         w_vals = tl.load(w_ptr, w_offsets, mask=mask_ck, other=0.0)
 
         # BUG: axis=1 instead of axis=0 — 对 1D 向量归约, axis=1 越界
-        acc = acc + tl.sum(x_vals * w_vals, axis=1)
+        acc += tl.sum(x_vals * w_vals, axis=1)
 
     b_val = tl.load(b_ptr, oc)
     out_val = acc + b_val
 
-    out_offs = np.array([
-        n  * stride_outn +
-        oc * stride_outc +
-        oh * stride_outh +
-        ow * stride_outw
-    ], dtype=np.int64)
-    tl.store(out_ptr, out_offs, out_val)
+    out_off = n * stride_outn + oc * stride_outc + oh * stride_outh + ow * stride_outw
+    tl.store(out_ptr, out_off, out_val)
 
 
 def conv2d_kernel_bug_window_oob(
@@ -164,7 +154,7 @@ def conv2d_kernel_bug_window_oob(
     ow = rn %  W_out
 
     window = C_in * kH * kW
-    acc = tl.zeros((1,), dtype=tl.float32)
+    acc = 0.0
 
     for ck_start in range(0, window, BLOCK_CK):
         offs = ck_start + tl.arange(0, BLOCK_CK)
@@ -193,18 +183,13 @@ def conv2d_kernel_bug_window_oob(
         x_vals = tl.load(x_ptr, x_offsets, mask=None)
         w_vals = tl.load(w_ptr, w_offsets, mask=mask_ck, other=0.0)
 
-        acc = acc + tl.sum(x_vals * w_vals, axis=0)
+        acc += tl.sum(x_vals * w_vals)
 
     b_val = tl.load(b_ptr, oc)
     out_val = acc + b_val
 
-    out_offs = np.array([
-        n  * stride_outn +
-        oc * stride_outc +
-        oh * stride_outh +
-        ow * stride_outw
-    ], dtype=np.int64)
-    tl.store(out_ptr, out_offs, out_val)
+    out_off = n * stride_outn + oc * stride_outc + oh * stride_outh + ow * stride_outw
+    tl.store(out_ptr, out_off, out_val)
 
 
 def conv2d_kernel_bug_weight_stride(
@@ -226,7 +211,7 @@ def conv2d_kernel_bug_weight_stride(
     ow = rn %  W_out
 
     window = C_in * kH * kW
-    acc = tl.zeros((1,), dtype=tl.float32)
+    acc = 0.0
 
     for ck_start in range(0, window, BLOCK_CK):
         offs = ck_start + tl.arange(0, BLOCK_CK)
@@ -254,18 +239,13 @@ def conv2d_kernel_bug_weight_stride(
         x_vals = tl.load(x_ptr, x_offsets, mask=mask_ck, other=0.0)
         w_vals = tl.load(w_ptr, w_offsets, mask=mask_ck, other=0.0)
 
-        acc = acc + tl.sum(x_vals * w_vals, axis=0)
+        acc += tl.sum(x_vals * w_vals)
 
     b_val = tl.load(b_ptr, oc)
     out_val = acc + b_val
 
-    out_offs = np.array([
-        n  * stride_outn +
-        oc * stride_outc +
-        oh * stride_outh +
-        ow * stride_outw
-    ], dtype=np.int64)
-    tl.store(out_ptr, out_offs, out_val)
+    out_off = n * stride_outn + oc * stride_outc + oh * stride_outh + ow * stride_outw
+    tl.store(out_ptr, out_off, out_val)
 
 
 # ============================================================

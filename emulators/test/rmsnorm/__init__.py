@@ -33,7 +33,7 @@ def rmsnorm_kernel(x_ptr, weight_ptr, out_ptr, n_cols, eps, BLOCK_SIZE: tl.const
 
     # RMS 计算: sqrt(mean(x^2) + eps)
     x_sq = x * x
-    mean_sq = tl.sum(x_sq, axis=0) / n_cols
+    mean_sq = tl.sum(x_sq) / n_cols
     rrms = 1.0 / tl.sqrt(mean_sq + eps)
 
     # 归一化并乘以权重

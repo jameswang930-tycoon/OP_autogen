@@ -33,6 +33,10 @@ OP_autogen/
 │       ├── resnet34/          # ResNet34 集成测试 [3,4,6,3]
 │       └── run_all_tests.py   # 全量自测入口
 ├── models/                    # 模型文件和 shape 注册表（不提交 git）
+├── perf_test/                 # NPU 性能微基准
+│   └── 910B3/                 # Ascend 910B3 带宽/算力测试
+│       ├── vecadd/            # vec core 五通路带宽 + 算力 (bench + plot)
+│       └── matmul/            # cube core matmul 算力 (bench + plot)
 ├── docs/
 │   ├── dev_plan/              # 开发计划
 │   ├── emulator_observations/ # emulator 观察（误差、精度、API、实现模式）

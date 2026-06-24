@@ -58,7 +58,25 @@ Multiple types can co-occur. Explicit shapes always take priority.
 
 ---
 
+## Step 2.5: Cost Model Planning (cost_emulator integration)
+
+Based on the op type + shape from Step 2, call `costModel/cost_planner.py` to estimate bottleneck / parallelism / bandwidth, producing a plan code that guides Step 3's tiling and memory-level choices.
+
+```python
+import sys; sys.path.insert(0, "costModel")
+from cost_planner import plan
+pc = plan(op_kind, shapes)   # op_kind ∈ {"matmul","vadd"}; others stubbed
+```
+
+- `pc["supported"]==True`: read `pc["plan"]` (bottleneck op / parallel-pair count / hints) + `pc["raw_llm"]` (full cost_emulator --llm output, incl. critical path / bandwidth ramp) as Step 3 context.
+- `pc["supported"]==False`: op not mapped to DSL; use a default plan (cube ops follow the matmul path GM→L1→L0→Cube; vec ops follow the vadd path GM→UB→Vec).
+- `pc["error"]`: cost_emulator call failed (needs a Python 3.10+ interpreter; set env `COST_SIM_PYTHON`); does not block generation, only cost is unknown.
+
+---
+
 ## Step 3: Generate Operator Module
+
+Use the Step 2.5 plan code (if supported) to pick tiling granularity and memory level.
 
 Create `emulators/test/<op_name>/__init__.py` with 4-part structure:
 

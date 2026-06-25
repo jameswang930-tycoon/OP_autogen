@@ -40,27 +40,31 @@ SIM_PATH = os.path.join(_HERE, "cost_emulator", "simulator.py")
 # requires 3.10+; default python3, override via env COST_SIM_PYTHON
 SIM_PYTHON = os.environ.get("COST_SIM_PYTHON", "python3")
 
-ELEM = 2  # fp16 bytes per element
+# bytes per element by dtype. cost_planner converts element counts -> bytes here;
+# cost_emulator/simulator.py only ever sees bytes (dtype-agnostic, zero-intrusion).
+_ELEM_BYTES = {"fp16": 2, "bf16": 2, "fp32": 4, "fp8": 1}
+DEFAULT_DTYPE = "fp32"   # matches existing emulators (fp32); pass dtype="fp16" to estimate NPU deploy
 
 
 # ── DSL builders (op_kind, shape -> cost_emulator program string) ────────────
 # cost_emulator 7 engines: gm_to_ub / ub_to_gm / vadd(VecUnit) /
 #                          gm_to_l1 / l1_to_l0 / matrixmul(CubeUnit) / l0_to_gm
 
-def _kb(elems: float) -> float:
-    """element count -> KB (fp16)."""
-    return elems * ELEM / 1024.0
+def _kb(elems: float, dtype: str = DEFAULT_DTYPE) -> float:
+    """element count -> KB for the given dtype (fp16/bf16=2B, fp32=4B, fp8=1B)."""
+    return elems * _ELEM_BYTES.get(dtype, _ELEM_BYTES[DEFAULT_DTYPE]) / 1024.0
 
 
-def dsl_matmul(M: int, N: int, K: int, tile: int = 128) -> str:
+def dsl_matmul(M: int, N: int, K: int, tile: int = 128, dtype: str = DEFAULT_DTYPE) -> str:
     """C[M,N] = A[M,K] @ B[K,N] -- cube path GM->L1->L0->Cube->L0->GM.
 
     tile is the block on L1/L0 (BM=BN=tile, BK=tile representative). One tile's
     transfer is what cost_emulator times; the full tiling strategy is decided
-    later (by the LLM) from the critical path.
+    later (by the LLM) from the critical path. dtype sets bytes/element for A/B/C
+    storage (accumulator dtype is a separate concern, handled by triton-gen).
     """
-    a, b, c = _kb(M * K), _kb(K * N), _kb(M * N)
-    t = _kb(tile * tile)
+    a, b, c = _kb(M * K, dtype), _kb(K * N, dtype), _kb(M * N, dtype)
+    t = _kb(tile * tile, dtype)
     return (
         f"alloc(gm_a,{a:.1f}KB) alloc(gm_b,{b:.1f}KB) alloc(gm_c,{c:.1f}KB) "
         f"alloc(l1_a,{t:.1f}KB) alloc(l1_b,{t:.1f}KB) "
@@ -71,14 +75,14 @@ def dsl_matmul(M: int, N: int, K: int, tile: int = 128) -> str:
     )
 
 
-def dsl_vadd(N: int, tile: int = 8192) -> str:  # 8192 elem = 16KB UB block
+def dsl_vadd(N: int, tile: int = 8192, dtype: str = DEFAULT_DTYPE) -> str:  # 8192 elem UB block
     """C[N] = A[N] + 1.0 -- vec path GM->UB->VecUnit->UB->GM (elementwise proxy).
 
     cost_emulator's vadd is vector+scalar SIMD (compute_intensity=1). vec+vec
     elementwise is equivalent to one vec compute in this model, approximated
-    by vadd.
+    by vadd. dtype sets bytes/element for the data transfer sizing.
     """
-    full, t = _kb(N), _kb(tile)
+    full, t = _kb(N, dtype), _kb(tile, dtype)
     return (
         f"alloc(gm_a,{full:.1f}KB) alloc(gm_c,{full:.1f}KB) "
         f"alloc(ub_a,{t:.1f}KB) alloc(ub_c,{t:.1f}KB) "
@@ -87,8 +91,8 @@ def dsl_vadd(N: int, tile: int = 8192) -> str:  # 8192 elem = 16KB UB block
 
 
 DSL_BUILDERS = {
-    "matmul": lambda s: dsl_matmul(s["M"], s["N"], s["K"]),
-    "vadd":   lambda s: dsl_vadd(s["N"]),
+    "matmul": lambda s, dtype: dsl_matmul(s["M"], s["N"], s["K"], dtype=dtype),
+    "vadd":   lambda s, dtype: dsl_vadd(s["N"], dtype=dtype),
 }
 
 
@@ -168,7 +172,7 @@ def _suggestions(parsed: dict) -> list:
 
 # ── Entry: plan ──────────────────────────────────────────────────────────────
 
-def plan(op_kind: str, shapes: dict) -> dict:
+def plan(op_kind: str, shapes: dict, dtype: str = DEFAULT_DTYPE) -> dict:
     """op + shape -> plan code (dict).
 
     Return shape:
@@ -181,6 +185,7 @@ def plan(op_kind: str, shapes: dict) -> dict:
         return {
             "supported": False,
             "op": op_kind,
+            "dtype": dtype,
             "suggestions": [
                 f"'{op_kind}' not mapped to cost_emulator DSL -- using default plan. "
                 f"supported: {sorted(DSL_BUILDERS)}. "
@@ -188,13 +193,14 @@ def plan(op_kind: str, shapes: dict) -> dict:
             ],
         }
 
-    dsl = builder(shapes)
+    dsl = builder(shapes, dtype)
     try:
         out = run_simulator(dsl)
     except Exception as e:
         return {
             "supported": True,
             "op": op_kind,
+            "dtype": dtype,
             "shapes": shapes,
             "dsl": dsl,
             "error": str(e),
@@ -208,6 +214,7 @@ def plan(op_kind: str, shapes: dict) -> dict:
     return {
         "supported": True,
         "op": op_kind,
+        "dtype": dtype,
         "shapes": shapes,
         "dsl": dsl,
         "plan": {
@@ -223,14 +230,25 @@ def plan(op_kind: str, shapes: dict) -> dict:
 
 
 def _cli():
-    if len(sys.argv) < 3 or sys.argv[1] in ("-h", "--help"):
-        print("usage: cost_planner.py <matmul|vadd> <shapes...>")
-        print("  matmul M N K    e.g.  cost_planner.py matmul 1024 1024 1024")
-        print("  vadd   N        e.g.  cost_planner.py vadd 4096")
+    argv = list(sys.argv[1:])
+    # optional --dtype fp16|fp32|bf16 (default fp32)
+    dtype = DEFAULT_DTYPE
+    if "--dtype" in argv:
+        i = argv.index("--dtype")
+        if i + 1 < len(argv):
+            dtype = argv[i + 1]
+            del argv[i:i + 2]
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage: cost_planner.py <matmul|vadd> <shapes...> [--dtype fp16|fp32|bf16]")
+        print("  matmul M N K    e.g.  cost_planner.py matmul 1024 1024 1024 --dtype fp16")
+        print("  vadd   N        e.g.  cost_planner.py vadd 4096 --dtype fp32")
+        print(f"  --dtype         fp16|fp32|bf16  (default: {DEFAULT_DTYPE})")
         print(f"  env COST_SIM_PYTHON=<3.10+ python>  (default: {SIM_PYTHON})")
         return
-    op = sys.argv[1]
-    nums = [int(x) for x in sys.argv[2:]]
+    if dtype not in _ELEM_BYTES:
+        print(f"unknown dtype '{dtype}'; supported: {sorted(_ELEM_BYTES)}"); return
+    op = argv[0]
+    nums = [int(x) for x in argv[1:]]
     if op == "matmul":
         if len(nums) != 3:
             print("matmul needs M N K"); return
@@ -241,7 +259,7 @@ def _cli():
         shapes = {"N": nums[0]}
     else:
         print(f"unknown op '{op}'; supported: {sorted(DSL_BUILDERS)}"); return
-    print(json.dumps(plan(op, shapes), indent=2, ensure_ascii=False))
+    print(json.dumps(plan(op, shapes, dtype=dtype), indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

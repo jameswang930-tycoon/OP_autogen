@@ -14,10 +14,13 @@ You are an emulator kernel generation expert. Input: $ARGUMENTS (an `<op>` name)
 ## Step 1: Read Plan Code
 
 Read `emulators/test/<op>/.plan.json` (produced by `/triton-plan`). It carries
-`op_kind`, `shapes`, and (when supported) the cost-model `plan` + `raw_llm`. Use
-it as advisory context to choose tiling granularity and memory level. `mock: true`
-means the cost model did not support this op — fall back to the default path
-(cube ops → matmul path GM→L1→L0; vec ops → vadd path GM→UB→Vec).
+`op_kind`, `shapes`, `dtype`, and (when supported) the cost-model `plan` +
+`raw_llm`. Use it as advisory context to choose tiling granularity and memory
+level. `mock: true` means the cost model did not support this op — fall back to
+the default path (cube ops → matmul path GM→L1→L0; vec ops → vadd path GM→UB→Vec).
+
+**dtype**: the plan's `dtype` field (fp16/fp32/bf16, default fp32) sets the
+storage dtype for the generated kernel (see Step 2).
 
 **If the input is a baseline Triton kernel** (the user pasted `@triton.jit` code,
 not an `<op>` name with a plan): convert it to emulator form first — the reverse
@@ -51,6 +54,10 @@ generated kernel deploys to real hardware without rewrite):
 1. Scalar accumulators — `0.0`, never `tl.zeros((1,), ...)`.
 2. In-place accumulation — `acc += expr`, never `acc = acc + expr`.
 3. No redundant axis on 1D reduction — `tl.sum(x)`, not `tl.sum(x, axis=0)`.
+
+**dtype**: use the plan's `dtype` (default fp32) for storage via
+`{"fp16":np.float16, "fp32":np.float32, "bf16":np.float32}`. **matmul accumulator
+stays fp32** (mixed precision — don't replace every float32 with the storage dtype).
 
 **common API**: read `emulators/common/__init__.py` for the authoritative `tl.*`
 signatures (load/store/dot/zeros/full/arith/reduce/program_id/cdiv,

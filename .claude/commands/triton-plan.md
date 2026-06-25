@@ -29,11 +29,10 @@ dump → stub**. Never interpret the plan or encode generation guidance here.
 Multiple types can coexist; explicit shape takes priority. Detection details +
 shapes_registry: `docs/project_knowledge/input_detection.md`.
 
-## Step 2: Extract Semantics → op_kind + shapes
+## Step 2: Extract Semantics → op_kind + shapes + dtype
 
-Map the parsed input to an `op_kind` (e.g. matmul / vadd / conv2d / softmax ...)
-and a `shapes` dict. Op→DSL mapping notes and shapes_registry live in
-`input_detection.md`.
+Map the parsed input to `op_kind` + `shapes` (mappings in `input_detection.md`),
+and extract `dtype` (`fp16`/`fp32`/`bf16`, default `fp32`).
 
 ## Step 3: Call the External Cost Model + Dump Plan Code
 
@@ -42,7 +41,7 @@ import sys, json, os
 sys.path.insert(0, "costModel")
 from cost_planner import plan
 
-pc = plan(op_kind, shapes)   # op_kind currently supported: matmul, vadd; others stubbed
+pc = plan(op_kind, shapes, dtype=dtype)   # supported: matmul, vadd; others stubbed
 # COST_SIM_PYTHON must point to a Python 3.10+ interpreter (cost_emulator needs 3.10+)
 ```
 
@@ -52,7 +51,7 @@ pc = plan(op_kind, shapes)   # op_kind currently supported: matmul, vadd; others
 - `pc["supported"] == False` or the call raises: write a **mock plan** stub and do
   NOT block downstream:
   ```json
-  {"mock": true, "op": "<op_kind>", "shapes": {...},
+  {"mock": true, "op": "<op_kind>", "shapes": {...}, "dtype": "<dtype>",
    "note": "cost model does not support this op; triton-gen uses the default path"}
   ```
 

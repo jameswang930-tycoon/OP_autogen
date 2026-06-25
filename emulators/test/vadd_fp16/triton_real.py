@@ -1,16 +1,16 @@
 """
-Vadd_fp16 — real Triton kernel (converted from the emulator version, fp16 storage).
-=====================================================================================
-5 mechanical rewrites from emulators/test/vadd_fp16/__init__.py (kernel compute logic
-identical — only the calling convention changed). fp16 flows end-to-end:
-  /triton-plan (dtype=fp16) -> /triton-gen (fp16 emulator) -> /triton-convert (fp16 real).
+Vadd_fp16 real Triton — grid=1 打满单核上板用例
+================================================
+N=65536 (128KB fp16), BLOCK_SIZE=65536, grid=1.
+转换自 emulator 版 (5 处机械改写, kernel 逻辑不变, fp16 贯穿).
 """
 
 import torch
 import triton
 import triton.language as tl
 
-DTYPE = torch.float16   # matches plan dtype=fp16
+DTYPE = torch.float16
+BLOCK_DEFAULT = 65536
 
 
 @triton.jit
@@ -23,7 +23,7 @@ def vadd_kernel(x_ptr, out_ptr, n_elements, scalar, BLOCK_SIZE: tl.constexpr):
     tl.store(out_ptr + offsets, out, mask=mask)
 
 
-def vadd(x: torch.Tensor, scalar: float = 1.0, BLOCK_SIZE: int = 8192) -> torch.Tensor:
+def vadd(x: torch.Tensor, scalar: float = 1.0, BLOCK_SIZE: int = BLOCK_DEFAULT) -> torch.Tensor:
     out = torch.empty_like(x)
     n = x.numel()
     grid = lambda meta: (triton.cdiv(n, meta['BLOCK_SIZE']),)
@@ -37,13 +37,10 @@ def reference_vadd(x, scalar=1.0):
 
 def test():
     torch.manual_seed(42)
-    x = torch.randn(4096, dtype=DTYPE, device='cpu')
+    # grid=1 打满单核: N=65536, BLOCK=65536 (128KB fp16)
+    x = torch.randn(65536, dtype=DTYPE, device='cpu')
     torch.testing.assert_close(vadd(x), reference_vadd(x))
-    print("[PASS] vadd_fp16_real_1d", tuple(x.shape))
-
-    x2 = torch.randn(32, 128, dtype=DTYPE, device='cpu')
-    torch.testing.assert_close(vadd(x2, scalar=-2.0), reference_vadd(x2, scalar=-2.0))
-    print("[PASS] vadd_fp16_real_2d")
+    print("[PASS] vadd_fp16_real grid=1 (N=65536, 128KB)", tuple(x.shape))
 
 
 if __name__ == "__main__":

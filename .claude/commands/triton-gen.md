@@ -1,121 +1,71 @@
 ---
 name: triton-gen
 description: >
-  Generate and verify Triton GPU kernels using a CPU-side emulator.
-  Use this skill whenever the user asks to: generate a Triton kernel,
-  write a GPU kernel for an operator (matmul, softmax, attention, conv, etc.),
-  verify a Triton kernel's correctness, debug a Triton kernel,
-  or create a fused operator kernel. Also trigger when the user mentions
-  "triton", "tl.load", "tl.store", "GPU kernel", or wants to test
-  kernel correctness without a GPU. This skill handles the full closed loop:
-  generate kernel -> execute on CPU emulator -> verify against reference ->
-  if wrong, analyze trace and fix -> repeat until correct.
+  Generate an emulator kernel module from a plan code file (.plan.json). Reads
+  the plan produced by /triton-plan, generates emulators/test/<op>/__init__.py
+  (4-part: kernel/emulate/reference/test), then runs ONE inline verification to
+  report PASS/FAIL — no repair loop (that is /triton-fix) and no real-Triton
+  conversion (that is /triton-convert). Trigger when the user says "generate
+  kernel", "/triton-gen <op>", after a plan exists.
 ---
 
-You are a Triton kernel generation and debugging expert. Your task is to **generate or fix** Triton kernels based on user input, and verify correctness using this project's CPU emulator.
+You are an emulator kernel generation expert. Input: $ARGUMENTS (an `<op>` name).
 
-User input: $ARGUMENTS
+## Step 1: Read Plan Code
 
----
+Read `emulators/test/<op>/.plan.json` (produced by `/triton-plan`). It carries
+`op_kind`, `shapes`, and (when supported) the cost-model `plan` + `raw_llm`. Use
+it as advisory context to choose tiling granularity and memory level. `mock: true`
+means the cost model did not support this op — fall back to the default path
+(cube ops → matmul path GM→L1→L0; vec ops → vadd path GM→UB→Vec).
 
-## Step 1: Determine Input Type
-
-| Input Type | Detection Rules |
-|------------|----------------|
-| **Natural language** | Plain text describing an operator or formula |
-| **PyTorch model** | `.pt`/`.pth`, `nn.Module`, `torch.nn`, `torchvision`, PyTorch code block |
-| **ONNX model** | `.onnx`, `onnxruntime`, `onnx.` |
-| **Baseline Triton kernel** | `@triton.jit`, `import triton`, `tl.program_id`, Triton code block |
-| **Fixed shape info** | Model name from registry, or explicit `[B,C,H,W]` shapes |
-
-Multiple types can co-occur. Explicit shapes always take priority.
-
-**Scenario**: Generation (no file to fix) or Repair (file path / "fix/debug" keywords).
-
----
-
-## Step 2: Extract Semantics by Input Type
-
-### 2a: Natural Language → determine shapes, formula, reduction needs, grid dimension (1D elementwise / 2D matrix/conv)
-
-### 2b: PyTorch Model → parse `forward()`, identify operators and shapes. Key mappings:
-- `F.conv2d` → `conv2d_resnet`, `F.batch_norm` → `batchnorm2d`, `F.relu` → `relu`
-- `F.max_pool2d` → `maxpool2d`, `F.adaptive_avg_pool2d` → `adaptive_avgpool2d`
-- `F.linear` → `matmul` + `add`, `torch.matmul` → `matmul`
-
-### 2c: ONNX Model → `onnx.load()` then extract nodes and shapes. Key mappings:
-- `Conv` → `conv2d_resnet`, `BatchNormalization` → `batchnorm2d`, `Relu` → `relu`
-- `MaxPool` → `maxpool2d`, `GlobalAveragePool` → `adaptive_avgpool2d`
-- `MatMul` → `matmul`, `Gemm` → `matmul` + `add`, `Softmax` → `softmax`
-
-### 2d: Baseline Triton → convert to emulator form:
+**If the input is a baseline Triton kernel** (the user pasted `@triton.jit` code,
+not an `<op>` name with a plan): convert it to emulator form first — the reverse
+of `/triton-convert`:
 - `import triton.language as tl` → `from common import tl`
-- Remove `@triton.jit`
+- drop `@triton.jit`
 - `tl.load(ptr + offsets, mask=...)` → `tl.load(ptr, offsets, mask=...)`
-- `kernel[grid](...)` → `launch_kernel_1d(kernel, ..., grid_size=N)`
+- `tl.store(ptr + offsets, ...)` → `tl.store(ptr, offsets, ...)`
+- `kernel[grid](...)` → `launch_kernel_Nd(kernel, ..., grid_size=)` with numpy data
 
-### 2e: Fixed Shape → read `models/shapes_registry.py` for model name. Use small spatial (8-32) for unit tests, real sizes for integration.
+Then wrap it in the 4-part module. `/triton-plan` is optional for this path.
 
----
+## Step 2: Generate the Module
 
-## Step 2.5: Cost Model Planning (cost_emulator integration)
+Create `emulators/test/<op>/__init__.py` with the 4-part structure:
 
-Based on the op type + shape from Step 2, call `costModel/cost_planner.py` to estimate bottleneck / parallelism / bandwidth, producing a plan code that guides Step 3's tiling and memory-level choices.
+1. **kernel** — pure `tl.*` API; data is 1D flat, offsets are linear indices, OOB masked.
+2. **emulate wrapper** — validate inputs → flatten → `launch_kernel_*` → reshape output.
+3. **reference** — numpy/torch ground truth.
+4. **test** — basic + edge cases.
+
+**Import whitelist** (ONLY these):
 
 ```python
-import sys; sys.path.insert(0, "costModel")
-from cost_planner import plan
-pc = plan(op_kind, shapes)   # op_kind ∈ {"matmul","vadd"}; others stubbed
+from common import tl, xarray, launch_kernel_1d, launch_kernel_2d, launch_kernel_3d, verify, EmulatorError
 ```
 
-- `pc["supported"]==True`: read `pc["plan"]` (bottleneck op / parallel-pair count / hints) + `pc["raw_llm"]` (full cost_emulator --llm output, incl. critical path / bandwidth ramp) as Step 3 context.
-- `pc["supported"]==False`: op not mapped to DSL; use a default plan (cube ops follow the matmul path GM→L1→L0→Cube; vec ops follow the vadd path GM→UB→Vec).
-- `pc["error"]`: cost_emulator call failed (needs a Python 3.10+ interpreter; set env `COST_SIM_PYTHON`); does not block generation, only cost is unknown.
+**NPU-compatible coding rules** (the emulator enforces these natively, so the
+generated kernel deploys to real hardware without rewrite):
 
----
+1. Scalar accumulators — `0.0`, never `tl.zeros((1,), ...)`.
+2. In-place accumulation — `acc += expr`, never `acc = acc + expr`.
+3. No redundant axis on 1D reduction — `tl.sum(x)`, not `tl.sum(x, axis=0)`.
 
-## Step 3: Generate Operator Module
+**common API**: read `emulators/common/__init__.py` for the authoritative `tl.*`
+signatures (load/store/dot/zeros/full/arith/reduce/program_id/cdiv,
+launch_kernel_Nd, verify, run_with_feedback, EmulatorError).
 
-Use the Step 2.5 plan code (if supported) to pick tiling granularity and memory level.
+Writing-kernel patterns & pitfalls: `docs/emulator_observations/implementation_patterns.md`.
+Import conventions & 4-part details: `docs/project_knowledge/test_conventions.md`.
 
-Create `emulators/test/<op_name>/__init__.py` with 4-part structure:
-
-1. **Kernel** — ONLY uses `tl.*` API. Data is 1D flat, offsets are linear indices, OOB must be masked.
-2. **Emulate wrapper** — validate inputs → flatten → `launch_kernel_*` → reshape output
-3. **Reference** — pure numpy/torch ground truth
-4. **Test** — basic + edge cases
-
-**Read `emulators/common/__init__.py`** for available `tl.*` APIs and their signatures. The source is the authoritative reference.
-
-**NPU-compatible coding rules** (emulator enforces these natively, so generated kernels deploy to real hardware without rewrite):
-
-1. **Scalar accumulators** — use `0.0`, never `tl.zeros((1,), dtype=tl.float32)`. Per-program accumulators are scalars, not 1-element tensors.
-2. **In-place accumulation** — use `acc += expr`, never `acc = acc + expr`. Different IR on NPU backends.
-3. **No redundant axis on 1D reduction** — use `tl.sum(x)`, never `tl.sum(x, axis=0)`. For 1D tensors, omit axis entirely.
-
----
-
-## Step 4: Run Verification
+## Step 3: Inline Verify (report only, no repair)
 
 ```bash
-cd emulators && python -c "from test.<op_name> import test; test()"
+cd emulators && python3 -c "from test.<op> import test; test()"
 ```
 
-If pass → register in `emulators/test/run_all_tests.py`. If model decomposition → continue to next operator.
+or call `run_with_feedback(emulate_<op>, reference_<op>)`.
 
----
-
-## Step 5: Iteration Repair (max 5 rounds)
-
-**Error Type A — EmulatorError** (crash with line number):
-Fix the reported line directly. Common: `offsets OOB` → add mask; `Shape mismatch` → align store shapes; `Both must be 2D` → reshape before `tl.dot`.
-
-**Error Type B — Shape Mismatch** (output shapes differ):
-Check output size formula and grid_size calculation.
-
-**Error Type C — Numerical Mismatch** (`max_abs_err`/`max_rel_err`):
-- `HAS_NAN` → division by zero, log of negative
-- `ALL_ZERO` → mask over-filtering or offsets all OOB
-- No anomaly but values off → check stride/offset formulas, pid decoding
-
-**Rules**: Smallest change per round. Re-run after every change. Record errors for emulator improvement.
+- **PASS** → print max_abs_err / max_rel_err; (optional) register in `emulators/test/run_all_tests.py`; tell the user: `/triton-convert <op>`.
+- **FAIL** → report the feedback; tell the user: `/triton-fix <op>`.

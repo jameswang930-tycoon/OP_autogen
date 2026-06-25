@@ -9,3 +9,4 @@ models/
 .venv/
 costModel/cost_emulator/
 costModel/archaludon/
+emulators/test/**/.plan.json

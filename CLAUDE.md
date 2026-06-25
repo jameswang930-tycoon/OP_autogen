@@ -66,15 +66,16 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ## Project Knowledge
 
-These files contain project context. Read on demand (not auto-loaded):
+These files contain project context. Read on demand (not auto-loaded). The **Owner skill** column shows which `/skill` owns each doc:
 
-| File | When to Read |
-|------|-------------|
-| `docs/project_knowledge/project_overview.md` | Understanding project structure, checking implemented operators |
-| `docs/project_knowledge/test_conventions.md` | Developing new operators, writing tests |
-| `docs/project_knowledge/triton_gen_skill.md` | Using /triton-gen or extending the skill |
-| `docs/project_knowledge/emulator_improvements_done.md` | Debugging emulator error feedback |
-| `docs/project_knowledge/emulator_error_coverage.md` | Assessing emulator capabilities and blind spots |
-| `docs/project_knowledge/emulator_next_steps.md` | Planning future improvements |
-| `docs/project_knowledge/emulator_to_triton_conversion.md` | Converting emulator kernels to real Triton for NPU deployment |
-| `docs/emulator_observations/` | Debugging operators, analyzing precision/error issues |
+| File | Owner skill | When to Read |
+|------|-------------|-------------|
+| `docs/project_knowledge/project_overview.md` | public (landing) | Project structure, the 5-skill workflow, implemented operators |
+| `docs/project_knowledge/input_detection.md` | /triton-plan | Detecting input type, extracting op_kind + shapes |
+| `docs/project_knowledge/test_conventions.md` | /triton-gen + /triton-verify | Import conventions (gen), weight/registration policy (verify) |
+| `docs/project_knowledge/emulator_improvements_done.md` | /triton-verify + /triton-fix | Error-feedback format, dedup mechanism |
+| `docs/project_knowledge/emulator_error_coverage.md` | /triton-verify + /triton-fix | Emulator detection capabilities & blind spots |
+| `docs/project_knowledge/emulator_next_steps.md` | public (roadmap) | DualRunner / Cost Model / iteration mode roadmap |
+| `docs/project_knowledge/emulator_to_triton_conversion.md` | /triton-convert | Converting emulator kernels to real Triton for NPU |
+| `docs/emulator_observations/implementation_patterns.md` | /triton-gen | Writing-kernel patterns & pitfalls |
+| `docs/emulator_observations/` (api_gaps, error_accumulation, precision_gaps, missing_coverage) | /triton-verify | Precision/coverage gaps, API differences |

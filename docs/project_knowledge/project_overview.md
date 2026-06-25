@@ -36,8 +36,7 @@ OP_autogen/
 │   ├── dev_plan/              <- development plans
 │   ├── emulator_observations/ <- emulator observations (error, precision, API, patterns)
 │   └── project_knowledge/     <- project knowledge (this directory)
-├── .claude/commands/
-│   └── triton-gen.md          <- triton-gen skill definition
+├── .claude/commands/          <- 5 skills: triton-plan / triton-gen / triton-verify / triton-fix / triton-convert
 └── README.md
 ```
 
@@ -78,4 +77,19 @@ add, matmul, transpose, reshape, relu, softmax, rmsnorm, addrmsnormgamma, conv1d
 
 - `emulators/test/run_all_tests.py` — run all operator self-tests
 - `run_with_feedback()` — top-level LLM feedback interface
-- `/triton-gen` skill — Claude Code project-level command, supports NL/PyTorch/ONNX/baseline Triton/fixed shape inputs
+
+## Workflow (5 single-responsibility skills)
+
+The kernel-generation pipeline is split into 5 skills, chained by **files on
+disk** (no orchestrator — invoke each manually):
+
+| Skill | Responsibility | Reads | Writes |
+|-------|---------------|-------|--------|
+| `/triton-plan` | input → op semantics → call cost model | user input | `emulators/test/<op>/.plan.json` |
+| `/triton-gen` | plan → emulator kernel (+ inline verify) | `.plan.json` | `emulators/test/<op>/__init__.py` |
+| `/triton-verify` | read-only correctness check | `__init__.py` | (terminal only) |
+| `/triton-fix` | repair loop (max 5 rounds) | `__init__.py` | `__init__.py` |
+| `/triton-convert` | emulator → real Triton | `__init__.py` | `emulators/test/<op>/triton_real.py` |
+
+Each skill's `.md` lists its own **References** (the docs it owns). Doc-to-skill
+ownership is indexed in `CLAUDE.md` → Project Knowledge.

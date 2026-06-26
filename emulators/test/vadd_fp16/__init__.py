@@ -1,11 +1,14 @@
 """
 Vadd_fp16 — grid=1 打满单核的上板用例
 =====================================
-配置: N=65536 (128KB fp16), BLOCK_SIZE=65536, grid=1 → 单 block 单核, 数据量接近 UB 上限.
-cost model 预测 (tile=N, grid=1 正确口径): total ≈ 270 ns.
+配置: N=32768 (64KB fp16), BLOCK_SIZE=32768, grid=1 → 单 block 单核.
+UB 占用: ub_a+ub_c = 64KB+64KB = 128KB peak < 实际 UB 192KB (不 overflow).
+cost model 预测 (tile=N, grid=1 正确口径): total ≈ 135 ns.
 
-上板对照: msprof 实测 total vs 预测 ~270 ns.
-预期偏差 < N=4096 的 48x (128KB 搬运占比上来), 但 grid=1 单核 scalar/启动无法多核分摊, 实际仍 > 270.
+注: cost model 的 MEMORY_CAPACITY_KB['UB']=512KB 是 placeholder, 实际 910B3 UB=192KB,
+所以 BLOCK 选 32768 (非 65536) 以避免实际 UB overflow.
+
+上板对照: msprof 实测 total vs 预测 ~135 ns.
 """
 
 import numpy as np
@@ -14,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from common import tl, xarray, launch_kernel_1d, verify, EmulatorError
 
 DTYPE = np.float16
-BLOCK_DEFAULT = 65536   # grid=1 打满单核: N=BLOCK → 单 block 128KB
+BLOCK_DEFAULT = 32768   # grid=1 打满单核: N=BLOCK → peak UB 128KB < 192KB
 
 
 def vadd_kernel(x_ptr, out_ptr, n_elements, scalar, BLOCK_SIZE: tl.constexpr):
@@ -51,10 +54,10 @@ def test():
     x = np.random.randn(4096).astype(DTYPE)
     verify(emulate_vadd(x, BLOCK_SIZE=8192), reference_vadd(x), "vadd_fp16_small")
 
-    # 打满单核上板点: N=65536, BLOCK=65536, grid=1 (128KB fp16)
-    x_big = np.random.randn(65536).astype(DTYPE)
-    verify(emulate_vadd(x_big, BLOCK_SIZE=65536), reference_vadd(x_big), "vadd_fp16_grid1_128KB")
-    print("  [info] grid=1 打满单核: N=65536 BLOCK=65536 → 128KB, cost model 预测 ~270ns")
+    # 打满单核上板点: N=32768, BLOCK=32768, grid=1 (64KB fp16, UB peak 128KB)
+    x_big = np.random.randn(32768).astype(DTYPE)
+    verify(emulate_vadd(x_big, BLOCK_SIZE=32768), reference_vadd(x_big), "vadd_fp16_grid1_64KB")
+    print("  [info] grid=1 打满单核: N=32768 BLOCK=32768 → 64KB, UB peak 128KB<192KB, 预测 ~135ns")
 
     try:
         emulate_vadd(np.zeros(0))

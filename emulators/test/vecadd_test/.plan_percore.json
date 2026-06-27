@@ -1,0 +1,12 @@
+{
+  "op": "vadd",
+  "dtype": "fp16",
+  "shapes": {
+    "chunk_elems": 5120,
+    "chunk_bytes": "10KB",
+    "threads": 40
+  },
+  "dsl": "alloc(gm_1,10KB) alloc(ub_1,10KB) alloc(ub_2,10KB) gm_to_ub(ub_1,gm_1) vadd(ub_2,ub_1,3)",
+  "raw_llm": "=== EXECUTION SUMMARY ===\ntotal_ns: 219.21\nnum_ops: 2\nexecution_mode: sequential\n\n=== TIME BREAKDOWN ===\n(time_ratio = op duration / total_ns, sorted biggest first; ops overlap so ratios need not sum to 100%)\nop0: gm_to_ub(ub_1, gm_1)  duration_ns=164.44  time_ratio=75.01%  (164.44/219.21 ns)\nop1: vadd(ub_2, ub_1, 3)  duration_ns=54.77  time_ratio=24.99%  (54.77/219.21 ns)\n\n=== PER-OP STATISTICS ===\nop0: gm_to_ub(ub_1, gm_1)\n  engine: GM→UB\n  size: 10 KB\n  cycles_ns: [0.00..164.44]  duration_ns=164.44  time_ratio=75.01%\n  bandwidth: effective=62.27 GB/s  peak=75 GB/s  utilization=83.03%  regime=ramp\n  wait_ns_before_start: 0.00\n  blocked_by: none\n\nop1: vadd(ub_2, ub_1, 3)\n  engine: VecUnit\n  size: 10 KB\n  cycles_ns: [164.44..219.21]  duration_ns=54.77  time_ratio=24.99%\n  bandwidth: effective=187 GB/s  peak=400 GB/s  utilization=46.74%  regime=ramp\n  wait_ns_before_start: 164.44\n  blocked_by: op0 via RAW on 'ub_1' — ub_1 written by op0, read by op1\n\n=== ENGINE UTILIZATION ===\nGM→UB: busy=164.44/219.21 ns  utilization=75.01%\nUB→GM: busy=0.00/219.21 ns  utilization=0.00%\nVecUnit: busy=54.77/219.21 ns  utilization=24.99%\nGM→L1: busy=0.00/219.21 ns  utilization=0.00%\nL1→L0: busy=0.00/219.21 ns  utilization=0.00%\nCubeUnit: busy=0.00/219.21 ns  utilization=0.00%\nL0→GM: busy=0.00/219.21 ns  utilization=0.00%\n\n=== BANDWIDTH UTILIZATION ===\n(effective_bw / peak_bw per op; bandwidth ramps with size, so small transfers run below peak)\nop0 (GM→UB): effective=62.27 GB/s  peak=75 GB/s  utilization=83.03%  regime=ramp  saturates_at=12 KB\nop1 (VecUnit): effective=187 GB/s  peak=400 GB/s  utilization=46.74%  regime=ramp  saturates_at=24 KB\n\n=== PARALLELISM ===\nparallel_pairs: 0\nroot_cause_of_sequential_execution:\n  op0->op1: RAW on 'ub_1' — ub_1 written by op0, read by op1\n\n=== CRITICAL PATH ===\nalgorithm: topo\nlength_ns: 219.21\nfraction_of_makespan: 100%\npath: op0 -> op1\nedges:\n  op0 -> op1: RAW on 'ub_1'\nper_op:\n  op0 gm_to_ub(ub_1, gm_1)  engine=GM→UB  ns=[0.00..164.44]  duration_ns=164.44\n  op1 vadd(ub_2, ub_1, 3)  engine=VecUnit  ns=[164.44..219.21]  duration_ns=54.77\n\n",
+  "note": "单核口径 (MTE2÷20, Vec÷40); 对照 verify_triton after kernel"
+}

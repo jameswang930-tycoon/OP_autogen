@@ -14,13 +14,13 @@ You are an emulator kernel generation expert. Input: $ARGUMENTS (an `<op>` name)
 ## Step 1: Read Plan Code
 
 Read `emulators/test/<op>/.plan.json` (produced by `/triton-plan`). It carries
-`op_kind`, `shapes`, `dtype`, and (when supported) the cost-model `plan` +
-`raw_llm`. Use it as advisory context to choose tiling granularity and memory
-level. `mock: true` means the cost model did not support this op — fall back to
-the default path (cube ops → matmul path GM→L1→L0; vec ops → vadd path GM→UB→Vec).
+`op`, `shapes`, `dtype`, `dsl`, and `raw_llm` (the simulator `--llm` full output).
+Read `raw_llm` in depth for data flow (which engines), bottleneck (TIME BREAKDOWN +
+CRITICAL PATH), and tiling (BANDWIDTH UTILIZATION regime / saturates_at). If
+`raw_llm` is missing (mock/simulator failed), fall back to the default path (cube
+→ matmul path GM→L1→L0; vec → vadd path GM→UB→Vec).
 
-**dtype**: the plan's `dtype` field (fp16/fp32/bf16, default fp32) sets the
-storage dtype for the generated kernel (see Step 2).
+**dtype**: the plan's `dtype` (fp16/fp32/bf16, default fp32) sets storage dtype.
 
 **If the input is a baseline Triton kernel** (the user pasted `@triton.jit` code,
 not an `<op>` name with a plan): convert it to emulator form first — the reverse

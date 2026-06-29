@@ -75,40 +75,37 @@ cost model 预测 load 12.5× 的依据：单 program 孤立 1KB 在 floor 区�
 
 ## 4. 方向2：after 实测 vs 理论预测 —— 为什么差这么多
 
-以 after（1×10KB）为例：
+以 after（1×10KB）为例。**真实 wall-clock（msprof Task Duration，稳定态平均）= 2.711 us**：
 
 | | 实测（grid=40）| 预测（单 program，单核含 store）|
 |---|---|---|
-| vec（vadd）| **4.946 us** | 54.8 ns |
-| mte2（load）| 0.919 us | 164.4 ns |
-| mte3（store）| 0.672 us | 141.6 ns |
-| scalar | 0.161 us | 0（没建）|
-| wall-clock | **~11.8 us**（反推）| 360.81 ns |
+| **wall-clock（总时延）**| **2.711 us（2711 ns）** | **360.81 ns** |
+| vec（vadd）累加 | 4.946 us | 54.8 ns |
+| mte2（load）累加 | 0.919 us | 164.4 ns |
+| mte3（store）累加 | 0.672 us | 141.6 ns |
+| scalar 累加 | 0.161 us | 0（没建）|
 
-差 **~33×**（11.8us vs 360.81ns）。根因：
+差 **7.5×**（2711 ns vs 360.81 ns）。
+
+**注**：各 pipe time（vec 4.946us 等）**> wall-clock（2.711us）**，说明它们是 **40 核累加**（aiv_vec_time 等 = 所有 aicore 的 pipe 时间累加，不是 wall-clock 期间单 op 占用），不能直接和 wall-clock 比。只有 **Task Duration（2.711us）才是 kernel 真实总时延**，拿它和预测 total 比。
 
 ### 根因 1：规模不同 —— 预测单 program，实测 grid=40（40 program）
 
-cost model 是**单核单 program** 模型（不建 grid）。预测 after 360.81ns = 一个 program（10KB chunk）时延。实测是 40 program 在 40 核跑（40×10KB=400KB 总数据）。**规模差 40×**，根本不是一回事。
+cost model 是单核单 program 模型（不建 grid）。预测 360.81ns = 一个 program（10KB）时延。实测 grid=40（40 program 在 40 核跑）。即使 40 核全并行（wall-clock ≈ 单 program 时延），实测 2.711us 仍是预测 360.81ns 的 7.5× —— 说明 40 核没做到"全并行等价单 program"，有 scalar/启动/同步开销。
 
-即使 40 核全并行（wall-clock ≈ 单 program），实测 11.8us 也远大于 360.81ns —— 说明 40 核没做到"全并行等价单 program"，有大量开销。
+### 根因 2：vec 严重没吃满
 
-### 根因 2：vec 严重没吃满（占 41.8% 但算力利用率 0.45%）
+after vec 累加 4.946us（40 核），单核 ≈ 124ns。总 vadd = 40×5120×1 = 204,800 FLOPs，40 核 vec 聚合算力 9.216 TFLOPS —— 每 program 5120 elem 太小，vec 喂不饱。
 
-after vec 实测 4.946us（最大头）。算利用率：
-- 总 vadd 计算 = 40 threads × 5120 elem × 1 FLOP = 204,800 FLOPs
-- vec time 4.946us → **0.041 TFLOPS**
-- 910B3 vec 聚合算力 9.216 TFLOPS → **利用率 0.45%**
+### 根因 3：scalar/启动/同步 —— 预测没建
 
-grid=40 但每个 program 的 vadd 计算量太小（5120 elem），40 核的 vec 算力根本喂不饱。vec pipe 在 wall-clock 期间持续占用（4.946us，41.8%）但没满载 —— 这是 after 实测大的主因。
-
-### 根因 3：scalar/启动/同步/空闲 —— 预测全没建
-
-after 占比和只有 77.3%（vec 41.8 + scalar 3.3 + mte2 18.6 + mte3 13.6），**剩 22.7% 是空闲/同步/调度**。cost model 完全没建（无 scalar engine、无启动开销、无多核同步）。
+实测有 scalar（0.161us 累加）+ 启动/同步开销。cost model 完全没建（无 scalar engine、无启动、无多核同步）。
 
 ### 方向2 结论
 
-after 实测 vs 预测差 33×，主因：① 规模（单 program vs 40 program）② vec 严重没吃满（0.45% 利用）③ scalar/启动/同步（22.7%）没建。
+after 实测 wall-clock **2.711 us** vs 预测 **360.81 ns**，差 **7.5×**。主因：① 规模（单 program vs 40 program，多核开销）② vec 没吃满（5120 elem/program 太小）③ scalar/启动/同步没建。
+
+（注：之前用占比反推 wall-clock ~11.8us 是错的 —— pipe time 是 40 核累加，占比基准不是 wall-clock，反推必然失真。真实 Task Duration 2.711us，差 7.5×，比反推的 33× 小得多。）
 
 ---
 

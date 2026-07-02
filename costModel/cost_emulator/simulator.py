@@ -90,14 +90,14 @@ ENG_NAME = {
 # the whole schedule stays in one coherent time unit, but only GM→UB and VecUnit are
 # calibrated. CubeUnit has no measured numbers yet, so it keeps a single flat breakpoint
 # (size-independent) until its throughput is measured.
-BANDWIDTH_CURVE_GB_S = {
-    0: [(1.0, 5.0),    (12.0, 75.0)],      # GM→UB  — MEASURED ÷20 (单核, 20 AI Core)
-    1: [(1.0, 15.15),  (8.0, 72.25), (32.0, 73.05)],  # UB→GM  — MEASURED ÷20 (单核; 实测303/1445/1461 ÷20)
-    2: [(1.0, 50.0),   (24.0, 400.0)],     # VecUnit — MEASURED ÷40 (单核, 40 Vec Core)
-    3: [(1.0, 50.0),   (12.0, 750.0)],     # GM→L1  — PLACEHOLDER (TODO: measure)
-    4: [(1.0, 100.0),  (12.0, 2000.0)],    # L1→L0  — PLACEHOLDER (TODO: measure)
-    5: [(1.0, 3000.0)],                    # CubeUnit — PLACEHOLDER, flat (TODO: measure)
-    6: [(1.0, 50.0),   (12.0, 750.0)],     # L0→GM  — PLACEHOLDER (TODO: measure)
+SATURATION_PARAMS = {
+    0: {"vpeak": 121.08, "k0": 6.65, "peak_clamp": 80.83},    # GM→UB  — perf_test MISS_256MB ÷20 (单核, 20 AI Core)
+    1: {"vpeak": 190.19, "k0": 10.72, "peak_clamp": 76.67},   # UB→GM  — perf_test write_grid40 ÷20 (单核)
+    2: {"vpeak": 461.0, "k0": 4.50, "peak_clamp": 404.0},     # VecUnit — perf_test Vec_ADD_grid40 ÷40 (单核, 40 Vec Core)
+    3: {"vpeak": 37.5, "k0": 6.65, "peak_clamp": 37.5},        # GM→L1  — PLACEHOLDER ÷20
+    4: {"vpeak": 100.0, "k0": 6.65, "peak_clamp": 100.0},      # L1→L0  — PLACEHOLDER ÷20
+    5: {"vpeak": 150.0, "k0": 0, "peak_clamp": 150.0},         # CubeUnit — PLACEHOLDER flat ÷20 (k0=0)
+    6: {"vpeak": 37.5, "k0": 6.65, "peak_clamp": 37.5},        # L0→GM  — PLACEHOLDER ÷20
 }
 
 # An engine is "flat" (size-independent throughput) iff its curve is a single breakpoint.
@@ -108,29 +108,24 @@ DEFAULT_SIZE_KB = 64.0   # fallback when a buffer has no alloc declaration
 
 
 def peak_bandwidth_gb_s(engine: int) -> float:
-    """The saturated (maximum) bandwidth of an engine — the last curve breakpoint."""
-    return BANDWIDTH_CURVE_GB_S[engine][-1][1]
+    """The saturated (maximum) bandwidth of an engine — peak_clamp from SATURATION_PARAMS."""
+    return SATURATION_PARAMS[engine]["peak_clamp"]
 
 
 def bandwidth_at_size(engine: int, size_kb: float) -> tuple[float, str]:
     """Achieved bandwidth (GB/s) for a transfer of `size_kb` on `engine`, plus the
-    regime label. Piecewise-linear interpolation between the engine's breakpoints;
-    clamped to the first/last bandwidth outside the breakpoint range."""
-    curve = BANDWIDTH_CURVE_GB_S[engine]
-    if len(curve) == 1:
-        return curve[-1][1], 'flat'
-    first_size, first_bw = curve[0]
-    last_size,  last_bw  = curve[-1]
-    if size_kb <= first_size:
-        return first_bw, 'floor'
-    if size_kb >= last_size:
-        return last_bw, 'saturated'
-    # Find the segment [lo, hi] containing size_kb and linearly interpolate.
-    for (lo_s, lo_bw), (hi_s, hi_bw) in zip(curve, curve[1:]):
-        if lo_s <= size_kb <= hi_s:
-            frac = (size_kb - lo_s) / (hi_s - lo_s)
-            return lo_bw + frac * (hi_bw - lo_bw), 'ramp'
-    return last_bw, 'saturated'   # unreachable; defensive
+    regime label. Saturation curve bw = vpeak * size / (size + k0), clamped to
+    peak_clamp. k0 is the half-saturation point (bw = vpeak/2 at size = k0).
+    k0=0 means size-independent (flat, e.g. CubeUnit)."""
+    p = SATURATION_PARAMS[engine]
+    vpeak, k0, peak_clamp = p["vpeak"], p["k0"], p["peak_clamp"]
+    if k0 == 0:
+        return peak_clamp, 'flat'          # size-independent (CubeUnit)
+    bw = vpeak * size_kb / (size_kb + k0)
+    bw = min(bw, peak_clamp)
+    ratio = bw / peak_clamp if peak_clamp else 1.0
+    regime = 'saturated' if ratio >= 0.95 else ('floor' if ratio <= 0.5 else 'ramp')
+    return bw, regime
 
 
 # Physical capacity of each on-chip memory region (KB). A program is only correct if,
@@ -167,7 +162,7 @@ def bandwidth_profile(engine: int, size_kb: float) -> tuple[float, float, float,
     """
     Map a transfer/compute size to (duration_ns, effective_bw_GB_s, utilization, regime).
 
-    Bandwidth ramps with transfer size (see BANDWIDTH_CURVE_GB_S): small transfers
+    Bandwidth ramps with transfer size (see SATURATION_PARAMS): small transfers
     achieve below-peak bandwidth, so they cost proportionally more time per byte.
     Utilization = effective_bw / peak_bw (1.0 == saturated).
 
@@ -926,14 +921,13 @@ def render(ops: list[Op], deps: Deps, cp_algo: str | None = None) -> None:
     print(PAD + 'Engine bandwidth ramps with transfer size (small transfers run below peak);')
     print(PAD + 'duration = size ÷ bandwidth(size), reported in nanoseconds:')
     for eng in range(len(ENG_NAME)):
-        curve = BANDWIDTH_CURVE_GB_S[eng]
+        p = SATURATION_PARAMS[eng]
         peak  = peak_bandwidth_gb_s(eng)
         label = f"{ENG_NAME[eng]:10}"
-        if len(curve) == 1:
+        if p["k0"] == 0:
             print(PAD + f"  {label}  {peak:6.0f} GB/s  (compute, size-independent)")
         else:
-            pts = ', '.join(f"{_fmt_size(s)}→{bw:.0f} GB/s" for s, bw in curve)
-            print(PAD + f"  {label}  {peak:6.0f} GB/s peak  (ramp: {pts})")
+            print(PAD + f"  {label}  {peak:6.0f} GB/s peak  (saturation: vpeak={p['vpeak']:.0f}, k0={p['k0']:.1f}KB)")
     print()
 
     # Time ruler (nanoseconds). Tick every ~10 columns.
@@ -1107,12 +1101,11 @@ def render_llm(ops: list[Op], deps: Deps, cp_algo: str | None = None) -> None:
           "transfers run below peak)")
     for op in ops:
         peak  = peak_bandwidth_gb_s(op.engine)
-        curve = BANDWIDTH_CURVE_GB_S[op.engine]
-        if len(curve) == 1:
+        p = SATURATION_PARAMS[op.engine]
+        if p["k0"] == 0:
             ramp_s = ""
         else:
-            sat_size = curve[-1][0]
-            ramp_s = f"  saturates_at={_fmt_size(sat_size)}"
+            ramp_s = f"  k0={p['k0']:.1f}KB (half-sat)"
         print(f"op{op.idx} ({ENG_NAME[op.engine]}): "
               f"effective={op.effective_bw:.4g} GB/s  peak={peak:.0f} GB/s  "
               f"utilization={op.bw_utilization:.2%}  regime={op.regime}{ramp_s}")
@@ -1389,9 +1382,9 @@ def build_graph(ops: list[Op], deps: Deps) -> nx.DiGraph:
     G.graph['engine_bandwidth'] = {
         ENG_NAME[e]: {
             'peak_gb_s':        peak_bandwidth_gb_s(e),
-            'curve_gb_s':       [list(pt) for pt in BANDWIDTH_CURVE_GB_S[e]],
-            'size_dependent':   len(BANDWIDTH_CURVE_GB_S[e]) > 1,
-            'saturates_at_kb':  BANDWIDTH_CURVE_GB_S[e][-1][0],
+            'saturation':       SATURATION_PARAMS[e],
+            'size_dependent':   SATURATION_PARAMS[e]["k0"] > 0,
+            'k0_kb':            SATURATION_PARAMS[e]["k0"],
         }
         for e in range(len(ENG_NAME))
     }

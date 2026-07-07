@@ -8,15 +8,11 @@
 
 **Design doc:** `tmp/DESIGN_dual_runner.md`
 
-## Cost Model (partially integrated)
+## Cost Model (integrated via direct simulator call)
 
 **Problem:** The full closed-loop goal is "correctness + performance". CallCapture data naturally supports performance analysis.
 
-**Current status:** A cost model (`costModel/cost_emulator`, an external collaborator's work-in-progress) is integrated loosely via `/triton-plan`, which calls `costModel/cost_planner.py` and dumps plan code to `.plan.json`. Only `vadd`/`matmul` are mapped; other ops get a mock plan stub. This is a read-only adapter — the cost model's internal DSL/bandwidth curves are NOT modified from this project.
-
-**Extension points (future):**
-- `CostModelAnalyzer.analyze_memory()` — total bytes, unique address count, access pattern classification
-- `CostModelAnalyzer.analyze_compute()` — FLOPs estimation, arithmetic intensity, roofline comparison
+**Current status:** The cost model (`costModel/cost_emulator`, an external collaborator's work-in-progress, vendored as a subtree) is integrated via `/triton-plan`, which writes a cost_emulator DSL program from the op semantics, runs `cost_emulator/simulator.py` **directly** (`--verify` + `--llm --critical-path`), and dumps the simulator's `raw_llm` output verbatim as plan code to `.plan.json` = `{op, shapes, dtype, dsl, raw_llm}`. `/triton-gen` then reads `raw_llm` in depth to guide kernel generation. This is a read-only, zero-intrusion adapter — the cost model's internal DSL/bandwidth curves are NOT modified from this project. If the simulator call fails, `/triton-plan` writes a mock stub so downstream is not blocked.
 
 ## LLM Iteration Mode
 

@@ -2,7 +2,7 @@
 
 OP_autogen is a **Triton Language CPU Emulator** that enables the closed loop: **PyTorch → Triton kernel → Emulator (correctness + perf) → LLM feedback → iterate**.
 
-The goal is to let LLMs get fast, precise correctness feedback when generating Triton kernels — without needing a GPU. Future work includes a cost model for performance estimation before hardware deployment.
+The goal is to let LLMs get fast, precise correctness feedback when generating Triton kernels — without needing a GPU. A cost model (`costModel/cost_emulator`, vendored as a subtree) is integrated via `/triton-plan`, which runs the simulator directly to estimate cost/performance before hardware deployment.
 
 ## Directory Structure
 
@@ -85,7 +85,7 @@ disk** (no orchestrator — invoke each manually):
 
 | Skill | Responsibility | Reads | Writes |
 |-------|---------------|-------|--------|
-| `/triton-plan` | input → op semantics → call cost model | user input | `emulators/test/<op>/.plan.json` |
+| `/triton-plan` | input → DSL → run simulator directly | user input | `emulators/test/<op>/.plan.json` |
 | `/triton-gen` | plan → emulator kernel (+ inline verify) | `.plan.json` | `emulators/test/<op>/__init__.py` |
 | `/triton-verify` | read-only correctness check | `__init__.py` | (terminal only) |
 | `/triton-fix` | repair loop (max 5 rounds) | `__init__.py` | `__init__.py` |
@@ -93,3 +93,15 @@ disk** (no orchestrator — invoke each manually):
 
 Each skill's `.md` lists its own **References** (the docs it owns). Doc-to-skill
 ownership is indexed in `CLAUDE.md` → Project Knowledge.
+
+## Running & external interfaces
+
+- **How to run anything** (which Python, simulator vs emulator commands): see
+  `environment_and_running.md`. TL;DR — always use `.venv/bin/python` from the repo
+  root; the system `python3` (3.7, no torch) cannot run this project.
+- **The plan→gen handoff** (`.plan.json` schema, field semantics, the `raw_llm`
+  contract): see `plan_code_contract.md`.
+- **Cost-model deep reference** (DSL syntax, the seven-engine model, bandwidth
+  curves, how to read `--llm` output): the collaborator's
+  `costModel/cost_emulator/Skills/bottleneck-analysis/SKILL.md` is authoritative.
+  `costModel/cost_emulator/` is a vendored subtree — read-only, never modified.

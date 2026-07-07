@@ -29,6 +29,10 @@ tests use real sizes.
 
 ## Note on cost-model coverage
 
-The cost model (`costModel/cost_planner.py`) currently maps only `matmul` and
-`vadd` to its DSL; other op_kinds return a stub and `/triton-plan` writes a mock
-plan. That is expected — this project keeps the cost model loosely coupled.
+`/triton-plan` writes the cost_emulator DSL by hand from the op semantics (it is
+not limited to a fixed op list) and runs `cost_emulator/simulator.py` directly.
+Any op_kind whose data flow can be expressed in the seven-engine DSL
+(`gm_to_ub`/`ub_to_gm`/`vadd`/`gm_to_l1`/`l1_to_l0`/`matrixmul`/`l0_to_gm`) is
+covered; if the DSL cannot be written or the simulator call fails, `/triton-plan`
+writes a mock stub so `/triton-gen` is not blocked. The cost model stays loosely
+coupled (read-only, zero-intrusion).

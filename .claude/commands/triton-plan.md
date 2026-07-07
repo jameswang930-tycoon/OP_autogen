@@ -2,7 +2,7 @@
 name: triton-plan
 description: >
   Write a cost_emulator DSL program from op semantics, run the simulator DIRECTLY
-  (--verify + --llm --critical-path, no cost_planner wrapper), and dump raw_llm as
+  (--verify + --llm --critical-path), and dump raw_llm as
   plan code to .plan.json. Same call style as the collaborator's bottleneck-analysis
   skill. Only writes DSL + runs simulator + dumps raw_llm; does NOT interpret the
   output (that is triton-gen's job). Trigger when the user wants to "plan",
@@ -32,12 +32,12 @@ for the full engine table + syntax. Key points:
 - **cube ops** (matmul): GM→L1 → L1→L0 → CubeUnit → L0→GM
 - Example (vadd N=4096 fp16): `alloc(gm_a,8KB) alloc(gm_c,8KB) alloc(ub_a,16KB) alloc(ub_c,16KB) gm_to_ub(ub_a,gm_a) vadd(ub_c,ub_a,1.0) ub_to_gm(gm_c,ub_c)`
 
-## Step 3: Run the simulator DIRECTLY (no cost_planner wrapper)
+## Step 3: Run the simulator DIRECTLY
 
 ```bash
-# COST_SIM_PYTHON must be Python 3.10+ (simulator uses str | None)
-COST_SIM_PYTHON=.venv/bin/python .venv/bin/python costModel/cost_emulator/simulator.py --verify "<DSL>"
-COST_SIM_PYTHON=.venv/bin/python .venv/bin/python costModel/cost_emulator/simulator.py --llm --critical-path "<DSL>"
+# simulator needs Python 3.10+ (uses str | None); system python3 is 3.7, so use .venv
+.venv/bin/python costModel/cost_emulator/simulator.py --verify "<DSL>"
+.venv/bin/python costModel/cost_emulator/simulator.py --llm --critical-path "<DSL>"
 ```
 
 `--llm` stdout = `raw_llm` (7 sections: execution summary / time breakdown / per-op /

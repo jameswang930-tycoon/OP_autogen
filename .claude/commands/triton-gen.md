@@ -69,7 +69,7 @@ Import conventions & 4-part details: `docs/project_knowledge/test_conventions.md
 ## Step 3: Inline Verify (report only, no repair)
 
 ```bash
-cd emulators && python3 -c "from test.<op> import test; test()"
+cd emulators && ../.venv/bin/python -c "from test.<op> import test; test()"
 ```
 
 or call `run_with_feedback(emulate_<op>, reference_<op>)`.

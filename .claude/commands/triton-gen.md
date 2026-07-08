@@ -20,6 +20,12 @@ CRITICAL PATH), and tiling (BANDWIDTH UTILIZATION regime / saturates_at). If
 `raw_llm` is missing (mock/simulator failed), fall back to the default path (cube
 → matmul path GM→L1→L0; vec → vadd path GM→UB→Vec).
 
+**Optional `retrieved_experience`**: if present (the memory module appended it via
+`memory_cli.py inject <op>` after `/triton-plan`), it carries formatted historical
+experience for this op class — read it as an extra generation reference (how similar
+ops were tiled/parallelized, pitfalls hit). Absent ⇒ memory is off / empty; generate
+exactly as without it. (See `docs/project_knowledge/plan_code_contract.md`.)
+
 **dtype**: the plan's `dtype` (fp16/fp32/bf16, default fp32) sets storage dtype.
 
 **If the input is a baseline Triton kernel** (the user pasted `@triton.jit` code,

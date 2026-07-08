@@ -10,3 +10,7 @@ models/
 .venv/
 costModel/archaludon/
 emulators/test/**/.plan.json
+
+# memory 运行产物(经验库/日志,首次运行自动生成)
+memory/experience/
+memory/runlog/

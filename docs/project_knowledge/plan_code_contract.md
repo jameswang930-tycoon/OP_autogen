@@ -36,10 +36,13 @@ Written by `/triton-plan` to `emulators/test/<op>/.plan.json`:
 | `dsl` | the cost_emulator program string handed to the simulator |
 | `raw_llm` | simulator `--llm` full stdout, **verbatim** — `/triton-gen` reads it in depth for data flow (which engines), bottleneck (TIME BREAKDOWN + CRITICAL PATH), and tiling (BANDWIDTH UTILIZATION regime / `saturates_at`) |
 | `mock` | present only on failure; signals `/triton-gen` to fall back to the default path (cube → matmul GM→L1→L0; vec → vadd GM→UB→Vec) |
+| `retrieved_experience` | **optional** — present only when the memory module is integrated; formatted historical-experience text that `/triton-gen` may read as an extra generation reference. Absent ⇒ memory is off / empty, and `/triton-gen` behaves exactly as without memory. |
 
-`/triton-gen` reads **only** `op` / `shapes` / `dtype` / `dsl` / `raw_llm` (+ `mock`).
-It does **not** parse any structured "plan" sub-object — the LLM reads `raw_llm`
-directly.
+`/triton-gen` reads **only** `op` / `shapes` / `dtype` / `dsl` / `raw_llm` (+ `mock`,
++ optional `retrieved_experience`). It does **not** parse any structured "plan"
+sub-object — the LLM reads `raw_llm` directly. `retrieved_experience` is appended to
+an already-written `.plan.json` by the memory module's inject step (see
+`memory_skeleton/GLM_接入指南.md` §3); it is **not** produced by `/triton-plan`.
 
 ## How `raw_llm` is produced
 

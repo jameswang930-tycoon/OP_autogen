@@ -42,7 +42,7 @@ Written by `/triton-plan` to `emulators/test/<op>/.plan.json`:
 + optional `retrieved_experience`). It does **not** parse any structured "plan"
 sub-object — the LLM reads `raw_llm` directly. `retrieved_experience` is appended to
 an already-written `.plan.json` by the memory module's inject step (see
-`memory_skeleton/GLM_接入指南.md` §3); it is **not** produced by `/triton-plan`.
+`docs/project_knowledge/memory_integration.md` §3); it is **not** produced by `/triton-plan`.
 
 ## How `raw_llm` is produced
 

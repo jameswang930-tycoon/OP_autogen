@@ -1,7 +1,8 @@
 """最小记忆闭环:运行日志 + 经验库 + 检索 + 写回。
 
-只暴露最小 API。回路演示见 memory_skeleton/demo.py,架构说明见
-memory_skeleton/README.md,接入指南见 memory_skeleton/GLM_接入指南.md。
+只暴露最小 API。回路演示见 memory/demo.py,架构说明见
+docs/project_knowledge/memory_architecture.md,接入指南见
+docs/project_knowledge/memory_integration.md。
 """
 
 from .schema import Fingerprint, Experience, AttemptRecord

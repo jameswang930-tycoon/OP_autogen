@@ -1,6 +1,6 @@
 """最小数据结构:算子特征、经验条目、日志记录。
 
-字段刻意精简,后续需要时再加。架构说明见 memory_skeleton/README.md。
+字段刻意精简,后续需要时再加。架构说明见 docs/project_knowledge/memory_architecture.md。
 """
 
 from __future__ import annotations

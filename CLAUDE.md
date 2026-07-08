@@ -73,6 +73,8 @@ These files contain project context. Read on demand (not auto-loaded). The **Own
 | `docs/project_knowledge/project_overview.md` | public (landing) | Project structure, the 5-skill workflow, implemented operators |
 | `docs/project_knowledge/environment_and_running.md` | public | Which Python to use (`.venv` vs system `python3`), how to run each component |
 | `docs/project_knowledge/plan_code_contract.md` | /triton-plan + /triton-gen | `.plan.json` schema, the plan→gen handoff, cost-model entry point |
+| `docs/project_knowledge/memory_architecture.md` | public | Memory module: two-layer structure (experience/runlog), fingerprint, retrieve/record |
+| `docs/project_knowledge/memory_integration.md` | public | How the memory module plugs into the pipeline (inject/record hooks, AB test) |
 | `docs/project_knowledge/input_detection.md` | /triton-plan | Detecting input type, extracting op_kind + shapes |
 | `docs/project_knowledge/test_conventions.md` | /triton-gen + /triton-verify | Import conventions (gen), weight/registration policy (verify) |
 | `docs/project_knowledge/emulator_improvements_done.md` | /triton-verify + /triton-fix | Error-feedback format, dedup mechanism |

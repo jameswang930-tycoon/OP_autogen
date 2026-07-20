@@ -66,20 +66,8 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ## Project Knowledge
 
-These files contain project context. Read on demand (not auto-loaded). The **Owner skill** column shows which `/skill` owns each doc:
-
-| File | Owner skill | When to Read |
-|------|-------------|-------------|
-| `docs/project_knowledge/project_overview.md` | public (landing) | Project structure, the 5-skill workflow, implemented operators |
-| `docs/project_knowledge/environment_and_running.md` | public | Which Python to use (`.venv` vs system `python3`), how to run each component |
-| `docs/project_knowledge/plan_code_contract.md` | /triton-plan + /triton-gen | `.plan.json` schema, the plan→gen handoff, cost-model entry point |
-| `docs/project_knowledge/memory_architecture.md` | public | Memory module: two-layer structure (experience/runlog), fingerprint, retrieve/record |
-| `docs/project_knowledge/memory_integration.md` | public | How the memory module plugs into the pipeline (inject/record hooks, AB test) |
-| `docs/project_knowledge/input_detection.md` | /triton-plan | Detecting input type, extracting op_kind + shapes |
-| `docs/project_knowledge/test_conventions.md` | /triton-gen + /triton-verify | Import conventions (gen), weight/registration policy (verify) |
-| `docs/project_knowledge/emulator_improvements_done.md` | /triton-verify + /triton-fix | Error-feedback format, dedup mechanism |
-| `docs/project_knowledge/emulator_error_coverage.md` | /triton-verify + /triton-fix | Emulator detection capabilities & blind spots |
-| `docs/project_knowledge/emulator_next_steps.md` | public (roadmap) | DualRunner / Cost Model / iteration mode roadmap |
-| `docs/project_knowledge/emulator_to_triton_conversion.md` | /triton-convert | Converting emulator kernels to real Triton for NPU |
-| `docs/emulator_observations/implementation_patterns.md` | /triton-gen | Writing-kernel patterns & pitfalls |
-| `docs/emulator_observations/` (api_gaps, error_accumulation, precision_gaps, missing_coverage) | /triton-verify | Precision/coverage gaps, API differences |
+Read on demand (not auto-loaded). Start here:
+- `docs/project_knowledge/project_overview.md` — project structure and the 5-skill workflow
+- `docs/project_knowledge/emulator_next_steps.md` — roadmap
+- `docs/project_knowledge/memory_architecture.md` — memory module (experience/runlog, fingerprint, retrieve/record)
+- `docs/project_knowledge/memory_integration.md` — how memory plugs into the pipeline (inject/record hooks, AB test)

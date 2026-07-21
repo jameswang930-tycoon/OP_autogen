@@ -172,3 +172,4 @@ Skill 文件在 [.claude/commands/](.claude/commands/)；各 skill 的文档归�
 - 2026-05-27：项目知识迁移至 `docs/project_knowledge/`，emulator 观察记录至 `docs/emulator_observations/`
 - 2026-06-01：emulator 拉齐真实 Triton 行为（`keepdims=False`、标量累加器、标量 store），生成的 kernel 无需 NPU 编码适配
 - 2026-06-25：triton-gen 拆分为 5 个职责单一 skill（plan/gen/verify/fix/convert），docs 按 skill 归属重组
+- 2026-07-20：5 个 slash command 迁移为 Agent Skill（`.claude/skills/`，description 文件态前置条件治理触发），删除 `.claude/commands/`，CLAUDE.md 瘦身；验证链全绿（vadd_fp16 verify PASS + softmax 真触发实测）

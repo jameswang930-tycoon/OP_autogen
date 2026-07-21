@@ -71,3 +71,4 @@ Read on demand (not auto-loaded). Start here:
 - `docs/project_knowledge/emulator_next_steps.md` — roadmap
 - `docs/project_knowledge/memory_architecture.md` — memory module (experience/runlog, fingerprint, retrieve/record)
 - `docs/project_knowledge/memory_integration.md` — how memory plugs into the pipeline (inject/record hooks, AB test)
+- `README.md`「开发记录」 — dev milestones & push history; scan at session start to recall recent progress

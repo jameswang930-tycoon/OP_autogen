@@ -1,0 +1,5 @@
+# Emulator pipeline dependencies (plan/gen/verify/fix stages).
+# Rebuild venv:  uv venv --python 3.13 && uv pip install -r requirements.txt
+# torch / triton are only needed by triton-convert (on-device); install separately.
+numpy>=2.0
+networkx>=3.0

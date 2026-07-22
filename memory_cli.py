@@ -71,15 +71,18 @@ def cmd_record(args):
         log, store, fp,
         retrieved_ids=ids,
         passed=args.passed,
+        cycles=args.cycles,
         kernel_ref=args.kernel_ref or f"emulators/test/{args.op}",
+        extension_used=args.extension_used,
     )
-    print(f"已记录 run={rec.run_id} fp={fp.key()} passed={rec.passed} retrieved={ids}")
+    print(f"已记录 run={rec.run_id} fp={fp.key()} passed={rec.passed} "
+          f"cycles={rec.cycles} retrieved={ids}")
 
 
 def cmd_add(args):
     store = ExperienceStore(STORE_PATH)
     _, _, fp = _load_plan(args.op, args.plan, args.bottleneck)
-    eid = add_experience(store, fp, text=args.text)
+    eid = add_experience(store, fp, text=args.text, extension_used=args.extension_used)
     print(f"已新增经验 [{eid}] applies_to={fp.key()}: {args.text}")
 
 
@@ -88,13 +91,18 @@ def cmd_stats(args):
     exps = store.all()
     if args.op:
         exps = [e for e in exps if e.applies_to.split("|", 1)[0] == args.op]
-    if not exps:
+    if exps:
+        print(f"共 {len(exps)} 条经验:")
+        for e in exps:
+            print(f"  [{e.id}] {e.applies_to}  used={e.used} helped={e.helped} "
+                  f"failed={e.failed} harmed={e.harmed} score={e.score():.3f}  {e.text[:30]}")
+    else:
         print("(经验库为空)")
-        return
-    print(f"共 {len(exps)} 条经验:")
-    for e in exps:
-        print(f"  [{e.id}] {e.applies_to}  used={e.used} helped={e.helped} "
-              f"failed={e.failed} harmed={e.harmed} score={e.score():.3f}  {e.text[:30]}")
+    best = store.best_cycles_all()
+    if best:
+        print("历史最优 cycles:")
+        for k, c in sorted(best.items()):
+            print(f"  {k}: {c}")
 
 
 def main():
@@ -111,11 +119,14 @@ def main():
     g.add_argument("--passed", action="store_true")
     g.add_argument("--failed", action="store_true")
     pr.add_argument("--kernel-ref")
+    pr.add_argument("--cycles", type=int, help="实测 cycles（--passed 时性能信号）")
+    pr.add_argument("--extension-used", help="本轮用的 extension 原语名")
     pr.set_defaults(func=cmd_record)
 
     pa = sub.add_parser("add", help="手工新增一条经验")
     pa.add_argument("op"); pa.add_argument("--plan"); pa.add_argument("--bottleneck")
     pa.add_argument("--text", required=True)
+    pa.add_argument("--extension-used", help="该经验推荐的 extension 原语名")
     pa.set_defaults(func=cmd_add)
 
     ps = sub.add_parser("stats", help="看经验库统计")

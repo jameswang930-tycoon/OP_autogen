@@ -16,13 +16,17 @@ class ExperienceStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.best_path = self.path.parent / "best_cycles.json"
         self._items: dict[str, Experience] = {}
+        self._best_cycles: dict[str, int] = {}
         self._load()
 
     def _load(self) -> None:
         if self.path.exists():
             data = json.loads(self.path.read_text(encoding="utf-8") or "{}")
             self._items = {k: Experience.from_dict(v) for k, v in data.items()}
+        if self.best_path.exists():
+            self._best_cycles = json.loads(self.best_path.read_text(encoding="utf-8") or "{}")
 
     def save(self) -> None:
         data = {k: v.to_dict() for k, v in self._items.items()}
@@ -52,8 +56,40 @@ class ExperienceStore:
             if e.applies_to.split("|", 1)[0] == op_kind
         ]
 
-    def bump(self, ids: list[str], passed: bool) -> None:
-        """写回:用过次数加一;通过则 helped+1,否则 failed+1(中性负向)。
+    def update_best(self, key: str, cycles: int) -> bool:
+        """登记某 fingerprint 的实测 cycles，返回「是否刷新历史最优」。
+
+        - 首次记录（无先验）→ 记为基线，返回 False（无先验可比，不计为「帮上忙」）。
+        - 严格优于历史最优 → 更新并返回 True（价值信号：性能改善，§5.2）。
+        - 否则 → 不更新，返回 False。
+        """
+        prior = self._best_cycles.get(key)
+        if prior is None:
+            self._best_cycles[key] = cycles
+            self._save_best()
+            return False
+        if cycles < prior:
+            self._best_cycles[key] = cycles
+            self._save_best()
+            return True
+        return False
+
+    def best_cycles_for(self, key: str) -> int | None:
+        return self._best_cycles.get(key)
+
+    def best_cycles_all(self) -> dict[str, int]:
+        return dict(self._best_cycles)
+
+    def _save_best(self) -> None:
+        self.best_path.write_text(
+            json.dumps(self._best_cycles, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def bump(self, ids: list[str], *, helped: bool = False, failed: bool = False) -> None:
+        """写回价值信号（性能驱动，§5.2）。
+
+        - pass 轮：used+1；若 helped（在场且本轮刷新该 fingerprint 历史最优 cycles）则 helped+1。
+        - FAIL 轮：failed+1（中性负向）；不碰 used/helped，故 score 不受影响。
 
         harmed(被证实有害)预留:第一版不在此自动判定,需归因机制。
         """
@@ -61,9 +97,10 @@ class ExperienceStore:
             e = self._items.get(i)
             if e is None:
                 continue
-            e.used += 1
-            if passed:
-                e.helped += 1
-            else:
+            if failed:
                 e.failed += 1
+            else:
+                e.used += 1
+                if helped:
+                    e.helped += 1
         self.save()

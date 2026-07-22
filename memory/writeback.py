@@ -18,21 +18,33 @@ def record_attempt(
     fp: Fingerprint,
     retrieved_ids: list[str],
     passed: bool,
+    cycles: Optional[int] = None,
     kernel_ref: Optional[str] = None,
-    latency_us: Optional[float] = None,
+    extension_used: Optional[str] = None,
     stage: str = "drafting",
 ) -> AttemptRecord:
-    """写回点:在模拟器给出正确性结果之后调用。"""
+    """写回点:在仿真给出正确性结果之后调用。
+
+    价值信号已从「正确性」转向「性能」（架构文档 §5.2 / §3.5）：
+    - correct=True 且本轮刷新该 fingerprint 历史最优 cycles → helped+1（价值=性能改善）。
+    - correct=True 未刷新最优 → used+1，helped 不动。
+    - correct=False → 不碰 used/helped（score 不受影响），仅记 failed；仍写 runlog。
+    FAIL 轮的 cycles 作废（§3.6），不写入记录。
+    """
+    record_cycles = cycles if passed else None
+    helped = bool(passed and record_cycles is not None
+                  and store.update_best(fp.key(), record_cycles))
     record = AttemptRecord(
         fingerprint=fp.key(),
         retrieved=retrieved_ids,
         passed=passed,
         kernel_ref=kernel_ref,
-        latency_us=latency_us,
+        cycles=record_cycles,
+        extension_used=extension_used,
         stage=stage,
     )
     log.append(record)
-    store.bump(retrieved_ids, passed=passed)
+    store.bump(retrieved_ids, helped=helped, failed=not passed)
     return record
 
 
@@ -41,11 +53,15 @@ def add_experience(
     fp: Fingerprint,
     text: str,
     source_run: Optional[str] = None,
+    extension_used: Optional[str] = None,
 ) -> str:
     """新增经验(最小版:手工或用固定模板调用)。
 
     自动蒸馏是预留位:将来由离线蒸馏智能体读取日志、提炼、去重、消解矛盾后
     调用本函数入库。当前先手工让经验库有内容。
     """
-    exp = Experience(text=text, applies_to=fp.key(), source_run=source_run)
+    exp = Experience(
+        text=text, applies_to=fp.key(),
+        source_run=source_run, extension_used=extension_used,
+    )
     return store.add(exp)

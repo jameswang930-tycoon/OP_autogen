@@ -51,6 +51,7 @@ class Experience:
     helped: int = 0                        # 帮上忙次数(在场且该次通过)
     failed: int = 0                        # 预留:在场且该次未通过(中性负向;bump 在 passed=False 时 +1)
     harmed: int = 0                        # 预留:被证实有害/误导次数(第一版恒 0,归因机制待引入)
+    extension_used: Optional[str] = None   # 该经验推荐的 extension 原语(架构文档 §5.4)
     id: str = field(default_factory=lambda: _new_id("exp"))
     created_at: str = field(default_factory=_now)
 
@@ -78,7 +79,8 @@ class AttemptRecord:
     retrieved: list[str]                   # 本次注入的经验编号
     passed: bool                           # 是否通过正确性校验
     kernel_ref: Optional[str] = None       # 生成产物的存放位置
-    latency_us: Optional[float] = None     # 未上板则为空
+    cycles: Optional[int] = None           # 实测 cycles（correct=False 时为空，性能作废，架构文档 §3.6）
+    extension_used: Optional[str] = None   # 本轮用的 extension 原语（架构文档 §5.4）
     stage: str = "drafting"
     run_id: str = field(default_factory=lambda: _new_id("run"))
     timestamp: str = field(default_factory=_now)

@@ -8,8 +8,8 @@
 |---|---|---|---|---|
 | T1 | ✅ 门禁通过 | `pytest tests/test_t1_structure.py` (4 passed) | 7a430ee | 删 triton-convert/verify/fix；emulators 标退役；costModel 未改动 |
 | T2 | ✅ 门禁通过 | `pytest tests/test_t2_contracts.py` (22 passed) | d8740cd | contracts(Event/Verdict/SimResult)+vocabulary.yaml/.py+一致性脚本；内容留空 |
-| T3 | ✅ 门禁通过 | `pytest tests/test_t3_controller.py` (9 passed) | （见 T3 commit） | loop-controller 全量实现；ε/轮数/不可约/振荡/无进展/numerical-fail；best-so-far；env 可配 |
-| T4 | ⬜ | — | — | |
+| T3 | ✅ 门禁通过 | `pytest tests/test_t3_controller.py` (9 passed) | 508f89b | loop-controller 全量实现；ε/轮数/不可约/振荡/无进展/numerical-fail；best-so-far；env 可配 |
+| T4 | ✅ 门禁通过 | `pytest tests/test_t4_memory.py` (7 passed) | （见 T4 commit） | latency_us→cycles；extension_used；每 fp 历史最优；score 价值=性能改善；FAIL 不影响 score；CLI --cycles/stats |
 | T5 | ⬜ | — | — | |
 | T6 | ⬜ | — | — | |
 | T7 | ⬜ | — | — | |

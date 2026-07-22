@@ -14,7 +14,7 @@
 | T6 | ✅ 门禁通过 | `pytest tests/test_t6_launch.py` (8 passed) | 26867a3 | launch_template：多段式模板(kernel/ref/compare)+launch()槽+build_sim_result+run()；假 launch 跑通出 SimResult |
 | T7 | ✅ 门禁通过 | `pytest tests/test_t7_gate.py` (9 passed) | （见 T7 commit） | presim_gate：语法+shape/dtype 静态校验(matmul/elementwise/reduce)；挡下不自洽 kernel；check_extension_calls 占位恒通过 |
 | T8 | ✅ 门禁通过（待人工复核 description cross-trigger） | `pytest tests/test_t8_skills.py` (12 passed) | （见 T8 commit） | triton-plan→sim-analyze；triton-gen 改真实 Triton+extension；新建 extension-guide+样例+校验脚本；3 skill 英文正文 |
-| T9 | ⬜ | — | — | 需人工复核（本批不执行） |
+| T9 | ✅ 门禁通过（待人工复核） | `pytest tests/test_t9_config.py` (3 passed) | （见 T9 commit） | opencode.json(permission.skill: gen/analyze=ask, guide=allow)；AGENTS.md 镜像 CLAUDE.md + 三条纪律；skill 名跨路径唯一 |
 | T10 | ⬜ | — | — | 必须人工复核（本批不执行） |
 
 状态: ⬜未开始 / 🔄进行中 / ✅门禁通过 / ⛔阻塞待确认
@@ -24,4 +24,4 @@
 
 - **停止点①已到达（T7 完成）**：T1–T7 全部门禁通过（66 tests green），`costModel/` 自 fork 点 e1dc19d 起零改动。按指令停下，**未执行 T8/T9/T10**。
 - **门禁判据说明（非阻塞）**：计划里 T1 的"`.claude/skills/` 下只剩三个 skill"描述的是 T8 之后的最终态（sim-analyze、extension-guide 在 T8 才产生）。T1 门禁因此只校验 T1 自身的产出——删 triton-convert/verify/fix、emulators 标退役、costModel 未动；"三 skill 最终态"留给 T8。已在 test_t1_structure.py 注释中写明。
-- **基线 commit 说明（非阻塞）**：计划/手册以 `79b4da1` 为基线，实际从 `e1dc19d`（多一个 requirements.txt 提交，未触及 skills/memory）建分支，符合手册"若已前进"协议。
+- **停止点②已到达（T9 完成）**：T8、T9 门禁通过（累计 81 tests green），`costModel/` 自 fork 点起零改动。按指令停下，**未执行 T10**。停止点②复核要点：人工读三个 skill 的 description 判断是否 cross-trigger；确认 extension-guide 样例条目清晰到能让 4.7 照填。

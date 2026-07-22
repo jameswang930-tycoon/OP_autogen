@@ -1,0 +1,9 @@
+{
+  "permission": {
+    "skill": {
+      "triton-gen": "ask",
+      "sim-analyze": "ask",
+      "extension-guide": "allow"
+    }
+  }
+}

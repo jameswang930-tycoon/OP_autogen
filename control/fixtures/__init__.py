@@ -4,6 +4,9 @@
 保密环境接手时只需实现 parse_raw() 把真实仿真输出转成同样的 Event 列表，
 adapter 其余部分零改动。
 
+注意：这是**纯合成假数据**。unit 名（COMPUTE/MEMORY）只是角色标签，不代表任何
+真实硬件执行单元；真实单元名由保密环境在 parse_raw() 里填。不臆造硬件细节。
+
 三份夹具：
   COMPUTE_BOUND        —— 算力达峰，计算单元串行占满（bottleneck=compute_bound_at_peak）
   MEMORY_UNDERFILLED   —— 访存主导且带宽未填满（bottleneck=memory_underfilled）
@@ -13,28 +16,28 @@ adapter 其余部分零改动。
 """
 from ..contracts import Event
 
-# 1) compute-bound：ALU 三段串行占满 200 cyc，访存小幅重叠在开头
+# 1) compute-bound：计算三段串行占满 200 cyc，访存小幅重叠在开头
 COMPUTE_BOUND = [
-    Event("alu_mac_0", 0, 60, 60, "ALU", "compute_bound_at_peak"),
-    Event("alu_mac_1", 60, 120, 60, "ALU", "compute_bound_at_peak"),
-    Event("alu_mac_2", 120, 200, 80, "ALU", "compute_bound_at_peak"),
-    Event("mte_load", 0, 30, 30, "MTE", "memory_underfilled", bytes=4096),
+    Event("mac_0", 0, 60, 60, "COMPUTE", "compute_bound_at_peak"),
+    Event("mac_1", 60, 120, 60, "COMPUTE", "compute_bound_at_peak"),
+    Event("mac_2", 120, 200, 80, "COMPUTE", "compute_bound_at_peak"),
+    Event("load_0", 0, 30, 30, "MEMORY", "memory_underfilled", bytes=4096),
 ]
 
 # 2) memory-underfilled：两段访存串行占满 160 cyc（带宽未饱和），计算小幅重叠
 MEMORY_UNDERFILLED = [
-    Event("mte_gather_0", 0, 80, 80, "MTE", "memory_underfilled", bytes=2048),
-    Event("mte_gather_1", 80, 160, 80, "MTE", "memory_underfilled", bytes=2048),
-    Event("alu_fma", 0, 40, 40, "ALU", "compute_bound_at_peak"),
+    Event("gather_0", 0, 80, 80, "MEMORY", "memory_underfilled", bytes=2048),
+    Event("gather_1", 80, 160, 80, "MEMORY", "memory_underfilled", bytes=2048),
+    Event("fma_0", 0, 40, 40, "COMPUTE", "compute_bound_at_peak"),
 ]
 
 # 3) stall-dependency：load->compute->load->compute->store 长串行链，每段依赖上一段
 STALL_DEPENDENCY = [
-    Event("load_a", 0, 50, 50, "MTE", "stall_dependency", bytes=8192),
-    Event("compute_a", 50, 90, 40, "ALU", "stall_dependency"),
-    Event("load_b", 90, 140, 50, "MTE", "stall_dependency", bytes=8192),
-    Event("compute_b", 140, 180, 40, "ALU", "stall_dependency"),
-    Event("store_c", 180, 210, 30, "MTE", "stall_dependency", bytes=8192),
+    Event("load_a", 0, 50, 50, "MEMORY", "stall_dependency", bytes=8192),
+    Event("compute_a", 50, 90, 40, "COMPUTE", "stall_dependency"),
+    Event("load_b", 90, 140, 50, "MEMORY", "stall_dependency", bytes=8192),
+    Event("compute_b", 140, 180, 40, "COMPUTE", "stall_dependency"),
+    Event("store_c", 180, 210, 30, "MEMORY", "stall_dependency", bytes=8192),
 ]
 
 ALL_FIXTURES = {

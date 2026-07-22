@@ -10,8 +10,8 @@
 | T2 | ✅ 门禁通过 | `pytest tests/test_t2_contracts.py` (22 passed) | d8740cd | contracts(Event/Verdict/SimResult)+vocabulary.yaml/.py+一致性脚本；内容留空 |
 | T3 | ✅ 门禁通过 | `pytest tests/test_t3_controller.py` (9 passed) | 508f89b | loop-controller 全量实现；ε/轮数/不可约/振荡/无进展/numerical-fail；best-so-far；env 可配 |
 | T4 | ✅ 门禁通过 | `pytest tests/test_t4_memory.py` (7 passed) | 853a71f | latency_us→cycles；extension_used；每 fp 历史最优；score 价值=性能改善；FAIL 不影响 score；CLI --cycles/stats |
-| T5 | ✅ 门禁通过 | `pytest tests/test_t5_adapter.py` (7 passed) | （见 T5 commit） | feedback_adapter（reduce/classify/render→7段+Verdict 头）；3 份夹具；parse_raw 留槽；体量受限 |
-| T6 | ⬜ | — | — | |
+| T5 | ✅ 门禁通过 | `pytest tests/test_t5_adapter.py` (7 passed) | 3c73783 | feedback_adapter（reduce/classify/render→7段+Verdict 头）；3 份夹具；parse_raw 留槽；体量受限 |
+| T6 | ✅ 门禁通过 | `pytest tests/test_t6_launch.py` (8 passed) | （见 T6 commit） | launch_template：多段式模板(kernel/ref/compare)+launch()槽+build_sim_result+run()；假 launch 跑通出 SimResult |
 | T7 | ⬜ | — | — | |
 | T8 | ⬜ | — | — | 需人工复核（本批不执行） |
 | T9 | ⬜ | — | — | 需人工复核（本批不执行） |

@@ -1,5 +1,7 @@
 # Test Conventions
 
+> **Used by:** `/triton-gen` (§Directory Strategy, §Import Paths) and `/triton-verify` (§Running Tests, §Weight Policy, §Operator Registration).
+
 ## Directory Strategy
 
 - `emulators/common/` — Triton API emulator infrastructure (tl, launch_kernel, verify, etc.)

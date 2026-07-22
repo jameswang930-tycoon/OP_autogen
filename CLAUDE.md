@@ -66,15 +66,9 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ## Project Knowledge
 
-These files contain project context. Read on demand (not auto-loaded):
-
-| File | When to Read |
-|------|-------------|
-| `docs/project_knowledge/project_overview.md` | Understanding project structure, checking implemented operators |
-| `docs/project_knowledge/test_conventions.md` | Developing new operators, writing tests |
-| `docs/project_knowledge/triton_gen_skill.md` | Using /triton-gen or extending the skill |
-| `docs/project_knowledge/emulator_improvements_done.md` | Debugging emulator error feedback |
-| `docs/project_knowledge/emulator_error_coverage.md` | Assessing emulator capabilities and blind spots |
-| `docs/project_knowledge/emulator_next_steps.md` | Planning future improvements |
-| `docs/project_knowledge/emulator_to_triton_conversion.md` | Converting emulator kernels to real Triton for NPU deployment |
-| `docs/emulator_observations/` | Debugging operators, analyzing precision/error issues |
+Read on demand (not auto-loaded). Start here:
+- `docs/project_knowledge/project_overview.md` — project structure and the 5-skill workflow
+- `docs/project_knowledge/emulator_next_steps.md` — roadmap
+- `docs/project_knowledge/memory_architecture.md` — memory module (experience/runlog, fingerprint, retrieve/record)
+- `docs/project_knowledge/memory_integration.md` — how memory plugs into the pipeline (inject/record hooks, AB test)
+- `README.md`「开发记录」 — dev milestones & push history; scan at session start to recall recent progress

@@ -18,6 +18,6 @@ Error feedback precision overhaul in `emulators/common/__init__.py`. Solved the 
 - TraceLogger soft errors: from 2304 trace lines → **6-line deduplicated summary**
 - All existing tests backward-compatible and passing
 
-## Skill Created
+## Skills
 
-Created `.claude/commands/triton-gen.md` project-level slash command, later extended to support 5 input types.
+The original single `triton-gen` skill was later split into 5 single-responsibility skills: `/triton-plan` (input→plan), `/triton-gen` (plan→emulator kernel), `/triton-verify` (read-only check), `/triton-fix` (repair loop), `/triton-convert` (→real triton). This document is referenced by `/triton-verify` and `/triton-fix` for the error-feedback format.

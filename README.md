@@ -42,8 +42,12 @@ OP_autogen/
 │   ├── emulator_observations/ # emulator 观察（误差、精度、API、实现模式）
 │   └── project_knowledge/     # 项目知识索引
 ├── .claude/
-│   └── commands/
-│       └── triton-gen.md      # triton-gen skill：自动算子生成/调试
+│   └── commands/              # 5 个职责单一的 skill（见下「Skill 工作流」）
+│       ├── triton-plan.md     # 输入 → cost model → plan code
+│       ├── triton-gen.md      # plan → emulator kernel
+│       ├── triton-verify.md   # 只读校验
+│       ├── triton-fix.md      # 修复循环
+│       └── triton-convert.md  # emulator → 真实 triton
 ├── CLAUDE.md                  # 编码规范
 └── README.md
 ```
@@ -96,16 +100,20 @@ cd emulators && python -c "from test.resnet18 import test; test()"
 | 算子 | 说明 | Grid |
 |---|---|---|
 | `add` | 逐元素加法 `out = x + y` | 1D |
+| `mul` | 逐元素乘法 `out = x * y` | 1D |
 | `matmul` | 2D tiled 矩阵乘法 `C = A @ B` | 2D |
 | `transpose` | 2D 矩阵转置 `out = x^T` | 2D |
 | `reshape` | 张量形状变换（零拷贝） | 1D |
 | `relu` | ReLU / Leaky ReLU 激活 | 1D |
+| `hardsigmoid` | Hardsigmoid `min(max(x+3,0),6)/6` | 1D |
+| `hardswish` | Hardswish `x * min(max(x+3,0),6)/6` | 1D |
 | `softmax` | 行级数值稳定 softmax | 1D |
 | `rmsnorm` | RMS Layer Normalization | 1D |
 | `addrmsnormgamma` | 融合 Add + RMSNorm + Gamma | 1D |
 | `attention-relu` | 缩放点积注意力 + ReLU | 2D |
 | `conv1d` | 1D 卷积 | 1D |
 | `conv2d` | 简单 2D 卷积（无 stride/padding） | 1D |
+| `conv2d_depthwise` | 深度可分离 2D 卷积（stride + padding + bias） | 1D |
 
 ### 集成测试用例
 
@@ -117,6 +125,7 @@ cd emulators && python -c "from test.resnet18 import test; test()"
 | `adaptive_avgpool2d` | 全局自适应平均池化 `(N,C,H,W) -> (N,C,1,1)` | 1D | - |
 | `resnet18` | 集成测试：Stem + BasicBlock + chain | - | [开发日志](emulators/test/resnet18/DEVELOPMENT_LOG.md) |
 | `resnet34` | 集成测试 [3,4,6,3]：7 个测试全部 PASS | - | - |
+| `mobilenetv3_small` | 集成测试：完整 MobileNetV3-Small `[1,3,224,224] -> [1,1000]` | - | - |
 | `gcn_spmm` | 图稀疏矩阵乘法（CSR 格式） | 1D | - |
 | `gcn` | GCN 集成：SpMM + matmul | - | - |
 
@@ -132,17 +141,19 @@ cd emulators && python -c "from test.resnet18 import test; test()"
 
 详见 [emulators/test/resnet18/DEVELOPMENT_LOG.md](emulators/test/resnet18/DEVELOPMENT_LOG.md)
 
-## triton-gen Skill
+## Skill 工作流
 
-使用 `/triton-gen` 指令可以自动生成或修复 Triton kernel，支持 5 种输入类型：
+算子生成流水线拆成 5 个职责单一的 skill，靠文件传递产物（无 orchestrator，依次手动调用）：
 
-- **自然语言** — 算子描述（如 "layernorm" 或 "y = x * sigmoid(x)"）
-- **PyTorch 模型** — `nn.Module` 或 `.pt`/`.pth` 文件
-- **ONNX 模型** — `.onnx` 文件，解析计算图提取算子语义
-- **基线 Triton kernel** — `@triton.jit` 装饰的已有 kernel
-- **固定 Shape** — 模型名（如 "resnet18"）或 `[B,C,H,W]` 标注
+| Skill | 职责 | 读 | 写 |
+|-------|------|----|----|
+| `/triton-plan` | 输入识别 + 语义提取 + 调外部 cost model | 用户输入（NL / PyTorch / ONNX / 基线 triton / shape） | `emulators/test/<op>/.plan.json` |
+| `/triton-gen` | 读 plan → 生成 emulator kernel（+ 内联校验） | `.plan.json` | `emulators/test/<op>/__init__.py` |
+| `/triton-verify` | 只读校验 | `__init__.py` | （仅终端输出） |
+| `/triton-fix` | 修复循环（max 5 轮） | `__init__.py` | `__init__.py` |
+| `/triton-convert` | emulator → 真实 Triton | `__init__.py` | `emulators/test/<op>/triton_real.py` |
 
-Skill 文件：[.claude/commands/triton-gen.md](.claude/commands/triton-gen.md)
+Skill 文件在 [.claude/commands/](.claude/commands/)；各 skill 的文档归属见 [CLAUDE.md](CLAUDE.md) 的 Project Knowledge 表。
 
 ## 重要设计约束
 
@@ -160,3 +171,6 @@ Skill 文件：[.claude/commands/triton-gen.md](.claude/commands/triton-gen.md)
 - 2026-05-27：triton-gen skill 精简至 ~100 行，支持 5 种输入类型
 - 2026-05-27：项目知识迁移至 `docs/project_knowledge/`，emulator 观察记录至 `docs/emulator_observations/`
 - 2026-06-01：emulator 拉齐真实 Triton 行为（`keepdims=False`、标量累加器、标量 store），生成的 kernel 无需 NPU 编码适配
+- 2026-06-25：triton-gen 拆分为 5 个职责单一 skill（plan/gen/verify/fix/convert），docs 按 skill 归属重组
+- 2026-07-20：5 个 slash command 迁移为 Agent Skill（`.claude/skills/`，description 文件态前置条件治理触发），删除 `.claude/commands/`，CLAUDE.md 瘦身；验证链全绿（vadd_fp16 verify PASS + softmax 真触发实测）
+- 2026-07-21：新增 `requirements.txt`（numpy + networkx）固化 emulator 依赖；`.venv` 不进 git，换机器用 `uv venv --python 3.13 && uv pip install -r requirements.txt` 重建

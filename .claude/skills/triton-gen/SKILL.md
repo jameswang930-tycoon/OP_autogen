@@ -1,86 +1,60 @@
 ---
 name: triton-gen
 description: >
-  Pipeline stage 2 (emulator kernel generation). Use when
-  emulators/test/<op>/.plan.json already exists and a kernel must be generated
-  from it into emulators/test/<op>/__init__.py (4-part: kernel / emulate /
-  reference / test); also use when the user pastes a baseline triton kernel to be
-  turned into emulator form. After generating, run ONE inline verification and
-  report PASS/FAIL only: do NOT enter a repair loop (that is triton-fix) and do
-  NOT do real-triton conversion (that is triton-convert). Trigger for any
-  "generate kernel / 生成算子 / turn the plan into a kernel" request.
+  Pipeline generate stage. Use when a plan or an adapter Verdict exists and a kernel must be
+  generated ("生成算子" / generate kernel / turn the plan into a kernel). Produces a REAL
+  Triton + extension kernel as a multi-segment module (kernel / reference / compare) ready
+  to launch on the simulator — NOT an emulator-form kernel. Defaults to standard Triton and
+  adds an extension primitive only when the Verdict bottleneck category requires it. Does
+  NOT convert to emulator form and does NOT run a repair loop. Trigger for any kernel
+  generation request once a plan / Verdict is available.
 ---
 
-You are an emulator kernel generation expert. Input: extract the operator name <op> (and any optional input type / feedback) from the user's request.
+You are a Triton kernel generator. The pipeline is reversed: you generate a real Triton
+kernel, it is measured on a real simulator, and the feedback drives the next round. Your
+output is a **multi-segment module** (kernel / reference / compare) — not a bare kernel and
+not an emulator-form kernel.
 
-## Step 1: Read Plan Code
+## Step 1: Read inputs
 
-Read `emulators/test/<op>/.plan.json` (produced by `/triton-plan`). It carries
-`op`, `shapes`, `dtype`, `dsl`, and `raw_llm` (the simulator `--llm` full output).
-Read `raw_llm` in depth for data flow (which engines), bottleneck (TIME BREAKDOWN +
-CRITICAL PATH), and tiling (BANDWIDTH UTILIZATION regime / saturates_at). If
-`raw_llm` is missing (mock/simulator failed), fall back to the default path (cube
-→ matmul path GM→L1→L0; vec → vadd path GM→UB→Vec).
+- The plan / op semantics: op name, shapes, dtype (fp16 / fp32 / bf16, default fp32).
+- The adapter **Verdict** (from `control/feedback_adapter.py`) if a prior round ran: its
+  `bottleneck` category tells you whether an extension primitive is warranted this round.
+- `retrieved_experience` (injected by `memory_cli.py inject`): historical experience for
+  this op class — read it as an extra generation reference (how similar ops were tiled or
+  parallelized, which extension primitive helped, pitfalls). Absent means memory is off.
 
-**Optional `retrieved_experience`**: if present (the memory module appended it via
-`memory_cli.py inject <op>` after `/triton-plan`), it carries formatted historical
-experience for this op class — read it as an extra generation reference (how similar
-ops were tiled/parallelized, pitfalls hit). Absent ⇒ memory is off / empty; generate
-exactly as without it. (See `docs/project_knowledge/plan_code_contract.md`.)
+## Step 2: Extension usage rule (default to vanilla Triton)
 
-**dtype**: the plan's `dtype` (fp16/fp32/bf16, default fp32) sets storage dtype.
+Write **standard Triton** by default. Add an extension primitive **only** when the Verdict
+`bottleneck` category explicitly calls for one. The category-to-primitive mapping lives in
+the extension cheatsheet at `.claude/skills/extension-guide/`, indexed by bottleneck
+category. Benefit: the baseline is always legal vanilla Triton; if you mis-apply an
+extension, the worst case is correct-but-unoptimized code, not broken code.
 
-**If the input is a baseline Triton kernel** (the user pasted `@triton.jit` code,
-not an `<op>` name with a plan): convert it to emulator form first — the reverse
-of `/triton-convert`:
-- `import triton.language as tl` → `from common import tl`
-- drop `@triton.jit`
-- `tl.load(ptr + offsets, mask=...)` → `tl.load(ptr, offsets, mask=...)`
-- `tl.store(ptr + offsets, ...)` → `tl.store(ptr, offsets, ...)`
-- `kernel[grid](...)` → `launch_kernel_Nd(kernel, ..., grid_size=)` with numpy data
+If no Verdict exists (first round), generate plain vanilla Triton.
 
-Then wrap it in the 4-part module. `/triton-plan` is optional for this path.
+## Step 3: Generate the multi-segment module
 
-## Step 2: Generate the Module
+Follow the launchable-unit template `LAUNCHABLE_TEMPLATE` in `control/launch_template.py`:
+three segments — kernel / reference (numpy or torch gold standard) / compare harness. The
+compare harness computes max_abs_err versus reference and emits the canonical raw_sim_output
+(`correct`, `max_abs_err`, `cycles`, `pipeline`) so correctness and performance stay two
+distinguishable signals.
 
-Create `emulators/test/<op>/__init__.py` with the 4-part structure:
+Coding rules:
+- Standard Triton syntax (`@triton.jit`, `import triton.language as tl`, pointer-plus-offset
+  load / store). No emulator dialect, no `from common import tl`.
+- dtype per the plan; matmul accumulator stays fp32 (mixed precision).
 
-1. **kernel** — pure `tl.*` API; data is 1D flat, offsets are linear indices, OOB masked.
-2. **emulate wrapper** — validate inputs → flatten → `launch_kernel_*` → reshape output.
-3. **reference** — numpy/torch ground truth.
-4. **test** — basic + edge cases.
+## Step 4: Pre-sim gate (cheap, before spending a simulation)
 
-**Import whitelist** (ONLY these):
+Run `control/presim_gate.py` on the generated kernel plus a shape_contract. If it reports
+problems (syntax / shape / dtype), fix them here before launching — a wasted large-kernel
+simulation is the most expensive mistake.
 
-```python
-from common import tl, xarray, launch_kernel_1d, launch_kernel_2d, launch_kernel_3d, verify, EmulatorError
-```
+## Do NOT
 
-**NPU-compatible coding rules** (the emulator enforces these natively, so the
-generated kernel deploys to real hardware without rewrite):
-
-1. Scalar accumulators — `0.0`, never `tl.zeros((1,), ...)`.
-2. In-place accumulation — `acc += expr`, never `acc = acc + expr`.
-3. No redundant axis on 1D reduction — `tl.sum(x)`, not `tl.sum(x, axis=0)`.
-
-**dtype**: use the plan's `dtype` (default fp32) for storage via
-`{"fp16":np.float16, "fp32":np.float32, "bf16":np.float32}`. **matmul accumulator
-stays fp32** (mixed precision — don't replace every float32 with the storage dtype).
-
-**common API**: read `emulators/common/__init__.py` for the authoritative `tl.*`
-signatures (load/store/dot/zeros/full/arith/reduce/program_id/cdiv,
-launch_kernel_Nd, verify, run_with_feedback, EmulatorError).
-
-Writing-kernel patterns & pitfalls: `docs/emulator_observations/implementation_patterns.md`.
-Import conventions & 4-part details: `docs/project_knowledge/test_conventions.md`.
-
-## Step 3: Inline Verify (report only, no repair)
-
-```bash
-cd emulators && ../.venv/bin/python -c "from test.<op> import test; test()"
-```
-
-or call `run_with_feedback(emulate_<op>, reference_<op>)`.
-
-- **PASS** → print max_abs_err / max_rel_err; (optional) register in `emulators/test/run_all_tests.py`; tell the user: `/triton-convert <op>`.
-- **FAIL** → report the feedback; tell the user: `/triton-fix <op>`.
+- Do not generate emulator-form code (`from common import tl`, comma-form `tl.load`, etc.) —
+  the emulator is retired (see `emulators/README.md`).
+- Do not enter a repair loop; report PASS / FAIL and let the loop-controller decide.

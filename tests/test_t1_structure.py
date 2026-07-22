@@ -6,7 +6,8 @@ by T8 (sim-analyze is triton-plan renamed; extension-guide is new). So this gate
 checks exactly what T1 owns:
 
   - the three retired skills (triton-convert, triton-verify, triton-fix) are gone
-  - the kept skills (triton-gen, triton-plan) are NOT over-deleted
+  - triton-gen (the skill kept through the whole refactor) is NOT over-deleted
+    (triton-plan is renamed to sim-analyze at T8, so it is not asserted here)
   - emulators/ is marked retired (README notice), not deleted
   - costModel/ is untouched by this branch (read-only collaborator repo)
 """
@@ -16,7 +17,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILLS_DIR = REPO_ROOT / ".claude" / "skills"
 RETIRED = {"triton-convert", "triton-verify", "triton-fix"}
-KEPT = {"triton-gen", "triton-plan"}  # survive T1; triton-plan -> sim-analyze in T8
+# triton-gen survives the whole refactor; triton-plan is renamed to sim-analyze at T8,
+# so it is NOT asserted here (its disappearance is expected from T8 on).
+KEPT = {"triton-gen"}
 
 
 def _skills_present():

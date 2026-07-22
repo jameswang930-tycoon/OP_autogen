@@ -1,0 +1,24 @@
+# Extension primitive entry — SAMPLE / TEMPLATE.
+#
+# This is a public-form illustrative example (NOT a real primitive). It exists so the
+# confidential-env GLM 4.7 has a concrete format to copy. Replace the content with real
+# primitives there; do NOT ship real primitive semantics to the public branch.
+#
+# Required fields: name / semantics / signature / category / example / pitfalls.
+# `category` MUST be a bottleneck category id from control/vocabulary.yaml
+# (enforced by control/check_extension_cheatsheet.py).
+
+name: sample_async_copy_template
+semantics: >
+  Illustrative async / bulk copy that overlaps a memory transfer with compute. Public-form
+  placeholder only — not a real primitive.
+signature: async_copy(dst, src, shape, stride)   # illustrative; replace with the real signature
+category: memory_underfilled
+example: |
+  # illustrative usage; replace with a real, runnable example in the confidential env
+  async_copy(dst, src, [M, K], [K, 1])
+  # ... independent compute that overlaps the copy ...
+pitfalls:
+  - must issue the copy early enough to overlap; issued too late there is nothing to hide
+  - watch the staging buffer size — oversubscription spills and negates the gain
+  - a copy that the dependency chain immediately waits on gives zero overlap

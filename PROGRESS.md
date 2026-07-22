@@ -13,7 +13,7 @@
 | T5 | ✅ 门禁通过 | `pytest tests/test_t5_adapter.py` (7 passed) | 3c73783 | feedback_adapter（reduce/classify/render→7段+Verdict 头）；3 份夹具；parse_raw 留槽；体量受限 |
 | T6 | ✅ 门禁通过 | `pytest tests/test_t6_launch.py` (8 passed) | 26867a3 | launch_template：多段式模板(kernel/ref/compare)+launch()槽+build_sim_result+run()；假 launch 跑通出 SimResult |
 | T7 | ✅ 门禁通过 | `pytest tests/test_t7_gate.py` (9 passed) | （见 T7 commit） | presim_gate：语法+shape/dtype 静态校验(matmul/elementwise/reduce)；挡下不自洽 kernel；check_extension_calls 占位恒通过 |
-| T8 | ⬜ | — | — | 需人工复核（本批不执行） |
+| T8 | ✅ 门禁通过（待人工复核 description cross-trigger） | `pytest tests/test_t8_skills.py` (12 passed) | （见 T8 commit） | triton-plan→sim-analyze；triton-gen 改真实 Triton+extension；新建 extension-guide+样例+校验脚本；3 skill 英文正文 |
 | T9 | ⬜ | — | — | 需人工复核（本批不执行） |
 | T10 | ⬜ | — | — | 必须人工复核（本批不执行） |
 

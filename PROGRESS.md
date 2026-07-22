@@ -6,8 +6,8 @@
 
 | 任务 | 状态 | 门禁 | checkpoint commit | 备注 |
 |---|---|---|---|---|
-| T1 | ⬜ 未开始 | — | — | |
-| T2 | ⬜ | — | — | |
+| T1 | ✅ 门禁通过 | `pytest tests/test_t1_structure.py` (4 passed) | 7a430ee | 删 triton-convert/verify/fix；emulators 标退役；costModel 未改动 |
+| T2 | ✅ 门禁通过 | `pytest tests/test_t2_contracts.py` (22 passed) | （见 T2 commit） | contracts(Event/Verdict/SimResult)+vocabulary.yaml/.py+一致性脚本；内容留空 |
 | T3 | ⬜ | — | — | |
 | T4 | ⬜ | — | — | |
 | T5 | ⬜ | — | — | |

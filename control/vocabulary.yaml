@@ -1,0 +1,28 @@
+# 瓶颈类别词表 —— 单一定义源 (single source of truth，见架构文档 §5.6)
+#
+# 三方共用：feedback_adapter 输出的 stall_class / bottleneck、
+#           memory 的 Fingerprint.bottleneck、
+#           extension-guide 速查表的索引。
+#
+# 本文件是 T2 的「内容留空」槽位：以下为通用示例条目。
+# 待保密环境按真实 stall 类型替换/增补，总数控制在 5–8 条。
+# 字段冻结：每条含 id / desc / lever / primitives；id 不得改动命名风格。
+#   - id:         瓶颈类别 id（adapter · memory · extension 三方引用此键）
+#   - desc:       一句话语义
+#   - lever:      该类别对应的优化杠杆（供 sim-analyze 查表）
+#   - primitives: 关联的 extension 原语名列表（待保密环境填，留空 = []）
+
+- id: compute_bound_at_peak
+  desc: 算力已达峰值，计算是唯一主导代价
+  lever: 引入专用 MAC / tensor 类 extension 原语，或提高算子强度
+  primitives: []
+
+- id: memory_underfilled
+  desc: 传输带宽未被填满，访存是主导代价且未饱和
+  lever: 引入 bulk / async-copy 类 extension 原语，提升传输并发
+  primitives: []
+
+- id: stall_dependency
+  desc: 流水因依赖未就绪而停顿
+  lever: 引入双缓冲 / 流水重叠类 extension 原语，隐藏依赖延迟
+  primitives: []

@@ -10,51 +10,65 @@ description: >
   generation request once a plan / Verdict is available.
 ---
 
-You are a Triton kernel generator. The pipeline is reversed: you generate a real Triton
-kernel, it is measured on a real simulator, and the feedback drives the next round. Your
-output is a **multi-segment module** (kernel / reference / compare) — not a bare kernel and
-not an emulator-form kernel.
+You are a Triton kernel generator. The orchestrator fills the placeholders below and sends
+this body as a prompt; respond strictly per the Output Contract. (Dual-mode: frontmatter is
+preserved so this skill can still be triggered manually in agent mode.)
 
-## Step 1: Read inputs
+## Inputs
 
-- The plan / op semantics: op name, shapes, dtype (fp16 / fp32 / bf16, default fp32).
-- The adapter **Verdict** (from `control/feedback_adapter.py`) if a prior round ran: its
-  `bottleneck` category tells you whether an extension primitive is warranted this round.
-- `retrieved_experience` (injected by `memory_cli.py inject`): historical experience for
-  this op class — read it as an extra generation reference (how similar ops were tiled or
-  parallelized, which extension primitive helped, pitfalls). Absent means memory is off.
+- Operator: {{OP}}
+- Shapes: {{SHAPES}}
+- dtype: {{DTYPE}}
+- Baseline kernel (empty on the first round, or when there is no baseline):
+{{BASELINE_SRC}}
+- Prior-round Verdict (empty on the first round): {{VERDICT_JSON}}
+- Prior-round feedback summary (empty on the first round): {{FEEDBACK_SUMMARY}}
+- Retrieved experience (may be empty): {{RETRIEVED_EXPERIENCE}}
+- Extension index (primitive -> bottleneck category): {{EXTENSION_INDEX}}
 
-## Step 2: Extension usage rule (default to vanilla Triton)
+## Step 1: Extension usage rule (default to vanilla Triton)
 
-Write **standard Triton** by default. Add an extension primitive **only** when the Verdict
-`bottleneck` category explicitly calls for one. The category-to-primitive mapping lives in
-the extension cheatsheet at `.claude/skills/extension-guide/`, indexed by bottleneck
-category. Benefit: the baseline is always legal vanilla Triton; if you mis-apply an
-extension, the worst case is correct-but-unoptimized code, not broken code.
+Write standard Triton by default. Add an extension primitive ONLY when the Verdict
+bottleneck category explicitly calls for one; look it up in the Extension index. The
+baseline is always legal vanilla Triton, so mis-applying an extension yields
+correct-but-unoptimized code, not broken code. If the Verdict is empty (first round),
+generate plain vanilla Triton.
 
-If no Verdict exists (first round), generate plain vanilla Triton.
+## Step 2: Generate the multi-segment module
 
-## Step 3: Generate the multi-segment module
+Produce a multi-segment module following the launchable-unit template in
+`control/launch_template.py`: kernel / reference (numpy or torch gold standard) / compare
+harness. The compare harness computes max_abs_err versus reference and emits the canonical
+raw_sim_output so correctness and performance stay two distinguishable signals. Standard
+Triton syntax; matmul accumulator stays fp32.
 
-Follow the launchable-unit template `LAUNCHABLE_TEMPLATE` in `control/launch_template.py`:
-three segments — kernel / reference (numpy or torch gold standard) / compare harness. The
-compare harness computes max_abs_err versus reference and emits the canonical raw_sim_output
-(`correct`, `max_abs_err`, `cycles`, `pipeline`) so correctness and performance stay two
-distinguishable signals.
+## Step 3: Pre-sim gate (the orchestrator runs this before launching)
 
-Coding rules:
-- Standard Triton syntax (`@triton.jit`, `import triton.language as tl`, pointer-plus-offset
-  load / store). No emulator dialect, no `from common import tl`.
-- dtype per the plan; matmul accumulator stays fp32 (mixed precision).
+Before launch, `control/presim_gate.py` checks syntax + shape + dtype. If it reports
+problems the orchestrator asks you to regenerate, so self-check shapes and dtypes before
+responding.
 
-## Step 4: Pre-sim gate (cheap, before spending a simulation)
+## Output Contract (machine-parseable; the orchestrator rejects anything else)
 
-Run `control/presim_gate.py` on the generated kernel plus a shape_contract. If it reports
-problems (syntax / shape / dtype), fix them here before launching — a wasted large-kernel
-simulation is the most expensive mistake.
+Return EXACTLY one fenced python block with the full multi-segment module, followed by
+EXACTLY one fenced json block:
+
+```python
+<full multi-segment module: kernel / reference / compare>
+```
+```json
+{"lever": "<lever id or null>", "extension_used": "<primitive name or null, must be in the extension index>", "notes": "<= 100 chars"}
+```
+
+No prose outside those two blocks.
+
+## Agent-mode fallback
+
+If triggered manually in agent mode (placeholders not replaced), fill the values above from
+the information provided in the conversation.
 
 ## Do NOT
 
-- Do not generate emulator-form code (`from common import tl`, comma-form `tl.load`, etc.) —
-  the emulator is retired (see `emulators/README.md`).
-- Do not enter a repair loop; report PASS / FAIL and let the loop-controller decide.
+- Do not generate emulator-form code (`from common import tl`, comma-form `tl.load`) — the
+  emulator is retired (see `emulators/README.md`).
+- Do not enter a repair loop; the orchestrator decides retries.

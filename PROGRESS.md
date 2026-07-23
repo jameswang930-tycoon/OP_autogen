@@ -15,7 +15,7 @@
 | T7 | ✅ 门禁通过 | `pytest tests/test_t7_gate.py` (9 passed) | b0f6e31 | presim_gate：语法+shape/dtype 静态校验(matmul/elementwise/reduce)；挡下不自洽 kernel；check_extension_calls 占位恒通过 |
 | T8 | ✅ 门禁通过（待人工复核 description cross-trigger） | `pytest tests/test_t8_skills.py` (12 passed) | 39d2181 | triton-plan→sim-analyze；triton-gen 改真实 Triton+extension；新建 extension-guide+样例+校验脚本；3 skill 英文正文 |
 | T9 | ✅ 门禁通过（待人工复核） | `pytest tests/test_t9_config.py` (3 passed) | 7277b90 | opencode.json(permission.skill: gen/analyze=ask, guide=allow)；AGENTS.md 镜像 CLAUDE.md + 三条纪律；skill 名跨路径唯一 |
-| T10 | ⬜ 未开始 | — | — | 三个 skill 双模改造（dual-mode，新增）—— 正文改 `{{VAR}}` 占位符 + 输出契约；frontmatter 不动 |
+| T10 | ✅ 门禁通过 | `pytest tests/test_t10_skills_dualmode.py` (6 passed) | （见 T10 commit） | skill 双模：triton-gen/sim-analyze 正文改 `{{VAR}}` 占位符+输出契约；frontmatter 不动；control/placeholders.py 单一来源 |
 | T11 | ⬜ 未开始 | — | — | 确定性编排器 orchestrator（新增）—— job_spec + 主循环 + 重试预算分离 + report |
 | T12 | ⬜ 未开始 | — | — | 交接包 `HANDOFF_GLM47.md`（原 T10，重编号为 T12）—— 单独会话写 |
 

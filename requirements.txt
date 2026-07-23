@@ -1,5 +1,11 @@
-# Emulator pipeline dependencies (plan/gen/verify/fix stages).
 # Rebuild venv:  uv venv --python 3.13 && uv pip install -r requirements.txt
-# torch / triton are only needed by triton-convert (on-device); install separately.
+
+# --- 旧 emulator 流水线遗留（plan/gen/verify/fix stages；新框架非必需，保留以防回看）---
 numpy>=2.0
 networkx>=3.0
+
+# --- 新框架（确定性编排器 / 契约 / 词表 / 测试）所需 ---
+pyyaml>=6.0    # control/vocabulary.yaml + jobs/*.yaml 解析
+pytest>=8.0    # tests/ 全部门禁
+
+# torch / triton 仅远端仿真 / 上板需要，本地构建机不装。

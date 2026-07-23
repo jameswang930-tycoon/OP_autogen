@@ -92,16 +92,22 @@ class Verdict:
 class SimResult:
     """发射脚本输出。正确性与性能是两个可分辨字段（架构文档 §3.6）。
 
-      correct    : 数值是否正确（True/False 二值）
-      max_abs_err: 最大绝对误差（正确性信号）
-      cycles     : 实测 cycles（性能信号）。correct=False 时为 None —— 性能数据作废
-      pipeline   : 机器可读的流水分项（{unit: cycles}，供 adapter reduce）
+      correct     : 数值是否正确（True/False 二值）
+      max_abs_err : 最大绝对误差（正确性信号）
+      cycles      : 实测 cycles（性能信号）。correct=False 时为 None —— 性能数据作废
+      pipeline    : 机器可读的流水分项（{unit: cycles}，供 adapter reduce）
+      compiled    : 是否编译通过（T13-3 独立信号）。编译失败与数值算错处理路径不同：
+                    编译失败不计入轮数、走 compile_retries、把 compile_log 回喂 gen；
+                    数值 FAIL 才计入轮数（T3 口径）。
+      compile_log : 编译日志（编译失败时非空，成功时可为空串）。原样回喂 gen，不截断改写。
     """
 
     correct: bool
     max_abs_err: float
     cycles: Optional[int]
     pipeline: dict
+    compiled: bool = True
+    compile_log: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.correct, bool):
@@ -114,3 +120,7 @@ class SimResult:
             _check_nonneg_int(self.cycles, "SimResult.cycles")
         if not isinstance(self.pipeline, dict):
             raise TypeError("SimResult.pipeline must be a dict")
+        if not isinstance(self.compiled, bool):
+            raise TypeError("SimResult.compiled must be bool")
+        if not isinstance(self.compile_log, str):
+            raise TypeError("SimResult.compile_log must be str")

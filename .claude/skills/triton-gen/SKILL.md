@@ -25,6 +25,14 @@ preserved so this skill can still be triggered manually in agent mode.)
 - Prior-round feedback summary (empty on the first round): {{FEEDBACK_SUMMARY}}
 - Retrieved experience (may be empty): {{RETRIEVED_EXPERIENCE}}
 - Extension index (primitive -> bottleneck category): {{EXTENSION_INDEX}}
+- Compile error from the previous attempt (empty unless the last attempt failed to compile): {{COMPILE_ERROR}}
+
+## Step 0: If there is a compile error, fix it first
+
+If `{{COMPILE_ERROR}}` is non-empty, the previous kernel did not compile. **Prioritize
+fixing that exact compile error this round, and do NOT introduce any new optimization.**
+A kernel that does not compile cannot be measured; correctness of the build comes before
+performance tuning.
 
 ## Step 1: Extension usage rule (default to vanilla Triton)
 

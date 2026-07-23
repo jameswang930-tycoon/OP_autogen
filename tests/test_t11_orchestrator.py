@@ -71,14 +71,16 @@ class FakeLauncher:
         if self.first_is_baseline and not self._baseline_done:
             self._baseline_done = True
             return {"correct": True, "max_abs_err": 0.0,
-                    "cycles": self.baseline_cycles, "pipeline": {}}
+                    "cycles": self.baseline_cycles, "pipeline": {},
+                    "compiled": True, "compile_log": ""}
         cyc = self.round_cycles[min(self._round_idx, len(self.round_cycles) - 1)]
         self._round_idx += 1
         correct = self.round_correct
         return {"correct": correct,
                 "max_abs_err": 0.0 if correct else 9.9,
                 "cycles": cyc if correct else None,
-                "pipeline": {}}
+                "pipeline": {},
+                "compiled": True, "compile_log": ""}
 
 
 def _fake_parse_raw(raw):
@@ -200,7 +202,7 @@ def test_placeholder_consistency():
     job = _job(has_baseline=False)
     gen_prompt = build_gen_prompt(
         job, baseline_src="", verdict_json="", feedback_summary="",
-        retrieved_experience="", extension_index="{}",
+        retrieved_experience="", extension_index="{}", compile_error="",
     )
     analyze_prompt = build_analyze_prompt("{}", "(summary)", "[leverA, leverB]")
     assert "{{" not in gen_prompt, "gen prompt has unsubstituted placeholders"

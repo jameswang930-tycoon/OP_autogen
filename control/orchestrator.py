@@ -94,7 +94,7 @@ def _render(skill: str, values: dict) -> str:
 def build_gen_prompt(
     job: NormalizedJob, *, baseline_src: Optional[str], verdict_json: Optional[str],
     feedback_summary: Optional[str], retrieved_experience: Optional[str],
-    extension_index: str,
+    extension_index: str, compile_error: Optional[str] = None,
 ) -> str:
     values = {
         "OP": job.op,
@@ -105,6 +105,7 @@ def build_gen_prompt(
         "FEEDBACK_SUMMARY": feedback_summary or "(none)",
         "RETRIEVED_EXPERIENCE": retrieved_experience or "(none)",
         "EXTENSION_INDEX": extension_index,
+        "COMPILE_ERROR": compile_error or "",
     }
     assert set(values) == set(placeholders.TRITON_GEN_PLACEHOLDERS), (
         f"gen prompt keys {set(values)} != template {set(placeholders.TRITON_GEN_PLACEHOLDERS)}"
@@ -207,10 +208,12 @@ class RoundRecord:
     extension_used: Optional[str]
     rolled_back: bool
     kernel_path: str
+    compiled: bool = True
 
     def to_dict(self, baseline_cycles: Optional[int]) -> dict:
         d = {
             "n": self.n, "correct": self.correct, "cycles": self.cycles,
+            "compiled": self.compiled,
             "bottleneck": self.bottleneck, "lever": self.lever,
             "extension_used": self.extension_used, "rolled_back": self.rolled_back,
             "kernel": self.kernel_path,
@@ -305,17 +308,15 @@ class Orchestrator:
         retrieved = self._retrieve_experience()
         lever, ext_hint = self._resolve_lever(prior_verdict)
 
-        # steps 3-4: produce a kernel that parses AND passes presim (separate budgets)
-        kernel_src, meta = self._produce_kernel(
+        # steps 3-5: produce a kernel, launch, and ensure it compiled. Compile failures
+        # do NOT count as a round: the compile_log is fed back to gen and the kernel is
+        # regenerated up to compile_retries (T13-3); only a compiled kernel proceeds.
+        kernel_src, meta, raw, sim = self._produce_and_compile(
             verdict_json=_verdict_json(prior_verdict),
             feedback_summary=feedback_summary,
             retrieved_experience=retrieved,
             round_n=n,
         )
-
-        # step 5: launch (infra retry budget)
-        raw = self._launch_with_retries(kernel_src, f"round_{n}")
-        sim = build_sim_result(raw)
         self._write_artifact(f"round_{n}_raw_sim.txt", json.dumps(raw, ensure_ascii=False, indent=2))
 
         # steps 6-7: parse + adapt
@@ -351,9 +352,36 @@ class Orchestrator:
             n=n, correct=sim.correct, cycles=sim.cycles,
             bottleneck=bottleneck, lever=lever,
             extension_used=meta.get("extension_used"), rolled_back=decision.rolled_back,
-            kernel_path=f"log/round_{n}_response.txt",
+            kernel_path=f"log/round_{n}_response.txt", compiled=sim.compiled,
         )
         return rec, decision
+
+    # ---- produce + compile (compile failures don't count as a round; T13-3) ----
+    def _produce_and_compile(
+        self, *, verdict_json, feedback_summary, retrieved_experience, round_n,
+    ) -> tuple[str, dict, dict, SimResult]:
+        compile_fails = 0
+        compile_log = ""
+        while True:
+            kernel_src, meta = self._produce_kernel(
+                verdict_json=verdict_json,
+                feedback_summary=feedback_summary,
+                retrieved_experience=retrieved_experience,
+                round_n=round_n,
+                compile_error=compile_log,
+            )
+            raw = self._launch_with_retries(kernel_src, f"round_{round_n}")
+            sim = build_sim_result(raw)
+            if sim.compiled:
+                return kernel_src, meta, raw, sim
+            # compile failure: feed the log back, regenerate (does not count as a round)
+            compile_fails += 1
+            compile_log = sim.compile_log or "(no compile log returned)"
+            self._write_artifact(
+                f"round_{round_n}_compile_fail_{compile_fails}.log", sim.compile_log or "",
+            )
+            if compile_fails >= self.job.budget.compile_retries:
+                raise BudgetExhausted("compile")
 
     # ---- lever resolution (step 2) ----
     def _resolve_lever(self, verdict: Optional[Verdict]) -> tuple[Optional[str], Optional[str]]:
@@ -374,7 +402,10 @@ class Orchestrator:
         return chosen, chosen
 
     # ---- produce kernel (parse + presim budgets) ----
-    def _produce_kernel(self, *, verdict_json, feedback_summary, retrieved_experience, round_n) -> tuple[str, dict]:
+    def _produce_kernel(
+        self, *, verdict_json, feedback_summary, retrieved_experience, round_n,
+        compile_error: Optional[str] = None,
+    ) -> tuple[str, dict]:
         allowed = _allowed_extensions()
         parse_fails = 0
         presim_fails = 0
@@ -388,6 +419,7 @@ class Orchestrator:
                 feedback_summary=feedback_summary,
                 retrieved_experience=retrieved_experience,
                 extension_index=extension_index_text(),
+                compile_error=compile_error,
             )
             resp = self.llm.generate(prompt)
             try:

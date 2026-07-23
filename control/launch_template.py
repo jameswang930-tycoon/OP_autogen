@@ -12,7 +12,8 @@
   4. run(kernel_file)      —— 端到端：launch() -> raw -> SimResult。
 
 raw_sim_output 规范 schema（launch() 必须按此返回；多余键如 events 留给 feedback_adapter.parse_raw）:
-  {"correct": bool, "max_abs_err": float, "cycles": int|None, "pipeline": {unit: cycles}}
+  {"correct": bool, "max_abs_err": float, "cycles": int|None, "pipeline": {unit: cycles},
+   "compiled": bool, "compile_log": str}        # T13-3：编译状态独立信号
 
 目录式调用约束（T13-2，launch() 实现必须遵守）：
   ① 目录路径必须可配置——输入目录、输出目录、远程脚本路径全部走配置或环境变量，
@@ -31,7 +32,7 @@ from typing import Any, Callable, Optional
 from .contracts import SimResult
 
 # raw_sim_output 中 build_sim_result 直接读取的键
-_REQUIRED_KEYS = ("correct", "max_abs_err", "pipeline")
+_REQUIRED_KEYS = ("correct", "max_abs_err", "pipeline", "compiled")
 
 _run_counter = 0
 
@@ -65,6 +66,8 @@ def build_sim_result(raw_sim_output: dict) -> SimResult:
         max_abs_err=raw_sim_output["max_abs_err"],
         cycles=raw_sim_output.get("cycles"),  # None on FAIL (perf voided, §3.6)
         pipeline=raw_sim_output["pipeline"],
+        compiled=raw_sim_output["compiled"],
+        compile_log=raw_sim_output.get("compile_log", ""),
     )
 
 
@@ -106,6 +109,8 @@ def _compare():
         "max_abs_err": float(max_abs_err),
         "cycles": int(measured_cycles),      # None if correct == False (perf voided, §3.6)
         "pipeline": {unit: cycles},          # 机器可读流水分项，供 adapter reduce
+        "compiled": bool(compiled_ok),       # T13-3：编译是否通过
+        "compile_log": str(compile_log),     # T13-3：编译日志（失败时非空，成功时可空）
         # "events": [...]                    # 可选：流水事件，供 feedback_adapter.parse_raw
     }
     return result

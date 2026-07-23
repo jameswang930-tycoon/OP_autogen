@@ -19,6 +19,7 @@ class Budget:
     llm_retries: int = 3       # 解析失败重试，不计入轮数
     presim_retries: int = 2    # 未过静态闸门重试，不计入轮数
     sim_retries: int = 3       # 仿真设施故障退避重试，不计入轮数
+    compile_retries: int = 3   # 编译失败重试（T13-3），不计入轮数；耗尽 -> BUDGET_COMPILE
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "Budget":
@@ -29,6 +30,7 @@ class Budget:
             llm_retries=int(d.get("llm_retries", 3)),
             presim_retries=int(d.get("presim_retries", 2)),
             sim_retries=int(d.get("sim_retries", 3)),
+            compile_retries=int(d.get("compile_retries", 3)),
         )
 
 

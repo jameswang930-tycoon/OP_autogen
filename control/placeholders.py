@@ -15,6 +15,7 @@ TRITON_GEN_PLACEHOLDERS = frozenset({
     "FEEDBACK_SUMMARY",    # empty on the first round
     "RETRIEVED_EXPERIENCE",
     "EXTENSION_INDEX",
+    "COMPILE_ERROR",       # empty unless the previous attempt failed to compile (T13-3)
 })
 
 # sim-analyze (llm_choose_lever) template placeholders.

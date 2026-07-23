@@ -15,6 +15,7 @@ def _raw_pass():
     return {
         "correct": True, "max_abs_err": 1.2e-6, "cycles": 148230,
         "pipeline": {"MTE": 120, "ALU": 80},
+        "compiled": True, "compile_log": "",
         "events": [],  # extra key for the adapter's parse_raw; ignored here
     }
 
@@ -34,21 +35,23 @@ def test_build_sim_result_pass():
 
 
 def test_build_sim_result_fail_voids_cycles():
-    raw = {"correct": False, "max_abs_err": 9.9, "cycles": None, "pipeline": {}}
+    raw = {"correct": False, "max_abs_err": 9.9, "cycles": None, "pipeline": {},
+           "compiled": True, "compile_log": ""}
     r = launch.build_sim_result(raw)
     assert r.correct is False
     assert r.cycles is None  # §3.6: perf voided on FAIL
 
 
 def test_build_sim_result_rejects_missing_required_field():
-    # max_abs_err is required; cycles is optional (None on FAIL)
+    # max_abs_err and compiled are required; cycles is optional (None on FAIL)
     with pytest.raises(Exception):
         launch.build_sim_result({"correct": True, "cycles": 1, "pipeline": {}})
 
 
 def test_build_sim_result_rejects_bad_correct_type():
     with pytest.raises(Exception):
-        launch.build_sim_result({"correct": "yes", "max_abs_err": 0.0, "cycles": 1, "pipeline": {}})
+        launch.build_sim_result({"correct": "yes", "max_abs_err": 0.0, "cycles": 1,
+                                 "pipeline": {}, "compiled": True})
 
 
 def _fake_launcher(kernel_file):

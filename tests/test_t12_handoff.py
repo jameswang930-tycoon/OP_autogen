@@ -15,6 +15,7 @@ HANDOFF = (REPO / "HANDOFF_GLM47.md").read_text(encoding="utf-8")
 
 # (slot label, substrings that MUST appear — file path + frozen signature)
 SLOTS = {
+    "llm_backend": ["control/llm_backend.py", "ConfigurableLLMBackend"],
     "vocabulary": ["control/vocabulary.yaml"],
     "parse_raw": ["control/feedback_adapter.py", "parse_raw(raw_sim_output)"],
     "extension_refs": [".claude/skills/extension-guide/references/"],
@@ -56,7 +57,7 @@ def _slot_chunks():
 
 def test_five_slots_each_with_steps_selfcheck_and_stop_branch():
     chunks = _slot_chunks()
-    assert len(chunks) == 5, f"expected 5 slot sections, got {len(chunks)}"
+    assert len(chunks) == 6, f"expected 6 slot sections (0-5), got {len(chunks)}"
     for c in chunks:
         assert re.search(r"^\s*\d+\.", c, flags=re.MULTILINE), "slot missing numbered steps"
         assert ".venv/bin/python" in c, "slot missing self-check command"

@@ -19,6 +19,17 @@
 | T11 | ✅ 门禁通过 | `pytest tests/test_t11_orchestrator.py` (10 passed) | （见 T11 commit） | 确定性编排器：job_spec(normalize triton_file；pytorch/shape_only 留槽)+主循环+解析/pre-sim/正确性闸门+重试预算分离+词表闭包+report；全离线可测 |
 | T12 | ✅ 门禁通过 | `pytest tests/test_t12_handoff.py` (7 passed) | （见 T12 commit） | 交接包 HANDOFF_GLM47.md：推导程序式（材料自举+5 槽位+四节）；路径/签名已与 control/ 实际代码逐一核对；自包含、不引 spec |
 
+### T13 增补（六项，逐项门禁）
+
+| 子项 | 状态 | 门禁 | commit | 备注 |
+|---|---|---|---|---|
+| T13-1 LLM 后端 | ✅ 门禁通过 | `pytest tests/test_t13_llm_backend.py` (5 passed) | （见下） | control/llm_backend.py(ConfigurableLLMBackend，env 可配，不硬编码)；HANDOFF 加槽位 0；test_t12 同步至 6 槽位 |
+| T13-2 launch 目录式 | ⬜ | — | — | |
+| T13-3 编译信号（契约修订，已授权） | ⬜ | — | — | |
+| T13-4 槽位 4 分工表述 | ⬜ | — | — | |
+| T13-5 extension 四渠道（含 extension-forward，已授权） | ⬜ | — | — | |
+| T13-6 requirements.txt | ⬜ | — | — | |
+
 > **重编号说明（2026-07-23）**：依 `docs/T10_T12_orchestrator_spec.md`，原 T10（交接包）改为 **T12**；新增 **T10**（skill 双模改造）与 **T11**（确定性编排器）。目标形态收紧为「确定性编排器驱动的流水线」。本批执行 T10、T11，完成后停于停止点④。
 
 状态: ⬜未开始 / 🔄进行中 / ✅门禁通过 / ⛔阻塞待确认

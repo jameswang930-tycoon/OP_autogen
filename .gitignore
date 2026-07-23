@@ -1,16 +1,118 @@
-.claude/settings.local.json
-.claude/settings.json
+# ═══════════════════════════════════════════════════════════════════════════
+#  Python
+# ═══════════════════════════════════════════════════════════════════════════
 __pycache__/
-*.pyc
-.DS_Store
-*.swp
-.vscode/
-tmp/
-models/
-.venv/
-costModel/archaludon/
-emulators/test/**/.plan.json
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
 
-# memory 运行产物(经验库/日志,首次运行自动生成)
+# ═══════════════════════════════════════════════════════════════════════════
+#  Virtual environment
+# ═══════════════════════════════════════════════════════════════════════════
+.venv/
+venv/
+env/
+*.venv
+pip-wheel-metadata/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  IDE & Editor
+# ═══════════════════════════════════════════════════════════════════════════
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Project: Model files (large binaries, not in git)
+# ═══════════════════════════════════════════════════════════════════════════
+models/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Project: Memory runtime artifacts (auto-generated at first run)
+# ═══════════════════════════════════════════════════════════════════════════
 memory/experience/
 memory/runlog/
+memory/__pycache__/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Project: Cost model — vendored subtree, read-only
+#  cost_emulator/ is tracked; archaludon/ is excluded
+# ═══════════════════════════════════════════════════════════════════════════
+costModel/archaludon/
+costModel/__pycache__/
+costModel/cost_emulator/__pycache__/
+costModel/cost_emulator/saved_sessions/*.json
+costModel/cost_emulator/experiments/**/bench_result.csv
+costModel/cost_emulator/experiments/**/*.png
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Project: Emulator — plan files (generated per-op, not shared)
+# ═══════════════════════════════════════════════════════════════════════════
+emulators/test/**/.plan.json
+emulators/test/**/__pycache__/
+emulators/__pycache__/
+emulators/common/__pycache__/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Project: Emulator — generated chart images
+# ═══════════════════════════════════════════════════════════════════════════
+emulators/test/**/*.png
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Project: Fusion Pipeline — generated output
+# ═══════════════════════════════════════════════════════════════════════════
+fusion_pipeline/__pycache__/
+fusion_pipeline/example_output/
+fusion_pipeline/hivmir_output/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Project: Triton Agent Optimizer — runtime artifacts
+# ═══════════════════════════════════════════════════════════════════════════
+triton_agent_optimizer/__pycache__/
+triton_agent_optimizer/**/__pycache__/
+triton_agent_optimizer/output/
+triton_agent_optimizer/rounds/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Project: Temp / debug files
+# ═══════════════════════════════════════════════════════════════════════════
+tmp/
+*.tmp
+*.log
+*.bak
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Claude Code — local settings (per-machine, not shared)
+# ═══════════════════════════════════════════════════════════════════════════
+.claude/settings.local.json
+.claude/settings.json
+.claude/worktrees/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Generated chart images (don't track binary plots)
+# ═══════════════════════════════════════════════════════════════════════════
+example_output/
+*.png
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Jupyter
+# ═══════════════════════════════════════════════════════════════════════════
+.ipynb_checkpoints/
+*.ipynb
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Coverage & profiling
+# ═══════════════════════════════════════════════════════════════════════════
+htmlcov/
+.coverage
+.coverage.*
+*.prof

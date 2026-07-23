@@ -86,13 +86,14 @@
 
 ## 槽位 4：`launch()` in `control/launch_template.py`
 
-冻结签名：`launch(kernel_file) -> raw_sim_output`（返回值是槽位 2 `parse_raw` 能吃进去的东西）。
+冻结签名：`launch(kernel_file) -> raw_sim_output`（返回值是槽位 2 `parse_raw` 能吃进去的东西）。真实调用是**目录式**：写入输入目录 → 远程脚本执行 → 读输出目录。须交代三个细节：
 
-1. 找到第 0 步那份已能跑通的仿真调用代码/命令。
-2. 包一层壳适配签名：入参是 kernel 文件路径，返回**原始仿真输出**。不要在这里解析——解析是 `parse_raw` 的职责，分工不得混淆。
-3. 加超时与错误处理：设施故障（超时、连接断）抛可识别异常，编排器会按 `sim_retries` 退避重试且不计入轮数。
-4. 自检：`.venv/bin/python -m pytest tests/test_t6_launch.py -q`
-5. 端到端：跑一个小 kernel，确认拿到合法 `SimResult`（`correct` / `max_abs_err` / `cycles` / `pipeline` 齐全）。
+1. 找到第 0 步那份已能跑通的仿真调用代码/命令。输入目录、输出目录、远程脚本路径**全部走环境变量或配置，不得硬编码**（公开分支不得出现真实路径）。
+2. **多轮隔离（最易出错）**：编排器单作业跑 5–8 轮，每轮调一次 `launch()`。每次用 `control/launch_template.py` 的 `new_run_id()` 生成唯一 id，用 run id 区分输入/输出文件名或子目录；**读取结果时校验其确实属于本次 run id**，不匹配视为故障。共享目录不做区分会让性能数据**静默错位**，极难排查。
+3. **等待与超时**：目录式提交是异步的，脚本返回不代表结果已写完。轮询等待完成标志 + 设超时；超时或连接故障抛**可识别异常**，编排器按 `sim_retries` 退避重试且不计入轮数。
+4. 包一层壳适配签名：入参是 kernel 文件路径，返回**原始仿真输出**。解析分工见槽位 2 / 槽位 4 末尾说明。
+5. 自检：`.venv/bin/python -m pytest tests/test_t6_launch.py -q`
+6. 端到端：跑一个小 kernel，确认拿到合法 `SimResult`（`correct` / `max_abs_err` / `cycles` / `pipeline` 齐全）。
    - 缺材料 / 推不出来 → 停下上报，不要猜。
 
 ## 槽位 5：`check_extension_calls()` in `control/presim_gate.py`

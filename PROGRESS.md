@@ -24,7 +24,7 @@
 | 子项 | 状态 | 门禁 | commit | 备注 |
 |---|---|---|---|---|
 | T13-1 LLM 后端 | ✅ 门禁通过 | `pytest tests/test_t13_llm_backend.py` (5 passed) | （见下） | control/llm_backend.py(ConfigurableLLMBackend，env 可配，不硬编码)；HANDOFF 加槽位 0；test_t12 同步至 6 槽位 |
-| T13-2 launch 目录式 | ⬜ | — | — | |
+| T13-2 launch 目录式 | ✅ 门禁通过 | `pytest tests/test_t13_launch_dirmode.py` (5 passed) | （见下） | launch_template docstring 三细节(可配置目录/run-id 隔离/等待超时)+new_run_id()；HANDOFF 槽位 4 同步 |
 | T13-3 编译信号（契约修订，已授权） | ⬜ | — | — | |
 | T13-4 槽位 4 分工表述 | ⬜ | — | — | |
 | T13-5 extension 四渠道（含 extension-forward，已授权） | ⬜ | — | — | |

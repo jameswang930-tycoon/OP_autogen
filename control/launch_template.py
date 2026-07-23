@@ -13,9 +13,19 @@
 
 raw_sim_output 规范 schema（launch() 必须按此返回；多余键如 events 留给 feedback_adapter.parse_raw）:
   {"correct": bool, "max_abs_err": float, "cycles": int|None, "pipeline": {unit: cycles}}
+
+目录式调用约束（T13-2，launch() 实现必须遵守）：
+  ① 目录路径必须可配置——输入目录、输出目录、远程脚本路径全部走配置或环境变量，
+     不得硬编码（公开分支不得出现真实路径）。
+  ② 多轮结果隔离——编排器单作业跑 5–8 轮，每轮调一次 launch()。必须每次用 new_run_id()
+     生成唯一 id，用 run id 区分文件名/子目录，并在读取结果时**校验结果确实属于本次 run id**
+     （不匹配视为故障）。共享目录不做区分会让性能数据静默错位，极难排查。
+  ③ 等待与超时——目录式提交是异步的：脚本返回不代表结果已写完。轮询等待完成标志 + 设置超时；
+     超时或连接故障抛**可识别异常**（编排器按 sim_retries 退避重试，不计入轮数）。
 """
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Optional
 
 from .contracts import SimResult
@@ -23,11 +33,22 @@ from .contracts import SimResult
 # raw_sim_output 中 build_sim_result 直接读取的键
 _REQUIRED_KEYS = ("correct", "max_abs_err", "pipeline")
 
+_run_counter = 0
+
+
+def new_run_id() -> str:
+    """生成唯一 run id（时间戳 + 序号），供 launch() 做多轮结果隔离（T13-2 ②）。"""
+    global _run_counter
+    _run_counter += 1
+    return f"run_{int(time.time())}_{_run_counter:04d}"
+
 
 def launch(kernel_file: str) -> dict:
     """槽位：把 kernel_file 发射到远端仿真器并取回原始输出。
 
     由保密环境的 GLM 4.7 实现。返回值须符合 raw_sim_output 规范 schema（见模块 docstring）。
+    实现须遵守「目录式调用约束」三条（见模块 docstring）：目录可配置、用 new_run_id()
+    做多轮隔离并在读结果时校验 run id、轮询等待 + 超时并抛可识别异常。
     """
     raise NotImplementedError("待保密环境实现：把 kernel 发射到远端仿真器并取回原始输出")
 

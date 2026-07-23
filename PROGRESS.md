@@ -17,7 +17,7 @@
 | T9 | ✅ 门禁通过（待人工复核） | `pytest tests/test_t9_config.py` (3 passed) | 7277b90 | opencode.json(permission.skill: gen/analyze=ask, guide=allow)；AGENTS.md 镜像 CLAUDE.md + 三条纪律；skill 名跨路径唯一 |
 | T10 | ✅ 门禁通过 | `pytest tests/test_t10_skills_dualmode.py` (6 passed) | （见 T10 commit） | skill 双模：triton-gen/sim-analyze 正文改 `{{VAR}}` 占位符+输出契约；frontmatter 不动；control/placeholders.py 单一来源 |
 | T11 | ✅ 门禁通过 | `pytest tests/test_t11_orchestrator.py` (10 passed) | （见 T11 commit） | 确定性编排器：job_spec(normalize triton_file；pytorch/shape_only 留槽)+主循环+解析/pre-sim/正确性闸门+重试预算分离+词表闭包+report；全离线可测 |
-| T12 | ⬜ 未开始 | — | — | 交接包 `HANDOFF_GLM47.md`（原 T10，重编号为 T12）—— 单独会话写 |
+| T12 | ✅ 门禁通过 | `pytest tests/test_t12_handoff.py` (7 passed) | （见 T12 commit） | 交接包 HANDOFF_GLM47.md：推导程序式（材料自举+5 槽位+四节）；路径/签名已与 control/ 实际代码逐一核对；自包含、不引 spec |
 
 > **重编号说明（2026-07-23）**：依 `docs/T10_T12_orchestrator_spec.md`，原 T10（交接包）改为 **T12**；新增 **T10**（skill 双模改造）与 **T11**（确定性编排器）。目标形态收紧为「确定性编排器驱动的流水线」。本批执行 T10、T11，完成后停于停止点④。
 
@@ -30,3 +30,4 @@
 - **门禁判据说明（非阻塞）**：计划里 T1 的"`.claude/skills/` 下只剩三个 skill"描述的是 T8 之后的最终态（sim-analyze、extension-guide 在 T8 才产生）。T1 门禁因此只校验 T1 自身的产出——删 triton-convert/verify/fix、emulators 标退役、costModel 未动；"三 skill 最终态"留给 T8。已在 test_t1_structure.py 注释中写明。
 - **停止点②已到达（T9 完成）**：T8、T9 门禁通过（累计 81 tests green），`costModel/` 自 fork 点起零改动。按指令停下，**未执行 T10**。停止点②复核要点：人工读三个 skill 的 description 判断是否 cross-trigger；确认 extension-guide 样例条目清晰到能让 4.7 照填。
 - **停止点④已到达（T11 完成）**：T10、T11 门禁通过（累计 97 tests green），`costModel/` 自 fork 点起零改动。按指令停下，**未执行 T12**（交接包须单独会话：先重扫 control/ 实际签名再写）。
+- **停止点⑤已到达（T12 完成）**：交接包 HANDOFF_GLM47.md 写成推导程序式；五个槽位的路径/签名已与 `control/` 实际代码逐一核对（test_t12_handoff 自动检查）；累计 **104 tests green**，`costModel/` 自 fork 点起零改动。T1–T12 全部完成。

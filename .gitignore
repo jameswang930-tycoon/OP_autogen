@@ -14,3 +14,7 @@ emulators/test/**/.plan.json
 # memory 运行产物(经验库/日志,首次运行自动生成)
 memory/experience/
 memory/runlog/
+
+# T12: 保密环境材料不进公开分支；编排器运行产物
+materials/
+outputs/

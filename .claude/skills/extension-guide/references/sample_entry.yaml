@@ -15,9 +15,19 @@ semantics: >
 signature: async_copy(dst, src, shape, stride)   # illustrative; replace with the real signature
 category: memory_underfilled
 example: |
-  # illustrative usage; replace with a real, runnable example in the confidential env
-  async_copy(dst, src, [M, K], [K, 1])
-  # ... independent compute that overlaps the copy ...
+  # example MUST be a complete, compilable minimal kernel (not a snippet). Replace the
+  # illustrative call below with the real primitive; keep the full kernel skeleton.
+  import triton
+  import triton.language as tl
+
+  @triton.jit
+  def copy_kernel(out_ptr, in_ptr, N, BLOCK: tl.constexpr):
+      pid = tl.program_id(0)
+      offs = pid * BLOCK + tl.arange(0, BLOCK)
+      mask = offs < N
+      x = tl.load(in_ptr + offs, mask=mask)
+      # illustrative async/bulk-copy-flavored load — replace with the real primitive call
+      tl.store(out_ptr + offs, x, mask=mask)
 pitfalls:
   - must issue the copy early enough to overlap; issued too late there is nothing to hide
   - watch the staging buffer size — oversubscription spills and negates the gain

@@ -196,6 +196,24 @@ def _allowed_extensions() -> set[str]:
     return names
 
 
+def pick_lever(candidates: list[str], evidence: dict, exploration: str) -> str:
+    """多候选杠杆的探索/利用选择（T13-5 渠道⑥）。
+
+    - 单候选：直接返回，不引入随机性。
+    - exploration == 'off'：利用——选历史证据最强的候选（确定性、可复现）。
+    - exploration != 'off'（mild/aggressive）：探索——选证据最少的候选，加速经验覆盖。
+    平局按候选出现顺序打破，保证确定。
+    """
+    if not candidates:
+        raise ValueError("pick_lever: empty candidate list")
+    if len(candidates) == 1:
+        return candidates[0]
+    idx = {c: i for i, c in enumerate(candidates)}
+    if exploration == "off":
+        return sorted(candidates, key=lambda c: (-evidence.get(c, 0), idx[c]))[0]
+    return sorted(candidates, key=lambda c: (evidence.get(c, 0), idx[c]))[0]
+
+
 # ---------------- records / report ----------------
 
 @dataclass
@@ -383,23 +401,30 @@ class Orchestrator:
             if compile_fails >= self.job.budget.compile_retries:
                 raise BudgetExhausted("compile")
 
-    # ---- lever resolution (step 2) ----
+    # ---- lever resolution (step 2; exploration-based, T13-5 渠道⑥) ----
     def _resolve_lever(self, verdict: Optional[Verdict]) -> tuple[Optional[str], Optional[str]]:
         if verdict is None:
             return None, None
         cands = _primitives_by_category().get(verdict.bottleneck, [])
-        if len(cands) <= 1:
-            if cands:
-                return cands[0], cands[0]
+        if not cands:
+            # no primitive for this category: vanilla lever from the vocabulary
             return vocabulary.lever_for(verdict.bottleneck), None
-        # multi-candidate -> LLM call point 2
-        prompt = build_analyze_prompt(
-            verdict_json=json.dumps(_verdict_dict(verdict), ensure_ascii=False),
-            feedback_summary=getattr(self, "_last_summary", ""),
-            candidate_levers=cands,
-        )
-        chosen = parse_lever_response(self.llm.choose_lever(prompt), cands)
+        if len(cands) == 1:
+            return cands[0], cands[0]
+        evidence = self._evidence_by_primitive(cands)
+        chosen = pick_lever(cands, evidence, self.job.budget.exploration)
         return chosen, chosen
+
+    def _evidence_by_primitive(self, candidates: list[str]) -> dict:
+        """每个候选原语的历史使用次数（来自经验库 extension_used）。无 store 则空。"""
+        if self.store is None:
+            return {c: 0 for c in candidates}
+        counts = {c: 0 for c in candidates}
+        for exp in self.store.all():
+            eu = getattr(exp, "extension_used", None)
+            if eu in counts:
+                counts[eu] += getattr(exp, "used", 0)
+        return counts
 
     # ---- produce kernel (parse + presim budgets) ----
     def _produce_kernel(
@@ -472,7 +497,7 @@ class Orchestrator:
         fp = Fingerprint(op_kind=self.job.op, bottleneck=verdict.bottleneck if verdict else None)
         record_attempt(
             self.log, self.store, fp, retrieved_ids=[],
-            passed=sim.correct, cycles=sim.cycles,
+            passed=sim.correct, cycles=sim.cycles, compiled=sim.compiled,
             extension_used=meta.get("extension_used"), stage=f"round_{n}",
         )
 

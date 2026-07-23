@@ -81,6 +81,7 @@ class AttemptRecord:
     kernel_ref: Optional[str] = None       # 生成产物的存放位置
     cycles: Optional[int] = None           # 实测 cycles（correct=False 时为空，性能作废，架构文档 §3.6）
     extension_used: Optional[str] = None   # 本轮用的 extension 原语（架构文档 §5.4）
+    failure_kind: Optional[str] = None     # 负面经验分类（T13-5）：'compile' / 'semantic' / None
     stage: str = "drafting"
     run_id: str = field(default_factory=lambda: _new_id("run"))
     timestamp: str = field(default_factory=_now)

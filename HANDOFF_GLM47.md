@@ -78,7 +78,9 @@
 
 1. 打开 `control/vocabulary.yaml`，取全部类别 id。
 2. 一次只做一类（控制上下文占用）：在 extension 文档里找出能解决该类的原语。
-3. 每个原语照 `references/sample_entry.yaml` 的格式填一个 YAML 文件：`name` / `semantics` / `signature` / `category` / `example` / `pitfalls`。格式不得改。
+3. 每个原语照 `references/sample_entry.yaml` 的格式填一个 YAML 文件：`name` / `semantics` / `signature` / `category` / `example` / `pitfalls`。格式不得改。两点要求：
+   - `example` 必须是**一个完整、可编译的最小 kernel**（含 import、`@triton.jit`、完整函数），不是代码片段——弱模型靠模式匹配，能跑的例子胜过散文。
+   - `signature` 若 extension 提供 `.pyi` 存根或头文件，**原样转录**（精确、紧凑、不会被转述走样）。
 4. 把原语名回填进 `control/vocabulary.yaml` 对应类别的 `primitives` 列表。
 5. 某类在 extension 里找不到原语 → `primitives` 保持 `[]` 并在条目标注，不要牵强对应。
 6. 自检：`.venv/bin/python -m control.check_extension_cheatsheet`（每条 `category` 必须在词表内）
@@ -101,6 +103,8 @@
 ## 槽位 5：`check_extension_calls()` in `control/presim_gate.py`
 
 冻结签名：`check_extension_calls(kernel_src) -> list[str]`（返回空列表表示通过，与占位实现一致）。
+
+**定位**：本地静态安全网——挡下原语名不存在、参数个数/类型不符等**低级误用**，无需付出一次远程编译代价；语义层面的错误（原语存在但用法语义错）交给编译错误反馈闭环（渠道②，`compile_log` 回流）。
 
 1. 从槽位 3 完成的速查表取出所有原语的**签名**。
 2. 实现静态检查：kernel 源码中出现的 extension 调用，其原语名是否存在、参数个数/类型是否符合签名。**只静态检查，不执行代码。**

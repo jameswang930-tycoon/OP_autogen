@@ -9,9 +9,9 @@ primitives here; the public branch ships only the worked sample (`sample_entry.y
 |------------|------------------------------------------------------------------|
 | name       | primitive name                                                   |
 | semantics  | one-line semantics                                              |
-| signature  | call signature (real signature; TODO if genuinely unknown)      |
+| signature  | call signature (real signature; TODO if genuinely unknown). If the extension ships a `.pyi` stub / header, transcribe it verbatim |
 | category   | bottleneck category id — MUST be in `control/vocabulary.yaml`   |
-| example    | a minimal, runnable example                                     |
+| example    | a COMPLETE, compilable minimal kernel (imports + `@triton.jit` + full fn), not a snippet |
 | pitfalls   | list of common mistakes                                         |
 
 ## Rules

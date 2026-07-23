@@ -85,13 +85,13 @@ class ExperienceStore:
             json.dumps(self._best_cycles, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    def bump(self, ids: list[str], *, helped: bool = False, failed: bool = False) -> None:
-        """写回价值信号（性能驱动，§5.2）。
+    def bump(self, ids: list[str], *, helped: bool = False, failed: bool = False,
+             semantic: bool = False) -> None:
+        """写回价值信号（性能驱动，§5.2；负面经验分类 T13-5）。
 
         - pass 轮：used+1；若 helped（在场且本轮刷新该 fingerprint 历史最优 cycles）则 helped+1。
         - FAIL 轮：failed+1（中性负向）；不碰 used/helped，故 score 不受影响。
-
-        harmed(被证实有害)预留:第一版不在此自动判定,需归因机制。
+        - semantic（编译过但数值算错，高价值负面）：harmed+1，预留进 score（§5.2 归因后）。
         """
         for i in ids:
             e = self._items.get(i)
@@ -103,4 +103,6 @@ class ExperienceStore:
                 e.used += 1
                 if helped:
                     e.helped += 1
+            if semantic:
+                e.harmed += 1
         self.save()

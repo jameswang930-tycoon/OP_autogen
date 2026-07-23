@@ -21,6 +21,7 @@ def record_attempt(
     cycles: Optional[int] = None,
     kernel_ref: Optional[str] = None,
     extension_used: Optional[str] = None,
+    compiled: bool = True,
     stage: str = "drafting",
 ) -> AttemptRecord:
     """写回点:在仿真给出正确性结果之后调用。
@@ -30,10 +31,19 @@ def record_attempt(
     - correct=True 未刷新最优 → used+1，helped 不动。
     - correct=False → 不碰 used/helped（score 不受影响），仅记 failed；仍写 runlog。
     FAIL 轮的 cycles 作废（§3.6），不写入记录。
+
+    负面经验分类（T13-5）：compiled=False 为编译类失败（低价值，自纠）；
+    compiled=True 且 correct=False 为语义误用（高价值负面，bump harmed）。
     """
     record_cycles = cycles if passed else None
     helped = bool(passed and record_cycles is not None
                   and store.update_best(fp.key(), record_cycles))
+    if not compiled:
+        failure_kind = "compile"
+    elif not passed:
+        failure_kind = "semantic"
+    else:
+        failure_kind = None
     record = AttemptRecord(
         fingerprint=fp.key(),
         retrieved=retrieved_ids,
@@ -41,10 +51,12 @@ def record_attempt(
         kernel_ref=kernel_ref,
         cycles=record_cycles,
         extension_used=extension_used,
+        failure_kind=failure_kind,
         stage=stage,
     )
     log.append(record)
-    store.bump(retrieved_ids, helped=helped, failed=not passed)
+    store.bump(retrieved_ids, helped=helped, failed=not passed,
+               semantic=(failure_kind == "semantic"))
     return record
 
 

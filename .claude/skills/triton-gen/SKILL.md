@@ -4,8 +4,9 @@ description: >
   Pipeline generate stage. Use when a plan or an adapter Verdict exists and a kernel must be
   generated ("生成算子" / generate kernel / turn the plan into a kernel). Produces a REAL
   Triton + extension kernel as a multi-segment module (kernel / reference / compare) ready
-  to launch on the simulator — NOT an emulator-form kernel. Defaults to standard Triton and
-  adds an extension primitive only when the Verdict bottleneck category requires it. Does
+  to launch on the simulator — NOT an emulator-form kernel. Uses the extension primitive
+  indicated by the Verdict bottleneck category when the cheatsheet has one
+  (extension-forward); standard Triton is the structural base, not a preference. Does
   NOT convert to emulator form and does NOT run a repair loop. Trigger for any kernel
   generation request once a plan / Verdict is available.
 ---
@@ -34,13 +35,24 @@ fixing that exact compile error this round, and do NOT introduce any new optimiz
 A kernel that does not compile cannot be measured; correctness of the build comes before
 performance tuning.
 
-## Step 1: Extension usage rule (default to vanilla Triton)
+## Step 1: Extension usage rule (extension-forward)
 
-Write standard Triton by default. Add an extension primitive ONLY when the Verdict
-bottleneck category explicitly calls for one; look it up in the Extension index. The
-baseline is always legal vanilla Triton, so mis-applying an extension yields
-correct-but-unoptimized code, not broken code. If the Verdict is empty (first round),
-generate plain vanilla Triton.
+The compile-error feedback loop (T13-3) made extension tryout cheap: a mis-used
+primitive costs an uncounted compile retry, not an optimization round; the worst case is
+caught by the loop-controller's best-so-far + rollback. So be extension-forward:
+
+1. **When the bottleneck chain points to a primitive, use it — do not hedge.** If
+   `{{VERDICT_JSON}}` resolves to a non-empty `primitives` list for its `bottleneck`,
+   use that primitive this round. Looking it up but retreating to vanilla voids the
+   bottleneck -> lever -> primitives chain.
+2. **First-round policy.** If `{{RETRIEVED_EXPERIENCE}}` hits a memory entry carrying
+   `extension_used`, use that primitive directly. Only when there is neither a hit nor a
+   Verdict to lean on, start from standard Triton — then you genuinely lack the
+   information to choose a primitive.
+3. **Vanilla is demoted from "preference" to "structural base".** The module skeleton
+   stays standard Triton so it parses and compiles; an extension is a local replacement
+   on that base, not an optional decoration.
+4. Multi-segment module and output format (below) are unchanged.
 
 ## Step 2: Generate the multi-segment module
 

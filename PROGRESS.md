@@ -27,7 +27,7 @@
 | T13-2 launch 目录式 | ✅ 门禁通过 | `pytest tests/test_t13_launch_dirmode.py` (5 passed) | （见下） | launch_template docstring 三细节(可配置目录/run-id 隔离/等待超时)+new_run_id()；HANDOFF 槽位 4 同步 |
 | T13-3 编译信号（契约修订，已授权） | ✅ 门禁通过 | `pytest tests/test_t13_compile_signal.py` (8 passed) | （见下） | SimResult+=compiled/compile_log；raw schema 同步；orchestrator COMPILE_FAIL(不计轮/compile_retries/compile_log 回喂/{{COMPILE_ERROR}})；triton-gen 加占位符；report rounds+=compiled；HANDOFF 槽位 4 加字段来源；test_t6/t10/t11 同步 |
 | T13-4 槽位 4 分工表述 | ✅ 门禁通过 | `pytest tests/test_t13_launch_split.py` (4 passed) | （见下） | HANDOFF 槽位 4：删旧"不要解析"句；加 launch() 组装 / parse_raw() 只转换流水 的分工 + "先确认两路来源写注释"步 |
-| T13-5 extension 四渠道（含 extension-forward，已授权） | ⬜ | — | — | |
+| T13-5 extension 四渠道（含 extension-forward，已授权） | ✅ 门禁通过 | `pytest tests/test_t13_extension_channels.py` (9 passed) | （见下） | ①sample example 改完整 kernel+.pyi 转录；④record_attempt 传 extension_used；⑤triton-gen vanilla-first→extension-forward(四规则,反向回归)；⑥pick_lever 探索偏好(off/mild/aggressive)；负面经验分类(compile/semantic) |
 | T13-6 requirements.txt | ⬜ | — | — | |
 
 > **重编号说明（2026-07-23）**：依 `docs/T10_T12_orchestrator_spec.md`，原 T10（交接包）改为 **T12**；新增 **T10**（skill 双模改造）与 **T11**（确定性编排器）。目标形态收紧为「确定性编排器驱动的流水线」。本批执行 T10、T11，完成后停于停止点④。

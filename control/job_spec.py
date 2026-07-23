@@ -20,6 +20,7 @@ class Budget:
     presim_retries: int = 2    # 未过静态闸门重试，不计入轮数
     sim_retries: int = 3       # 仿真设施故障退避重试，不计入轮数
     compile_retries: int = 3   # 编译失败重试（T13-3），不计入轮数；耗尽 -> BUDGET_COMPILE
+    exploration: str = "mild"  # 多候选杠杆的探索偏好（T13-5 渠道⑥）：off|mild|aggressive
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "Budget":
@@ -31,6 +32,7 @@ class Budget:
             presim_retries=int(d.get("presim_retries", 2)),
             sim_retries=int(d.get("sim_retries", 3)),
             compile_retries=int(d.get("compile_retries", 3)),
+            exploration=str(d.get("exploration", "mild")),
         )
 
 

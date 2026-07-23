@@ -1,0 +1,20 @@
+# Sample job for the deterministic orchestrator (T11).
+# Run:  .venv/bin/python -m control.orchestrator --job jobs/matmul.yaml
+#
+# This pass fully implements the `triton_file` form. `pytorch` and `shape_only`
+# are declared in the schema but raise NotImplementedError until a later pass.
+# A real run also needs an LLM backend + a launch() implementation
+# (see HANDOFF_GLM47.md for the confidential-env slots).
+
+op: matmul
+input:
+  form: triton_file
+  path: ./baseline.py        # user-provided Triton baseline kernel (relative to this file)
+shapes: [1024, 1024, 1024]
+dtype: fp16
+budget:
+  max_rounds: 6
+  epsilon: 0.03
+  llm_retries: 3      # parse failures (do not count as rounds)
+  presim_retries: 2   # static-gate failures (do not count as rounds)
+  sim_retries: 3      # simulator infra failures, exponential backoff (do not count)

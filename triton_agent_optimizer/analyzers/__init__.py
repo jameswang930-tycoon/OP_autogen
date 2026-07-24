@@ -1,21 +1,15 @@
-"""分析层 — 对接 simulator.py 和 HIVMIR 解析, 生成 DSL 流水线报告。"""
+"""分析层 —— msprof + HIVMIR 解析 + DSL 合并 + 瓶颈诊断 + 按需数据提取。"""
 
-from .msprof_analyzer import (
-    MsprofAnalyzer,
-    SimulatorOutputParser,
-    SimulatorResult,
-    SimulatorOp,
-    BlockedByInfo,
-    ParallelPair,
-    CriticalPathEdge,
-)
+from .msprof_analyzer import MsprofAnalyzer, TraceJsonParser, PipelineReport, PipelineOp
+from .hivmir_analyzer import HIVMIRAnalyzer, HIVMIRParser, HIVMIRReport, HIVMIROp, generate_mock_hivmir_from_dsl
+from .dsl_merger import merge, merge_round, format_llm, format_human
+from .bottleneck_diagnoser import diagnose, diagnose_round, BottleneckDiagnosis
+from .data_extractor import extract
 
 __all__ = [
-    "MsprofAnalyzer",
-    "SimulatorOutputParser",
-    "SimulatorResult",
-    "SimulatorOp",
-    "BlockedByInfo",
-    "ParallelPair",
-    "CriticalPathEdge",
+    "MsprofAnalyzer", "TraceJsonParser", "PipelineReport", "PipelineOp",
+    "HIVMIRAnalyzer", "HIVMIRParser", "HIVMIRReport", "HIVMIROp", "generate_mock_hivmir_from_dsl",
+    "merge", "merge_round", "format_llm", "format_human",
+    "diagnose", "diagnose_round", "BottleneckDiagnosis",
+    "extract",
 ]

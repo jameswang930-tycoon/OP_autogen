@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""
+Coder Agent — Prompt 编排器 + LLM 调用。
+
+═══════════════════════════════════════════════════════════════════════════════
+  职责: 读 Plan + 当前代码 → 调用 LLM 做最小化代码改动
+
+  输入 (从 Orchestrator):
+    - plan: RoundPlan (Planner 产出)
+    - kernel_code: str (当前 kernel 源码)
+    - previous_error: str (Verifier 回传的错误, 用于重试)
+    - round_dir: Path (本轮输出目录, 用于保存 diff)
+
+  输出:
+    - CoderResult (optimized_code, diff, lines_changed)
+
+═══════════════════════════════════════════════════════════════════════════════
+  约束
+═══════════════════════════════════════════════════════════════════════════════
+
+  可以读:
+    ✅ kernel.py (当前代码)
+    ✅ plan.md (优化计划)
+    ✅ Playbook (参考知识)
+
+  只能写:
+    ✅ optimized kernel.py (修改后代码)
+    ✅ diff.patch (变更记录)
+
+  绝对不能碰:
+    ❌ 任何 msprof/ hivmir/ merged 数据
+    ❌ optimization_trajectory.json
+    ❌ 其他 round 目录的文件
+
+═══════════════════════════════════════════════════════════════════════════════
+  回退机制
+═══════════════════════════════════════════════════════════════════════════════
+
+  Coder 不负责回退。回退由 Orchestrator 实现:
+    - Coder 把优化代码写入 round_N/kernel.py
+    - Verifier 验证 → 如果 REVERT:
+      Orchestrator.current_kernel 保持不变 (还是上一轮的代码)
+      round_N/kernel.py 保留在目录中作为记录 (不删除)
+    → 下一轮从上一轮代码开始, 自然实现了 "回退"
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import difflib
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional
+
+_PROJECT_DIR = Path(__file__).resolve().parent.parent
+if str(_PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_DIR))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  数据结构
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class CoderResult:
+    """Coder 产出的代码修改结果。"""
+    success: bool
+    optimized_code: str
+    diff: str
+    lines_changed: int = 0
+    error_message: str = ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Prompt 构建
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_system_prompt() -> str:
+    return """You are a precise Triton kernel code modifier for Huawei Ascend 910B3 NPU.
+
+## Rules
+1. Change ONLY what the plan specifies — nothing more, nothing less
+2. Maintain existing code style, indentation, and comments
+3. Output the COMPLETE modified file (not just changed lines)
+4. Keep all existing imports and function signatures unless the plan says to change them
+5. Do NOT add new features, refactoring, or "improvements" beyond the plan
+6. If the plan says "BLOCK_SIZE: 256 → 8192", change ONLY that one parameter
+
+## Output Format
+Return ONLY the complete modified Python code. No markdown, no explanation, no diff.
+The code must be syntactically valid Python."""
+
+
+def _build_user_prompt(
+    plan_text: str,
+    kernel_code: str,
+    previous_error: str = "",
+) -> str:
+    parts = []
+
+    parts.append("## Optimization Plan")
+    parts.append(plan_text)
+    parts.append("")
+
+    if previous_error:
+        parts.append("## Previous Attempt Failed")
+        parts.append(f"The last code change caused this error:")
+        parts.append(f"```")
+        parts.append(previous_error[:1000])
+        parts.append(f"```")
+        parts.append("Please fix this error while still implementing the plan.")
+        parts.append("")
+
+    parts.append("## Current Kernel Code")
+    parts.append("```python")
+    parts.append(kernel_code)
+    parts.append("```")
+    parts.append("")
+    parts.append("---")
+    parts.append("Output the COMPLETE modified kernel code (no explanation, no markdown).")
+
+    return "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  代码验证
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _validate_python(code: str) -> tuple[bool, str]:
+    """Python 语法检查。"""
+    try:
+        compile(code, "<kernel>", "exec")
+        return True, ""
+    except SyntaxError as e:
+        return False, f"SyntaxError at line {e.lineno}: {e.msg}"
+
+
+def _generate_diff(original: str, optimized: str) -> str:
+    """生成 unified diff。"""
+    orig_lines = original.splitlines(keepends=True)
+    opt_lines = optimized.splitlines(keepends=True)
+    diff = difflib.unified_diff(
+        orig_lines, opt_lines,
+        fromfile="kernel.py (original)",
+        tofile="kernel.py (optimized)",
+    )
+    return "".join(diff)
+
+
+def _count_lines_changed(diff_text: str) -> int:
+    """统计 diff 中的行数变更。"""
+    additions = sum(1 for line in diff_text.split("\n") if line.startswith("+") and not line.startswith("+++"))
+    deletions = sum(1 for line in diff_text.split("\n") if line.startswith("-") and not line.startswith("---"))
+    return additions + deletions
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Coder Agent
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CoderAgent:
+    """编码智能体 — Prompt 编排器。
+
+    只负责改代码, 不改任何其他文件。
+    回退由 Orchestrator 负责 (保持 current_kernel 不变即可回退)。
+
+    Usage:
+        coder = CoderAgent()
+        result = coder.apply(
+            kernel_code=current_kernel,
+            plan_text=plan.plan_text,
+            previous_error="",
+        )
+    """
+
+    def __init__(self, use_llm: bool = False):
+        self.use_llm = use_llm
+        if not use_llm:
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if api_key:
+                self.use_llm = True
+
+    def apply(
+        self,
+        kernel_code: str,
+        plan_text: str = "",
+        previous_error: str = "",
+    ) -> CoderResult:
+        """应用优化计划到代码。
+
+        Args:
+            kernel_code: 当前 kernel 源码
+            plan_text: Planner 产出的计划文本 (JSON 格式)
+            previous_error: 上一轮失败的错误信息 (Verifier 重试时传入)
+
+        Returns:
+            CoderResult (optimized_code + diff)
+        """
+
+        # Step 1: 调用 LLM (或 stub)
+        if self.use_llm:
+            optimized = self._call_llm(kernel_code, plan_text, previous_error)
+        else:
+            optimized = self._stub_apply(kernel_code, plan_text)
+
+        # Step 2: 清理 LLM 输出
+        optimized = self._clean_output(optimized, kernel_code)
+
+        # Step 3: Python 语法检查
+        valid, err = _validate_python(optimized)
+        if not valid:
+            return CoderResult(
+                success=False,
+                optimized_code=kernel_code,
+                diff="",
+                error_message=err,
+            )
+
+        # Step 4: 生成 diff
+        diff = _generate_diff(kernel_code, optimized)
+        lines = _count_lines_changed(diff)
+
+        return CoderResult(
+            success=True,
+            optimized_code=optimized,
+            diff=diff,
+            lines_changed=lines,
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  LLM
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _call_llm(self, kernel_code: str, plan_text: str,
+                  previous_error: str) -> str:
+        import anthropic
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            system=_build_system_prompt(),
+            messages=[{
+                "role": "user",
+                "content": _build_user_prompt(plan_text, kernel_code, previous_error),
+            }],
+        )
+        return response.content[0].text
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  Stub
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _stub_apply(self, kernel_code: str, plan_text: str) -> str:
+        """Stub 模式: 不做修改, 直接返回原代码。"""
+        return kernel_code
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  输出清理
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _clean_output(self, raw: str, original: str) -> str:
+        """清理 LLM 输出 — 去掉 markdown 代码块包裹。"""
+        text = raw.strip()
+        # 去掉 ```python ... ``` 包裹
+        if text.startswith("```"):
+            lines = text.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines)
+
+        # 如果输出为空或太短, 返回原始代码
+        if len(text) < 10:
+            return original
+
+        return text
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  自测
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _self_test():
+    coder = CoderAgent()
+
+    # 模拟 kernel
+    kernel = """import triton, triton.language as tl
+
+@triton.jit
+def add_kernel(x_ptr, y_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+    x = tl.load(x_ptr + offs, mask=mask)
+    y = tl.load(y_ptr + offs, mask=mask)
+    tl.store(out_ptr + offs, x + y, mask=mask)
+"""
+    plan_text = json.dumps({
+        "strategy": "increase_tile_size",
+        "specific_change": "BLOCK_SIZE: 256 → 8192",
+        "expected_impact": "bw_util from 21% to 90%+",
+    }, indent=2)
+
+    # Stub 测试
+    r = coder.apply(kernel, plan_text)
+    print(f"Coder stub test: success={r.success}, diff_len={len(r.diff)}")
+    assert r.success
+
+    # 语法检查测试
+    valid, err = _validate_python(kernel)
+    print(f"Syntax check: valid={valid}, err='{err}'")
+    assert valid
+
+    # 损坏代码测试
+    bad = "def foo(\n"
+    valid, err = _validate_python(bad)
+    print(f"Bad code check: valid={valid}, err='{err[:50]}'")
+    assert not valid
+
+    # Diff 测试
+    modified = kernel.replace("BLOCK_SIZE: tl.constexpr",
+                               "BLOCK_SIZE: tl.constexpr, NUM_STAGES: tl.constexpr")
+    diff = _generate_diff(kernel, modified)
+    lines = _count_lines_changed(diff)
+    print(f"Diff test: {lines} lines changed")
+    assert lines == 2
+
+    print("\n[Coder] All tests passed")
+
+
+if __name__ == "__main__":
+    _self_test()

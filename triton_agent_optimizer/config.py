@@ -563,14 +563,14 @@ class OptimizationParams:
     """同一策略层级连续 N 轮无改进 → 晋升到下一层级。"""
 
     strategy_tiers: Dict[int, str] = field(default_factory=lambda: {
-        1: "Block Size & Launch Config",
-        2: "Memory Access & Coalescing",
-        3: "Operator Fusion",
-        4: "Compute Optimization",
-        5: "910B3 Architecture-Specific",
-        6: "Algorithmic Restructure",
+        1: "Algorithmic Structure",
+        2: "Operator Fusion",
+        3: "Tiling & Block Config",
+        4: "Memory Access & Coalescing",
+        5: "Compute & Occupancy",
+        6: "910B3 Architecture-Specific",
     })
-    """6 层优化策略定义 (从粗到细)。"""
+    """6 层优化策略定义 (从结构影响最大到最小)。详见 docx/OPTIMIZATION_METHODOLOGY.md"""
 
     # ── Emulator 重试 ─────────────────────────────────────────────────────────
     emulator_retry_max: int = 3

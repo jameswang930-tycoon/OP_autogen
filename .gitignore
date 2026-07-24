@@ -81,6 +81,7 @@ triton_agent_optimizer/__pycache__/
 triton_agent_optimizer/**/__pycache__/
 triton_agent_optimizer/output/
 triton_agent_optimizer/rounds/
+triton_agent_optimizer/outputs/
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Project: Temp / debug files

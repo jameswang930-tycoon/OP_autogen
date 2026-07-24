@@ -35,21 +35,21 @@ self.use_llm = bool(os.environ.get("ANTHROPIC_API_KEY"))
 - ✅ 重试循环 (Verifier FAIL → Coder retry ×3)
 - ✅ 所有决策委托给 feedback/record_manager.py
 
-### 1.2 需要在 910B3 上修改
+### 1.2 自动检测 (不需要手动修改)
 
-| 项目 | 位置 | 当前值 | 改为什么 |
-|---|---|---|---|
-| `kernel_path` | 构造函数参数 | 用户传入 | `outputs/<kernel>/round0/kernel.py` |
-| `kernel_name` | 构造函数参数 | 用户传入 | 如 `vector_add_fp16_N65536` |
-| `target_speedup` | 构造函数参数 | `1.5` | 根据实际目标调整 |
-| `max_rounds` | 构造函数参数 | `200` | 根据预算调整 |
-| `kernel_fn_name` | `_call_verifier()` | `"add_kernel"` | **改为实际的 kernel 函数名** |
+`main.py` 入口自动完成:
+- `detect_kernels()` → AST 解析，找到所有 `@triton.jit` 函数名
+- `_classify_kernel_type()` → 分析函数体，判断 element_wise/matmul/reduction/attention
+- 自动注入 `orch._kernel_fn_name` + `orch._op_type` → 全链路传递
 
-**关键修改**: `orchestrator.py` 中 `_call_verifier` 调用:
-```python
-# Line ~190 — 改为实际 kernel 函数名
-kernel_fn_name="add_kernel",  # TODO: 改成你的 kernel 函数名
-```
+**不再需要手动改 kernel 函数名。**
+
+### 1.3 910B3 上需要确认
+
+| 项目 | 说明 |
+|---|---|
+| `target_speedup` | 构造函数参数，默认 1.5，根据目标调整 |
+| `max_rounds` | 构造函数参数，默认 200，根据预算调整 |
 
 ### 1.3 验证命令
 

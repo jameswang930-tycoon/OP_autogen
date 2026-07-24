@@ -103,6 +103,7 @@ class VerifierAgent:
         kernel_path: Path,
         round_dir: Optional[Path] = None,
         kernel_fn_name: str = "add_kernel",
+        op_type: str = "element_wise",
         baseline_latency_ms: float = 0.0,
     ) -> VerifyResult:
         """完整两阶段验证。
@@ -119,7 +120,7 @@ class VerifierAgent:
         kernel_path = Path(kernel_path)
 
         # ── Stage 1: CPU Emulator ──
-        emu = self._run_stage1(kernel_path, kernel_fn_name)
+        emu = self._run_stage1(kernel_path, kernel_fn_name, op_type)
         if not emu.passed:
             return VerifyResult(
                 stage1_passed=False,
@@ -149,9 +150,10 @@ class VerifierAgent:
     #  Stage 1: CPU Emulator
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def _run_stage1(self, kernel_path: Path, fn_name: str) -> EmulatorStageResult:
+    def _run_stage1(self, kernel_path: Path, fn_name: str,
+                    op_type: str = "element_wise") -> EmulatorStageResult:
         """从 round_N/kernel.py 导入 kernel, 用 emulators/common 验证正确性。"""
-        r = self.emulator.verify(kernel_path, kernel_fn_name=fn_name)
+        r = self.emulator.auto_verify(kernel_path, fn_name, op_type=op_type)
         shapes_tested = len(self.emulator.DEFAULT_SHAPES)
         return EmulatorStageResult(
             passed=r.passed,

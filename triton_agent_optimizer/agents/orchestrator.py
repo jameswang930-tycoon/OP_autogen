@@ -68,6 +68,8 @@ class Orchestrator:
 
         self.current_kernel = ""
         self.best_kernel = ""
+        self._kernel_fn_name = "add_kernel"  # 可由 main.py 注入
+        self._op_type = "element_wise"       # 可由 main.py 注入
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  主循环
@@ -199,7 +201,9 @@ class Orchestrator:
         v = VerifierAgent()
         max_r = 3; cur = opt_code
         for a in range(max_r + 1):
-            vr = v.verify(rd / "kernel.py", rd)
+            vr = v.verify(rd / "kernel.py", rd,
+                          kernel_fn_name=self._kernel_fn_name,
+                          op_type=self._op_type)
             if vr.stage1_passed:
                 return vr, a
             if a < max_r:

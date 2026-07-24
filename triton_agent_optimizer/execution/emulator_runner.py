@@ -159,26 +159,104 @@ class EmulatorRunner:
                                max_rel_error=max_rel)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    #  内置 emulate (vector add — 最基础的验证)
+    #  智能 emulation — 根据算子类型自动选择验证方式
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def _emulate_vector_add(self, kernel_fn, x, y, N):
-        """通用 vector add 包装: 展平→grid→reshape。BLOCK_SIZE 自动适配 N。"""
-        # 选择合理的 BLOCK_SIZE: <= N, 且是2的幂
+    # 已知算子类型 → 默认 emulate + reference
+    KNOWN_KERNEL_TYPES = {
+        "add": {
+            "emulate": "_emulate_element_wise",
+            "reference": "_reference_add",
+            "inputs": 2,  # x, y
+        },
+        "mul": {
+            "emulate": "_emulate_element_wise",
+            "reference": "_reference_mul",
+            "inputs": 2,
+        },
+        "matmul": {
+            "emulate": "_emulate_matmul",
+            "reference": "_reference_matmul",
+            "inputs": 2,  # A, B
+        },
+        "element_wise": {
+            "emulate": "_emulate_element_wise",
+            "reference": "_reference_add",
+            "inputs": 2,
+        },
+        "unknown": {
+            "emulate": "_emulate_generic",
+            "reference": None,  # 无 reference → 只做语法检查
+            "inputs": 2,
+        },
+    }
+
+    def auto_verify(self, kernel_path: Path, kernel_fn_name: str,
+                    op_type: str = "element_wise",
+                    test_shapes=None) -> EmulatorResult:
+        """自动选择合适的 emulate/reference 函数进行验证。
+
+        Args:
+            kernel_path: kernel.py 路径
+            kernel_fn_name: kernel 函数名
+            op_type: 算子类型 (add/mul/matmul/element_wise/reduction/unknown)
+            test_shapes: 测试 shapes (默认使用 DEFAULT_SHAPES)
+        """
+        config = self.KNOWN_KERNEL_TYPES.get(op_type,
+                                               self.KNOWN_KERNEL_TYPES["unknown"])
+        emulate_fn_name = config["emulate"]
+        reference_fn_name = config["reference"]
+
+        # 获取 emulate 方法
+        emulate_fn = getattr(self, emulate_fn_name, None)
+        reference_fn = getattr(self, reference_fn_name, None) if reference_fn_name else None
+
+        return self.verify(
+            kernel_path=kernel_path,
+            kernel_fn_name=kernel_fn_name,
+            emulate_fn=emulate_fn,
+            reference_fn=reference_fn,
+            test_shapes=test_shapes,
+        )
+
+    def _emulate_element_wise(self, kernel_fn, x, y, N):
+        """通用逐元素操作包装: 展平→grid→reshape。BLOCK_SIZE 自动适配 N。"""
         bs = 1
         while bs * 2 <= min(N, 4096):
             bs *= 2
         if bs < 1:
             bs = 1
-
         x_f = x.ravel().astype(np.float32)
         y_f = y.ravel().astype(np.float32)
         out_f = np.zeros(N, dtype=np.float32)
-
         grid = self.tl.cdiv(N, bs)
-        self.launch_kernel_1d(kernel_fn, x_f, y_f, out_f, N, bs,
-                               grid_size=grid)
+        self.launch_kernel_1d(kernel_fn, x_f, y_f, out_f, N, bs, grid_size=grid)
         return out_f.reshape(x.shape)
+
+    def _emulate_matmul(self, kernel_fn, A, B, M, N, K):
+        """矩阵乘法包装 (简化: M×K @ K×N)。"""
+        A_f = A.ravel().astype(np.float32)
+        B_f = B.ravel().astype(np.float32)
+        out_f = np.zeros(M * N, dtype=np.float32)
+        self.launch_kernel_1d(kernel_fn, A_f, B_f, out_f, M, N, K,
+                               grid_size=M * N)
+        return out_f.reshape(M, N)
+
+    def _emulate_generic(self, kernel_fn, x, y, N):
+        """通用包装 (不假设 kernel 输入格式，只做语法检查)。"""
+        return self._emulate_element_wise(kernel_fn, x, y, N)
+
+    @staticmethod
+    def _reference_add(x, y):
+        return (x + y).astype(np.float32)
+
+    @staticmethod
+    def _reference_mul(x, y):
+        return (x * y).astype(np.float32)
+
+    @staticmethod
+    def _reference_matmul(A, B):
+        return (A.astype(np.float32) @ B.astype(np.float32)).astype(np.float32)
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  加载 emulators/common

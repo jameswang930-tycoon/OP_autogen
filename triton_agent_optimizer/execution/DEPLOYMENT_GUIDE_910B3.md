@@ -5,14 +5,21 @@
 
 ## 1. emulator_runner.py — CPU 仿真验证
 
-**本地即可运行，不需要 NPU。**
+**本地即可运行，不需要 NPU。支持智能识别算子类型。**
+
+`auto_verify(kernel_path, kernel_fn_name, op_type)`:
+- `op_type="element_wise"` → `_emulate_element_wise` + `_reference_add`
+- `op_type="matmul"` → `_emulate_matmul` + `_reference_matmul`
+- `op_type="add"` → `_emulate_element_wise` + `_reference_add`
+- `op_type="unknown"` → `_emulate_generic` (仅语法检查)
+- `op_type` 由 main.py 自动检测，不需要手动指定
 
 验证命令:
 ```bash
 python execution/emulator_runner.py
 ```
 
-**需要在 910B3 上确认**: kernel 函数名是否正确 (`add_kernel` → 你的实际函数名)。
+**需要在 910B3 上扩展**: 如果新算子类型需要特殊的 emulate/reference，在 `KNOWN_KERNEL_TYPES` dict 中添加。
 
 ---
 

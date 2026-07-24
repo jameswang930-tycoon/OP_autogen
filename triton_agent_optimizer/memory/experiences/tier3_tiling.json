@@ -1,0 +1,39 @@
+[
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_latency",
+      "engine": "GM→UB"
+    },
+    "strategy": "increase_tile_size",
+    "speedup": 1.3,
+    "status": "SUCCESS",
+    "description": "BLOCK_SIZE 256 → 8192, bw_util 21% → 90%",
+    "timestamp": "2026-07-24T10:49:51.876687"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_latency",
+      "engine": "GM→UB"
+    },
+    "strategy": "merge_small_transfers",
+    "speedup": 1.15,
+    "status": "SUCCESS",
+    "description": "合并 4×1KB → 1×4KB gm_to_ub",
+    "timestamp": "2026-07-24T10:49:51.879304"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "UB→GM"
+    },
+    "strategy": "double_buffering",
+    "speedup": 0.97,
+    "status": "FAIL",
+    "description": "UB 溢出, 无法 double buffer",
+    "timestamp": "2026-07-24T10:49:51.882424",
+    "decision_reason": "UB capacity 不足"
+  }
+]

@@ -100,14 +100,27 @@ def _load_playbook(tier: int, playbook_dir: Optional[Path] = None) -> str:
 def _retrieve_similar_cases(diagnosis, max_cases: int = 3) -> str:
     """从 memory/ 经验库检索相似案例。"""
     try:
-        from memory import compute_fingerprint, retrieve, format_context
+        from memory.experience_retriever import retrieve, format_for_prompt
 
+        cases = retrieve(
+            op_type=getattr(diagnosis, "bottleneck_op_type", ""),
+            bottleneck_type=getattr(diagnosis, "bottleneck_type", ""),
+            engine=getattr(diagnosis, "bottleneck_engine", ""),
+            tier=getattr(diagnosis, "current_tier", 1),
+            max_results=max_cases,
+        )
+        if cases:
+            return format_for_prompt(cases)
+    except Exception:
+        pass
+    # Fallback: 尝试旧的 memory/ 模块
+    try:
+        from memory import compute_fingerprint, retrieve, format_context
         fp = compute_fingerprint({
             "op_type": getattr(diagnosis, "bottleneck_op_type", "?"),
             "bottleneck_type": getattr(diagnosis, "bottleneck_type", "?"),
             "engine": getattr(diagnosis, "bottleneck_engine", "?"),
         })
-
         from memory.store import ExperienceStore
         store_path = _PROJECT_DIR / "memory" / "experience" / "store.json"
         if store_path.exists():
@@ -117,7 +130,7 @@ def _retrieve_similar_cases(diagnosis, max_cases: int = 3) -> str:
                 return format_context(hits)
     except Exception:
         pass
-    return "(no similar cases found — experience store empty or memory module unavailable)"
+    return "(no similar cases found)"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

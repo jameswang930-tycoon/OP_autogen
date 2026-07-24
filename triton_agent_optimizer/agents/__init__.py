@@ -1,13 +1,11 @@
-"""智能体层。"""
+"""智能体层 + 反馈层。"""
 
-from .orchestrator import Orchestrator, StopChecker, RoundPlan, CoderResult, VerifyResult, RoundRecord
+from .orchestrator import Orchestrator
 from .planner import PlannerAgent, PLAYBOOK_FILES, TIER_NAMES
 from .coder import CoderAgent
 from .verifier import VerifierAgent
 
 __all__ = [
-    "Orchestrator", "StopChecker",
-    "PlannerAgent", "CoderAgent", "VerifierAgent",
+    "Orchestrator", "PlannerAgent", "CoderAgent", "VerifierAgent",
     "PLAYBOOK_FILES", "TIER_NAMES",
-    "RoundPlan", "CoderResult", "VerifyResult", "RoundRecord",
 ]

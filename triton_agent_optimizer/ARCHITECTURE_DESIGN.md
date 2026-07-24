@@ -85,10 +85,17 @@
 │                                ↓                                    │
 │  ┌─────────────────────────────────────────────────────────┐       │
 │  │              瓶颈诊断 (BottleneckDiagnoser)              │       │
-│  │  • 识别瓶颈操作（时间占比最大）                          │       │
-│  │  • 分类瓶颈类型（memory_bandwidth / memory_latency /     │       │
-│  │    compute_vec / compute_cube / dependency / engine_contention）│
-│  │  • 评估可优化空间（是否已达到理论峰值）                  │       │多加一个关键数据提取的文件
+│  │  • 识别瓶颈操作 (Tier-aware: 不同Tier关注不同类型)       │       │
+│  │  • 分类瓶颈类型 (memory_bandwidth/latency/compute_vec    │       │
+│  │    /compute_cube/dependency/engine_contention)           │       │
+│  │  • 评估可优化空间 (HIGH/MEDIUM/LOW/UNCERTAIN)           │       │
+│  └─────────────────────────────────────────────────────────┘       │
+│                                ↓                                    │
+│  ┌─────────────────────────────────────────────────────────┐       │
+│  │           关键数据提取 (DataExtractor)                  │       │
+│  │  • Tier-aware 列过滤 (不同Tier保留不同列)               │       │
+│  │  • 聚合分析 (同类型op合并统计)                          │       │
+│  │  • 输出 ~2KB 精简文本 → 注入 Planner LLM prompt         │       │
 │  └─────────────────────────────────────────────────────────┘       │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -98,44 +105,49 @@
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
 │  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐       │
-│  │ Planner Agent  │  │  Coder Agent   │  │ Verifier Agent │       │
+│  │ Planner (LLM)  │  │  Coder (LLM)   │  │Verifier(脚本)  │       │
 │  │   规划智能体    │  │   编码智能体    │  │   验证智能体    │       │
 │  │  ────────────  │  │  ────────────  │  │  ────────────  │       │
-│  │ • 读瓶颈报告   │  │ • 读优化计划   │  │ • 三阶段验证   │       │每一轮循环中调度器开始调度智能体之前执行一轮分析层的函数
-│  │ • 选优化策略   │  │ • 最小化代码改 │  │   ① CPU Emulator│       │
-│  │ • 写本轮计划   │  │ • 单文件变更   │  │   ② Simulator  │       │
-│  │ • 参考历史案例 │  │ • 保持可回退   │  │   ③ 910B3 实测  │       │
+│  │ • 读 Playbook  │  │ • 读优化计划   │  │ Stage1:CPU仿真 │       │
+│  │ • 读诊断+数据  │  │ • 最小化代码改 │  │ Stage2:910B3实测│       │
+│  │ • 检索相似案例 │  │ • 只改kernel.py│  │ FAIL→Coder重试 │       │
+│  │ • 生成本轮计划 │  │ • 语法检查     │  │ 最多3次        │       │
 │  └────────────────┘  └────────────────┘  └────────────────┘       │
 │         │                    │                    │                  │
 │         └────────────────────┼────────────────────┘                  │
 │                              ↓                                       │
 │  ┌─────────────────────────────────────────────────────────┐       │
-│  │              Orchestrator (调度器)                       │       │
-│  │  • 轮次管理（每轮：Plan→Code→Verify→Decide→Record）     │       │
-│  │  • 上下文管理（滑动窗口 + 摘要压缩 + 经验检索）         │       │
-│  │  • 停止条件判断                                          │       │
-│  │  • 全局状态维护                                          │       │
+│  │           Orchestrator (Python 状态机, 非 LLM)          │       │
+│  │  • 每轮: Analyzers→Plan→Code→Verify(retry)→Decide→Record│       │
+│  │  • 6-Tier 管理 (晋升+降级规则)                           │       │
+│  │  • 停止条件检查 (7条)                                    │       │
+│  │  • 全局状态: optimization_trajectory.json               │       │
 │  └─────────────────────────────────────────────────────────┘       │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│              执行层 (Execution Layer)                               │
+│              执行层 (Execution Layer) — 验证                      │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌────────────────┐   │
-│  │  CPU Emulator    │  │  Cost Simulator  │  │  910B3 Hardware│   │
-│  │  ────────────    │  │  ────────────    │  │  ────────────  │   │
-│  │  • 秒级反馈      │  │  • 秒级反馈      │  │  • 分钟级反馈  │   │
-│  │  • 正确性验证    │  │  • 性能预估      │  │  • 真实性能     │   │
-│  │  • Shape sweep   │  │  • 瓶颈分析      │  │  • msprof 数据  │   │
-│  │  • 边界条件       │  │  • 引擎利用率    │  │  • HIVMIR 提取  │   │
-│  └──────────────────┘  └──────────────────┘  └────────────────┘   │
+│  ┌──────────────────────────┐  ┌──────────────────────────┐       │
+│  │  Stage 1: CPU Emulator   │  │  Stage 2: 910B3 Hardware│       │
+│  │  ────────────────────    │  │  ────────────────────    │       │
+│  │  • emulators/common 模拟 │  │  • Ascend 编译器编译     │       │
+│  │  • 多shape/dtype测试     │  │  • benchmark 基准测试    │       │
+│  │  • verify()数值对比      │  │  • msprof性能数据采集    │       │
+│  │  • 秒级反馈              │  │  • 分钟级反馈            │       │
+│  │  • FAIL → Coder重试(×3)  │  │  • 本地环境自动跳过      │       │
+│  └──────────────────────────┘  └──────────────────────────┘       │
+│                                                                     │
+│  注意: Cost Simulator 不在验证环节                                  │
+│  → 它在分析层 (dsl_merger) 做瓶颈诊断用, 不是验证步骤               │
 │                                                                     │
 │  ┌─────────────────────────────────────────────────────────┐       │
-│  │          决策 (Keep / Revert)                            │       │
-│  │  • 正确性通过 + 性能提升 > 1% → Keep                     │       │
-│  │  • 正确性失败 or 性能下降    → Revert                    │       │
+│  │          决策 (Orchestrator 规则引擎)                   │       │
+│  │  • Stage1 PASS + speedup > 1.01 → KEEP                  │       │
+│  │  • Stage1 FAIL → REVERT (error回传Coder)               │       │
+│  │  • 回退: current_kernel 不变 (自然回退, 不删文件)       │       │
 │  └─────────────────────────────────────────────────────────┘       │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -181,7 +193,49 @@
 
 ---
 
-## 1.5 数据流与输出格式对齐
+## 1.5 每轮完整执行流程 (Round N)
+
+```
+Round N 开始
+│
+├─ ① Analyzers (Python 脚本, 每轮重跑)
+│   msprof_analyzer → hivmir_analyzer → dsl_merger
+│   → merged_report.json (29字段完整流水线)
+│   → bottleneck_diagnoser → BottleneckDiagnosis (~2KB)
+│   → data_extractor → tier 相关的精简数据 (~2KB)
+│
+├─ ② Planner (LLM Agent)
+│   输入: diagnosis + extracted_data + playbook_tier_N + history[-5:] + kernel_code
+│   输出: round_N_plan.md + RoundPlan (strategy, change, expected_impact)
+│
+├─ ③ Coder (LLM Agent)
+│   输入: plan_text + kernel_code (+ previous_error 如果重试)
+│   输出: optimized kernel.py (写入 round_N/) + diff.patch
+│   约束: 只能改 kernel.py, 不改任何其他文件
+│
+├─ ④ Verifier (Python 脚本, 两阶段)
+│   Stage 1: CPU Emulator (emulators/common)
+│     → 导入 round_N/kernel.py → 多shape/dtype测试 → verify()数值对比
+│     → PASS → Stage 2
+│     → FAIL → error_details 回传 Coder 重试 (最多3次)
+│   Stage 2: 910B3 Hardware (可选, 本地跳过)
+│     → 编译 + benchmark + msprof → 真实延迟/吞吐/加速比
+│
+├─ ⑤ Decide (Orchestrator 规则引擎)
+│   speedup > 1.01? → KEEP (current_kernel = optimized)
+│   speedup ≤ 1.01? → REVERT (current_kernel 不变, 自然回退)
+│
+├─ ⑥ Record
+│   更新 optimization_trajectory.json (state + history)
+│   保存 optimization_record.json 到 round_N/
+│
+├─ ⑦ Check Stop
+│   连续5 REVERT → tier+1 或 停止 | 平台期 | 预算耗尽 | 目标达成
+│
+└─ Round N 结束 → Round N+1
+```
+
+## 1.6 数据流与输出格式对齐
 
 ### 1.5.1 核心数据流
 
@@ -880,61 +934,38 @@ Round N 开始
 
 ---
 
-## 4. 验证三阶段详解
+## 4. 验证两阶段详解
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                    Verification Pipeline                          │
+│                    Verification Pipeline (两阶段)                 │
 ├──────────────────────────────────────────────────────────────────┤
 │                                                                   │
-│  Stage 1: CPU Emulator (秒级，每轮必跑)                           │
+│  Stage 1: CPU Emulator (秒级，每轮必跑，正确性 gate)              │
 │  ─────────────────────────────────────                            │
-│  输入: optimized_kernel.py                                        │
+│  输入: round_N/kernel.py (Coder 产出的 Triton kernel)             │
 │  执行:                                                            │
-│    a. 基础正确性: 单 shape 输入，输出 vs PyTorch reference        │
-│    b. Shape Sweep:                                                │
-│       - 小 shape (边界条件: 1, 3, 7)                              │
-│       - 中 shape (典型值: 256, 512)                               │
-│       - 大 shape (压力测试: 4096, 8192)                           │
-│       - 非整除 shape (测试 mask 逻辑: 1025, 2049)                 │
-│    c. Dtype Sweep: fp16, fp32, bf16 (如适用)                      │
-│    d. 边界条件: 全零输入、极值 (±max)、空张量                     │
-│    e. 数值精度: max_abs_error, max_rel_error, ULP 分布            │
-│  输出: PASS/FAIL + 详细错误报告（行号、期望值、实际值）           │
-│  对接: emulators/common/ (tl, launch_kernel, verify, TraceLogger) │
-│  策略: 借鉴 "The Correctness Illusion" 论文的 seeded fuzzing      │
-│        oracle — 多 shape + 多 dtype + 严格 tolerance              │
+│    a. 动态导入 kernel 函数                                        │
+│    b. 用 emulators/common 的 tl 打桩 + launch_kernel 模拟执行     │
+│    c. Shape Sweep: 小/中/大/非整除 shapes                        │
+│    d. 与 NumPy reference 数值对比: max_abs_error, max_rel_error   │
+│  输出: PASS/FAIL + error_details                                  │
+│  FAIL时: error_details 回传 Coder → 基于错误修复 → 重试(最多3次)│
+│  对接: emulators/common/__init__.py (tl, launch_kernel, verify)   │
 │                                                                   │
-│  Stage 2: Cost Simulator (秒级，Stage 1 PASS 后跑)                 │
+│  Stage 2: 910B3 Hardware (分钟级，Stage1 PASS 后跑)               │
 │  ─────────────────────────────────────                            │
-│  输入: kernel → DSL program                                       │
+│  输入: round_N/kernel.py                                          │
 │  执行:                                                            │
-│    python simulator.py --llm --critical-path "<DSL program>"      │
-│  输出:                                                            │
-│    - total_ns (预估总时间)                                        │
-│    - 瓶颈 op + time_ratio                                         │
-│    - 关键路径 (critical path)                                     │
-│    - 引擎利用率                                                   │
-│    - 带宽利用率 (per op)                                          │
-│  对接: costModel/cost_emulator/simulator.py                       │
+│    a. 导入真实 triton (import triton, triton.language)            │
+│    b. 编译 (Ascend 编译器 → NPU binary)                           │
+│    c. 基准测试 (warmup=30, repeat=200)                            │
+│    d. msprof 数据采集                                             │
+│  输出: latency_ms, throughput_gb_s, speedup_vs_baseline           │
+│  本地环境: 自动跳过 (返回 tested=false)                           │
 │                                                                   │
-│  Stage 3: 910B3 Hardware (分钟级，Stage 1+2 PASS 后跑)              │
-│  ─────────────────────────────────────                            │
-│  输入: optimized_kernel.py                                        │
-│  执行:                                                            │
-│    a. 编译 (Ascend 编译器)                                        │
-│    b. 基准测试 (warmup=30, repeat=200)                            │
-│    c. 收集 msprof 数据                                            │
-│    d. 提取 HIVMIR                                                 │
-│  输出:                                                            │
-│    - 真实延迟 (ms) / 吞吐 (GB/s, TFLOPS)                          │
-│    - msprof 报告 (时序、带宽、引擎利用率)                         │
-│    - HIVMIR 文件 (供下轮分析)                                     │
-│                                                                   │
-│  特殊处理:                                                        │
-│    - 编译失败 → 记录错误，Revert                                  │
-│    - UB overflow → 提示 tile 太大，Revert + 调整策略             │
-│    - 运行时错误 → 记录完整错误栈，Revert                          │
+│  注意: Cost Simulator 不在这里                                    │
+│  → 它在分析层每轮开头运行, 做瓶颈诊断 (dsl_merger → diagnoser)    │
 │                                                                   │
 └──────────────────────────────────────────────────────────────────┘
 ```

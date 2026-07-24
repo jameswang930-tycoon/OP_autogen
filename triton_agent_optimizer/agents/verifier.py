@@ -170,24 +170,39 @@ class VerifierAgent:
         self, kernel_path: Path, round_dir: Optional[Path],
         baseline_latency_ms: float,
     ) -> HardwareStageResult:
-        """在 910B3 上编译 + benchmark。"""
+        """在 910B3 上: 编译 → 提取HIVMIR → benchmark。"""
         if not self.hardware.available:
             return HardwareStageResult(tested=False)
-
         if self.skip_hardware:
             return HardwareStageResult(tested=False)
 
         try:
-            # 编译
             from execution.compiler import CompilerInterface
             compiler = CompilerInterface()
+            if not compiler.available:
+                return HardwareStageResult(tested=False)
+
             code = kernel_path.read_text(encoding="utf-8")
-            compile_r = compiler.compile(code, round_dir or kernel_path.parent)
+            rd = round_dir or kernel_path.parent
+
+            # 编译 + HIVMIR 提取
+            compile_r = compiler.compile(code, rd / "compiler_output")
             if not compile_r.success:
                 return HardwareStageResult(tested=True, passed=False)
 
+            # 将 HIVMIR 复制到 hivmir/ 目录 (供下轮分析)
+            hivmir_dir = rd / "hivmir"
+            hivmir_dir.mkdir(exist_ok=True)
+            hivmir_compiler_dir = hivmir_dir / "compiler_output"
+            hivmir_compiler_dir.mkdir(exist_ok=True)
+            if compile_r.hivmir_path:
+                import shutil
+                shutil.copy2(compile_r.hivmir_path,
+                             hivmir_compiler_dir / "hivmir_output.mlir")
+
             # benchmark
-            hw_r = self.hardware.benchmark(Path(compile_r.binary_path), baseline_latency_ms)
+            hw_r = self.hardware.benchmark(
+                Path(compile_r.binary_path), baseline_latency_ms)
             return HardwareStageResult(
                 tested=True, passed=hw_r.success,
                 latency_ms=hw_r.latency_ms,

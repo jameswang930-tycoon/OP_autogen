@@ -170,64 +170,17 @@ Output ONLY valid JSON — no explanation, no markdown.
 ```"""
 
 
-def _build_user_prompt(
-    diagnosis, extracted_text: str, history: list,
-    kernel_code: str, similar_cases: str, tier: int,
-) -> str:
-    """构建 User Prompt — 注入本轮数据。"""
-
-    # 诊断信息
-    diag_block = f"""## Current Bottleneck (Tier {tier})
-- op_id: {getattr(diagnosis, 'bottleneck_op_id', '?')}
-- op_type: {getattr(diagnosis, 'bottleneck_op_type', '?')}
-- engine: {getattr(diagnosis, 'bottleneck_engine', '?')}
-- bottleneck_type: {getattr(diagnosis, 'bottleneck_type', '?')}
-- category: {getattr(diagnosis, 'bottleneck_category', '?')}
-- time_ratio: {getattr(diagnosis, 'bottleneck_time_ratio', 0):.2%}
-- bw_utilization: {getattr(diagnosis, 'bottleneck_bw_utilization', 0):.2%}
-- regime: {getattr(diagnosis, 'bottleneck_regime', '?')}
-- optimization_headroom: {getattr(diagnosis, 'optimization_headroom', '?')}
-- suggested_strategies: {getattr(diagnosis, 'suggested_strategies', [])}
-"""
-
-    # 精简数据
-    data_block = f"""## Pipeline Data (Tier {tier} relevant columns)
-{extracted_text if extracted_text else '(no data)'}
-"""
-
-    # 历史
-    if history:
-        recent = history[-5:]
-        hist_lines = ["## Recent History (last 5 rounds)"]
-        for r in recent:
-            hist_lines.append(
-                f"- Round {r.get('round','?')}: {r.get('strategy','?')} → "
-                f"{r.get('decision','?')} ({r.get('actual_speedup',1.0):.2f}x)"
-            )
-        hist_block = "\n".join(hist_lines)
-    else:
-        hist_block = "## Recent History\n(no history — this is the first optimization round)"
-
-    # 相似案例
-    case_block = f"## Similar Cases from Experience Store\n{similar_cases}"
-
-    # Kernel 代码
-    code_block = f"## Current Kernel Code\n```python\n{kernel_code}\n```"
-
-    return f"""{diag_block}
-
-{data_block}
-
-{hist_block}
-
-{case_block}
-
-{code_block}
-
----
-
-Generate the optimization plan for Tier {tier} ({TIER_NAMES.get(tier, '?')}).
-Return ONLY valid JSON (no markdown, no explanation)."""
+def _format_history(history: list) -> str:
+    """将 history 列表格式化为文本。"""
+    if not history:
+        return "(no history)"
+    recent = history[-5:]
+    lines = ["## Recent History (last 5 rounds)"]
+    for r in recent:
+        lines.append(
+            f"- Round {r.get('round','?')}: {r.get('strategy','?')} → "
+            f"{r.get('decision','?')} ({r.get('actual_speedup',1.0):.2f}x)")
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -280,16 +233,25 @@ class PlannerAgent:
         # Step 2: 检索相似案例
         similar_cases = _retrieve_similar_cases(diagnosis)
 
-        # Step 3: 构建 Prompt
-        system_prompt = _build_system_prompt(tier, playbook)
-        user_prompt = _build_user_prompt(
-            diagnosis, extracted_text, history,
-            kernel_code, similar_cases, tier,
+        # Step 3: 构建 Prompt (使用 ContextManager 做 token 管理)
+        from memory.context_manager import build_context, format_diagnosis, estimate_tokens
+
+        diagnosis_text = format_diagnosis(diagnosis)
+        history_text = _format_history(history)
+        full_prompt = build_context(
+            diagnosis_text=diagnosis_text,
+            extracted_text=extracted_text,
+            playbook_text=playbook,
+            history_text=history_text,
+            similar_cases_text=similar_cases,
+            kernel_code=kernel_code,
         )
+        system_prompt = _build_system_prompt(tier, playbook)
+        print(f"  [Planner] prompt ~{estimate_tokens(system_prompt + full_prompt):,} tokens")
 
         # Step 4: 调用 LLM (或 stub)
         if self.use_llm:
-            plan_dict = self._call_llm(system_prompt, user_prompt)
+            plan_dict = self._call_llm(system_prompt, full_prompt)
         else:
             plan_dict = self._stub_plan(diagnosis, tier)
 

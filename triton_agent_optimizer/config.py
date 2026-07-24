@@ -125,14 +125,9 @@ class PlatformPaths:
         return self.emulator_root / "common" / "__init__.py"
 
     @property
-    def fusion_pipeline_root(self) -> Path:
-        """fusion_pipeline/ 目录 (HIVMIR + Simulator 合并管线)"""
-        return self.repo_root / "fusion_pipeline"
-
-    @property
-    def hivmir_extractor_path(self) -> Path:
-        """HIVMIR 提取脚本 (在 910B3 上运行)"""
-        return self.fusion_pipeline_root / "extract_hivmir_from_compiler.py"
+    def compiler_path(self) -> Path:
+        """Ascend 编译器接口 (编译 + HIVMIR 提取)"""
+        return self.triton_agent_root / "execution" / "compiler.py"
 
     @property
     def memory_root(self) -> Path:

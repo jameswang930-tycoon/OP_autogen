@@ -7,283 +7,257 @@
 
 ## 1. 核心理念
 
-**不是盲试。** AutoKernel 只能知道 "kernel X 占 60% 时间" → 盲目尝试 300~400 轮。我们的方案通过 **DSL 流水线分析** 精确知道：
-- 哪个 op 是瓶颈 (如 op2: ub_to_gm)
-- 为什么慢 (带宽利用率 46%, regime=ramp, k0=10.72KB, 当前 tile=1KB)
-- 怎么改 (合并小传输, tile > 10.72KB 进入饱和区)
+**不是盲试。** AutoKernel 只能知道 "kernel X 占 60% 时间" → 盲目试 300~400 轮。我们的方案通过 DSL 流水线精确知道：哪个 op 是瓶颈、为什么慢、带宽利用率多少、该改什么参数。**精准度比盲试高一个数量级, 预估 20~50 轮收敛。**
 
-**精准度比盲试高一个数量级, 预估 20~50 轮即可收敛。**
+---
 
-### 完整闭环
+## 2. 整体流程
 
 ```
-Triton Kernel (.py)
-  → HIVMIR 编译器中间产物 (变量名/依赖/数据大小)
-  → msprof op simulator (时序/带宽/引擎利用率/瓶颈识别)
-  → DSL 流水线合并 (精确到每个 op: 时间占比/瓶颈类型/依赖关系)
-  → Agent 智能体 (Planner→Coder→Verifier, 按 Playbook 精准优化)
-  → CPU Emulator 验证 (秒级正确性检查, 不上板)
-  → 910B3 真机实测 (最终性能验证)
-  → 记录本轮结果 → 下一轮 → 直到收敛
+Round 0 (Baseline):
+  Analyzers (msprof→hivmir→merger→diagnoser→extractor) → trajectory.json
+
+Round 1..N (Optimize):
+  ┌─────────────────────────────────────────────────────────┐
+  │ ① Analyzers (分析层, 5脚本)                             │
+  │    msprof → hivmir → merger → diagnoser → extractor    │
+  │    每轮重跑, 生成最新 merged_report + diagnosis         │
+  ├─────────────────────────────────────────────────────────┤
+  │ ② Planner (LLM Agent)                                   │
+  │    输入: diagnosis + extracted + playbook + history     │
+  │    输出: round_N_plan.md (优化策略 + 具体改动 + 预期效果)│
+  ├─────────────────────────────────────────────────────────┤
+  │ ③ Coder (LLM Agent)                                     │
+  │    输入: plan.md + kernel.py                            │
+  │    输出: optimized kernel.py + diff.patch               │
+  │    约束: 只能改 kernel.py                               │
+  ├─────────────────────────────────────────────────────────┤
+  │ ④ Verifier (脚本, 两阶段)                               │
+  │    Stage 1: CPU Emulator (正确性, 秒级)                 │
+  │    Stage 2: 910B3 Hardware (性能, 分钟级, 本地跳过)     │
+  │    FAIL → 错误回传 Coder 重试 (最多3次)                  │
+  ├─────────────────────────────────────────────────────────┤
+  │ ⑤ RecordManager (反馈层 — 决策引擎)                     │
+  │    KEEP/REVERT → 写 optimization_record.json            │
+  │    → 更新 optimization_trajectory.json                  │
+  │    → 管理 Tier 晋升/降级                                 │
+  │    → 检查 7 条停止条件                                   │
+  │    → 达标时生成案例模板 + 轨迹图                         │
+  └─────────────────────────────────────────────────────────┘
+     │
+     └──→ Round N+1 (自动切换 Tier 目录) → ... → Finalize
 ```
 
 ---
 
-## 2. 目录结构
+## 3. 6 层优化策略
+
+**原则: 从结构影响最大到最小。改了上层, 下层要重做。**
+
+| Tier | 名称 | 做什么 | Playbook |
+|---|---|---|---|
+| **1** | Algorithmic Structure | Online Softmax / Split-K / Persistent Kernel | `playbook_tier1_algorithm.md` |
+| **2** | Operator Fusion | 逐元素融合 / WAR打破 / 激活融合 | `playbook_tier2_fusion.md` |
+| **3** | Tiling & Block Config | BLOCK_SIZE / num_warps / num_stages | `playbook_tier3_tiling.md` |
+| **4** | Memory Access | 小传输合并 / double buffer / coalescing | `playbook_tier4_memory.md` |
+| **5** | Compute & Occupancy | 计算-传输重叠 / 向量化 / 精度取舍 | `playbook_tier5_compute.md` |
+| **6** | 910B3 Architecture | Grid / Pipeline / L2驻留 / 混合精度 | `playbook_tier6_architecture.md` |
+
+**晋升**: 连续 3 轮无改进 → Tier+1
+**降级**: 融合新算子 → 回退 Tier 3; 改了算法 → 回退 Tier 2
+
+---
+
+## 4. 文件架构
 
 ```
 triton_agent_optimizer/
 │
 ├── README.md                           # 本文档
-├── ARCHITECTURE_DESIGN.md              # 完整架构设计
-├── IMPLEMENTATION_PLAN.md              # 逐文件实现计划 (36 文件)
-├── OUTPUT_STRUCTURE.md                 # 输出目录架构
-├── config.py                           # ★ 全局配置中心
+├── config.py                           # ★ 全局配置 (路径/硬件参数/阈值)
+├── main.py                             # (待实现) 主入口
 │
-├── analyzers/                          # ★ 分析层 (已完成 4/5)
-│   ├── msprof_analyzer.py              #   ① msprof op simulator 解析 → timing
-│   ├── hivmir_analyzer.py              #   ② HIVMIR 编译器产物解析 → buffer/size/deps
+├── prepare/                            # 环境准备
+│   ├── setup_env.sh                    #   Linux/910B3 环境设置
+│   ├── setup_env.bat                   #   Windows 环境设置
+│   └── env_check.py                    #   35项环境验证
+│
+├── analyzers/                          # ★ 分析层 (5文件, 全部完成)
+│   ├── msprof_analyzer.py              #   ① msprof trace.json → timing/engine/channel
+│   ├── hivmir_analyzer.py              #   ② HIVMIR .mlir → buffer/size/deps
 │   ├── dsl_merger.py                   #   ③ 合并 → 29字段完整报告 + LLM文本 + Gantt图
-│   ├── bottleneck_diagnoser.py         #   ④ 瓶颈诊断 → ~2KB 结构化数据 (Tier-aware)
-│   └── data_extractor.py               #   ⑤ 按需数据提取 (待实现)
+│   ├── bottleneck_diagnoser.py         #   ④ Tier-aware 瓶颈诊断 (~2KB)
+│   └── data_extractor.py               #   ⑤ 按需提取关键列 (Tier×列过滤, ~2KB)
 │
-├── agents/                             # 智能体层 (待实现)
-│   ├── orchestrator.py                 #   调度器: 管理 6-tier 优化循环
-│   ├── planner.py                      #   规划器: 读诊断+Playbook+历史 → 生成优化计划
-│   ├── coder.py                        #   编码器: 按计划做最小化代码改动
-│   └── verifier.py                     #   验证器: 三阶段验证 (CPU→Sim→HW)
+├── agents/                             # ★ 智能体层 (4文件, 全部完成)
+│   ├── orchestrator.py                 #   调度器 (Python 状态机, 薄循环)
+│   ├── planner.py                      #   规划器 (LLM Prompt 编排器)
+│   ├── coder.py                        #   编码器 (LLM Prompt 编排器, 只改kernel.py)
+│   └── verifier.py                     #   验证器 (脚本: CPU仿真 + 910B3实测)
 │
-├── optimizers/                         # 优化器 (待实现)
-│   ├── tile_optimizer.py, memory_optimizer.py,
-│   ├── fusion_optimizer.py, compute_optimizer.py
+├── execution/                          # ★ 执行层 (2文件 + 2 stub)
+│   ├── emulator_runner.py              #   Stage 1: CPU Emulator 正确性验证
+│   ├── compiler.py                     #   Ascend 编译器接口 (需910B3)
+│   ├── hardware_runner.py              #   Stage 2: 910B3 benchmark (需910B3)
+│   └── simulator_runner.py             #   (备用) cost simulator 包装器
 │
-├── execution/                          # 执行层 (待实现)
-│   ├── emulator_runner.py              #   CPU Emulator (秒级正确性)
-│   ├── simulator_runner.py             #   Cost Simulator (秒级预估)
-│   ├── compiler.py                     #   Ascend 编译器接口
-│   └── hardware_runner.py              #   910B3 真机运行 (分钟级实测)
+├── feedback/                           # ★ 反馈与记录层 (2文件, 全部完成)
+│   ├── record_manager.py               #   决策引擎: KEEP/REVERT + Tier + 停止 + 轨迹
+│   └── trajectory_chart.py             #   优化轨迹图: 6阶段加速比曲线
 │
-├── feedback/                           # 反馈层 (待实现)
-│   ├── round_logger.py                 #   每轮记录 (JSONL)
-│   ├── optimization_journal.py         #   跨轮日志管理
-│   ├── stop_condition.py               #   7 条停止条件
-│   ├── trajectory_chart.py             #   优化轨迹图
-│   └── case_template.py               #   优秀案例模板生成
+├── memory/                             # ★ 记忆层 (3文件, 全部完成)
+│   ├── sliding_window.py               #   热/温/冷三层滑动窗口
+│   ├── context_manager.py              #   Token估算 + 裁剪 + prompt构建
+│   ├── experience_retriever.py         #   分Tier检索 + 3级匹配 + 经验记录
+│   └── experiences/                    #   6个Tier经验库JSON
 │
-├── memory/                             # 上下文记忆层 (待实现)
-│   ├── context_manager.py              #   上下文构建 (滑窗+摘要+token管理)
-│   ├── experience_retriever.py         #   经验检索 (对接 memory/ 模块)
-│   └── sliding_window.py               #   三层滑动窗口
+├── playbooks → docx/                   # 优化指导手册 (7文件, 全部完成)
+│   ├── OPTIMIZATION_METHODOLOGY.md      #   总纲: 方法论 + 参考文献
+│   ├── playbook_tier1_algorithm.md      #   Tier 1: 算子→算法对照表
+│   ├── playbook_tier2_fusion.md         #   Tier 2: 融合决策树 + WAR打破
+│   ├── playbook_tier3_tiling.md         #   Tier 3: K0参考 + BLOCK_SIZE启发式
+│   ├── playbook_tier4_memory.md         #   Tier 4: 合并传输 + double buffer
+│   ├── playbook_tier5_compute.md        #   Tier 5: 计算-传输重叠 + 向量化
+│   └── playbook_tier6_architecture.md   #   Tier 6: Grid/Pipeline/L2
 │
-├── playbooks/                          # 优化指导手册 (待编写, ~20章)
-│   ├── optimization_playbook.md        #   总纲
-│   ├── playbook_algorithmic.md         #   Tier 1: 算法选择
-│   ├── playbook_fusion.md              #   Tier 2: 算子融合
-│   ├── playbook_tiling.md              #   Tier 3: 分块配置
-│   ├── playbook_memory.md              #   Tier 4: 内存访问
-│   ├── playbook_compute.md             #   Tier 5: 计算调优
-│   └── playbook_910b3_arch.md          #   Tier 6: 硬件专属
+├── outputs/                            # 优化产物 (自动生成, 不入git)
+│   └── <kernel_name>/
+│       ├── round0/                     #   基准分析 (msprof/hivmir/merged)
+│       ├── 01_algorithmic_structure/    #   Tier 1 优化轮次
+│       ├── 02_operator_fusion/          #   Tier 2
+│       ├── 03_tiling_block_config/      #   Tier 3
+│       ├── 04_memory_access/            #   Tier 4
+│       ├── 05_compute_occupancy/        #   Tier 5
+│       ├── 06_910b3_architecture/       #   Tier 6
+│       ├── optimization_trajectory.json  #   ★ 全局状态文件
+│       └── final_output/                #   最终产物
+│           ├── optimized_kernel.py
+│           ├── trajectory_chart.png
+│           └── optimization_summary.md
 │
-├── docx/                               # 文档
-│   └── OPTIMIZATION_METHODOLOGY.md     #   ★ 优化方法论文档 (含参考文献)
-│
-├── example_output/                     # 参考示例
-│   ├── README.md                       #   索引
-│   ├── FIELD_SOURCE_MATRIX.md          #   29字段 × 来源矩阵 (msprof vs HIVMIR)
-│   ├── mock_pipeline_report_vector_add.json
-│   ├── mock_hivmir_report_vector_add.json
-│   └── 01~07_*.txt                     #   simulator 输出示例
-│
-├── scripts/
-│   └── init_output_structure.py        #   初始化 outputs/ 目录结构
-│
-└── output/                             # (旧, 已废弃 → 用 outputs/)
+├── example_output/                     # 参考示例 (simulator输出)
+├── scripts/                            # 工具脚本
+│   └── init_output_structure.py        #   初始化 outputs/ 目录
+└── docx/ → playbooks                   # 优化指导手册
 ```
 
 ---
 
-## 3. 6 层优化策略 (正确顺序)
-
-**核心原则: 从结构影响最大到最小。改了上层结构, 下层要重做 → 结构性的先做。**
-
-| Tier | 名称 | 做什么 | 晋升条件 |
-|---|---|---|---|
-| **1** | Algorithmic Structure | 选择最优算法 (Online Softmax/Flash Attention/Split-K) | 算法已最优 |
-| **2** | Operator Fusion | 融合逐元素/激活/残差操作, 打破 WAR | 无可融合 op |
-| **3** | Tiling & Block Config | BLOCK_SIZE, num_warps, num_stages, grid | 连续 3 轮无改进 |
-| **4** | Memory Access | 合并小传输, coalescing, double buffering | 连续 3 轮无改进 |
-| **5** | Compute & Occupancy | 计算-传输重叠, 向量化, 精度取舍 | 连续 3 轮无改进 |
-| **6** | 910B3 Architecture | grid 选择, pipeline 切换, L2 驻留 | 连续 3 轮无改进 → 停止 |
-
-**降级规则**: 融合了新算子 → 回退到 Tier 3; 改了算法 → 回退到 Tier 2。
-
-详见: `docx/OPTIMIZATION_METHODOLOGY.md`
-
----
-
-## 4. 数据流 (一轮优化)
+## 5. 数据流与对齐
 
 ```
-Step 0: 准备
-  Orchestrator 决定当前 Tier
-     │
-Step 1: 分析
-  ├─ ① msprof_analyzer  → outputs/<kernel>/roundN/msprof/pipeline_report.json
-  ├─ ② hivmir_analyzer  → outputs/<kernel>/roundN/hivmir/hivmir_report.json
-  ├─ ③ dsl_merger       → outputs/<kernel>/roundN/merged/merged_report.json
-  │                       + final_report_llm.txt (LLM 读, 7-section)
-  │                       + final_report_human.txt (人读, Gantt图)
-  └─ ④ bottleneck_diagnoser → BottleneckDiagnosis (~2KB JSON, Tier-aware)
-     │
-Step 2: 规划 (Planner LLM)
-  输入: BottleneckDiagnosis + merged 完整数据 + Playbook Tier N 章节 + 历史 + kernel 代码
-  输出: round_N_plan.md (具体优化操作/预期效果/验证方法)
-     │
-Step 3: 编码 (Coder LLM)
-  输入: plan.md + kernel.py
-  输出: optimized_kernel.py + diff.patch
-     │
-Step 4: 验证 (Verifier)
-  ① CPU Emulator (秒级, 多 shape/dtype)
-  ② Cost Simulator (秒级, 预估加速比)
-  ③ 910B3 Hardware (分钟级, 实测加速比)
-     │
-Step 5: 决策
-  Keep (>1% 提升) / Revert
-     │
-Step 6: 记录
-  optimization_record.json → optimization_journal.jsonl
-     │
-Step 7: 检查停止条件 → 继续下一轮 或 停止
+                    msprof trace.json          HIVMIR .mlir
+                          │                        │
+                    msprof_analyzer          hivmir_analyzer
+                          │                        │
+                    pipeline_report.json     hivmir_report.json
+                    (16 fields ✅)           (9 fields ✅)
+                    (13 fields ❌)           (16 fields ❌)
+                          │                        │
+                          └──────────┬─────────────┘
+                                     ▼
+                               dsl_merger
+                          (op_id 对齐, 互相填补)
+                                     │
+                                     ▼
+                            merged_report.json
+                            (29 fields 全部填充)
+                                     │
+                          ┌──────────┴──────────┐
+                          ▼                     ▼
+                   bottleneck_diagnoser    data_extractor
+                   (瓶颈分类+评估)         (Tier×列过滤, ~2KB)
+                          │                     │
+                          └──────────┬──────────┘
+                                     ▼
+                              Planner (LLM)
+                        (诊断 + Playbook + 历史 → 计划)
 ```
 
 ---
 
-## 5. 输出目录结构
+## 6. 输出目录
+
+每轮输出到 `outputs/<kernel>/<tier_dir>/roundN/`:
 
 ```
-outputs/<kernel_name>/
-│
-├── round0/                              # 基准分析 (优化前)
-│   ├── kernel.py                        # 原始 kernel
-│   ├── benchmark_result.json            # 延迟/加速比/吞吐/时间占比
-│   ├── msprof/
-│   │   ├── OPPROF_*/simulator/trace.json # msprof 中间产物
-│   │   └── pipeline_report.json         #   解析产物 (16✅+13❌)
-│   ├── hivmir/
-│   │   ├── compiler_output/hivmir_output.mlir
-│   │   └── hivmir_report.json           #   解析产物 (9✅+16❌)
-│   └── merged/
-│       ├── merged_report.json            #   ★ 合并产物 (29字段全填)
-│       ├── final_report_llm.txt          #   LLM 读: 7-section 文本
-│       └── final_report_human.txt        #   人读: ASCII Gantt 图
-│
-├── 01_algorithmic_structure/            # Tier 1
-│   └── round1/...roundN/               # (每轮含 round0 全部 + optimization_record.json)
-├── 02_operator_fusion/                  # Tier 2
-├── 03_tiling_block_config/             # Tier 3
-├── 04_memory_access/                   # Tier 4
-├── 05_compute_occupancy/               # Tier 5
-├── 06_910b3_architecture/              # Tier 6
-│
-├── optimization_trajectory.json         # 跨轮汇总
-├── optimization_summary.md              # 总结报告
-└── final_output/                        # 最终产物
-    ├── optimized_kernel.py
-    ├── trajectory_chart.png
-    └── optimization_summary.md
+roundN/
+├── kernel.py                  # Coder 修改后的代码
+├── plan.md                    # Planner 优化计划
+├── diff.patch                 # 代码变更
+├── optimization_record.json   # 本轮决策+效果 (RecordManager)
+├── verification.json          # 验证结果 (Verifier)
+├── msprof/pipeline_report.json   # 分析产物
+├── hivmir/hivmir_report.json     # 分析产物
+└── merged/merged_report.json     # 合并产物
+```
+
+全局状态文件: `optimization_trajectory.json`
+
+```json
+{
+  "state": {"tier": 3, "round": 12, "best_speedup": 1.52},
+  "baseline": {"total_ns": 3655.6, "bottleneck_type": "memory_bandwidth"},
+  "history": [
+    {"round": 1, "tier": 1, "strategy": "...", "speedup": 1.0, "decision": "KEEP"},
+    ...
+  ]
+}
 ```
 
 ---
 
-## 6. 核心设计决策
+## 7. 快速开始
+
+```bash
+# 1. 环境准备
+source prepare/setup_env.sh          # Linux/910B3
+prepare\setup_env.bat                # Windows
+
+# 2. 初始化输出目录
+python scripts/init_output_structure.py
+
+# 3. 运行优化
+python agents/orchestrator.py
+
+# 4. 查看结果
+ls outputs/<kernel>/final_output/
+#   optimized_kernel.py
+#   trajectory_chart.png
+#   optimization_summary.md
+```
+
+---
+
+## 8. 设计决策
 
 | 决策 | 选择 | 理由 |
 |---|---|---|
-| **瓶颈诊断** | 脚本 (规则引擎) | 阈值分类是确定性的, 不依赖 LLM; OPAL 论文: 990MB→6KB 压缩 |
-| **策略规划** | LLM | 需要结合 Playbook + 历史 + 代码上下文做推理 |
-| **验证顺序** | CPU → Simulator → Hardware | 逐级过滤, 节省硬件时间 |
-| **优化顺序** | Algorithm → Fusion → Tiling → Memory → Compute → Arch | 结构影响从大到小, 上层改了底层白做 |
-| **上下文管理** | 热(5轮完整) / 温(15轮摘要) / 冷(数据点) | 1M 上下文窗口, 控制 token 用量 |
-| **输出格式** | JSON (LLM 直接读取) + TXT (7-section 文本) + TXT (Gantt 图) | 同时满足 AI 和人 |
-| **字段对齐** | 29 字段全结构, msprof 和 HIVMIR 输出格式完全一致 | dsl_merger 通过 op_id 直接对齐 |
+| 瓶颈诊断 | 脚本 (规则引擎) | 阈值分类是确定性的, OPAL: 压缩到 ~2KB |
+| 策略规划 | LLM Agent | 需要 Playbook + 历史 + 代码上下文推理 |
+| 代码修改 | LLM Agent | 需要理解语义, 不能只做文本替换 |
+| 验证 | 脚本 (CPU仿真 + Hardware) | 确定性, 不需要推理 |
+| 调度器 | Python 状态机 | 管循环+状态, 不做决策 |
+| 决策/记录 | RecordManager | 所有决策集中, 调度器只管循环 |
+| 优化顺序 | Algorithm→Fusion→Tiling→Memory→Compute→Arch | 结构影响从大到小 |
+| 输出格式 | JSON (LLM) + TXT (7-section) + TXT (Gantt) | 同时满足 AI 和人 |
 
 ---
 
-## 7. 关键文件说明
-
-### 7.1 分析层 (已实现, 可运行)
-
-| 文件 | 做什么 | 怎么运行 |
-|---|---|---|
-| `analyzers/msprof_analyzer.py` | 运行 msprof op simulator → 解析 trace.json → timing 数据 | `python analyzers/msprof_analyzer.py` (自测) |
-| `analyzers/hivmir_analyzer.py` | 解析 HIVMIR 编译器文本 → buffer/size/deps | `python analyzers/hivmir_analyzer.py` (自测) |
-| `analyzers/dsl_merger.py` | 合并 msprof + HIVMIR → 29字段完整报告 | `python analyzers/dsl_merger.py outputs/.../round0` |
-| `analyzers/bottleneck_diagnoser.py` | 从 merged_report.json 诊断瓶颈 (Tier-aware) | `python analyzers/bottleneck_diagnoser.py outputs/.../merged/merged_report.json 3` |
-
-### 7.2 29 字段完整清单
-
-| # | 字段 | 来源 | 说明 |
-|---|---|---|---|
-| 1 | op_id | msprof + HIVMIR | 操作序号 |
-| 2 | op_type | msprof + HIVMIR | gm_to_ub/vadd/ub_to_gm/... |
-| 3 | engine | msprof | GM→UB/VecUnit/UB→GM/... |
-| 4 | instruction | HIVMIR | gm_to_ub(ub_1, gm_1) |
-| 5-7 | dst/src/src2 | HIVMIR | buffer 名 |
-| 8 | size_kb | HIVMIR | 精确数据大小 |
-| 9 | memory_region | HIVMIR | GM/UB/L1/L0 |
-| 10 | variable_name | HIVMIR | 变量名 |
-| 11-13 | duration_ns/start_ns/end_ns | msprof | 时序 |
-| 14 | time_ratio | msprof (计算) | 时间占比 |
-| 15-17 | effective_bw/peak_bw/bw_util | merger (计算) | 带宽 |
-| 18 | regime | merger (计算) | floor/ramp/saturated/flat |
-| 19 | wait_before_start_ns | msprof | 等待时间 |
-| 20 | blocked_by | HIVMIR + msprof | 阻塞关系 |
-| 21 | pipeline_channel | msprof | MTE2/VECTOR/MTE3/... |
-| 22-23 | core_id/trace_event_name | msprof | 核/事件名 |
-| 24-29 | dependencies/scalar/address_offset/line_number | HIVMIR | 依赖/标量/偏移/行号 |
-
-详见: `example_output/FIELD_SOURCE_MATRIX.md`
-
----
-
-## 8. 快速开始
-
-```bash
-# 1. 检查环境
-python config.py
-
-# 2. 初始化输出目录 (示例)
-python scripts/init_output_structure.py
-
-# 3. 合并 round0 数据
-python analyzers/dsl_merger.py outputs/vector_add_fp16_N65536/round0
-
-# 4. 诊断瓶颈 (Tier 2: Fusion)
-python analyzers/bottleneck_diagnoser.py outputs/vector_add_fp16_N65536/round0/merged/merged_report.json 2
-```
-
----
-
-## 9. 参考文档
-
-| 文档 | 内容 |
-|---|---|
-| `ARCHITECTURE_DESIGN.md` | 完整架构设计: 架构图/数据流/智能体模式/上下文管理/停止条件 |
-| `IMPLEMENTATION_PLAN.md` | 36 个文件的实现顺序/依赖关系/接口定义 |
-| `OUTPUT_STRUCTURE.md` | outputs/ 目录架构 + optimization_record.json schema |
-| `docx/OPTIMIZATION_METHODOLOGY.md` | 6 层优化方法论 + 参考文献 |
-| `example_output/FIELD_SOURCE_MATRIX.md` | 29 字段 × 来源矩阵 (msprof vs HIVMIR) |
-| `../claude_resume_summary/resume_2026-07-23.md` | 对话上下文恢复文档 |
-| `../costModel/cost_emulator/simulator.py` | 7-engine pipeline simulator |
-| `../emulators/common/__init__.py` | CPU Triton Emulator |
-
-## 10. 相关项目
+## 9. 参考
 
 | 项目 | 借鉴点 |
 |---|---|
 | [KernelAgent](https://github.com/meta-pytorch/KernelAgent) (Meta) | 多智能体协作 (Planner+Coder+Verifier) |
-| [AutoKernel](https://github.com/rightnow-ai/autokernel) | 6层优化手册、迭代优化闭环、轨迹图 |
-| [GEAK](https://github.com/AMD-AIG-AIMA/GEAK-Agent) (AMD) | Reflexion 迭代修复、pass@k 验证 |
-| [OPAL](https://arxiv.org/abs/2510.00932) (2025) | 脚本压缩诊断数据 → LLM 推理 |
-| [TritonForge](https://arxiv.org/abs/...) (2025) | Profiling-guided 自动化优化循环 |
+| [AutoKernel](https://github.com/rightnow-ai/autokernel) | 6层优化手册、闭环优化、轨迹图 |
+| [GEAK](https://github.com/AMD-AIG-AIMA/GEAK-Agent) (AMD) | Reflexion 迭代修复 |
+| [OPAL](https://arxiv.org/abs/2510.00932) (2025) | 脚本压缩诊断→LLM推理 |
+| [TritonForge](https://arxiv.org/abs/2512.09196) (2025) | Profiling-guided 自动优化 |
+
+### 配套文档
+
+| 文档 | 内容 |
+|---|---|
+| `docx/OPTIMIZATION_METHODOLOGY.md` | 优化方法论 + 参考文献 |
+| `example_output/FIELD_SOURCE_MATRIX.md` | 29字段 × 来源矩阵 (msprof vs HIVMIR) |
+| `../claude_resume_summary/resume_2026-07-23.md` | 对话上下文恢复文档 |

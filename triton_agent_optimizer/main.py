@@ -87,9 +87,20 @@ def _classify_kernel_type(func_node: ast.FunctionDef) -> str:
 
 
 def get_kernel_name(kernel_path: Path) -> str:
-    """从文件路径推断 kernel 名称 (用于 outputs/ 目录)。"""
+    """从文件路径推断 kernel 名称 (用于 outputs/ 目录)。
+
+    优先级: 父目录名 (如果在 input/ 下) > 文件名 (去 _kernel 后缀)
+    input/rms_norm_residual/triton_kernel.py → rms_norm_residual
+    standalone_kernel.py → standalone
+    """
+    # 如果在 input/ 子目录中, 用目录名
+    if "input" in kernel_path.parts:
+        idx = list(kernel_path.parts).index("input")
+        if idx + 1 < len(kernel_path.parts):
+            return kernel_path.parts[idx + 1]
+
+    # 否则用文件名
     stem = kernel_path.stem
-    # 去掉 _kernel 后缀
     if stem.endswith("_kernel"):
         stem = stem[:-7]
     return stem

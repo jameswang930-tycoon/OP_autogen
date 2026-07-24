@@ -1,0 +1,37 @@
+{
+  "scenario": "RMSNorm + Residual Add — Transformer FFN Layer",
+  "model": "Llama-2-7B / Llama-3-8B (Transformer Decoder)",
+  "target_hardware": "Huawei Ascend 910B3",
+
+  "operator_name": "add_rms_norm",
+  "description": "Fused residual add + RMSNorm. Computes: output = rms_norm(input + residual) * gamma. This is the critical normalization layer in every Transformer block, executed 2x per layer (attention-norm + ffn-norm).",
+
+  "shapes": [
+    {"name": "llama2_7b_hidden_1024", "batch": 1, "seq_len": 1024, "hidden_dim": 4096, "dtype": "fp16", "note": "Llama-2-7B hidden_size=4096, typical inference"},
+    {"name": "llama2_7b_hidden_2048", "batch": 1, "seq_len": 2048, "hidden_dim": 4096, "dtype": "fp16", "note": "medium context"},
+    {"name": "llama3_8b_hidden_1024", "batch": 1, "seq_len": 1024, "hidden_dim": 4096, "dtype": "fp16", "note": "Llama-3-8B hidden_size=4096"},
+    {"name": "large_batch_1024", "batch": 8, "seq_len": 1024, "hidden_dim": 4096, "dtype": "fp16", "note": "batch inference"}
+  ],
+
+  "baseline_performance": {
+    "unfused_latency_us": 85,
+    "reference_pytorch_latency_us": 120,
+    "target_throughput_tokens_per_sec": 2420,
+    "note": "参考: 910B3 上未融合 RMSNorm 85us, 融合后 40us (2.1x). PyTorch eager baseline ~120us."
+  },
+
+  "optimization_targets": {
+    "primary": "latency < 50us per call (from baseline 85us)",
+    "secondary": "throughput > 2420 tok/s for batch inference",
+    "speedup_target": 1.7
+  },
+
+  "known_bottlenecks": [
+    "Two-pass computation (sum_x + sum_x2) causes intermediate UB→GM write",
+    "No double buffering between load and compute",
+    "BLOCK_SIZE=1024 may not saturate GM→UB bandwidth (k0=6.65KB)"
+  ],
+
+  "dtype": "fp16",
+  "epsilon": 1e-6
+}

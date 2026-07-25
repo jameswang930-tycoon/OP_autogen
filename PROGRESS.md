@@ -48,7 +48,7 @@
 | E4 launch 失败五分类 | ✅ 门禁通过 | `pytest tests/test_e4_launch_errors.py` (6 passed) | （见下） | launch_template 定义 5 类异常(带证据)+launch() docstring 归类约定；前四类+SimInfraError 退避重试、ResultMismatch 立即停；证据入 report.detail/log |
 | E5 HANDOFF 故障定位节 | ✅ 门禁通过 | `pytest tests/test_e5_handoff_fault.py` (3 passed) | （见下） | HANDOFF 增"故障定位"表（症状→看哪个文件→怎么办）+ 指引先用 E2 重放降维 |
 | E6 preflight + bringup | ✅ 门禁通过 | `pytest tests/test_e6_preflight_bringup.py` (11 passed) | （见下） | control/preflight.py(四态 OK/STUB/MISSING/EXAMPLE 状态表，纯本地)；control/bringup.py(template/llm/launch/parse/extcheck/all 单点验证，launch/parse 解耦)；mock 测试 |
-| E7 实时进度 | ⬜ | — | — | |
+| E7 实时进度 | ✅ 门禁通过 | `pytest tests/test_e7_progress.py` (3 passed) | （见下） | _Progress 旁路事件：stderr 人可读 + progress.jsonl 机器可读；baseline/retrieve/generate/launch/result/best/stop；quiet 仅关键节点、normal 各阶段；不承载状态 |
 | E8 HANDOFF 逐点联调节 | ⬜ | — | — | |
 
 > **重编号说明（2026-07-23）**：依 `docs/T10_T12_orchestrator_spec.md`，原 T10（交接包）改为 **T12**；新增 **T10**（skill 双模改造）与 **T11**（确定性编排器）。目标形态收紧为「确定性编排器驱动的流水线」。本批执行 T10、T11，完成后停于停止点④。

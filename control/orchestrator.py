@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -316,6 +317,38 @@ class _RoundTranscript:
         (self.dir / "meta.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+class _Progress:
+    """旁路进度事件（E7）：stderr 人可读 + progress.jsonl 机器可读。不承载状态。
+
+    quiet 仅出关键节点（baseline/result/stop）；normal 出各阶段；verbose 额外落盘路径。
+    """
+
+    KEY_STAGES = {"baseline_result", "result", "stop", "baseline_launching"}
+
+    def __init__(self, mode: str, path, run_id: str):
+        self.mode = mode
+        self.run_id = run_id
+        self._fh = open(path, "a", encoding="utf-8") if path else None
+
+    def emit(self, stage: str, round_n: int = None, **fields):
+        evt = {"run_id": self.run_id, "stage": stage}
+        if round_n is not None:
+            evt["round"] = round_n
+        evt.update(fields)
+        if self._fh is not None:
+            self._fh.write(json.dumps(evt, ensure_ascii=False) + "\n")
+            self._fh.flush()
+        if self.mode == "quiet" and stage not in self.KEY_STAGES:
+            return
+        prefix = f"[round {round_n}]" if round_n is not None else f"[{self.run_id}]"
+        details = " ".join(f"{k}={v}" for k, v in fields.items())
+        print(f"{prefix} {stage} {details}".rstrip(), file=sys.stderr)
+
+    def close(self):
+        if self._fh is not None:
+            self._fh.close()
+
+
 # ---------------- orchestrator ----------------
 
 class Orchestrator:
@@ -330,6 +363,8 @@ class Orchestrator:
         store=None,
         log=None,
         output_dir: Optional[Path] = None,
+        progress: str = "normal",
+        progress_path: Optional[Path] = None,
     ):
         self.job = job
         self.llm = llm or NoLLMBackend()
@@ -346,6 +381,7 @@ class Orchestrator:
         self._best: Optional[tuple[int, int, str]] = None   # (round, cycles, kernel_src)
         self._final: Optional[tuple[int, Optional[int], str]] = None
         self._baseline_cycles: Optional[int] = None
+        self._progress = _Progress(progress, progress_path, self.output_dir.name)
 
     @staticmethod
     def _default_output_dir() -> Path:
@@ -373,6 +409,11 @@ class Orchestrator:
         except ResultMismatch as exc:
             stop_reason, stop_detail = "RESULT_MISMATCH", str(exc)
 
+        best_desc = None
+        if self._best is not None:
+            best_desc = f"round{self._best[0]}({self._best[1]}cyc)"
+        self._progress.emit("stop", reason=stop_reason, best=best_desc)
+        self._progress.close()
         report = self._build_report(rounds, stop_reason, stop_detail)
         self._write_outputs(report)
         return report
@@ -381,11 +422,15 @@ class Orchestrator:
     def _maybe_seed_baseline(self) -> None:
         if not self.job.has_baseline:
             return
+        self._progress.emit("baseline_launching")
         raw = self._launch_with_retries(self.job.baseline_src, "baseline")
         sim = build_sim_result(raw)
         if sim.correct and sim.cycles is not None:
             self._best = (0, sim.cycles, self.job.baseline_src)
             self._baseline_cycles = sim.cycles
+            self._progress.emit("baseline_result", cycles=sim.cycles, best=True)
+        else:
+            self._progress.emit("baseline_result", correct=sim.correct)
         self._write_artifact("baseline_raw.txt", json.dumps(raw, ensure_ascii=False, indent=2))
 
     # ---- one optimization round ----
@@ -396,6 +441,7 @@ class Orchestrator:
             prior_verdict: Optional[Verdict] = getattr(self, "_last_verdict", None)
 
             retrieved = self._retrieve_experience()
+            self._progress.emit("retrieve", round_n=n, has_exp=bool(retrieved))
             lever, ext_hint = self._resolve_lever(prior_verdict, t)
 
             # steps 3-5: produce a kernel, launch, ensure it compiled (compile failures
@@ -406,6 +452,8 @@ class Orchestrator:
                 retrieved_experience=retrieved,
                 round_n=n, t=t,
             )
+            self._progress.emit("result", round_n=n, correct=sim.correct,
+                                cycles=sim.cycles)
 
             # steps 6-7: parse + adapt
             verdict: Optional[Verdict] = None
@@ -436,6 +484,7 @@ class Orchestrator:
             if sim.correct and sim.cycles is not None:
                 if self._best is None or sim.cycles < self._best[1]:
                     self._best = (n, sim.cycles, kernel_src)
+                    self._progress.emit("best", round_n=n, cycles=sim.cycles)
 
             t.note(model=getattr(self.llm, "last_model_echo", None),
                    result="pass" if sim.correct else "numerical_fail")
@@ -544,6 +593,7 @@ class Orchestrator:
             if t is not None:
                 t.write("01_prompt_generate.txt", prompt)
                 t.write("02_response_generate.txt", resp)
+            self._progress.emit("generate", round_n=round_n)
             try:
                 kernel_src, meta = parse_generate_response(resp, allowed)
             except ParseError:
@@ -583,7 +633,11 @@ class Orchestrator:
                      ResultNotFound, SimInfraError)
         for _ in range(self.job.budget.sim_retries):
             try:
-                return self.launcher(str(kernel_path))
+                t0 = time.time()
+                raw = self.launcher(str(kernel_path))
+                self._progress.emit("launch", round_n=t.n if t is not None else None,
+                                    elapsed_s=round(time.time() - t0, 2))
+                return raw
             except retryable:
                 continue
             except ResultMismatch as exc:

@@ -30,6 +30,14 @@
 | T13-5 extension 四渠道（含 extension-forward，已授权） | ✅ 门禁通过 | `pytest tests/test_t13_extension_channels.py` (9 passed) | （见下） | ①sample example 改完整 kernel+.pyi 转录；④record_attempt 传 extension_used；⑤triton-gen vanilla-first→extension-forward(四规则,反向回归)；⑥pick_lever 探索偏好(off/mild/aggressive)；负面经验分类(compile/semantic) |
 | T13-6 requirements.txt | ✅ 门禁通过 | `pytest tests/test_t13_requirements.py` (2 passed) | （见下） | 补 pyyaml+pytest；标注旧 emulator 遗留(numpy/networkx) vs 新框架所需 |
 
+### GLM52 收尾（任务 A/B/C，逐项门禁）
+
+| 子项 | 状态 | 门禁 | commit | 备注 |
+|---|---|---|---|---|
+| 任务 A / T13-7 NgaBackend | ✅ 门禁通过 | `pytest tests/test_t13_7_nga_backend.py` (7 passed) | （见下） | subprocess 调 nga run；无状态/只认 fenced block/忽略>头/失败抛异常不重试；模型配置驱动；mock 测试；HANDOFF 槽位 0 改为"框架已实现" |
+| 任务 B 槽位 5 逻辑下推 | ⬜ | — | — | |
+| 任务 C 槽位 6 模板文件化 | ⬜ | — | — | |
+
 > **重编号说明（2026-07-23）**：依 `docs/T10_T12_orchestrator_spec.md`，原 T10（交接包）改为 **T12**；新增 **T10**（skill 双模改造）与 **T11**（确定性编排器）。目标形态收紧为「确定性编排器驱动的流水线」。本批执行 T10、T11，完成后停于停止点④。
 
 状态: ⬜未开始 / 🔄进行中 / ✅门禁通过 / ⛔阻塞待确认

@@ -15,7 +15,7 @@ HANDOFF = (REPO / "HANDOFF_GLM47.md").read_text(encoding="utf-8")
 
 # (slot label, substrings that MUST appear — file path + frozen signature)
 SLOTS = {
-    "llm_backend": ["control/llm_backend.py", "ConfigurableLLMBackend"],
+    "llm_backend": ["control/llm_backend.py", "NgaBackend"],
     "vocabulary": ["control/vocabulary.yaml"],
     "parse_raw": ["control/feedback_adapter.py", "parse_raw(raw_sim_output)"],
     "extension_refs": [".claude/skills/extension-guide/references/"],

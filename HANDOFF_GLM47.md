@@ -17,16 +17,16 @@
 3. 找到 extension 包的 API 文档或头文件，路径记到 `materials/README.md`。
 4. 若第 1 步找不到可跑通的调用方式 → **停下上报**；下面四个槽位都依赖它。
 
-## 槽位 0：LLM 后端（材料自举之后、词表之前）
+## 槽位 0：LLM 后端（框架已实现，保密环境只填模型名 + 跑一次联调）
 
-编排器需要一个能调通的 LLM 后端，否则第一次 `generate` 即失败。
+框架侧已实现 `NgaBackend`（`control/llm_backend.py`）——保密环境模型无 HTTP API，只能经 OpenCode CLI `nga run` 访问，故 `NgaBackend` 用 `subprocess` 调 `nga run`。**这不是需要 4.7 编码的槽位**，保密环境只需：
 
-1. 拿到保密环境里 LLM 服务的**基地址与模型名**（用户已知；是现成服务）。
-2. 设环境变量：`LLM_BASE_URL`、`LLM_MODEL`；可选 `LLM_TEMPERATURE`（默认 `0.0`，低值利于复现）、`LLM_TIMEOUT`（默认 `30`）。
-3. `control/llm_backend.py` 的 `ConfigurableLLMBackend` 默认按 OpenAI 兼容 chat 格式发请求。若真实后端接口不同，**只改 `_post` 一个方法的请求体/响应解析**，不动类签名与 `generate`/`choose_lever`。
-4. 注入编排器：`Orchestrator(job, llm=ConfigurableLLMBackend(), ...)`。
-5. 自检：`.venv/bin/python -c "from control.llm_backend import ConfigurableLLMBackend; print(ConfigurableLLMBackend().generate('ping'))"`——能返回内容，且返回内容能过解析闸门（恰好一个 python 块 + 一个 json 块）。
-   - 拿不到基地址/模型名，或调不通 → 停下上报，不要猜端点。
+1. 拿到保密环境的真实模型名（`generate` 配强模型 + 高 variant，写 kernel 是难任务；`choose_lever` 配 GLM-4.7，多候选选杠杆是易任务）。模型名 / variant / timeout 全部走配置（`config` dict 或 `NGA_GENERATE_MODEL` / `NGA_CHOOSE_LEVER_MODEL` 等环境变量），不硬编码。
+2. 注入编排器：`Orchestrator(job, llm=NgaBackend(config), ...)`。`NgaBackend` 无状态（绝不传 `--continue` / `--session`），只认 fenced block、忽略 `>` 头，失败抛 `LLMInvocationError` / `LLMTimeout` 交编排器按重试预算处理（不计入优化轮数）。
+3. 自检（构造 + 联调）：
+   - `.venv/bin/python -c "from control.llm_backend import NgaBackend; NgaBackend({'generate':{'model':'X'},'choose_lever':{'model':'Y'}})"` —— 配置合法即可构造。
+   - 联调：`nga run --model <你的模型名> "输出一个python代码块打印hello，再输出一个json代码块{\"ok\":true}，不要解释"`，返回含 python 块 + json 块即可。
+   - 拿不到模型名 / `nga` 不可用 → 停下上报，不要猜。
 
 ## 槽位 1：`control/vocabulary.yaml`（先做，产出需用户确认）
 

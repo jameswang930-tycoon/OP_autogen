@@ -47,7 +47,7 @@
 | E3 组件边界断言 | ✅ 门禁通过 | `pytest tests/test_e3_boundary.py` (6 passed) | （见下） | feedback_adapter 加 ParseError + validate_events(duration==end-start/词表/索引定位) + validate_output(词表/cycles/summary 非空)；adapt 入口/出口强制 |
 | E4 launch 失败五分类 | ✅ 门禁通过 | `pytest tests/test_e4_launch_errors.py` (6 passed) | （见下） | launch_template 定义 5 类异常(带证据)+launch() docstring 归类约定；前四类+SimInfraError 退避重试、ResultMismatch 立即停；证据入 report.detail/log |
 | E5 HANDOFF 故障定位节 | ✅ 门禁通过 | `pytest tests/test_e5_handoff_fault.py` (3 passed) | （见下） | HANDOFF 增"故障定位"表（症状→看哪个文件→怎么办）+ 指引先用 E2 重放降维 |
-| E6 preflight + bringup | ⬜ | — | — | |
+| E6 preflight + bringup | ✅ 门禁通过 | `pytest tests/test_e6_preflight_bringup.py` (11 passed) | （见下） | control/preflight.py(四态 OK/STUB/MISSING/EXAMPLE 状态表，纯本地)；control/bringup.py(template/llm/launch/parse/extcheck/all 单点验证，launch/parse 解耦)；mock 测试 |
 | E7 实时进度 | ⬜ | — | — | |
 | E8 HANDOFF 逐点联调节 | ⬜ | — | — | |
 

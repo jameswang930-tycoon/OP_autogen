@@ -37,6 +37,10 @@ SECTIONS = (
 )
 
 
+class ParseError(Exception):
+    """组件边界断言失败（E3）：坏数据在产生它的那一步被拦下，带可操作的定位信息。"""
+
+
 def parse_raw(raw_sim_output) -> list[Event]:
     """槽位：把真实仿真输出解析为 Event 列表。由保密环境的 GLM 4.7 实现。
 
@@ -216,6 +220,7 @@ class AdapterOutput:
 
 def adapt(events: list[Event], k: int = TOP_K) -> AdapterOutput:
     """全链路：events -> (7 段摘要, Verdict)。"""
+    validate_events(events)
     r = reduce_events(events, k=k)
     c = classify(r)
     summary = render(r, c)
@@ -224,7 +229,44 @@ def adapt(events: list[Event], k: int = TOP_K) -> AdapterOutput:
             f"adapter output {len(summary)} chars exceeds budget {MAX_OUTPUT_CHARS}; "
             "reduce TOP_K or fixture size"
         )
-    return AdapterOutput(summary=summary, verdict=to_verdict(c))
+    out = AdapterOutput(summary=summary, verdict=to_verdict(c))
+    validate_output(out)
+    return out
+
+
+# ---------------- component boundary assertions (E3) ----------------
+
+def validate_events(events) -> None:
+    """parse_raw 输出边界：每条 Event 字段自洽、stall_class 在词表内、duration==end-start。
+
+    报错信息可操作：带索引、字段、原值，让 4.7 知道去改哪个映射。
+    """
+    ids = vocabulary.all_ids()
+    for i, e in enumerate(events):
+        if e.start > e.end:
+            raise ParseError(
+                f"Event[{i}].start={e.start} > end={e.end} (name={e.name!r})")
+        if e.duration != (e.end - e.start):
+            raise ParseError(
+                f"Event[{i}].duration={e.duration} but end-start={e.end - e.start} "
+                f"(name={e.name!r}); fix the mapping in parse_raw")
+        if e.stall_class not in ids:
+            raise ParseError(
+                f"Event[{i}].stall_class={e.stall_class!r} not in vocabulary {sorted(ids)} "
+                f"(name={e.name!r}); map it to a vocab id or extend the vocabulary")
+
+
+def validate_output(out: "AdapterOutput") -> None:
+    """adapt 输出边界：Verdict.bottleneck 在词表内、cycles>=0、summary 非空。"""
+    v = out.verdict
+    ids = vocabulary.all_ids()
+    if v.bottleneck not in ids:
+        raise ParseError(
+            f"Verdict.bottleneck={v.bottleneck!r} not in vocabulary {sorted(ids)}")
+    if v.cycles < 0:
+        raise ParseError(f"Verdict.cycles={v.cycles} must be >= 0")
+    if not (out.summary and out.summary.strip()):
+        raise ParseError("adapt produced an empty summary")
 
 
 # ---------------- single-round replay (E2, read-only) ----------------

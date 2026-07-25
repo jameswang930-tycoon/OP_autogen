@@ -142,6 +142,22 @@
 4. 词表一致性：`.venv/bin/python -m control.check_vocab_consistency` 与 `.venv/bin/python -m control.check_extension_cheatsheet` 均通过。
 5. 全量：`.venv/bin/python -m pytest tests/ -v` 全绿。
 
+## 故障定位（症状 → 看哪个文件 → 怎么办）
+
+定位不需要理解框架全局。先按下表找症状对应的文件，再用 E2 重放入口把出错组件单独跑一遍。
+
+| 症状 | 先看 | 常见原因 | 动作 |
+|---|---|---|---|
+| 编排器起不来 | 报错 traceback | 配置缺失 / 路径错 | 补配置（先跑 `preflight`） |
+| 每轮都在编译失败 | `log/round_N/02_response_generate.txt` + `compile_log` | gen 格式 / extension 用法错 | 看 `compile_log` 回流是否生效 |
+| `RemoteTimeout` / `RemoteScriptError` | `log/round_N/meta.txt` 的证据字段（超时秒数 / stderr 原文） | **基础设施问题，非框架、非 kernel** | 查远端脚本 / 网络，不要改 kernel |
+| `ResultMismatch` | `log/round_N/meta.txt` 的 run_id（期望 vs 实际） | **框架 bug（run id 隔离失效）** | 立即停止，上报框架侧，不要重试掩盖 |
+| `UNKNOWN_BOTTLENECK` | `log/round_N/08_events.json` 的 `stall_class` | 词表缺类 / `parse_raw` 映射错 | 补词表或修映射 |
+| `parse_raw` 报错（边界断言） | 用 E2 重放：`.venv/bin/python -m control.feedback_adapter replay log/round_N/06_raw_sim.json` | 黑盒格式与映射不符 | 改映射表，重放验证 |
+| 结果比 baseline 差 | `report.json` 的 `rounds[]` | 正常（`final_round` 保留诊断价值） | 看 `final_round` vs `recommended` |
+
+> **遇到不确定的问题，先用 E2 的重放入口把出错组件单独跑一遍**——把端到端问题降维成单组件的输入输出问题，这是弱模型能处理的粒度。重放只读，不发射、不调 LLM、不写 outputs。
+
 ## 保密纪律
 
 - 你填入的真实 stall 类型名、原语名、仿真字段名、`launch` 实现，**均不得回流公开分支**。公开分支保持占位，测试靠 fixture（预置测试数据）跑。

@@ -38,6 +38,19 @@
 | 任务 B 槽位 5 逻辑下推 | ✅ 门禁通过 | `pytest tests/test_slot5_logic.py` (8 passed) | （见下） | check_extension_calls 拆逻辑(AST 解析+比对签名)+数据(签名表文件)；ExtensionSignature+extract_extension_calls+load_signature_table；control/build_signature_table.py(inventory→签名表)；HANDOFF 槽位 5 改"只生成签名表" |
 | 任务 C 槽位 6 模板文件化 | ✅ 门禁通过 | `pytest tests/test_slot6_template.py` (5 passed) | （见下） | LAUNCHABLE_TEMPLATE 改文件加载(load_launchable_template/assemble_launchable)；冻结 LAUNCHABLE_PLACEHOLDERS；triton-gen 格式跟随加载模板；HANDOFF 加槽位 6；test_t12 同步至 7 槽位 |
 
+### 任务 E（可观测性与联调安全网，E1–E8，逐项门禁）
+
+| 子项 | 状态 | 门禁 | commit | 备注 |
+|---|---|---|---|---|
+| E1 每轮全量落盘 | ✅ 门禁通过 | `pytest tests/test_e1_transcript.py` (2 passed) | （见下） | log/round_N/ 编号文件 01-11 + meta.txt；失败轮落盘部分并标 fail_stage；_RoundTranscript |
+| E2 单轮重放入口 | ⬜ | — | — | |
+| E3 组件边界断言 | ⬜ | — | — | |
+| E4 launch 失败五分类 | ⬜ | — | — | |
+| E5 HANDOFF 故障定位节 | ⬜ | — | — | |
+| E6 preflight + bringup | ⬜ | — | — | |
+| E7 实时进度 | ⬜ | — | — | |
+| E8 HANDOFF 逐点联调节 | ⬜ | — | — | |
+
 > **重编号说明（2026-07-23）**：依 `docs/T10_T12_orchestrator_spec.md`，原 T10（交接包）改为 **T12**；新增 **T10**（skill 双模改造）与 **T11**（确定性编排器）。目标形态收紧为「确定性编排器驱动的流水线」。本批执行 T10、T11，完成后停于停止点④。
 
 状态: ⬜未开始 / 🔄进行中 / ✅门禁通过 / ⛔阻塞待确认

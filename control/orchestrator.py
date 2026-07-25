@@ -247,6 +247,72 @@ def _speedup(baseline_cycles: Optional[int], cycles: Optional[int]) -> Optional[
     return None
 
 
+def _sim_result_dict(sim: SimResult) -> dict:
+    return {
+        "correct": sim.correct, "max_abs_err": sim.max_abs_err,
+        "cycles": sim.cycles, "pipeline": sim.pipeline,
+        "compiled": sim.compiled, "compile_log": sim.compile_log,
+    }
+
+
+def _event_dict(e) -> dict:
+    return {"name": e.name, "start": e.start, "end": e.end, "duration": e.duration,
+            "unit": e.unit, "stall_class": e.stall_class, "bytes": e.bytes}
+
+
+def _decision_dict(d) -> dict:
+    best = None
+    if d.best is not None:
+        best = {"variant_id": d.best.variant_id, "cycles": d.best.cycles, "round_no": d.best.round_no}
+    return {"should_stop": d.should_stop, "reason": d.reason, "rolled_back": d.rolled_back,
+            "improved_best": d.improved_best, "rel_improvement": d.rel_improvement, "best": best}
+
+
+class _RoundTranscript:
+    """每轮全量落盘（E1）：把该轮全部中间产物写到 log/round_N/，便于完整复盘。
+
+    编号前缀让文件按流程顺序排列；失败轮也落盘已产生的部分，meta.txt 标注失败阶段。
+    """
+
+    def __init__(self, log_dir: Path, n: int):
+        self.dir = log_dir / f"round_{n}"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.n = n
+        self.model: Optional[str] = None
+        self.run_id: Optional[str] = None
+        self.result_class: Optional[str] = None
+        self.fail_stage: Optional[str] = None
+
+    def write(self, name: str, content) -> None:
+        p = self.dir / name
+        if isinstance(content, (dict, list)):
+            p.write_text(json.dumps(content, ensure_ascii=False, indent=2, default=str),
+                         encoding="utf-8")
+        else:
+            p.write_text(str(content), encoding="utf-8")
+
+    def note(self, *, model=None, run_id=None, result=None, fail_stage=None) -> None:
+        if model is not None:
+            self.model = model
+        if run_id is not None:
+            self.run_id = run_id
+        if result is not None:
+            self.result_class = result
+        if fail_stage is not None:
+            self.fail_stage = fail_stage
+
+    def finalize(self) -> None:
+        lines = [
+            f"round: {self.n}",
+            f"model: {self.model or '(unknown)'}",
+            f"run_id: {self.run_id or '(none)'}",
+            f"result: {self.result_class or '(running)'}",
+        ]
+        if self.fail_stage:
+            lines.append(f"fail_stage: {self.fail_stage}")
+        (self.dir / "meta.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 # ---------------- orchestrator ----------------
 
 class Orchestrator:
@@ -319,64 +385,74 @@ class Orchestrator:
 
     # ---- one optimization round ----
     def _run_one_round(self, n: int) -> tuple[RoundRecord, Optional[Any]]:
-        verdict_json = None
-        feedback_summary = None
-        prior_verdict: Optional[Verdict] = getattr(self, "_last_verdict", None)
+        t = _RoundTranscript(self._log_dir, n)
+        try:
+            feedback_summary = None
+            prior_verdict: Optional[Verdict] = getattr(self, "_last_verdict", None)
 
-        retrieved = self._retrieve_experience()
-        lever, ext_hint = self._resolve_lever(prior_verdict)
+            retrieved = self._retrieve_experience()
+            lever, ext_hint = self._resolve_lever(prior_verdict, t)
 
-        # steps 3-5: produce a kernel, launch, and ensure it compiled. Compile failures
-        # do NOT count as a round: the compile_log is fed back to gen and the kernel is
-        # regenerated up to compile_retries (T13-3); only a compiled kernel proceeds.
-        kernel_src, meta, raw, sim = self._produce_and_compile(
-            verdict_json=_verdict_json(prior_verdict),
-            feedback_summary=feedback_summary,
-            retrieved_experience=retrieved,
-            round_n=n,
-        )
-        self._write_artifact(f"round_{n}_raw_sim.txt", json.dumps(raw, ensure_ascii=False, indent=2))
+            # steps 3-5: produce a kernel, launch, ensure it compiled (compile failures
+            # do not count as a round; T13-3). Writes 01-07 + compile-fail logs.
+            kernel_src, meta, raw, sim = self._produce_and_compile(
+                verdict_json=_verdict_json(prior_verdict),
+                feedback_summary=feedback_summary,
+                retrieved_experience=retrieved,
+                round_n=n, t=t,
+            )
 
-        # steps 6-7: parse + adapt
-        verdict: Optional[Verdict] = None
-        bottleneck = None
-        if sim.correct:
-            events = self.parse_raw_fn(raw)
-            out = self.adapt_fn(events)
-            # §5 词表闭包：未知 bottleneck 立即停（不许猜）
-            if out.verdict.bottleneck not in vocabulary.all_ids():
-                raise UnknownBottleneck(out.verdict.bottleneck)
-            verdict = out.verdict
-            bottleneck = verdict.bottleneck
-            self._last_verdict = verdict
-            feedback_summary = out.summary
-            self._write_artifact(f"round_{n}_summary.txt", out.summary)
+            # steps 6-7: parse + adapt
+            verdict: Optional[Verdict] = None
+            bottleneck = None
+            if sim.correct:
+                events = self.parse_raw_fn(raw)
+                t.write("08_events.json", [_event_dict(e) for e in events])
+                out = self.adapt_fn(events)
+                # §5 词表闭包：未知 bottleneck 立即停（不许猜）
+                if out.verdict.bottleneck not in vocabulary.all_ids():
+                    t.note(fail_stage="adapt:unknown_bottleneck")
+                    raise UnknownBottleneck(out.verdict.bottleneck)
+                verdict = out.verdict
+                bottleneck = verdict.bottleneck
+                self._last_verdict = verdict
+                t.write("09_verdict.json", _verdict_dict(verdict))
+                t.write("10_summary.txt", out.summary)
 
-        # step 8: record (memory)
-        self._record_attempt(n, sim, verdict, meta)
+            # step 8: record (memory)
+            self._record_attempt(n, sim, verdict, meta)
 
-        # step 9: controller (stop decision)
-        decision = self.controller.update(
-            variant_id=f"r{n}", sim=sim, verdict=verdict,
-        )
+            # step 9: controller (stop decision)
+            decision = self.controller.update(variant_id=f"r{n}", sim=sim, verdict=verdict)
+            t.write("11_decision.json", _decision_dict(decision))
 
-        # track best-so-far / final
-        self._final = (n, sim.cycles, kernel_src)
-        if sim.correct and sim.cycles is not None:
-            if self._best is None or sim.cycles < self._best[1]:
-                self._best = (n, sim.cycles, kernel_src)
+            # track best-so-far / final
+            self._final = (n, sim.cycles, kernel_src)
+            if sim.correct and sim.cycles is not None:
+                if self._best is None or sim.cycles < self._best[1]:
+                    self._best = (n, sim.cycles, kernel_src)
 
-        rec = RoundRecord(
-            n=n, correct=sim.correct, cycles=sim.cycles,
-            bottleneck=bottleneck, lever=lever,
-            extension_used=meta.get("extension_used"), rolled_back=decision.rolled_back,
-            kernel_path=f"log/round_{n}_response.txt", compiled=sim.compiled,
-        )
-        return rec, decision
+            t.note(model=getattr(self.llm, "last_model_echo", None),
+                   result="pass" if sim.correct else "numerical_fail")
+            rec = RoundRecord(
+                n=n, correct=sim.correct, cycles=sim.cycles,
+                bottleneck=bottleneck, lever=lever,
+                extension_used=meta.get("extension_used"), rolled_back=decision.rolled_back,
+                kernel_path=f"log/round_{n}/03_kernel.py", compiled=sim.compiled,
+            )
+            return rec, decision
+        except BudgetExhausted as exc:
+            t.note(fail_stage=f"budget:{exc.kind}", result=f"fail:{exc.kind}")
+            raise
+        except UnknownBottleneck:
+            t.note(result="fail:unknown_bottleneck")
+            raise
+        finally:
+            t.finalize()
 
     # ---- produce + compile (compile failures don't count as a round; T13-3) ----
     def _produce_and_compile(
-        self, *, verdict_json, feedback_summary, retrieved_experience, round_n,
+        self, *, verdict_json, feedback_summary, retrieved_experience, round_n, t,
     ) -> tuple[str, dict, dict, SimResult]:
         compile_fails = 0
         compile_log = ""
@@ -387,22 +463,25 @@ class Orchestrator:
                 retrieved_experience=retrieved_experience,
                 round_n=round_n,
                 compile_error=compile_log,
+                t=t,
             )
-            raw = self._launch_with_retries(kernel_src, f"round_{round_n}")
+            raw = self._launch_with_retries(kernel_src, f"round_{round_n}", t=t)
             sim = build_sim_result(raw)
+            t.write("06_raw_sim.json", raw)
+            t.write("07_sim_result.json", _sim_result_dict(sim))
             if sim.compiled:
                 return kernel_src, meta, raw, sim
             # compile failure: feed the log back, regenerate (does not count as a round)
             compile_fails += 1
             compile_log = sim.compile_log or "(no compile log returned)"
-            self._write_artifact(
-                f"round_{round_n}_compile_fail_{compile_fails}.log", sim.compile_log or "",
-            )
+            t.write(f"compile_fail_{compile_fails}.log", sim.compile_log or "")
+            t.note(fail_stage=f"compile_fail_{compile_fails}")
             if compile_fails >= self.job.budget.compile_retries:
+                t.note(result="fail:compile")
                 raise BudgetExhausted("compile")
 
     # ---- lever resolution (step 2; exploration-based, T13-5 渠道⑥) ----
-    def _resolve_lever(self, verdict: Optional[Verdict]) -> tuple[Optional[str], Optional[str]]:
+    def _resolve_lever(self, verdict: Optional[Verdict], t=None) -> tuple[Optional[str], Optional[str]]:
         if verdict is None:
             return None, None
         cands = _primitives_by_category().get(verdict.bottleneck, [])
@@ -412,7 +491,17 @@ class Orchestrator:
         if len(cands) == 1:
             return cands[0], cands[0]
         evidence = self._evidence_by_primitive(cands)
-        chosen = pick_lever(cands, evidence, self.job.budget.exploration)
+        prompt = build_analyze_prompt(
+            verdict_json=json.dumps(_verdict_dict(verdict), ensure_ascii=False),
+            feedback_summary=getattr(self, "_last_summary", ""),
+            candidate_levers=cands,
+        )
+        if t is not None:
+            t.write("01b_prompt_lever.txt", prompt)
+        resp = self.llm.choose_lever(prompt)
+        if t is not None:
+            t.write("02b_response_lever.txt", resp)
+        chosen = parse_lever_response(resp, cands)
         return chosen, chosen
 
     def _evidence_by_primitive(self, candidates: list[str]) -> dict:
@@ -429,7 +518,7 @@ class Orchestrator:
     # ---- produce kernel (parse + presim budgets) ----
     def _produce_kernel(
         self, *, verdict_json, feedback_summary, retrieved_experience, round_n,
-        compile_error: Optional[str] = None,
+        compile_error: Optional[str] = None, t=None,
     ) -> tuple[str, dict]:
         allowed = _allowed_extensions()
         parse_fails = 0
@@ -447,32 +536,46 @@ class Orchestrator:
                 compile_error=compile_error,
             )
             resp = self.llm.generate(prompt)
+            if t is not None:
+                t.write("01_prompt_generate.txt", prompt)
+                t.write("02_response_generate.txt", resp)
             try:
                 kernel_src, meta = parse_generate_response(resp, allowed)
             except ParseError:
                 parse_fails += 1
+                if t is not None:
+                    t.note(fail_stage=f"parse_fail_{parse_fails}")
                 if parse_fails >= self.job.budget.llm_retries:
+                    if t is not None:
+                        t.note(result="fail:llm_parse")
                     raise BudgetExhausted("llm_retries")
                 continue
             gate = presim_check(kernel_src)
             if gate.ok:
-                self._write_artifact(f"round_{round_n}_prompt.txt", prompt)
-                self._write_artifact(f"round_{round_n}_response.txt", kernel_src)
+                if t is not None:
+                    t.write("03_kernel.py", kernel_src)
+                    t.write("04_meta.json", meta)
                 return kernel_src, meta
             presim_fails += 1
+            if t is not None:
+                t.note(fail_stage=f"presim_fail_{presim_fails}")
             if presim_fails >= self.job.budget.presim_retries:
+                if t is not None:
+                    t.note(result="fail:presim")
                 raise BudgetExhausted("presim_retries")
             # regenerate (kernel_src will be overwritten next loop)
 
     # ---- launch with infra retry ----
-    def _launch_with_retries(self, kernel_src: str, label: str) -> dict:
-        kernel_path = self._write_artifact(f"{label}_kernel.py", kernel_src)
-        last = None
+    def _launch_with_retries(self, kernel_src: str, label: str, t=None) -> dict:
+        if t is not None:
+            t.write("05_launch_input.py", kernel_src)
+            kernel_path = t.dir / "05_launch_input.py"
+        else:
+            kernel_path = self._write_artifact(f"{label}_kernel.py", kernel_src)
         for _ in range(self.job.budget.sim_retries):
             try:
                 return self.launcher(str(kernel_path))
-            except SimInfraError as exc:
-                last = exc
+            except SimInfraError:
                 continue
         raise BudgetExhausted("sim_retries")
 

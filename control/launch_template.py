@@ -26,7 +26,9 @@ raw_sim_output 规范 schema（launch() 必须按此返回；多余键如 events
 """
 from __future__ import annotations
 
+import os
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .contracts import SimResult
@@ -85,33 +87,35 @@ def run(
     return build_sim_result(raw)
 
 
-LAUNCHABLE_TEMPLATE = '''"""Launchable unit: kernel + reference + compare (架构文档 §1.0).
+# ---------------- launchable template (file-loaded, 任务 C) ----------------
 
-发射到远端仿真器的就是这一个文件。远端功能执行（真算数值）+ 时序采集（流水）兼具。
-compare 段负责比对 kernel 与 reference，并吐出规范化 raw_sim_output。
-"""
-# === SEGMENT 1: kernel (Triton + extension) ===
-# gen' 产物：默认标准 Triton，仅当 Verdict 瓶颈类别要求时叠加 extension 原语。
-<kernel_src>
+# Frozen placeholder contract for the launchable template. Confidential env's real
+# triton.py template must use the same set; consistency is auto-checked (T10 mechanism).
+LAUNCHABLE_PLACEHOLDERS = frozenset({
+    "OP", "SHAPES", "DTYPE", "KERNEL_BODY", "REFERENCE",
+})
 
-# === SEGMENT 2: reference (numpy / torch gold standard) ===
-# 与 kernel 同输入、同输出的金标准实现，用于数值比对。
-<reference_src>
+_DEFAULT_TEMPLATE_PATH = Path(__file__).resolve().parent / "launchable_template.example.py"
 
-# === SEGMENT 3: compare + emit result ===
-# 跑 kernel 与 reference，计算最大绝对误差；采集时序；吐出规范化 raw_sim_output。
-def _compare():
-    # out_kernel = run_kernel(...)
-    # out_ref    = run_reference(...)
-    # max_abs_err = float(max abs diff)
-    result = {
-        "correct": bool(max_abs_err <= TOL),
-        "max_abs_err": float(max_abs_err),
-        "cycles": int(measured_cycles),      # None if correct == False (perf voided, §3.6)
-        "pipeline": {unit: cycles},          # 机器可读流水分项，供 adapter reduce
-        "compiled": bool(compiled_ok),       # T13-3：编译是否通过
-        "compile_log": str(compile_log),     # T13-3：编译日志（失败时非空，成功时可空）
-        # "events": [...]                    # 可选：流水事件，供 feedback_adapter.parse_raw
-    }
-    return result
-'''
+
+def load_launchable_template(path: Optional[str | Path] = None) -> str:
+    """从文件加载可发射模板（公开分支默认占位模板；保密环境加载真实那份）。
+
+    路径取 LAUNCHABLE_TEMPLATE_PATH 环境变量或默认示例文件。模板占位符契约冻结于
+    LAUNCHABLE_PLACEHOLDERS；compare 段必须吐出规范 raw_sim_output 字段（固定契约）。
+    """
+    p = Path(path) if path else Path(
+        os.environ.get("LAUNCHABLE_TEMPLATE_PATH") or _DEFAULT_TEMPLATE_PATH)
+    return p.read_text(encoding="utf-8")
+
+
+def assemble_launchable(template_str: str, values: dict) -> str:
+    """把 values 填入模板的 {{VAR}} 占位符，产出可发射的 python 源码。"""
+    out = template_str
+    for key, val in values.items():
+        out = out.replace("{{" + key + "}}", str(val))
+    return out
+
+
+# 模块级常量：默认加载的占位模板（保持向后兼容；test_t6 等仍可引用）。
+LAUNCHABLE_TEMPLATE = load_launchable_template()

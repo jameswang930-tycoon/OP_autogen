@@ -54,13 +54,15 @@ caught by the loop-controller's best-so-far + rollback. So be extension-forward:
    on that base, not an optional decoration.
 4. Multi-segment module and output format (below) are unchanged.
 
-## Step 2: Generate the multi-segment module
+## Step 2: Generate the module per the loaded launchable template
 
-Produce a multi-segment module following the launchable-unit template in
-`control/launch_template.py`: kernel / reference (numpy or torch gold standard) / compare
-harness. The compare harness computes max_abs_err versus reference and emits the canonical
-raw_sim_output so correctness and performance stay two distinguishable signals. Standard
-Triton syntax; matmul accumulator stays fp32.
+The launchable file's structure is **whatever the loaded launchable template dictates** —
+`load_launchable_template` in `control/launch_template.py` loads it (public branch: a
+placeholder; confidential env: the real triton.py-based template). Fill the template's
+per-round placeholders (kernel body / reference) and keep its compare section, which MUST
+emit the canonical raw_sim_output fields (`correct` / `max_abs_err` / `cycles` /
+`pipeline` / `compiled` / `compile_log`). Do not hardcode a module format — follow the
+loaded template. Standard Triton syntax; matmul accumulator stays fp32.
 
 ## Step 3: Pre-sim gate (the orchestrator runs this before launching)
 

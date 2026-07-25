@@ -112,6 +112,15 @@
 
 **定位**：本地静态安全网——挡低级误用，无需付出一次远程编译代价；语义错误交给编译错误反馈闭环（渠道②，`compile_log` 回流）。
 
+## 槽位 6：可发射模板（框架已实现加载；保密环境只填模板文件）
+
+`control/launch_template.py` 的可发射模板已改为**从文件加载**（`load_launchable_template`，路径取 `LAUNCHABLE_TEMPLATE_PATH`，默认占位模板）。**这不是需要 4.7 编码的槽位**。保密环境只需：
+
+1. 把已跑通的真实 `triton.py` 按占位符契约挖成模板文件：固定骨架保留、每轮可变部分换成占位符。冻结占位符集合见 `control/launch_template.py` 的 `LAUNCHABLE_PLACEHOLDERS`（`OP` / `SHAPES` / `DTYPE` / `KERNEL_BODY` / `REFERENCE`）。
+2. 把该模板放到 `LAUNCHABLE_TEMPLATE_PATH` 指定路径。其 compare 段必须吐出规范 `raw_sim_output`（`correct` / `max_abs_err` / `cycles` / `pipeline` / `compiled` / `compile_log`，固定契约，真实模板也必须满足）。
+3. 自检：`.venv/bin/python -m pytest tests/test_slot6_template.py -q`（用占位模板，不需真实信息）。
+   - 真实模板对不上占位符契约 → 停下上报，不要改框架去迁就。
+
 ## 三条纪律
 
 1. 不改任何函数签名、schema、词表结构——只填内容。

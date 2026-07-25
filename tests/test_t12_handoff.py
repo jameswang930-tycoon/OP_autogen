@@ -21,6 +21,7 @@ SLOTS = {
     "extension_refs": [".claude/skills/extension-guide/references/"],
     "launch": ["control/launch_template.py", "launch(kernel_file)"],
     "check_extension_calls": ["control/presim_gate.py", "check_extension_calls(kernel_src)"],
+    "launchable_template": ["control/launch_template.py", "load_launchable_template"],
 }
 
 
@@ -57,7 +58,7 @@ def _slot_chunks():
 
 def test_five_slots_each_with_steps_selfcheck_and_stop_branch():
     chunks = _slot_chunks()
-    assert len(chunks) == 6, f"expected 6 slot sections (0-5), got {len(chunks)}"
+    assert len(chunks) == 7, f"expected 7 slot sections (0-6), got {len(chunks)}"
     for c in chunks:
         assert re.search(r"^\s*\d+\.", c, flags=re.MULTILINE), "slot missing numbered steps"
         assert ".venv/bin/python" in c, "slot missing self-check command"

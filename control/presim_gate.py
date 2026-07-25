@@ -6,7 +6,8 @@
 
   1. 语法合法（compile）
   2. shape / dtype 自洽（按声明的 shape_contract 校验；无 contract 则跳过）
-  3. extension 原语调用合法（槽位，4.7 实现；占位恒通过）
+  3. extension 原语调用合法（**逻辑由 5.2 实现**：AST 解析 + 比对签名表；
+     涉密的只有"真实签名表"这份数据，4.7 用 build_signature_table.py 生成后加载）
 
 shape_contract 是确定性检查的输入（gen'/4.7 随 kernel 一并提供），形如：
   {"kind": "matmul"|"elementwise"|"reduce",
@@ -18,8 +19,13 @@ shape_contract 是确定性检查的输入（gen'/4.7 随 kernel 一并提供）
 """
 from __future__ import annotations
 
+import ast
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
+
+import yaml
 
 
 @dataclass
@@ -28,12 +34,82 @@ class GateResult:
     problems: list[str] = field(default_factory=list)
 
 
-def check_extension_calls(kernel_src: str) -> list[str]:
-    """槽位：检查 extension 原语调用是否合法。返回问题列表，空表示通过。
+# ---------------- extension signature table (data = 4.7-filled) ----------------
 
-    由保密环境的 GLM 4.7 实现（需真实原语签名）。占位：保密环境实现前恒通过。
+@dataclass
+class ExtensionSignature:
+    """一个 extension 原语的签名。param_counts 为接受的位置参数个数列表（支持重载）。"""
+    name: str
+    param_counts: list[int]
+
+
+_DEFAULT_SIG_TABLE = Path(__file__).resolve().parent / "signature_table.example.yaml"
+
+
+def load_signature_table(path: Optional[str | Path] = None) -> dict[str, ExtensionSignature]:
+    """从 yaml 加载签名表 -> {primitive_name: ExtensionSignature}。"""
+    p = Path(path) if path else Path(
+        os.environ.get("PRESIM_SIGNATURE_TABLE") or _DEFAULT_SIG_TABLE)
+    if not p.exists():
+        return {}
+    data = yaml.safe_load(p.read_text(encoding="utf-8")) or []
+    table: dict[str, ExtensionSignature] = {}
+    for entry in data:
+        table[entry["name"]] = ExtensionSignature(
+            name=entry["name"], param_counts=list(entry["param_counts"]))
+    return table
+
+
+def _loaded_table() -> dict[str, ExtensionSignature]:
+    return load_signature_table()
+
+
+def _loaded_namespace() -> str:
+    return os.environ.get("EXTENSION_NAMESPACE") or "ext"
+
+
+def extract_extension_calls(kernel_src: str, namespace: str) -> list[tuple[str, int]]:
+    """AST 解析 kernel_src，提取所有 ``namespace.name(...)`` 调用 -> [(name, n_positional_args)].
+
+    语法错误时返回 []（语法由专门的语法闸门检查；extension 检查静默降级）。
     """
-    return []
+    try:
+        tree = ast.parse(kernel_src)
+    except SyntaxError:
+        return []
+    calls: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                and f.value.id == namespace):
+            calls.append((f.attr, len(node.args)))
+    return calls
+
+
+def check_extension_calls(
+    kernel_src: str,
+    signature_table: Optional[dict] = None,
+    namespace: Optional[str] = None,
+) -> list[str]:
+    """检查 extension 原语调用是否合法（逻辑层，5.2 实现）。
+
+    - 解析 kernel 中对 ``namespace`` 命名空间的调用；
+    - 逐个比对签名表：原语名是否存在、位置参数个数是否匹配某个重载。
+    签名表/命名空间缺省时从文件/环境加载（公开分支为示例表；保密环境为真实表）。
+    """
+    table = signature_table if signature_table is not None else _loaded_table()
+    ns = namespace or _loaded_namespace()
+    problems: list[str] = []
+    for name, n_args in extract_extension_calls(kernel_src, ns):
+        sig = table.get(name)
+        if sig is None:
+            problems.append(f"unknown extension primitive: {ns}.{name}")
+        elif n_args not in sig.param_counts:
+            problems.append(
+                f"{ns}.{name} expects {sig.param_counts} positional args, got {n_args}")
+    return problems
 
 
 def _check_syntax(kernel_src: str) -> list[str]:

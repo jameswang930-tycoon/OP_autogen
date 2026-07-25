@@ -42,7 +42,7 @@ def test_slot_signatures_match_actual_code():
     checks = {
         "control/feedback_adapter.py": "def parse_raw(raw_sim_output)",
         "control/launch_template.py": "def launch(kernel_file",
-        "control/presim_gate.py": "def check_extension_calls(kernel_src",
+        "control/presim_gate.py": "def check_extension_calls(",
     }
     for path, sig in checks.items():
         src = (REPO / path).read_text(encoding="utf-8")

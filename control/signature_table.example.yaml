@@ -1,0 +1,12 @@
+# Example extension signature table — public-branch placeholder (T13-7/任务B).
+#
+# 保密环境：由 control/build_signature_table.py 从 api_inventory.txt 生成真实表，
+# 放到 PRESIM_SIGNATURE_TABLE 指定的路径。本示例只用于让逻辑在开发机可测。
+#
+# 字段（冻结）：
+#   name          原语名
+#   param_counts  接受的位置参数个数列表（多个值 = 重载）
+- name: sample_bulk_copy
+  param_counts: [2, 3]
+- name: sample_tensor_mac
+  param_counts: [4]

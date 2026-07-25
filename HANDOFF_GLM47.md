@@ -100,18 +100,17 @@
 
 > **分工（务必分清）**：`launch()` 负责组装规范 `raw_sim_output`——从远端产物中取出编译状态与流水信息、从 compare 段输出中取出正确性字段，汇合成规范 dict（流水明细原样置入，不做转换）。`parse_raw()` 只负责把其中的流水部分转换为 `Event` 列表。
 
-## 槽位 5：`check_extension_calls()` in `control/presim_gate.py`
+## 槽位 5：`check_extension_calls()` 逻辑已实现（保密环境只生成签名表）
 
-冻结签名：`check_extension_calls(kernel_src) -> list[str]`（返回空列表表示通过，与占位实现一致）。
+**框架已实现检查逻辑**（`control/presim_gate.py` 的 `check_extension_calls(kernel_src)`：AST 解析 kernel + 比对签名表，挡下原语名不存在、参数个数不符等低级误用）。**这不是需要 4.7 编码的槽位**——涉密的只有"真实签名表"这份数据。保密环境只需：
 
-**定位**：本地静态安全网——挡下原语名不存在、参数个数/类型不符等**低级误用**，无需付出一次远程编译代价；语义层面的错误（原语存在但用法语义错）交给编译错误反馈闭环（渠道②，`compile_log` 回流）。
+1. 拿到保密环境的 `api_inventory.txt`（行格式 `模块路径 | 名称 | signature | doc首行`）。
+2. 跑生成脚本：`.venv/bin/python -m control.build_signature_table api_inventory.txt signature_table.yaml`——逻辑已写好，解析每行 signature 成位置参数个数、按名合并重载。
+3. 把产出的 `signature_table.yaml` 放到 `PRESIM_SIGNATURE_TABLE` 指定路径；把 extension 命名空间名设到 `EXTENSION_NAMESPACE`（默认 `ext`，按保密环境的真实调用形式）。
+4. 自检：`.venv/bin/python -m pytest tests/test_slot5_logic.py -q`（用示例表，不需真实信息）+ 写一个故意用错原语的 kernel，确认被挡下。
+   - 拿不到 inventory / 推不出来 → 停下上报，不要猜。
 
-1. 从槽位 3 完成的速查表取出所有原语的**签名**。
-2. 实现静态检查：kernel 源码中出现的 extension 调用，其原语名是否存在、参数个数/类型是否符合签名。**只静态检查，不执行代码。**
-3. 返回问题列表，空列表表示通过。
-4. 自检：`.venv/bin/python -m pytest tests/test_t7_gate.py -q`
-5. 端到端：写一个故意用错原语的 kernel，确认被挡下。
-   - 缺材料 / 推不出来 → 停下上报，不要猜。
+**定位**：本地静态安全网——挡低级误用，无需付出一次远程编译代价；语义错误交给编译错误反馈闭环（渠道②，`compile_log` 回流）。
 
 ## 三条纪律
 

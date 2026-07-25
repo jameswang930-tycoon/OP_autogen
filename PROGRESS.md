@@ -35,7 +35,7 @@
 | 子项 | 状态 | 门禁 | commit | 备注 |
 |---|---|---|---|---|
 | 任务 A / T13-7 NgaBackend | ✅ 门禁通过 | `pytest tests/test_t13_7_nga_backend.py` (7 passed) | （见下） | subprocess 调 nga run；无状态/只认 fenced block/忽略>头/失败抛异常不重试；模型配置驱动；mock 测试；HANDOFF 槽位 0 改为"框架已实现" |
-| 任务 B 槽位 5 逻辑下推 | ⬜ | — | — | |
+| 任务 B 槽位 5 逻辑下推 | ✅ 门禁通过 | `pytest tests/test_slot5_logic.py` (8 passed) | （见下） | check_extension_calls 拆逻辑(AST 解析+比对签名)+数据(签名表文件)；ExtensionSignature+extract_extension_calls+load_signature_table；control/build_signature_table.py(inventory→签名表)；HANDOFF 槽位 5 改"只生成签名表" |
 | 任务 C 槽位 6 模板文件化 | ⬜ | — | — | |
 
 > **重编号说明（2026-07-23）**：依 `docs/T10_T12_orchestrator_spec.md`，原 T10（交接包）改为 **T12**；新增 **T10**（skill 双模改造）与 **T11**（确定性编排器）。目标形态收紧为「确定性编排器驱动的流水线」。本批执行 T10、T11，完成后停于停止点④。

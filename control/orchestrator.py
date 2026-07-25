@@ -28,7 +28,10 @@ from .contracts import SimResult, Verdict
 from .feedback_adapter import adapt as _default_adapt
 from .feedback_adapter import parse_raw as _default_parse_raw
 from .job_spec import Budget, NormalizedJob
-from .launch_template import build_sim_result, launch as _default_launch
+from .launch_template import (
+    build_sim_result, launch as _default_launch,
+    RemoteConnectionError, RemoteTimeout, RemoteScriptError, ResultNotFound, ResultMismatch,
+)
 from .loop_controller import LoopController, StopReason
 from .presim_gate import check as presim_check
 
@@ -367,6 +370,8 @@ class Orchestrator:
             stop_reason = f"BUDGET_{exc.kind.upper()}"
         except UnknownBottleneck as exc:
             stop_reason, stop_detail = "UNKNOWN_BOTTLENECK", exc.bottleneck
+        except ResultMismatch as exc:
+            stop_reason, stop_detail = "RESULT_MISMATCH", str(exc)
 
         report = self._build_report(rounds, stop_reason, stop_detail)
         self._write_outputs(report)
@@ -572,11 +577,20 @@ class Orchestrator:
             kernel_path = t.dir / "05_launch_input.py"
         else:
             kernel_path = self._write_artifact(f"{label}_kernel.py", kernel_src)
+        # E4: 前四类 + SimInfraError 是基础设施问题 -> 退避重试、不计轮数；
+        # ResultMismatch 是框架 bug -> 立即暴露、不重试。
+        retryable = (RemoteConnectionError, RemoteTimeout, RemoteScriptError,
+                     ResultNotFound, SimInfraError)
         for _ in range(self.job.budget.sim_retries):
             try:
                 return self.launcher(str(kernel_path))
-            except SimInfraError:
+            except retryable:
                 continue
+            except ResultMismatch as exc:
+                if t is not None:
+                    t.note(fail_stage=f"result_mismatch:{exc.expected_run_id}/{exc.actual_run_id}",
+                           result="fail:result_mismatch")
+                raise
         raise BudgetExhausted("sim_retries")
 
     # ---- memory ----

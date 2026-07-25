@@ -33,6 +33,62 @@ from typing import Any, Callable, Optional
 
 from .contracts import SimResult
 
+
+# ---------------- launch failure classification (E4) ----------------
+# 异常类型与归类约定由框架侧（5.2）定义。launch() 本体仍是保密环境槽位（4.7 实现），
+# 实现时按下方约定抛对应异常即可，不用自己设计异常体系。
+
+class LaunchError(Exception):
+    """launch() 失败的基类（E4）。"""
+
+
+class RemoteConnectionError(LaunchError):
+    """连不上远端（基础设施）。编排器按 sim_retries 退避重试，不计轮数。"""
+
+    def __init__(self, endpoint: str, original):
+        self.endpoint = endpoint
+        self.original = original
+        super().__init__(f"cannot connect to {endpoint}: {original}")
+
+
+class RemoteTimeout(LaunchError):
+    """超时（基础设施）。编排器退避重试，不计轮数。"""
+
+    def __init__(self, timeout_s, run_id=None):
+        self.timeout_s = timeout_s
+        self.run_id = run_id
+        super().__init__(f"remote timeout after {timeout_s}s (run_id={run_id})")
+
+
+class RemoteScriptError(LaunchError):
+    """远程脚本非零退出（可能是环境问题，非 kernel 问题）。退避重试，不计轮数。"""
+
+    def __init__(self, exit_code: int, stderr: str):
+        self.exit_code = exit_code
+        self.stderr = stderr
+        super().__init__(f"remote script exit {exit_code}: {stderr}")
+
+
+class ResultNotFound(LaunchError):
+    """超时内输出目录未出现结果（基础设施）。退避重试，不计轮数。"""
+
+    def __init__(self, expected_path: str, run_id=None, wait_s=None):
+        self.expected_path = expected_path
+        self.run_id = run_id
+        self.wait_s = wait_s
+        super().__init__(f"result not found: {expected_path} (run_id={run_id}, waited {wait_s}s)")
+
+
+class ResultMismatch(LaunchError):
+    """拿到结果的 run_id 不匹配（多轮串扰）——这是框架 bug，立即停止、不重试。"""
+
+    def __init__(self, expected_run_id, actual_run_id):
+        self.expected_run_id = expected_run_id
+        self.actual_run_id = actual_run_id
+        super().__init__(
+            f"result run_id mismatch: expected {expected_run_id!r}, got {actual_run_id!r} "
+            f"(framework bug: run-id isolation failed)")
+
 # raw_sim_output 中 build_sim_result 直接读取的键
 _REQUIRED_KEYS = ("correct", "max_abs_err", "pipeline", "compiled")
 
@@ -52,6 +108,14 @@ def launch(kernel_file: str) -> dict:
     由保密环境的 GLM 4.7 实现。返回值须符合 raw_sim_output 规范 schema（见模块 docstring）。
     实现须遵守「目录式调用约束」三条（见模块 docstring）：目录可配置、用 new_run_id()
     做多轮隔离并在读结果时校验 run id、轮询等待 + 超时并抛可识别异常。
+
+    **失败归类约定（E4，异常类型框架已定义）**：按情况抛对应异常，编排器据此决定重试还是停：
+    - 连不上远端 → `RemoteConnectionError(endpoint, original)`
+    - 超时 → `RemoteTimeout(timeout_s, run_id)`
+    - 远程脚本非零退出 → `RemoteScriptError(exit_code, stderr)`（保留 stderr 原文）
+    - 超时内输出目录无结果 → `ResultNotFound(expected_path, run_id, wait_s)`
+    - 结果 run_id 不匹配（串扰）→ `ResultMismatch(expected_run_id, actual_run_id)`
+    前四类是基础设施问题（不重新生成 kernel、退避重试）；最后一类是框架 bug（立即暴露）。
     """
     raise NotImplementedError("待保密环境实现：把 kernel 发射到远端仿真器并取回原始输出")
 

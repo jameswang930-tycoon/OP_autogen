@@ -45,7 +45,7 @@
 | E1 每轮全量落盘 | ✅ 门禁通过 | `pytest tests/test_e1_transcript.py` (2 passed) | （见下） | log/round_N/ 编号文件 01-11 + meta.txt；失败轮落盘部分并标 fail_stage；_RoundTranscript |
 | E2 单轮重放入口 | ✅ 门禁通过 | `pytest tests/test_e2_replay.py` (5 passed) | （见下） | feedback_adapter(replay/adapt-only)、launch_template(assemble)、loop_controller(replay) CLI 重放；只读、坏输入清晰报错 |
 | E3 组件边界断言 | ✅ 门禁通过 | `pytest tests/test_e3_boundary.py` (6 passed) | （见下） | feedback_adapter 加 ParseError + validate_events(duration==end-start/词表/索引定位) + validate_output(词表/cycles/summary 非空)；adapt 入口/出口强制 |
-| E4 launch 失败五分类 | ⬜ | — | — | |
+| E4 launch 失败五分类 | ✅ 门禁通过 | `pytest tests/test_e4_launch_errors.py` (6 passed) | （见下） | launch_template 定义 5 类异常(带证据)+launch() docstring 归类约定；前四类+SimInfraError 退避重试、ResultMismatch 立即停；证据入 report.detail/log |
 | E5 HANDOFF 故障定位节 | ⬜ | — | — | |
 | E6 preflight + bringup | ⬜ | — | — | |
 | E7 实时进度 | ⬜ | — | — | |

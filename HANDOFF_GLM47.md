@@ -158,6 +158,21 @@
 
 > **遇到不确定的问题，先用 E2 的重放入口把出错组件单独跑一遍**——把端到端问题降维成单组件的输入输出问题，这是弱模型能处理的粒度。重放只读，不发射、不调 LLM、不写 outputs。
 
+## 逐点联调（bring-up）
+
+**拉代码进环境后，不要直接跑编排器。** 按以下顺序单点验证，每步 PASS 再下一步：
+
+1. `.venv/bin/python -m control.preflight` —— 看还差哪些配置，逐个补到全绿（除 `parse_raw` 可暂为 STUB）。
+2. `.venv/bin/python -m control.bringup llm` —— 确认 `nga` 能调、双块（1 python + 1 json）能解析（填模型名后）。
+3. `.venv/bin/python -m control.bringup template` —— 确认真实模板路径配对、占位符集合匹配、组装产物可编译。
+4. `.venv/bin/python -m control.bringup launch --kernel <已知能跑通的kernel>` —— 确认远程仿真通，**并把真实 raw 存到 `bringup/last_raw.json`**。
+5. 用存下的真实 raw 开发 `parse_raw`（槽位 2），反复 `.venv/bin/python -m control.bringup parse --raw bringup/last_raw.json` 直到 PASS —— **这一步不用反复发射**（省远程调用）。FAIL 时打印是哪个字段映射不上（复用 E3 边界断言信息）。
+6. `.venv/bin/python -m control.bringup extcheck --kernel <含 extension 调用的kernel>` —— 确认签名检查。
+7. 全部单点 PASS 后，`.venv/bin/python -m control.bringup all` 串起来跑一遍。
+8. 再用一个小算子跑真实编排器，`--progress verbose` 观察每轮。
+
+**任一步 FAIL：范围已锁定在那一个接缝。** 用对应的 `log/round_N/` 文件或 E2 重放入口定位，不要跳到下一步。配合上面的「故障定位」表，构成完整的"联调 + 排障"指南。
+
 ## 保密纪律
 
 - 你填入的真实 stall 类型名、原语名、仿真字段名、`launch` 实现，**均不得回流公开分支**。公开分支保持占位，测试靠 fixture（预置测试数据）跑。

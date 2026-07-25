@@ -15,7 +15,9 @@ Event 字段已冻结（见 control/contracts.py），4.7 不得更改。
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from .contracts import Event, Verdict
@@ -223,3 +225,51 @@ def adapt(events: list[Event], k: int = TOP_K) -> AdapterOutput:
             "reduce TOP_K or fixture size"
         )
     return AdapterOutput(summary=summary, verdict=to_verdict(c))
+
+
+# ---------------- single-round replay (E2, read-only) ----------------
+
+def _event_to_dict(e) -> dict:
+    return {"name": e.name, "start": e.start, "end": e.end, "duration": e.duration,
+            "unit": e.unit, "stall_class": e.stall_class, "bytes": e.bytes}
+
+
+def main(argv: Optional[list] = None) -> int:
+    """命令行重放入口（只读）：replay <raw.json> | adapt-only <events.json>。
+
+    不发射、不调 LLM、不写 outputs；读落盘文件，跑该组件，打印结果或清晰错误。
+    """
+    import argparse
+    ap = argparse.ArgumentParser(prog="control.feedback_adapter")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    rp = sub.add_parser("replay", help="parse_raw on a saved raw_sim_output json")
+    rp.add_argument("raw_json")
+    ao = sub.add_parser("adapt-only", help="adapt on a saved Event list json")
+    ao.add_argument("events_json")
+    args = ap.parse_args(argv)
+    try:
+        if args.cmd == "replay":
+            raw = json.loads(Path(args.raw_json).read_text(encoding="utf-8"))
+            events = parse_raw(raw)
+            print(json.dumps([_event_to_dict(e) for e in events], ensure_ascii=False, indent=2))
+        else:  # adapt-only
+            from .contracts import Event
+            data = json.loads(Path(args.events_json).read_text(encoding="utf-8"))
+            events = [Event(**d) for d in data]
+            out = adapt(events)
+            v = out.verdict
+            print("VERDICT " + json.dumps({
+                "bottleneck": v.bottleneck, "lever": v.lever,
+                "cycles": v.cycles, "expected_gain": v.expected_gain,
+            }, ensure_ascii=False))
+            print("\n# --- 7-section summary ---\n" + out.summary)
+    except Exception as exc:  # noqa: BLE001 - 重放要把任何错误清晰打印，不静默
+        import traceback
+        print(f"ERROR: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

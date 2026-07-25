@@ -173,3 +173,57 @@ class LoopController:
             and seq[-1] == seq[-3]
             and seq[-1] != seq[-2]
         )
+
+
+# ---------------- single-round replay (E2, read-only) ----------------
+
+def main(argv: Optional[list] = None) -> int:
+    """命令行重放入口（只读）：replay <history.json>。
+
+    history.json = 一组轮次记录 [{variant, correct, cycles, compiled?, bottleneck?, lever?, expected_gain?}]，
+    逐个喂给全新的 LoopController，打印每轮决策。只读，不写 outputs。
+    """
+    import argparse
+    import json
+    import sys
+    from pathlib import Path
+    from .contracts import SimResult, Verdict
+
+    ap = argparse.ArgumentParser(prog="control.loop_controller")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    rp = sub.add_parser("replay", help="feed a saved round history, print stop decisions")
+    rp.add_argument("history_json")
+    args = ap.parse_args(argv)
+    try:
+        hist = json.loads(Path(args.history_json).read_text(encoding="utf-8"))
+        ctrl = LoopController()
+        last = None
+        for i, entry in enumerate(hist, 1):
+            sim = SimResult(
+                correct=entry["correct"], max_abs_err=0.0,
+                cycles=entry.get("cycles"), pipeline={},
+                compiled=entry.get("compiled", True),
+            )
+            verdict = None
+            if entry.get("bottleneck"):
+                verdict = Verdict(
+                    bottleneck=entry["bottleneck"], lever=entry.get("lever", ""),
+                    cycles=entry.get("cycles") or 0,
+                    expected_gain=entry.get("expected_gain", 0.1),
+                )
+            last = ctrl.update(entry.get("variant", f"v{i}"), sim, verdict)
+            print(f"round {i}: should_stop={last.should_stop} reason={last.reason} "
+                  f"rolled_back={last.rolled_back} "
+                  f"best_cycles={(last.best.cycles if last.best else None)}")
+        print(f"FINAL reason={(last.reason if last else 'n/a')} "
+              f"best_cycles={(ctrl.best.cycles if ctrl.best else None)}")
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        print(f"ERROR: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

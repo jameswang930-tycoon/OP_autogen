@@ -119,3 +119,38 @@ def assemble_launchable(template_str: str, values: dict) -> str:
 
 # 模块级常量：默认加载的占位模板（保持向后兼容；test_t6 等仍可引用）。
 LAUNCHABLE_TEMPLATE = load_launchable_template()
+
+
+# ---------------- single-round replay (E2, read-only) ----------------
+
+def main(argv: Optional[list] = None) -> int:
+    """命令行重放入口（只读）：assemble <kernel.py> —— 组装可发射文件，不真发射。"""
+    import argparse
+    ap = argparse.ArgumentParser(prog="control.launch_template")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    asm = sub.add_parser("assemble", help="assemble a kernel into the launchable template (no launch)")
+    asm.add_argument("kernel_file")
+    asm.add_argument("--op", default="OP")
+    asm.add_argument("--dtype", default="fp32")
+    args = ap.parse_args(argv)
+    try:
+        import sys
+        kernel_src = Path(args.kernel_file).read_text(encoding="utf-8")
+        tmpl = load_launchable_template()
+        assembled = assemble_launchable(tmpl, {
+            "OP": args.op, "SHAPES": [1], "DTYPE": args.dtype,
+            "KERNEL_BODY": kernel_src,
+            "REFERENCE": "def reference(*a, **k):\n    pass\n",
+        })
+        compile(assembled, "<assemble>", "exec")
+        print(assembled)
+    except Exception as exc:  # noqa: BLE001
+        import sys, traceback
+        print(f"ERROR: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

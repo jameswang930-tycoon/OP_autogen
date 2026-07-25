@@ -43,7 +43,7 @@
 | 子项 | 状态 | 门禁 | commit | 备注 |
 |---|---|---|---|---|
 | E1 每轮全量落盘 | ✅ 门禁通过 | `pytest tests/test_e1_transcript.py` (2 passed) | （见下） | log/round_N/ 编号文件 01-11 + meta.txt；失败轮落盘部分并标 fail_stage；_RoundTranscript |
-| E2 单轮重放入口 | ⬜ | — | — | |
+| E2 单轮重放入口 | ✅ 门禁通过 | `pytest tests/test_e2_replay.py` (5 passed) | （见下） | feedback_adapter(replay/adapt-only)、launch_template(assemble)、loop_controller(replay) CLI 重放；只读、坏输入清晰报错 |
 | E3 组件边界断言 | ⬜ | — | — | |
 | E4 launch 失败五分类 | ⬜ | — | — | |
 | E5 HANDOFF 故障定位节 | ⬜ | — | — | |

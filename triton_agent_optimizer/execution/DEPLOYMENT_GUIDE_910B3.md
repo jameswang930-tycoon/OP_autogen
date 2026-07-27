@@ -3,6 +3,37 @@
 
 ---
 
+## 0. 关键: msprof op simulator 需要编译后的 .o 文件
+
+**msprof op simulator 不接受 .py 源码!** 必须先编译为 .o 二进制。
+
+完整流水线:
+```
+Triton .py → compiler.py (bisheng编译) → .asc.o 二进制
+  → msprof op simulator ./kernel.asc.o → trace.json
+  → msprof_analyzer.parse(trace.json) → pipeline_report.json
+```
+
+编译命令 (compiler.py 自动执行):
+```bash
+# Step 1: 编译 →仿真模式 .o
+bisheng -c kernel.asc -o kernel.asc.o --npu-arch=dav-2201 --run-mode=sim
+
+# Step 2: 链接仿真库 → 可执行文件
+bisheng -L${INSTALL_DIR}/tools/simulator/dav_2201/lib \
+  -lruntime_camodel -lnpu_drv_camodel -lm -lstdc++ \
+  kernel.asc.o -o kernel_sim
+
+# Step 3: 运行仿真
+msprof op simulator --soc-version=Ascend910B3 ./kernel_sim
+
+# 910B3 的 --npu-arch 对应 dav-2201 (可通过 npu-smi info 确认)
+```
+
+**本地 (Windows/无 CANN)**: compiler.py 不可用，整个 msprof 分析链 fallback 到 cost_emulator simulator。
+
+---
+
 ## 1. emulator_runner.py — CPU 仿真验证
 
 **本地即可运行，不需要 NPU。支持智能识别算子类型。**

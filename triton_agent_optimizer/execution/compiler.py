@@ -3,24 +3,27 @@
 Ascend 编译器接口 — 编译 + HIVMIR 提取。
 
 ═══════════════════════════════════════════════════════════════════════════════
-  完整流程 (910B3 服务器)
+  完整流程 (910B3 服务器) — 两条产物线
 ═══════════════════════════════════════════════════════════════════════════════
 
   Triton kernel (.py)
     │
-    ▼
-  ① 编译 (bishengir-compile / ascendc)
-     参数: --mlir-print-ir-after-all --run-mode=sim
-     输出: .om 二进制 + IR dump
+    ├─→ 产物线 A: msprof 分析 (给 msprof_analyzer)
+    │   ① 编译 (bisheng): --run-mode=sim → .o binary
+    │   ② 仿真: msprof op simulator ./binary → OPPROF_xxx/simulator/trace.json
+    │   ③ 解析: msprof_analyzer.parse(trace.json) → pipeline_report.json
     │
-    ▼
-  ② 提取 HIVMIR (解析 IR dump)
-     查找 hivm. 前缀的操作 → 保存为 .mlir
-    │
-    ▼
-  ③ 返回 CompileResult {binary_path, hivmir_text}
+    └─→ 产物线 B: HIVMIR 分析 (给 hivmir_analyzer)
+        ① 编译 (ascendc): --mlir-print-ir-after-all → IR dump
+        ② 提取: 解析 IR dump 中的 hivm.* 操作 → .mlir 文本
+        ③ 解析: hivmir_analyzer.parse(.mlir) → hivmir_report.json
 
-  这个文件整合了原 fusion_pipeline/extract_hivmir_from_compiler.py 的功能
+  关键: msprof op simulator 需要 .o 二进制文件, 不能直接接受 .py 源码。
+        编译命令: bisheng -c kernel.asc -o kernel.asc.o --npu-arch=dav-2201 --run-mode=sim
+        仿真命令: msprof op simulator --soc-version=Ascend910B3 ./kernel.asc.o
+
+  注意: --run-mode=sim 是关键参数, 它让编译器生成仿真模式的 .o 而非真机 .o。
+        SIMT 不支持仿真, 仅 SIMD 可用。
 
 ═══════════════════════════════════════════════════════════════════════════════
   本地开发 (无 NPU)
@@ -171,31 +174,50 @@ class CompilerInterface:
     def _run_compile(
         self, kernel_file: Path, ir_dump: Path, binary: Path,
     ) -> tuple[bool, str]:
-        """运行编译器, 捕获 IR dump。"""
-        # 构建命令
-        cmd = [
+        """运行 Bisheng 编译器, 生成仿真模式 .o 文件 + 捕获 IR dump。
+
+        Bisheng 编译命令:
+          bisheng -c kernel.asc -o kernel.asc.o --npu-arch=dav-2201 --run-mode=sim
+          --run-mode=sim  关键! 生成仿真模式 .o (不需要 NPU)
+          --npu-arch      芯片架构: 910B3 对应 dav-2201
+        """
+        # 仿真模式编译 (两步: 编译 .asc → .o, 链接仿真库 → executable)
+        asc_file = kernel_file.with_suffix(".asc")
+        obj_file = kernel_file.with_suffix(".asc.o")
+
+        # Step 1: 编译 → .o
+        compile_cmd = [
+            self.compiler_bin, "-c",
+            str(asc_file if asc_file.exists() else kernel_file),
+            "-o", str(obj_file),
+            "--npu-arch=dav-2201",
+            "--run-mode=sim",
+        ]
+        # Step 2: 链接仿真库 → executable
+        link_cmd = [
             self.compiler_bin,
-            str(kernel_file),
-            "-o", str(binary),
-            "--run-mode=sim",                # 仿真模式 (不需要真实 NPU)
-            "--mlir-print-ir-after-all",     # 每个 pass 后打印 IR
-            f"--mlir-print-ir-tree-dir={ir_dump.parent}",
+            "-L${INSTALL_DIR}/tools/simulator/dav_2201/lib",
+            "-lruntime_camodel", "-lnpu_drv_camodel",
+            "-lm", "-lstdc++",
+            str(obj_file), "-o", str(binary),
         ]
 
         env = {}
         if self.set_env_script:
-            # source 环境脚本并在同一 shell 中运行编译
-            # 用 bash -c 包装
-            cmd = [
-                "bash", "-c",
+            full_cmd = (
                 f"source {self.set_env_script} && "
-                f"{' '.join(str(c) for c in cmd)} "
-                f"> {ir_dump} 2>&1"
-            ]
+                f"{' '.join(compile_cmd)} && "
+                f"{' '.join(link_cmd)}"
+            )
+            if ir_dump:
+                full_cmd += f" > {ir_dump} 2>&1"
+            cmd = ["bash", "-c", full_cmd]
+        else:
+            cmd = compile_cmd + ["&&"] + link_cmd
 
         try:
             result = subprocess.run(
-                cmd if isinstance(cmd[0], str) else cmd,
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -203,10 +225,8 @@ class CompilerInterface:
             )
             output = result.stdout + "\n" + result.stderr
 
-            # 同时读 IR dump 文件 (如果编译器写到文件)
             if ir_dump.exists():
-                output += "\n" + ir_dump.read_text(encoding="utf-8",
-                                                    errors="replace")
+                output += "\n" + ir_dump.read_text(encoding="utf-8", errors="replace")
 
             return result.returncode == 0, output[:5000]
 

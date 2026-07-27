@@ -7,25 +7,26 @@
 
 ## 0. 前置知识
 
-### msprof op simulator — 可以本地跑！
+### msprof op simulator — 需要编译后的 .o 二进制!
 
-- **不需要 NPU 硬件**
-- 需要安装 CANN Toolkit (Linux only, ~2GB)
-- 本质是纯 CPU 软件仿真器, 模拟算子执行时序
-- 输出: `OPPROF_xxx/simulator/trace.json` (Chrome Trace Format)
+- **不需要 NPU 硬件**，但需要 CANN Toolkit (含 Bisheng 编译器)
+- **不接受 .py 源码**，必须先编译为 .o 文件
+- 本质是纯 CPU 软件仿真器，模拟算子执行时序
 
 ```
-安装 CANN → source set_env.sh → msprof op simulator ./binary
-→ OPPROF_xxx/simulator/trace.json → 我们的 msprof_analyzer 解析
+完整流水线 (910B3):
+  ① compiler.py: bisheng -c kernel.asc -o kernel.asc.o --npu-arch=dav-2201 --run-mode=sim
+  ② msprof op simulator --soc-version=Ascend910B3 ./kernel.asc.o
+  ③ → OPPROF_xxx/simulator/trace.json → msprof_analyzer 解析
 ```
 
 ### 两种分析路径
 
 | 环境 | 工具 | 输出 | 精度 |
 |---|---|---|---|
-| Linux + CANN (无 NPU) | `msprof op simulator` | trace.json → msprof_analyzer | 真实仿真 |
-| Linux + CANN + NPU | `msprof op` | 真实 trace.json + OPPROF_xxx/ | 最高精度 |
-| Windows 本地 | `cost_emulator/simulator.py --llm` | 模拟文本 | 低 (placeholder engines) |
+| Linux + CANN | ① compiler.py → ② msprof op simulator → ③ msprof_analyzer | trace.json | 真实仿真 |
+| Linux + CANN + NPU | ① compiler.py → ② msprof op → ③ msprof_analyzer | 真实 trace.json | 最高 |
+| Windows 本地 | `cost_emulator/simulator.py --llm` | 模拟文本 | 低 (placeholder) |
 
 ---
 

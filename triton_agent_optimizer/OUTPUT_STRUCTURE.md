@@ -1,6 +1,6 @@
 # 输出目录架构设计
 
-> 完整目录架构说明。确认后实现到 `outputs/` 目录中。
+> 完整目录架构说明。与 `README.md` §6 保持一致。
 
 ---
 
@@ -9,236 +9,183 @@
 ```
 outputs/
 │
-└── <triton_kernel_name>/                       # ★ 每个 Triton kernel 一个大文件夹
+└── <triton_kernel_name>/                       # ★ 每个 kernel 独立目录
     │
-    ├── round0/                                  # ★ 基准分析 (优化前原始数据)
+    ├── round0/                                  # ★ 基准分析 (优化前, 无优化文件)
     │   │
-    │   ├── kernel.py                            # 1. 原始 Triton kernel 代码
+    │   ├── kernel.py                            # 原始 Triton kernel
+    │   ├── benchmark_result.json                # 基准: 延迟/加速比/吞吐/时间占比
     │   │
-    │   ├── bench.py                             # 2. msprof 基准测试脚本
-    │   │   #    - 运行 msprof op ./binary
-    │   │   #    - 测量绝对延迟 (ms)、端到端加速比、吞吐量 (GB/s or TFLOPS)
-    │   │   #    - 计算各引擎时间占比
-    │   │
-    │   ├── benchmark_result.json                # 3. 基准测试结果
-    │   │   #    { "absolute_latency_ms": ..., "speedup_vs_baseline": 1.0,
-    │   │   #      "throughput_gb_s": ..., "time_ratios": {...},
-    │   │   #      "total_ops": ..., "execution_mode": "..." }
-    │   │
-    │   ├── msprof/                              # 4. msprof op simulator 分析产物
-    │   │   ├── OPPROF_{timestamp}_XXX/          #    msprof 中间产物目录 (原始输出)
+    │   ├── msprof/                              # msprof 分析产物
+    │   │   ├── OPPROF_{timestamp}_XXX/          #   msprof 原始中间产物
     │   │   │   └── simulator/
     │   │   │       ├── trace.json
-    │   │   │       └── core0.veccore0/
-    │   │   │           ├── trace.json
-    │   │   │           ├── core0.veccore0_code_exe.csv
-    │   │   │           └── core0.veccore0_instr_exe.csv
-    │   │   └── pipeline_report.json             #    ★ msprof 最终解析产物 (JSON)
-    │   │       #    msprof字段已填(16✅), HIVMIR字段标记"待补充"(13❌)
-    │   │       #    格式: 29字段完整流水线报告 (PARTIAL)
+    │   │   │       └── core0.veccore0/...
+    │   │   └── pipeline_report.json             #   msprof 解析产物 (16✅+13❌)
     │   │
-    │   ├── hivmir/                              # 5. HIVMIR 编译器中间产物分析
-    │   │   ├── compiler_output/                 #    HIVMIR 中间产物目录 (编译器原始输出)
-    │   │   │   └── hivmir_output.mlir           #    HIVMIR IR 文本
-    │   │   └── hivmir_report.json               #    ★ HIVMIR 最终解析产物 (JSON)
-    │   │       #    HIVMIR字段已填(9✅), msprof字段标记"待补充"(16❌)
-    │   │       #    格式: 与 pipeline_report.json 完全对齐的 29字段结构
+    │   ├── hivmir/                              # HIVMIR 分析产物
+    │   │   ├── compiler_output/                 #   HIVMIR 编译器原文
+    │   │   │   └── hivmir_output.mlir
+    │   │   └── hivmir_report.json               #   HIVMIR 解析产物 (9✅+16❌)
     │   │
-    │   └── merged/                              # 6. 合并产物 (dsl_merger.py)
-    │       ├── merged_report.json               #    ★ 合并后完整报告 (29字段全填)
-    │       ├── final_report_llm.txt             #    LLM 消费: 对齐 simulator --llm 格式
-    │       │   #    7 section: EXEC SUMMARY / TIME BREAKDOWN / PER-OP STATS /
-    │       │   #    ENGINE UTIL / BW UTIL / PARALLELISM / CRITICAL PATH
-    │       └── final_report_human.txt           #    人读: ASCII Gantt图 + 柱状图 + 表格
-    │           #    内容: Pipeline Execution Graph / 操作表格 /
-    │           #    时间占比柱状图 / 引擎利用率 / 带宽利用率 / 关键路径
+    │   └── merged/                              # 合并产物
+    │       ├── merged_report.json               #   ★ 29字段全填 (dsl_merger)
+    │       ├── final_report_llm.txt             #   LLM 读: 7-section 文本
+    │       └── final_report_human.txt           #   人读: ASCII Gantt 图
     │
-    ├── 01_block_size_launch/                    # Tier 1: Block Size & Launch Config 优化
-    │   ├── round1/
-    │   │   ├── kernel.py                        # 优化后 kernel
-    │   │   ├── bench.py
-    │   │   ├── benchmark_result.json
-    │   │   ├── msprof/
-    │   │   │   ├── OPPROF_{timestamp}_XXX/
-    │   │   │   └── pipeline_report.json
-    │   │   ├── hivmir/
-    │   │   │   ├── compiler_output/
-    │   │   │   └── hivmir_report.json
-    │   │   ├── merged/
-    │   │   │   ├── merged_report.json
-    │   │   │   ├── final_report_llm.txt
-    │   │   │   └── final_report_human.txt
-    │   │   └── optimization_record.json          # ★ 本轮独有: 优化记录
-    │   │       # {
-    │   │       #   "round": 1, "strategy_tier": 1,
-    │   │       #   "strategy": "increase_tile_size",
-    │   │       #   "optimization_target": "增大 BLOCK_SIZE 256→8192",
-    │   │       #   "bottleneck_before": {"op_id": 2, "type": "memory_bandwidth",
-    │   │       #       "time_ratio": 0.47, "bw_util": 0.21, "regime": "ramp"},
-    │   │       #   "bottleneck_after": {"op_id": 1, "type": "compute_vec",
-    │   │       #       "time_ratio": 0.35, "bw_util": 0.88, "regime": "saturated"},
-    │   │       #   "target_speedup": 1.10,
-    │   │       #   "actual_speedup": 1.12,
-    │   │       #   "cumulative_speedup": 1.12,
-    │   │       #   "decision": "KEEP",
-    │   │       #   "decision_reason": "GM→UB 带宽利用率 21→78%, 总时间 -12%",
-    │   │       #   "code_diff": "BLOCK_SIZE 256 → 8192"
-    │   │       # }
-    │   ├── round2/
-    │   │   └── ...
-    │   └── roundN/
+    ├── 01_algorithmic_structure/                # Tier 1: Algorithmic Structure (最先)
+    ├── 02_operator_fusion/                      # Tier 2: Operator Fusion
+    ├── 03_tiling_block_config/                  # Tier 3: Tiling & Block Config
+    ├── 04_memory_access/                        # Tier 4: Memory Access & Coalescing
+    ├── 05_compute_occupancy/                    # Tier 5: Compute & Occupancy
+    ├── 06_910b3_architecture/                   # Tier 6: 910B3 Architecture (最后)
+    │   │
+    │   └── roundN/                              #   每轮优化目录
+    │       │
+    │       │  ┌─ 分析产物 (每轮都有) ──────────────┐
+    │       │  │ msprof/ + hivmir/ + merged/       │
+    │       │  │ benchmark_result.json             │
+    │       │  │ kernel.py (本轮当前代码)           │
+    │       │  └───────────────────────────────────┘
+    │       │
+    │       │  ┌─ 优化产物 (roundN 独有) ───────────┐
+    │       │  │ plan.md           Planner 产出     │
+    │       │  │ plan.json         Planner 产出(JSON)│
+    │       │  │ diff.patch        Coder 产出       │
+    │       │  │ optimization_record.json 决策记录   │
+    │       │  │ verification.json Verifier 产出    │
+    │       │  │ AGENT_TASK_PLAN.md  任务文件        │
+    │       │  │ AGENT_TASK_CODE.md  任务文件        │
+    │       │  └───────────────────────────────────┘
     │
-    ├── 02_memory_access/                        # Tier 2: Memory Access & Coalescing
-    │   ├── round1/ ... roundN/
+    ├── optimization_trajectory.json              # ★ 全局中枢状态
     │
-    ├── 03_operator_fusion/                      # Tier 3: Operator Fusion
-    │   ├── round1/ ... roundN/
-    │
-    ├── 04_compute_optimization/                 # Tier 4: Compute Optimization
-    │   ├── round1/ ... roundN/
-    │
-    ├── 05_architecture_specific/                # Tier 5: 910B3 Architecture
-    │   ├── round1/ ... roundN/
-    │
-    ├── 06_algorithmic_restructure/              # Tier 6: Algorithmic Restructure
-    │   ├── round1/ ... roundN/
-    │
-    ├── optimization_trajectory.json              # ★ 跨轮汇总: 每轮瓶颈+策略+加速比
-    │   # [ {"round":0, "phase":"baseline", "speedup":1.0, "bottleneck":"ub_to_gm"},
-    │   #   {"round":1, "phase":"Tier1", "strategy":"increase_tile", "speedup":1.12,
-    │   #    "bottleneck":"vadd"}, ... ]
-    │
-    ├── trajectory_chart.png                      # ★ 优化轨迹图: 双面板(加速比+延迟)
-    │
-    ├── optimization_summary.md                   # ★ 优化总结报告
-    │   # - 关键瓶颈变化历史
-    │   # - 成功的优化策略清单
-    │   # - 失败的优化策略清单 (避免重复)
-    │   # - 最终加速比 + 各阶段贡献
-    │   # - 优化建议 (供后续类似算子参考)
-    │
-    └── optimized_kernel.py                       # ★ 最终优化版 kernel (通过全部验证)
+    └── final_output/                             # ★ 最终产物
+        ├── optimized_kernel.py                   #   最终优化版 kernel
+        ├── trajectory_chart.png                  #   6阶段加速比曲线图
+        ├── optimization_summary.md                #   总结报告
+        ├── final_merged_report.json              #   最终合并报告
+        ├── final_report_llm.txt                  #   最终 LLM 文本
+        └── final_report_human.txt                #   最终 Gantt 图
 ```
 
 ---
 
-## 各文件详细说明
+## round0 vs roundN 对比
 
-### round0 — 基准分析 (必做, 优化前)
-
-| 文件 | 内容 | 格式 | 谁产出 |
+| 文件 | round0 (基准) | roundN (优化) | 写入者 |
 |---|---|---|---|
-| `kernel.py` | 原始 Triton kernel 代码 | Python | 用户提供 |
-| `bench.py` | 基准测试脚本 (msprof 采集) | Python | execution/hardware_runner.py |
-| `benchmark_result.json` | 绝对延迟/加速比/吞吐量/时间占比 | JSON | hardware_runner.py |
-| `msprof/pipeline_report.json` | msprof 解析最终产物 (29字段, 16✅+13❌) | JSON | analyzers/msprof_analyzer.py |
-| `msprof/OPPROF_*/` | msprof 原始中间产物 | raw | msprof op simulator |
-| `hivmir/hivmir_report.json` | HIVMIR 解析最终产物 (29字段, 9✅+16❌) | JSON | analyzers/hivmir_analyzer.py |
-| `hivmir/compiler_output/` | HIVMIR 编译器原始输出 | .mlir | Ascend 编译器 |
-| `merged/merged_report.json` | 合并后完整报告 (29字段全填) | JSON | analyzers/dsl_merger.py |
-| `merged/final_report_llm.txt` | LLM 消费: 7-section 结构化文本 | TXT | dsl_merger.py |
-| `merged/final_report_human.txt` | 人读: ASCII Gantt + 柱状图 + 表格 | TXT | dsl_merger.py |
-
-### roundN — 每轮优化 (在对应 Tier 文件夹下)
-
-除 round0 的全部内容外, 额外多:
-
-| 文件 | 内容 | 格式 | 谁产出 |
-|---|---|---|---|
-| `optimization_record.json` | 本轮优化详情: 策略/瓶颈前后/加速比/决策 | JSON | agents/orchestrator.py |
-
-### kernel 顶层文件
-
-| 文件 | 内容 | 谁产出 |
-|---|---|---|
-| `optimization_trajectory.json` | 跨轮汇总 (每轮一条记录) | feedback/optimization_journal.py |
-| `trajectory_chart.png` | 优化轨迹图 | feedback/trajectory_chart.py |
-| `optimization_summary.md` | 优化总结报告 | feedback/case_template.py |
-| `optimized_kernel.py` | 最终优化版代码 | agents/orchestrator.py |
+| `kernel.py` | 原始 kernel | Coder 修改后 | Orchestrator / Coder |
+| `benchmark_result.json` | ✅ | ✅ | hardware_runner |
+| `msprof/` | ✅ | ✅ | msprof_analyzer |
+| `hivmir/` | ✅ | ✅ | hivmir_analyzer / compiler |
+| `merged/` | ✅ | ✅ | dsl_merger |
+| `plan.md` | — | ✅ | Planner |
+| `plan.json` | — | ✅ | Planner |
+| `diff.patch` | — | ✅ | Coder |
+| `optimization_record.json` | — | ✅ | RecordManager |
+| `verification.json` | — | ✅ | Verifier |
+| `AGENT_TASK_PLAN.md` | — | ✅ | Orchestrator |
+| `AGENT_TASK_CODE.md` | — | ✅ | Orchestrator |
 
 ---
 
-## optimization_record.json 详细 Schema
+## optimization_trajectory.json Schema
+
+```json
+{
+  "kernel": {
+    "name": "rms_norm_residual",
+    "dtype": "fp16",
+    "initial_kernel_path": "outputs/.../round0/kernel.py"
+  },
+  "state": {
+    "tier": 3,
+    "round": 12,
+    "best_speedup": 1.52,
+    "consecutive_reverts": 0,
+    "consecutive_no_improvement": 0,
+    "started_at": "2026-07-24T10:00:00",
+    "last_updated": "2026-07-24T12:30:00"
+  },
+  "baseline": {
+    "total_ns": 3655.6,
+    "num_ops": 3,
+    "execution_mode": "sequential",
+    "bottleneck_op_id": 2,
+    "bottleneck_op_type": "ub_to_gm",
+    "bottleneck_engine": "UB->GM",
+    "bottleneck_type": "memory_bandwidth",
+    "bottleneck_time_ratio": 0.4677,
+    "engine_utilization": {"GM->UB": 0.44, "UB->GM": 0.47, "VecUnit": 0.09}
+  },
+  "tier_progress": {
+    "tier_1": {"rounds_spent": 3, "best_in_tier": 1.00},
+    "tier_2": {"rounds_spent": 4, "best_in_tier": 1.09},
+    "tier_3": {"rounds_spent": 7, "best_in_tier": 1.19}
+  },
+  "history": [
+    {
+      "round": 1,
+      "tier": 1,
+      "tier_name": "Algorithmic Structure",
+      "strategy": "evaluate_algorithm_choice",
+      "target_speedup": 1.0,
+      "actual_speedup": 1.0,
+      "cumulative_speedup": 1.0,
+      "decision": "KEEP",
+      "decision_reason": "algorithm already optimal",
+      "bottleneck_before": {"op_id": 2, "type": "memory_bandwidth"},
+      "bottleneck_after": {},
+      "code_lines_changed": 0,
+      "emulator_passed": true,
+      "hardware_tested": false,
+      "coder_retries": 0,
+      "timestamp": "2026-07-24T10:05:00"
+    }
+  ]
+}
+```
+
+## optimization_record.json Schema (每轮独有)
 
 ```json
 {
   "round": 3,
-  "phase": "Tier2_memory_access",
-  "timestamp": "2026-07-23T16:00:00",
-
-  "plan": {
-    "strategy": "merge_small_transfers",
-    "strategy_tier": 2,
-    "description": "合并 4×1KB gm_to_ub 为 1×4KB 传输",
-    "plan_file": "round3_plan.md"
-  },
-
-  "bottleneck_before": {
-    "op_id": 0,
-    "op_type": "gm_to_ub",
-    "engine": "GM→UB",
-    "time_ratio": 0.35,
-    "bw_utilization": 0.21,
-    "regime": "ramp",
-    "size_kb": 1.0,
-    "target_k0": 6.65
-  },
-
-  "bottleneck_after": {
-    "op_id": 2,
-    "op_type": "ub_to_gm",
-    "engine": "UB→GM",
-    "time_ratio": 0.42,
-    "bw_utilization": 0.91,
-    "regime": "saturated"
-  },
-
-  "code_change": {
-    "diff_file": "round3_diff.patch",
-    "lines_changed": 2,
-    "summary": "合并 4个1KB tile → 1个4KB tile"
-  },
-
-  "verification": {
-    "stage1_emulator": {"passed": true, "max_abs_error": 4.77e-07},
-    "stage2_simulator": {"estimated_speedup": 1.08},
-    "stage3_hardware": {"passed": true, "actual_speedup": 1.07}
-  },
-
-  "performance": {
-    "target_speedup": 1.05,
-    "actual_speedup": 1.07,
-    "cumulative_speedup": 1.21,
-    "latency_ms_before": 0.0183,
-    "latency_ms_after": 0.0171,
-    "throughput_gb_s_before": 850.0,
-    "throughput_gb_s_after": 910.0
-  },
-
+  "tier": 3,
+  "tier_name": "Tiling & Block Config",
+  "strategy": "increase_tile_size",
+  "target_speedup": 1.15,
+  "actual_speedup": 1.12,
+  "cumulative_speedup": 1.21,
   "decision": "KEEP",
-  "decision_reason": "GM→UB 合并后带宽利用率 21→91%, 瓶颈转移到 ub_to_gm"
+  "decision_reason": "GM->UB bw_util 21->78%, bottleneck shifted to VecUnit",
+  "bottleneck_before": {"op_id": 0, "type": "memory_latency", "time_ratio": 0.35},
+  "bottleneck_after":  {"op_id": 1, "type": "compute_vec", "time_ratio": 0.30},
+  "code_lines_changed": 2,
+  "emulator_passed": true,
+  "hardware_tested": false,
+  "coder_retries": 0,
+  "verification": {
+    "stage1_passed": true,
+    "stage1_error": "",
+    "stage2_estimated_speedup": null,
+    "stage3_actual_speedup": null
+  }
 }
 ```
 
-## 关于融合分析
+## 六层优化策略顺序
 
-Tier 3 (算子融合) 的 round 目录包含 **所有被融合算子的串联流水线**。
+**核心原则: 从结构影响最大到最小。改了上层，下层要重做。**
 
-例如融合 `add + relu`:
-- `merged/final_report_llm.txt` 包含 6 个 op (gm_to_ub→vadd→vrelu→...), 全部显示
-- 需要单算子视图时, data_extractor 按 op_id 过滤即可
+| Tier | 文件夹 | 名称 | 做什么 | 晋升条件 |
+|---|---|---|---|---|
+| 1 | `01_algorithmic_structure` | Algorithmic Structure | Online Softmax / Split-K / Persistent Kernel | 算法已最优 |
+| 2 | `02_operator_fusion` | Operator Fusion | 逐元素融合 / WAR打破 / 激活融合 | 无可融合op |
+| 3 | `03_tiling_block_config` | Tiling & Block Config | BLOCK_SIZE / num_warps / num_stages | 连续3轮无改进 |
+| 4 | `04_memory_access` | Memory Access | 小传输合并 / double buffer / coalescing | 连续3轮无改进 |
+| 5 | `05_compute_occupancy` | Compute & Occupancy | 计算-传输重叠 / 向量化 / 精度取舍 | 连续3轮无改进 |
+| 6 | `06_910b3_architecture` | 910B3 Architecture | Grid / Pipeline / L2驻留 / 混合精度 | 连续3轮无改进→停止 |
 
----
-
-## 实现状态
-
-| 组件 | 状态 |
-|---|---|
-| msprof_analyzer (产出 pipeline_report.json) | ✅ 已实现 |
-| hivmir_analyzer (产出 hivmir_report.json) | ✅ 已实现 |
-| dsl_merger (合并 → merged_report.json) | ❌ 待实现 |
-| hardware_runner (bench.py + benchmark_result.json) | ❌ 待实现 |
-| optimization_record.json (每轮记录) | ❌ 待实现 |
-| optimization_trajectory.json (跨轮汇总) | ❌ 待实现 |
-| trajectory_chart.png (轨迹图) | ❌ 待实现 |
-| optimization_summary.md (总结报告) | ❌ 待实现 |
+**降级规则**: 融合新算子→回退 Tier 3; 改了算法→回退 Tier 2

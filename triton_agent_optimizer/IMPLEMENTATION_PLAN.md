@@ -1,5 +1,16 @@
 # Triton Agent Optimizer — 逐文件实现计划
 
+> **状态: 实现阶段已完成，本文档作为架构参考保留。**
+> 最新架构和完整数据流见 `ARCHITECTURE_DESIGN.md`。
+> 实际文件列表和用途见 `README.md` §4。
+>
+> **已发生的关键变更**:
+> - 三阶段验证 → 两阶段 (Simulator 不在验证环节，在分析层)
+> - Tier 顺序: Algorithm→Fusion→Tiling→Memory→Compute→Arch
+> - `fusion_pipeline/` → 迁移到 `analyzers/` + `execution/compiler.py`
+> - 新增 `main.py`、`prepare/`、`.claude/skills/triton-agent-*`
+> - Planner/Coder 支持 AGENT_TASK 文件模式 (非 LLM 环境可用)
+
 > 最后更新: 2026-07-23
 > 实现顺序: 按依赖关系排列，每个文件一个对话，一次只做一个。
 
@@ -635,7 +646,7 @@ class RoundRecord:
     # 代码变更
     code_change: dict  # {diff_file, lines_changed, files_changed}
 
-    # 验证 (三阶段)
+    # 验证 (两阶段)
     verification: dict
 
     # 决策
@@ -1099,7 +1110,7 @@ Output ONLY the modified code, no explanation.
 
 ### 文件 21: `agents/verifier.py`
 
-**做什么**: 验证智能体——协调三阶段验证
+**做什么**: 验证智能体——协调两阶段验证 (CPU Emulator + 910B3 Hardware)
 
 **依赖**: `execution/emulator_runner.py`, `execution/simulator_runner.py`, `execution/hardware_runner.py`, `config.py`
 

@@ -178,32 +178,71 @@ triton_agent_optimizer/
 
 ## 6. 输出目录
 
-每轮输出到 `outputs/<kernel>/<tier_dir>/roundN/`:
-
 ```
-roundN/
-├── kernel.py                  # Coder 修改后的代码
-├── plan.md                    # Planner 优化计划
-├── diff.patch                 # 代码变更
-├── optimization_record.json   # 本轮决策+效果 (RecordManager)
-├── verification.json          # 验证结果 (Verifier)
-├── msprof/pipeline_report.json   # 分析产物
-├── hivmir/hivmir_report.json     # 分析产物
-└── merged/merged_report.json     # 合并产物
+outputs/<kernel_name>/
+│
+├── round0/                                    # ★ 基准分析 (无优化文件)
+│   ├── kernel.py                              #   原始 Triton kernel
+│   ├── benchmark_result.json                  #   延迟/加速比/吞吐
+│   ├── msprof/                                #   msprof 分析
+│   │   ├── OPPROF_*/simulator/trace.json      #     原始数据
+│   │   └── pipeline_report.json               #     解析产物 (16✅+13❌)
+│   ├── hivmir/                                #   HIVMIR 分析
+│   │   ├── compiler_output/hivmir_output.mlir  #     编译器原文
+│   │   └── hivmir_report.json                 #     解析产物 (9✅+16❌)
+│   └── merged/                                #   合并产物
+│       ├── merged_report.json                 #     ★ 29字段全填
+│       ├── final_report_llm.txt               #     LLM 文本
+│       └── final_report_human.txt             #     Gantt 图
+│
+├── 01_algorithmic_structure/roundN/           # Tier 1: Algorithm
+├── 02_operator_fusion/roundN/                 # Tier 2: Fusion
+├── 03_tiling_block_config/roundN/             # Tier 3: Tiling
+├── 04_memory_access/roundN/                   # Tier 4: Memory
+├── 05_compute_occupancy/roundN/               # Tier 5: Compute
+├── 06_910b3_architecture/roundN/              # Tier 6: Arch
+│
+│   每个 roundN/ 含 (round0 的全部 + 以下):
+│   ├── plan.md                 Planner 产出
+│   ├── plan.json               Planner 产出 (机器可读)
+│   ├── diff.patch              Coder 产出
+│   ├── optimization_record.json RecordManager 产出
+│   ├── verification.json       Verifier 产出
+│   ├── AGENT_TASK_PLAN.md      任务文件 (无 API key 时)
+│   └── AGENT_TASK_CODE.md      任务文件 (无 API key 时)
+│
+├── optimization_trajectory.json               # ★ 全局中枢
+│   {
+│     "state": {"tier":3, "round":12, "best_speedup":1.52},
+│     "baseline": {"total_ns":3655.6, ...},
+│     "history": [{...每轮一条...}, ...]
+│   }
+│
+└── final_output/                              # ★ 最终产物
+    ├── optimized_kernel.py                    #   最终 kernel
+    ├── trajectory_chart.png                   #   6阶段加速比图
+    ├── optimization_summary.md                #   总结报告
+    ├── final_merged_report.json               #   最终合并报告
+    ├── final_report_llm.txt                   #   最终 LLM 文本
+    └── final_report_human.txt                 #   最终 Gantt 图
 ```
 
-全局状态文件: `optimization_trajectory.json`
+### round0 vs roundN 文件对比
 
-```json
-{
-  "state": {"tier": 3, "round": 12, "best_speedup": 1.52},
-  "baseline": {"total_ns": 3655.6, "bottleneck_type": "memory_bandwidth"},
-  "history": [
-    {"round": 1, "tier": 1, "strategy": "...", "speedup": 1.0, "decision": "KEEP"},
-    ...
-  ]
-}
-```
+| 文件 | round0 | roundN | 写入者 |
+|---|---|---|---|
+| `kernel.py` | ✅ 原始 | ✅ Coder修改 | Orchestrator / Coder |
+| `benchmark_result.json` | ✅ | ✅ | hardware_runner |
+| `msprof/` | ✅ | ✅ | msprof_analyzer |
+| `hivmir/` | ✅ | ✅ | hivmir_analyzer / compiler |
+| `merged/` | ✅ | ✅ | dsl_merger |
+| `plan.md` | — | ✅ | Planner |
+| `plan.json` | — | ✅ | Planner |
+| `diff.patch` | — | ✅ | Coder |
+| `optimization_record.json` | — | ✅ | RecordManager |
+| `verification.json` | — | ✅ | Verifier |
+| `AGENT_TASK_PLAN.md` | — | ✅ | Orchestrator |
+| `AGENT_TASK_CODE.md` | — | ✅ | Orchestrator |
 
 ---
 

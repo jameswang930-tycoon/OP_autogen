@@ -22,20 +22,18 @@ Softmax + GELU — Triton-Ascend 完整测试脚本 (多管线通路验证)
   python3 run_and_profile.py
   ls -la hivmir/
 
-  # ── 3. msprof 采集 softmax ──
+  # ── 3. msprof 采集 softmax (CANN 8.5.1: --application 已废弃, 命令直接放最后) ──
   msprof op \
-      --application="python3 run_and_profile.py" \
       --kernel-name=softmax_kernel \
-      --aic-metrics=PipeUtilization,ResourceConflictRatio,PMSampling \
-      --output=./msprof_softmax
+      --output=./msprof_softmax \
+      python3 run_and_profile.py
   ls -la msprof_softmax/OPPROF_*/
 
   # ── 4. msprof 采集 gelu ──
   msprof op \
-      --application="python3 run_and_profile.py" \
       --kernel-name=fused_gelu_kernel \
-      --aic-metrics=PipeUtilization,ResourceConflictRatio,PMSampling \
-      --output=./msprof_gelu
+      --output=./msprof_gelu \
+      python3 run_and_profile.py
   ls -la msprof_gelu/OPPROF_*/
 
 ════════════════════════════════════════════════════════════════════════════

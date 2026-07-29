@@ -1,20 +1,28 @@
 #!/bin/bash
 # ═════════════════════════════════════════════════════════════════════════════════
-#  Step 1: Triton .py → HIVM MLIR + msprof simulator trace
+#  Step 1: Triton .py → HIVM MLIR + msprof op simulator trace
 #  CANN 8.5.1 + triton-ascend 3.5.x + Ascend 910B3
 # ═════════════════════════════════════════════════════════════════════════════════
 #
-#  服务器上执行:
+#  服务器执行:
 #    cd triton_agent_optimizer/input/softmax
 #    bash step1_compile_simulator.sh [softmax_kernel|fused_gelu_kernel]
 #
 # ═════════════════════════════════════════════════════════════════════════════════
-#  已知问题:
-#   - aicpu_legacy.tar.gz warning → CANN 可选包, 忽略, 不影响功能
-#   - triton-ascend 3.5.x: kernel.npuir.mlir 可能不生成 (pass 重命名 bug)
-#     来源: https://gitcode.com/Ascend/triton-ascend/blob/release/3.5.x/docs/zh/FAQ.md
-#     修复: 合并请求 !1656, 如未修复则只有 .ttir.mlir + .ttadapter.mlir
-#   - 大量 INFO 日志 → triton JIT 编译正常输出, PIPE 到文件即可
+#  已知 CANN 8.5 问题 (全部搜自官方文档/博客):
+#
+#  1. TRITON_DISABLE_CACHE Ascend 后端不生效 → 用 TRITON_ALWAYS_COMPILE=1
+#  2. msprof op simulator CANN 8.5 bug: OPPROF dump 有但 simulator 子目录空
+#     → "GetOutputPathFromRemote failed" (解析阶段失败, 即使仿真本身成功)
+#     → 尝试 --dump on 触发 dump 生成
+#  3. triton-ascend 3.5.x: kernel.npuir.mlir 不生成 (pass 重命名, 需 MR !1656)
+#  4. aicpu_legacy.tar.gz: CANN 可选包, 忽略
+#  5. taskfailcallbackmanager: triton 内部类名, 非报错
+#
+#  参考:
+#   https://github.com/triton-lang/triton-ascend/blob/main/docs/en/debug_guide/profiling.md
+#   https://gitcode.com/cann/asc-devkit/blob/.../msProf/README_en.md
+#   https://gitcode.com/Ascend/triton-ascend/blob/release/3.5.x/docs/zh/FAQ.md
 # ═════════════════════════════════════════════════════════════════════════════════
 
 KERNEL="${1:-softmax_kernel}"
@@ -23,204 +31,218 @@ cd "$HERE"
 LOG_DIR="$HERE/step1_logs"
 mkdir -p "$LOG_DIR"
 
-ERRORS=""
-WARNS=""
-OKS=""
-
-add_err()  { ERRORS="$ERRORS\n  [ERROR] $*"; }
-add_warn() { WARNS="$WARNS\n  [WARN] $*"; }
-add_ok()   { OKS="$OKS\n  [OK] $*"; }
+# ── 辅助函数 ──
+ERRORS=""; WARNS=""; OKS=""
+add_err()  { echo -e "  \033[31m[ERROR]\033[0m $*"; ERRORS="$ERRORS\n  [ERROR] $*"; }
+add_warn() { echo -e "  \033[33m[WARN]\033[0m  $*"; WARNS="$WARNS\n  [WARN] $*"; }
+add_ok()   { echo -e "  \033[32m[OK]\033[0m    $*"; OKS="$OKS\n  [OK] $*"; }
+_chk()     { if eval "$2"; then add_ok "$1"; else add_err "$1"; fi; }
 
 echo "=============================================="
-echo " Step 1: HIVM MLIR + msprof simulator trace"
+echo " Step 1: HIVM MLIR + msprof op simulator"
 echo " kernel: $KERNEL"
-echo " logs:   $LOG_DIR"
 echo "=============================================="
 
-# ── 检查 triton-ascend 版本 ──
+# ── 环境信息 ──
 echo ""
-echo "── 环境信息 ──"
-python3 -c "import triton; print('triton version:', getattr(triton, '__version__', 'unknown'))" 2>/dev/null || add_warn "无法获取 triton 版本"
+echo "── 环境 ──"
+python3 -c "import triton; print('triton:', getattr(triton, '__version__', '?'))" 2>/dev/null || true
 python3 -c "import torch_npu; print('torch_npu:', torch_npu.__version__)" 2>/dev/null || true
-echo "CANN_HOME: ${ASCEND_HOME:-${ASCEND_TOOLKIT_HOME:-未设置}}"
-
-# ── 清理旧产物 ──
-rm -rf ~/.triton/dump/ 2>/dev/null || true
-rm -rf "$HERE/hivmir" 2>/dev/null || true
-rm -rf "$HERE/msprof_sim" 2>/dev/null || true
-
-# ═════════════════════════════════════════════════════════════════════════════════
-#  1a. HIVM MLIR 提取
-# ═════════════════════════════════════════════════════════════════════════════════
+echo "npu-smi: $(npu-smi info -l 2>/dev/null | head -1 || echo 'N/A')"
+echo "CANN:    ${ASCEND_HOME:-${ASCEND_TOOLKIT_HOME:-未设置}}"
 echo ""
-echo "── 1a. 提取 HIVM MLIR (TRITON_DEBUG=1) ──"
+
+# ── 强制清理 ──
+rm -rf ~/.triton/cache/ ~/.triton/dump/ 2>/dev/null || true
+rm -rf "$HERE/hivmir" "$HERE/msprof_sim" 2>/dev/null || true
+
+# ═════════════════════════════════════════════════════════════════════════════════
+#  第1步: 提取 HIVM MLIR
+# ═════════════════════════════════════════════════════════════════════════════════
+echo "── 1. HIVM MLIR ──"
 
 export TRITON_DEBUG=1
-export TRITON_DISABLE_CACHE=1
+export TRITON_ALWAYS_COMPILE=1
 
-# 抑制 INFO 日志, 只保留关键输出
-python3 run_and_profile.py > "$LOG_DIR/triton_run.log" 2>&1
-TRITON_RC=$?
+python3 run_and_profile.py > "$LOG_DIR/triton.log" 2>&1
+echo "Triton 退出码: $?"
 
-# 从日志中提取 dump 路径
-DUMP_PATH=$(grep -oP 'Dumping intermediate results to \K.*' "$LOG_DIR/triton_run.log" 2>/dev/null | head -1)
-echo "Triton 退出码: $TRITON_RC"
-
-# ── 查找 dump 文件 ──
-FOUND_MLIRS=""
 DUMP_DIR=$(ls -dt ~/.triton/dump/*/ 2>/dev/null | head -1)
+CACHE_MLIRS=$(find ~/.triton/cache -name "*.mlir" -o -name "*.ttir" -o -name "*.ttadapter" -o -name "*.npuir" 2>/dev/null)
+
+mkdir -p "$HERE/hivmir"
 
 if [ -n "$DUMP_DIR" ]; then
     echo "dump 目录: $DUMP_DIR"
-    FOUND_MLIRS=$(find "$DUMP_DIR" -type f \( -name "*.mlir" -o -name "*.ttir" -o -name "*.ttadapter" -o -name "*.npuir" \) 2>/dev/null)
-fi
-
-# 也检查 triton cache 目录 (编译产物可能在里面)
-CACHE_DIR=$(ls -dt ~/.triton/cache/*/ 2>/dev/null | head -1)
-if [ -n "$CACHE_DIR" ]; then
-    echo "cache 目录: $CACHE_DIR"
-    CACHE_MLIRS=$(find "$CACHE_DIR" -type f \( -name "*.mlir" -o -name "*.o" \) 2>/dev/null)
-fi
-
-# ── 拷贝 .mlir 文件 ──
-mkdir -p "$HERE/hivmir"
-
-if [ -n "$FOUND_MLIRS" ]; then
-    echo ""
-    echo "找到的 MLIR 文件:"
-    echo "$FOUND_MLIRS"
-    echo "$FOUND_MLIRS" | while read f; do
-        [ -f "$f" ] && cp "$f" "$HERE/hivmir/" && echo "  已拷贝: $(basename "$f")"
+    find "$DUMP_DIR" -type f 2>/dev/null | while read f; do
+        cp "$f" "$HERE/hivmir/" && echo "  + $(basename "$f") ($(wc -c < "$f") bytes)"
     done
-    add_ok "HIVM MLIR: $(echo "$FOUND_MLIRS" | wc -l) 个文件"
+elif [ -n "$CACHE_MLIRS" ]; then
+    echo "dump 为空, 从 cache 提取:"
+    echo "$CACHE_MLIRS" | while read f; do
+        cp "$f" "$HERE/hivmir/" && echo "  + cache→hivmir: $(basename "$f")"
+    done
 else
-    add_err "HIVM MLIR: 未找到任何 .mlir 文件"
-    echo ""
-    echo "  检查以下位置:"
-    echo "    ~/.triton/dump/     → $(ls ~/.triton/dump/ 2>/dev/null | wc -l) 个子目录"
-    echo "    ~/.triton/cache/    → $(ls ~/.triton/cache/ 2>/dev/null | wc -l) 个子目录"
-
-    # 尝试从 cache 拷贝 .o 文件 (可能编译成功但没有 dump)
-    if [ -n "$CACHE_DIR" ] && ls "$CACHE_DIR"/*.o 2>/dev/null; then
-        cp "$CACHE_DIR"/*.o "$HERE/hivmir/" 2>/dev/null
-        add_warn "只有 .o 编译产物, 无 .mlir (triton-ascend 3.5.x pass 重命名 bug)"
-        echo "  备选: 拷贝了 .o 文件, 可用 bishengir-opt 反编译回 MLIR"
-    fi
-
-    # 检查 triton 运行日志是否有编译错误
-    if grep -qi "error\|ERROR\|FAIL" "$LOG_DIR/triton_run.log" 2>/dev/null; then
-        echo ""
-        echo "  !! triton 日志中有错误:"
-        grep -i "error\|ERROR\|FAIL" "$LOG_DIR/triton_run.log" | head -10
-    fi
+    echo "!! dump 和 cache 都没有 .mlir/.ttir 文件"
 fi
+
+HIVM_COUNT=$(find "$HERE/hivmir" -type f 2>/dev/null | wc -l)
+_chk "HIVM MLIR: $HIVM_COUNT 个文件" '[ "$HIVM_COUNT" -gt 0 ]'
 
 echo ""
-echo "hivmir/ 产物:"
+echo "hivmir/:"
 ls -la "$HERE/hivmir/" 2>/dev/null || echo "  (空)"
 
+# HIVM 文件类型检查
+echo "文件类型:"
+for f in "$HERE/hivmir/"*; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f")
+    if file "$f" 2>/dev/null | grep -q "text"; then
+        echo "  $name → 文本文件 (OK)"
+    else
+        echo "  $name → 可能是二进制, 前80字符: $(head -c 80 "$f" 2>/dev/null | tr -d '\0')"
+    fi
+done
+
 # ═════════════════════════════════════════════════════════════════════════════════
-#  1b. msprof op simulator
+#  第2步: msprof op simulator
 # ═════════════════════════════════════════════════════════════════════════════════
 echo ""
-echo "── 1b. msprof op simulator 采集 ──"
+echo "── 2. msprof op simulator ──"
 
 # 找 simulator lib
 SIM_LIB=""
 for d in "${ASCEND_TOOLKIT_HOME:-}/tools/simulator/Ascend910B3/lib" \
          "${ASCEND_HOME:-}/tools/simulator/Ascend910B3/lib" \
+         "${ASCEND_HOME:-}/tools/simulator/dav_2201/lib" \
          "/usr/local/Ascend/ascend-toolkit/latest/tools/simulator/Ascend910B3/lib" \
          "/usr/local/Ascend/cann/tools/simulator/Ascend910B3/lib" \
-         "/usr/local/Ascend/tools/simulator/Ascend910B3/lib"; do
-    if [ -d "$d" ]; then SIM_LIB="$d"; break; fi
+         "/usr/local/Ascend/cann/tools/simulator/dav_2201/lib"; do
+    [ -d "$d" ] && { SIM_LIB="$d"; break; }
 done
 
-MSPROF_SIM_OK=0
 if [ -z "$SIM_LIB" ]; then
-    add_warn "msprof simulator: 未找到 simulator lib (可能不在此环境)"
-    echo "  查找路径: \$CANN_HOME/tools/simulator/Ascend910B3/lib"
+    echo "!! 未找到 simulator lib"
+    echo "   搜索路径:"
+    for d in /usr/local/Ascend/ascend-toolkit/latest/tools/simulator/*/lib \
+             /usr/local/Ascend/cann/tools/simulator/*/lib; do
+        [ -d "$d" ] && echo "   存在: $d"
+    done
+    add_err "SIM LIB: 未找到 → 无法运行 simulator"
 else
     export LD_LIBRARY_PATH="$SIM_LIB:$LD_LIBRARY_PATH"
     echo "SIM lib: $SIM_LIB"
+    echo "LD_LIBRARY_PATH 已设置"
+fi
 
-    msprof op simulator \
-        --kernel-name="$KERNEL" \
-        --soc-version=Ascend910B3 \
-        --output="$HERE/msprof_sim" \
-        python3 run_and_profile.py > "$LOG_DIR/msprof_simulator.log" 2>&1 || true
+# ── 跑 msprof op simulator ──
+echo ""
+echo "执行 msprof op simulator (stdout/stderr → $LOG_DIR/msprof_sim.log)..."
 
-    OPPROF=$(ls -dt "$HERE/msprof_sim"/OPPROF_*/ 2>/dev/null | head -1)
-    if [ -n "$OPPROF" ]; then
-        INSTRS=$(find "$OPPROF" -name "*_instr_exe.csv" 2>/dev/null | head -1)
-        if [ -n "$INSTRS" ]; then
-            add_ok "msprof simulator: $(basename "$OPPROF") ($(wc -l < "$INSTRS") 条指令)"
-            MSPROF_SIM_OK=1
+msprof op simulator \
+    --kernel-name="$KERNEL" \
+    --soc-version=Ascend910B3 \
+    --dump=on \
+    --output="$HERE/msprof_sim" \
+    python3 run_and_profile.py > "$LOG_DIR/msprof_sim.log" 2>&1
+MSPROF_RC=$?
+echo "msprof 退出码: $MSPROF_RC"
+
+# ── 诊断 msprof 输出 ──
+echo ""
+echo "msprof 日志关键信息:"
+grep -i "error\|fail\|warn\|dump\|profiling data" "$LOG_DIR/msprof_sim.log" 2>/dev/null \
+    | grep -v "taskfailcallbackmanager\|TaskFailCallbackManager" \
+    | head -20 || echo "  (无)"
+
+OPPROF_DIR=$(ls -dt "$HERE/msprof_sim"/OPPROF_*/ 2>/dev/null | head -1)
+
+if [ -z "$OPPROF_DIR" ]; then
+    add_err "msprof simulator: OPPROF 目录未生成"
+    echo ""
+    echo "  msprof 日志全文 (最后40行):"
+    tail -40 "$LOG_DIR/msprof_sim.log" 2>/dev/null
+else
+    echo ""
+    echo "OPPROF: $OPPROF_DIR"
+    echo "OPPROF 顶层:"
+    ls -la "$OPPROF_DIR/" 2>/dev/null
+
+    echo ""
+    echo "OPPROF 完整目录树:"
+    find "$OPPROF_DIR" -type f 2>/dev/null | head -50 || echo "  (空)"
+
+    # 检查 simulator 子目录
+    SIM_SUBDIR="$OPPROF_DIR/simulator"
+    if [ -d "$SIM_SUBDIR" ]; then
+        SIM_FILES=$(find "$SIM_SUBDIR" -type f 2>/dev/null | wc -l)
+        INSTRS=$(find "$SIM_SUBDIR" -name "*_instr_exe.csv" 2>/dev/null | wc -l)
+        TRACES=$(find "$SIM_SUBDIR" -name "trace.json" 2>/dev/null | wc -l)
+
+        _chk "simulator/ 存在: $SIM_FILES 个文件" '[ "$SIM_FILES" -gt 0 ]'
+        echo "  instr_exe.csv: $INSTRS"
+        echo "  trace.json:    $TRACES"
+
+        if [ "$SIM_FILES" -gt 0 ]; then
+            add_ok "msprof simulator 采集成功"
         else
-            add_warn "msprof simulator: OPPROF 目录生成但无 instr_exe.csv"
+            add_warn "msprof simulator: simulator/ 为空 (已知 CANN bug: GetOutputPathFromRemote failed)"
+            echo ""
+            echo "  原因 (CANN 文档+社区确认):"
+            echo "  1. CANN 8.5 解析阶段 bug — 仿真成功但解析失败"
+            echo "  2. 尝试升级 CANN 版本"
+            echo "  3. 备选: 用 msprof op (真机模式) 采集 PipeUtilization.csv"
+            echo "  4. 备选: 用 bishengir-opt 从 .mlir 做 IR 层面分析"
         fi
     else
-        add_warn "msprof simulator: 未生成 OPPROF 目录"
+        add_err "msprof simulator: simulator/ 子目录不存在"
+        echo ""
+        echo "  OPPROF 内容:"
+        ls -laR "$OPPROF_DIR/" 2>/dev/null | head -30
+    fi
+
+    # 检查 dump 目录 (原始仿真数据)
+    if [ -d "$OPPROF_DIR/dump" ]; then
+        DUMP_FILES=$(find "$OPPROF_DIR/dump" -type f 2>/dev/null | wc -l)
+        echo ""
+        echo "  dump/ 原始数据: $DUMP_FILES 个文件"
+        [ "$DUMP_FILES" -gt 0 ] && echo "  (仿真成功, 但解析阶段可能失败)"
     fi
 fi
 
-# ── 备选: 真机 msprof op ──
-if [ "$MSPROF_SIM_OK" = "0" ]; then
-    echo ""
-    echo "── 1b备选: 真机 msprof op (simulator 不可用) ──"
-    MSPROF_BIN=$(command -v msprof 2>/dev/null || echo "")
-    if [ -n "$MSPROF_BIN" ]; then
-        rm -rf "$HERE/msprof_timing" 2>/dev/null || true
-        msprof op \
-            --kernel-name="$KERNEL" \
-            --output="$HERE/msprof_timing" \
-            python3 run_and_profile.py > "$LOG_DIR/msprof_op.log" 2>&1 || true
-
-        OPPROF_HW=$(ls -dt "$HERE/msprof_timing"/OPPROF_*/ 2>/dev/null | head -1)
-        if [ -n "$OPPROF_HW" ]; then
-            add_ok "msprof 真机: $(basename "$OPPROF_HW")"
-            ls "$OPPROF_HW"/*.csv 2>/dev/null | while read f; do
-                echo "  $(basename "$f") ($(wc -l < "$f") lines)"
-            done
-        else
-            add_warn "msprof 真机: 也未生成 OPPROF 目录"
-        fi
-    fi
-fi
+# ── 检查 msprof 工具本身 ──
+echo ""
+echo "── msprof 工具版本 ──"
+msprof --version 2>/dev/null | head -3 || echo "  无法获取版本"
+echo "msprof 路径: $(command -v msprof 2>/dev/null || echo '未找到')"
 
 # ═════════════════════════════════════════════════════════════════════════════════
 #  汇总
 # ═════════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "=============================================="
-echo " Step 1 完成 — 诊断汇总"
+echo " Step 1 汇总"
 echo "=============================================="
 
-echo -e "$OKS"
-echo -e "$WARNS"
-echo -e "$ERRORS"
+echo ""
+echo "── 产物 ──"
+echo "hivmir:       $(find "$HERE/hivmir" -type f 2>/dev/null | wc -l) files"
+echo "msprof_sim:   $(find "$HERE/msprof_sim" -type f 2>/dev/null | wc -l) files"
+echo "日志:         $LOG_DIR"
 
 echo ""
-echo "── 产物清单 ──"
-echo "hivmir/       ($(find "$HERE/hivmir" -type f 2>/dev/null | wc -l) files)"
-find "$HERE/hivmir" -type f 2>/dev/null | while read f; do
-    echo "  $(basename "$f") ($(wc -c < "$f") bytes)"
-done
-
-echo "msprof_sim/   ($(find "$HERE/msprof_sim" -type f 2>/dev/null | wc -l) files)"
-echo "msprof_timing/ ($(find "$HERE/msprof_timing" -type f 2>/dev/null | wc -l) files)"
-echo "日志:         $LOG_DIR/"
+echo "── 日志摘要 ──"
+echo "triton log ($(wc -l < "$LOG_DIR/triton.log" 2>/dev/null || echo 0) lines):"
+tail -5 "$LOG_DIR/triton.log" 2>/dev/null || true
 
 echo ""
-echo "── triton 运行日志 (最后 20 行) ──"
-tail -20 "$LOG_DIR/triton_run.log" 2>/dev/null || echo "  (无日志)"
-
-echo ""
-echo "下一步:"
-if ls "$HERE/hivmir/"*.mlir 2>/dev/null || ls "$HERE/hivmir/"*.ttir 2>/dev/null; then
+echo "── 下一步 ──"
+if [ "$HIVM_COUNT" -gt 0 ]; then
     echo "  bash step2_parse_hivm.sh"
 fi
 if ls "$HERE/msprof_sim"/OPPROF_*/simulator/*/*_instr_exe.csv 2>/dev/null; then
     echo "  bash step3_parse_msprof.sh"
-elif ls "$HERE/msprof_timing"/OPPROF_*/*.csv 2>/dev/null; then
-    echo "  (真机 msprof 数据需手动解析)"
+else
+    echo "  (msprof simulator 未产出 instr_exe.csv, 需排查)"
 fi

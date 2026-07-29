@@ -1,69 +1,34 @@
 #!/usr/bin/env python3
 """
-Softmax + GELU — Triton-Ascend 完整测试脚本 (多管线通路验证)
+Softmax + GELU — Triton-Ascend 完整测试脚本
+════════════════════════════════════════════════════════════════════════════
+  全部在服务器上封闭执行 (CANN 8.5.1 + triton-ascend 3.5.x + Ascend 910B3):
+════════════════════════════════════════════════════════════════════════════
 
-════════════════════════════════════════════════════════════════════════════
-  服务器执行命令 (CANN 8.5.1 + triton-ascend 3.5.x):
-════════════════════════════════════════════════════════════════════════════
-  # 进入目标目录
   cd triton_agent_optimizer/input/softmax
-
-  # ── 0. 先确认 msprof 语法 (CANN 8.5.1 可能参数名不同) ──
-  msprof --help
-  msprof op --help
 
   # ── 1. 验证正确性 ──
   python3 run_and_profile.py
 
-  # ── 2. 提取 HIVM MLIR (TRITON_KERNEL_DUMP 支持自定义输出路径) ──
-  export TRITON_KERNEL_DUMP=1
-  export TRITON_DUMP_DIR=./hivmir
-  export TRITON_ALWAYS_COMPILE=1
-  python3 run_and_profile.py
-  ls -la hivmir/
+  # ── 2. 编译采集 (HIVM MIR + msprof op simulator) ──
+  bash step1_compile_simulator.sh
 
-  # ── 3. msprof 采集 softmax (CANN 8.5.1: --application 已废弃, 命令直接放最后) ──
-  msprof op \
-      --kernel-name=softmax_kernel \
-      --output=./msprof_softmax \
-      python3 run_and_profile.py
-  ls -la msprof_softmax/OPPROF_*/
+  # ── 3. 解析 HIVM MI → 11 语义字段 ──
+  bash step2_parse_hivm.sh
 
-  # ── 4. msprof 采集 gelu ──
-  msprof op \
-      --kernel-name=fused_gelu_kernel \
-      --output=./msprof_gelu \
-      python3 run_and_profile.py
-  ls -la msprof_gelu/OPPROF_*/
+  # ── 4. 解析 msprof trace → 14 时序字段 ──
+  bash step3_parse_msprof.sh
 
-════════════════════════════════════════════════════════════════════════════
-  服务器产出物 (全部在 cd 到的 softmax/ 目录):
-════════════════════════════════════════════════════════════════════════════
+  # ── 5. 合并 → 29 字段全填充 ──
+  bash step4_merge.sh
 
-  input/softmax/
-  ├── run_and_profile.py
-  ├── triton_kernel.py
-  ├── hivmir/                          ← HIVM MLIR 拷到这里
-  ├── msprof_softmax/OPPROF_xxx/       ← msprof 时序 (softmax)
-  └── msprof_gelu/OPPROF_xxx/          ← msprof 时序 (gelu)
+  产物:
+    hivmir/hivmir_report.json        ← 11 语义字段
+    msprof_sim/pipeline_report.json  ← 14 时序字段
+    merged_report.json               ← 29 字段
+    final_report_llm.txt             ← LLM 可读文本
 
-════════════════════════════════════════════════════════════════════════════
-  分析流程 (Windows 端):
-════════════════════════════════════════════════════════════════════════════
-
-  # 5. HIVM 解析 → 11 字段
-  python3 analyzers/hivmir_analyzer.py input/softmax/hivmir/softmax_kernel.npuir.mlir
-
-  # 6. msprof trace 解析 → 14 字段
-  python3 analyzers/msprof_analyzer.py input/softmax/msprof_softmax/OPPROF_*/
-
-  # 7. 合并 → 29 字段
-  python3 analyzers/dsl_merger.py ...
-
-  # 8. 瓶颈诊断 → Planner prompt
-  ...
-
-════════════════════════════════════════════════════════════════════════════
+  完整文档: PIPELINE_DOCS.md
 """
 import os
 import torch

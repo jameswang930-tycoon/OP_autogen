@@ -1,6 +1,52 @@
-# Triton Agent Optimizer — 完整架构设计
+# Triton Agent Optimizer — 完整架构设计 (v3.0)
 
-> **核心差异化优势**: 不靠盲试（AutoKernel 300~400轮），而是通过 **DSL 流水线分析 (HIVMIR + msprof op simulator)** 精确诊断瓶颈——知道哪个 op、哪个引擎、带宽利用率多少、为什么慢、该改什么参数。精准度比盲试高一个数量级。
+> **核心差异化优势**: 不靠盲试（AutoKernel 300~400轮），而是通过 **Triton→TTIR→HIVM + msprof op simulator** 精确诊断瓶颈——知道哪个 op、哪个引擎、带宽利用率多少、为什么慢、该改什么参数。精准度比盲试高一个数量级。
+>
+> **环境**: WSL2 Ubuntu 24.04 + CANN 9.0 + triton 2.3.1 (无需 NPU 硬件，纯 CPU 闭环)
+> **更新**: 2026-07-28 — Triton .py → HIVM MLIR 全自动化链路打通
+
+---
+
+## 0. 完整数据流 (已验证闭环)
+
+```
+Triton Kernel (.py)
+  │  triton 2.3.1 (ast_to_ttir, 纯CPU)
+  ▼
+TTIR MLIR (triton intermediate representation)
+  │  ttir_to_hivm.py (自研转换器)
+  ▼
+HIVM MLIR (Ascend NPU 指令级 IR)
+  │                        │
+  │  hivmir_analyzer.py    │  bishengir-compile → .o
+  │  解析 11 语义字段       │  → msprof op simulator
+  ▼                        ▼
+HIVM Report              OPPROF_xxx/
+(ops, buffers, deps)       ├── trace.json
+                           └── instr_exe.csv
+                              │
+                              │  msprof_analyzer.py
+                              ▼
+                           msprof Report
+                           (14 timing/pipe 字段)
+                              │
+  └────────── dsl_merger.py ──┘
+              ▼
+         29 字段全填充 merged_report.json
+              │
+              ▼
+         Planner (LLM) → Coder (LLM) → Verifier → RecordManager
+```
+
+### 环境需求
+
+| 步骤 | 环境 | 工具 |
+|---|---|---|
+| Triton .py → TTIR | WSL2 + CUDA driver | triton 2.3.1 + LD_PRELOAD stub |
+| TTIR → HIVM | 任何 Python | ttir_to_hivm.py (自研) |
+| HIVM MLIR compile | WSL2 + CANN 9.0 | bishengir-compile |
+| msprof trace | WSL2 + CANN 9.0 | msprof op simulator |
+| Analyer + Optimizer | 任何 Python | hivmir/msprof/dsl_merger analyzer |
 
 ---
 

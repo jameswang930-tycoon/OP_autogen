@@ -9,6 +9,7 @@ dist/
 build/
 *.egg
 .eggs/
+*.so
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Virtual environment
@@ -17,7 +18,6 @@ build/
 venv/
 env/
 *.venv
-pip-wheel-metadata/
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  IDE & Editor
@@ -32,77 +32,65 @@ Thumbs.db
 Desktop.ini
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Project: Model files (large binaries, not in git)
+#  Secrets — .env contains API keys, NEVER commit
+#  .env.template IS committed (no secrets, just field names)
 # ═══════════════════════════════════════════════════════════════════════════
-models/
+.env
+!.env.template
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Project: Memory runtime artifacts (auto-generated at first run)
+#  Generated outputs — all runtime artifacts
 # ═══════════════════════════════════════════════════════════════════════════
-memory/experience/
-memory/runlog/
-memory/__pycache__/
+outputs/
+output/
+rounds/
+triton_agent_optimizer/output/
+triton_agent_optimizer/outputs/
+triton_agent_optimizer/rounds/
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Project: Cost model — vendored subtree, read-only
-#  cost_emulator/ is tracked; archaludon/ is excluded
-# ═══════════════════════════════════════════════════════════════════════════
-costModel/archaludon/
-costModel/__pycache__/
-costModel/cost_emulator/__pycache__/
-costModel/cost_emulator/saved_sessions/*.json
-costModel/cost_emulator/experiments/**/bench_result.csv
-costModel/cost_emulator/experiments/**/*.png
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Project: Emulator — plan files (generated per-op, not shared)
+#  Emulator — generated per-op plan files
 # ═══════════════════════════════════════════════════════════════════════════
 emulators/test/**/.plan.json
-emulators/test/**/__pycache__/
-emulators/__pycache__/
-emulators/common/__pycache__/
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Project: Emulator — generated chart images
+#  msprof simulator test — generated trace data + binaries
 # ═══════════════════════════════════════════════════════════════════════════
-emulators/test/**/*.png
+msprof_simulator_test/output/
+msprof_simulator_test/build/
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Project: Fusion Pipeline — generated output
+#  Paper reference — external repo copy, not our code
 # ═══════════════════════════════════════════════════════════════════════════
-fusion_pipeline/__pycache__/
-fusion_pipeline/example_output/
-fusion_pipeline/hivmir_output/
+paper_reference/
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Project: Triton Agent Optimizer — runtime artifacts
+#  Local dev notes — session summaries, not needed on server
 # ═══════════════════════════════════════════════════════════════════════════
-triton_agent_optimizer/__pycache__/
-triton_agent_optimizer/**/__pycache__/
-triton_agent_optimizer/output/
-triton_agent_optimizer/rounds/
-triton_agent_optimizer/outputs/
+claude_resume_summary/
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Project: Temp / debug files
+#  Temp & logs
 # ═══════════════════════════════════════════════════════════════════════════
 tmp/
+temp/
 *.tmp
 *.log
 *.bak
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Claude Code — local settings (per-machine, not shared)
+#  Large binaries
 # ═══════════════════════════════════════════════════════════════════════════
-.claude/settings.local.json
-.claude/settings.json
-.claude/worktrees/
+*.o
+*.run
+*.bin
+*.png
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Generated chart images (don't track binary plots)
+#  Claude Code — per-machine settings
 # ═══════════════════════════════════════════════════════════════════════════
-example_output/
-*.png
+.claude/settings.local.json
+.claude/worktrees/
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Jupyter
@@ -117,3 +105,8 @@ htmlcov/
 .coverage
 .coverage.*
 *.prof
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  OS junk
+# ═══════════════════════════════════════════════════════════════════════════
+__MACOSX/

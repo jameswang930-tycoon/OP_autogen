@@ -1,0 +1,207 @@
+{
+  "meta": {
+    "source": "hivmir_compiler_trace",
+    "generated_at": "2026-07-23T15:19:21.364104",
+    "hivmir_file_path": "(compiler trace output)",
+    "hivmir_fields_provided": [
+      "op_id",
+      "op_type",
+      "instruction",
+      "dst",
+      "src",
+      "src2",
+      "size_kb",
+      "memory_region_dst",
+      "memory_region_src",
+      "variable_name",
+      "address_offset",
+      "line_number",
+      "dependencies (RAW/WAR/WAW)",
+      "buffer_info (producers/consumers)"
+    ],
+    "hivmir_fields_missing_need_msprof": [
+      "start_ns",
+      "end_ns",
+      "duration_ns",
+      "time_ratio",
+      "engine",
+      "pipeline_channel",
+      "effective_bw",
+      "peak_bw",
+      "bw_utilization",
+      "regime",
+      "wait_before_start_ns",
+      "total_ns",
+      "execution_mode",
+      "engine_utilization",
+      "bandwidth_utilization",
+      "parallelism",
+      "critical_path"
+    ],
+    "note": "标记为'待补充'的字段 HIVMIR 无法提供, 由 msprof trace.json 补充 (timing/bandwidth/regime)"
+  },
+  "execution_summary": {
+    "total_ns": "待补充",
+    "num_ops": 3,
+    "execution_mode": "待补充"
+  },
+  "time_breakdown": "待补充",
+  "per_op_statistics": [
+    {
+      "op_id": 0,
+      "op_type": "gm_to_ub",
+      "engine": "GM→UB",
+      "instruction": "gm_to_ub(ub_1, gm_1)",
+      "dst": "ub_1",
+      "src": "gm_1",
+      "src2": "",
+      "scalar": 0.0,
+      "size_kb": 128.0,
+      "memory_region_dst": "UB",
+      "memory_region_src": "GM",
+      "variable_name": "ub_1",
+      "address_offset": "",
+      "line_number": 4,
+      "duration_ns": "待补充",
+      "start_ns": "待补充",
+      "end_ns": "待补充",
+      "time_ratio": "待补充",
+      "effective_bw_gb_s": "待补充",
+      "peak_bw_gb_s": "待补充",
+      "bw_utilization": "待补充",
+      "regime": "待补充",
+      "wait_before_start_ns": "待补充",
+      "pipeline_channel": "待补充",
+      "dependencies": []
+    },
+    {
+      "op_id": 1,
+      "op_type": "vadd",
+      "engine": "VecUnit",
+      "instruction": "vadd(ub_2, ub_1, 3.0)",
+      "dst": "ub_2",
+      "src": "ub_1",
+      "src2": "",
+      "scalar": 3.0,
+      "size_kb": 128.0,
+      "memory_region_dst": "UB",
+      "memory_region_src": "UB",
+      "variable_name": "ub_2",
+      "address_offset": "",
+      "line_number": 5,
+      "duration_ns": "待补充",
+      "start_ns": "待补充",
+      "end_ns": "待补充",
+      "time_ratio": "待补充",
+      "effective_bw_gb_s": "待补充",
+      "peak_bw_gb_s": "待补充",
+      "bw_utilization": "待补充",
+      "regime": "待补充",
+      "wait_before_start_ns": "待补充",
+      "pipeline_channel": "待补充",
+      "dependencies": [
+        {
+          "from_op_id": 0,
+          "type": "RAW"
+        }
+      ]
+    },
+    {
+      "op_id": 2,
+      "op_type": "ub_to_gm",
+      "engine": "UB→GM",
+      "instruction": "ub_to_gm(gm_2, ub_2)",
+      "dst": "gm_2",
+      "src": "ub_2",
+      "src2": "",
+      "scalar": 0.0,
+      "size_kb": 128.0,
+      "memory_region_dst": "GM",
+      "memory_region_src": "UB",
+      "variable_name": "gm_2",
+      "address_offset": "",
+      "line_number": 6,
+      "duration_ns": "待补充",
+      "start_ns": "待补充",
+      "end_ns": "待补充",
+      "time_ratio": "待补充",
+      "effective_bw_gb_s": "待补充",
+      "peak_bw_gb_s": "待补充",
+      "bw_utilization": "待补充",
+      "regime": "待补充",
+      "wait_before_start_ns": "待补充",
+      "pipeline_channel": "待补充",
+      "dependencies": [
+        {
+          "from_op_id": 1,
+          "type": "RAW"
+        }
+      ]
+    }
+  ],
+  "engine_utilization": "待补充",
+  "bandwidth_utilization": "待补充",
+  "parallelism": "待补充",
+  "critical_path": "待补充",
+  "buffers": {
+    "gm_1": {
+      "region": "GM",
+      "size_kb": 128.0,
+      "producers": [],
+      "consumers": [
+        0
+      ]
+    },
+    "ub_1": {
+      "region": "UB",
+      "size_kb": 128.0,
+      "producers": [
+        0
+      ],
+      "consumers": [
+        1
+      ]
+    },
+    "ub_2": {
+      "region": "UB",
+      "size_kb": 128.0,
+      "producers": [
+        1
+      ],
+      "consumers": [
+        2
+      ]
+    },
+    "gm_2": {
+      "region": "GM",
+      "size_kb": 128.0,
+      "producers": [
+        2
+      ],
+      "consumers": []
+    }
+  },
+  "dependencies_summary": {
+    "total_dependencies": 2,
+    "raw": [
+      {
+        "from_op": 0,
+        "to_op": 1,
+        "type": "RAW",
+        "from_instruction": "gm_to_ub(ub_1, gm_1)",
+        "to_instruction": "vadd(ub_2, ub_1, 3.0)",
+        "buffer": "ub_1"
+      },
+      {
+        "from_op": 1,
+        "to_op": 2,
+        "type": "RAW",
+        "from_instruction": "vadd(ub_2, ub_1, 3.0)",
+        "to_instruction": "ub_to_gm(gm_2, ub_2)",
+        "buffer": "ub_2"
+      }
+    ],
+    "war": [],
+    "waw": []
+  }
+}

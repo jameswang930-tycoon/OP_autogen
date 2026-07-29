@@ -1,0 +1,16 @@
+==============================================
+ Triton Agent Optimizer — Environment Setup v3.0
+ Project: /d/vscodeproject/huawei_work/OP_autogen/OP_autogen_hjkc
+==============================================
+  Environment: local_windows
+
+--- CANN / Bisheng / msprof ---
+  \033[1;33m[WARN]\033[0m CANN set_env.sh not found
+  Install CANN 9.0+: download from https://www.hiascend.com
+  Install command: ./Ascend-cann-toolkit_9.x.x.run --full --install-path=/usr/local/Ascend
+
+--- cost_emulator (DSL → bandwidth/regime) ---
+  \033[0;32m[OK]\033[0m simulator.py: /d/vscodeproject/huawei_work/OP_autogen/OP_autogen_hjkc/costModel/cost_emulator/simulator.py
+  \033[1;33m[WARN]\033[0m Python import failed (need numpy?)
+
+--- Python ---

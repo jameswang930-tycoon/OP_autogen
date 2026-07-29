@@ -1,15 +1,15 @@
-"""分析层 —— msprof + HIVMIR 解析 + DSL 合并 + 瓶颈诊断 + 按需数据提取。"""
+"""分析层 v2.0 — HIVMIR(MLIR) + msprof(trace) + DSL 合并 + 瓶颈诊断 + 数据提取。"""
 
-from .msprof_analyzer import MsprofAnalyzer, TraceJsonParser, PipelineReport, PipelineOp
-from .hivmir_analyzer import HIVMIRAnalyzer, HIVMIRParser, HIVMIRReport, HIVMIROp, generate_mock_hivmir_from_dsl
-from .dsl_merger import merge, merge_round, format_llm, format_human
+from .hivmir_analyzer import HIVMIRAnalyzer, HIVMIRReport, HIVMIROp, BufferInfo
+from .msprof_analyzer import MsprofAnalyzer, MsprofReport, PipelineOp, InstrRecord
+from .dsl_merger import merge, merge_round, format_llm
 from .bottleneck_diagnoser import diagnose, diagnose_round, BottleneckDiagnosis
-from .data_extractor import extract
+from .data_extractor import extract, TIER_CONFIGS
 
 __all__ = [
-    "MsprofAnalyzer", "TraceJsonParser", "PipelineReport", "PipelineOp",
-    "HIVMIRAnalyzer", "HIVMIRParser", "HIVMIRReport", "HIVMIROp", "generate_mock_hivmir_from_dsl",
-    "merge", "merge_round", "format_llm", "format_human",
+    "HIVMIRAnalyzer", "HIVMIRReport", "HIVMIROp", "BufferInfo",
+    "MsprofAnalyzer", "MsprofReport", "PipelineOp", "InstrRecord",
+    "merge", "merge_round", "format_llm",
     "diagnose", "diagnose_round", "BottleneckDiagnosis",
-    "extract",
+    "extract", "TIER_CONFIGS",
 ]

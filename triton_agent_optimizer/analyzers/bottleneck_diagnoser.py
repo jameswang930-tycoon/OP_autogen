@@ -142,6 +142,16 @@ def diagnose(merged_report: dict, current_tier: int = 1) -> BottleneckDiagnosis:
         BottleneckDiagnosis 结构化诊断结果
     """
     ops = merged_report.get("per_op_statistics", [])
+    if not ops:
+        print("  [DIAG] WARNING: no ops in merged_report, skipping diagnosis")
+        return BottleneckDiagnosis(
+            bottleneck_op_id=-1, bottleneck_op_type="?", bottleneck_engine="?",
+            bottleneck_time_ratio=0, bottleneck_bw_utilization=0,
+            bottleneck_regime="?", on_critical_path=False,
+            bottleneck_type="unknown", bottleneck_category="UNKNOWN",
+            optimization_headroom="NONE", headroom_reason="No ops to diagnose",
+            current_tier=current_tier, tier_name=f"Tier {current_tier}",
+        )
     summary = merged_report.get("execution_summary", {})
     engine_util = merged_report.get("engine_utilization", {})
     cp = merged_report.get("critical_path", {})
@@ -253,10 +263,16 @@ def _find_candidates(
     # 在关键路径上的排前面
     for c in candidates:
         if c["op_id"] in cp_ops:
-            c["score"] += 100
+            c["score"] = c.get("score", 0) + 100
     # 时间占比大的排前面
     for c in candidates:
-        c["score"] += c.get("time_ratio", 0) * 200
+        tr = c.get("time_ratio", 0)
+        if isinstance(tr, str):
+            try:
+                tr = float(tr.rstrip("%")) / 100.0
+            except ValueError:
+                tr = 0.0
+        c["score"] = c.get("score", 0) + float(tr) * 200
 
     candidates.sort(key=lambda c: c["score"], reverse=True)
     return candidates

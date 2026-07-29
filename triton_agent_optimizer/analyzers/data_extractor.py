@@ -300,8 +300,17 @@ def extract(merged_report: dict, diagnosis: dict | None = None,
         lines.append(f"  op:      op{bn.get('op_id','?')} ({bn.get('op_type','?')}, {bn.get('engine','?')})")
         lines.append(f"  type:    {bn.get('type','?')} ({bn.get('category','?')})")
         lines.append(f"  headroom: {bn.get('headroom','?')}")
-        lines.append(f"  time_ratio: {bn.get('time_ratio',0):.2%}")
-        lines.append(f"  bw_util:   {bn.get('bw_utilization',0):.2%}" if bn.get('bw_utilization') else "")
+        tr = bn.get("time_ratio", 0)
+        if isinstance(tr, str):
+            try: tr = float(tr.rstrip("%")) / 100.0
+            except: tr = 0.0
+        lines.append(f"  time_ratio: {float(tr):.2%}")
+        bu = bn.get("bw_utilization", 0)
+        if isinstance(bu, str):
+            try: bu = float(bu.rstrip("%")) / 100.0
+            except: bu = 0.0
+        if bu:
+            lines.append(f"  bw_util:   {float(bu):.2%}")
         lines.append(f"  regime:    {bn.get('regime','?')}")
         strategies = d.get("strategies", d.get("suggested_strategies", []))
         if strategies:

@@ -23,6 +23,34 @@ import sys
 import json
 import shutil
 import platform
+import subprocess
+from pathlib import Path as _Path
+
+# ═════════════════════════════════════════════════════════════════════════════════
+#  .env 文件加载 (无需 python-dotenv 依赖)
+# ═════════════════════════════════════════════════════════════════════════════════
+
+def _load_dotenv():
+    """手动解析 .env 文件，加载到 os.environ。"""
+    _dir = _Path(__file__).resolve().parent
+    for env_file in (_dir / ".env", _dir.parent / ".env"):
+        if env_file.exists():
+            with open(env_file, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    key, val = key.strip(), val.strip()
+                    # 去掉引号
+                    if (val.startswith('"') and val.endswith('"')) or \
+                       (val.startswith("'") and val.endswith("'")):
+                        val = val[1:-1]
+                    # 只设置未设置的变量 (环境变量优先级更高)
+                    if key not in os.environ:
+                        os.environ[key] = val
+
+_load_dotenv()
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
@@ -106,12 +134,12 @@ class PlatformPaths:
 
     @property
     def cost_model_root(self) -> Path:
-        """costModel/ 目录 (合作方的 cost_emulator vendored subtree)"""
+        """(deprecated) costModel/ 目录"""
         return self.repo_root / "costModel" / "cost_emulator"
 
     @property
     def simulator_path(self) -> Path:
-        """simulator.py 的绝对路径"""
+        """(deprecated) simulator.py 路径"""
         return self.cost_model_root / "simulator.py"
 
     @property
@@ -805,20 +833,65 @@ class Config:
         # ── 环境摘要 ──────────────────────────────────────────────────────────
         self.env_info = self._build_env_info()
 
+        # ── msprof simulator / 真机切换 ───────────────────────────────────────
+        self._detect_msprof()
+
+    def _detect_msprof(self):
+        """检测 msprof 工具状态，自动决定用 simulator 还是真机。
+
+        优先级:
+          1. 环境变量 TRITON_AGENT_MSPROF_MODE = "simulator" | "hardware"
+          2. 自动检测: 有 npu-smi → hardware, 有 msprof → simulator
+        """
+        import shutil
+
+        # 用户强制指定
+        mode = os.environ.get("TRITON_AGENT_MSPROF_MODE", "")
+        if mode in ("simulator", "hardware"):
+            self.msprof_mode = mode
+            self.msprof_available = True
+            return
+
+        # 自动检测
+        self.msprof_bin = shutil.which("msprof") or ""
+        self.msprof_available = bool(self.msprof_bin)
+        self.npu_available = False
+
+        # 检测 NPU (npu-smi)
+        npu_smi = shutil.which("npu-smi") or ""
+        if npu_smi:
+            try:
+                r = subprocess.run([npu_smi, "info"], capture_output=True, timeout=10)
+                self.npu_available = r.returncode == 0
+            except Exception:
+                pass
+
+        if self.npu_available:
+            self.msprof_mode = "hardware"
+        elif self.msprof_available:
+            self.msprof_mode = "simulator"
+        else:
+            self.msprof_mode = "none"
+
     def _load_hardware_params(self):
-        """从 simulator.py 动态加载硬件参数 (不硬编码)。"""
-        try:
-            self.hardware.load_from_simulator(self.paths.simulator_path)
-        except Exception as e:
-            # 本地环境可能没有 networkx 或其他依赖
-            import sys
-            print(
-                f"[config] Warning: Failed to load hardware params from "
-                f"{self.paths.simulator_path}: {e}\n"
-                f"  Hardware params will use defaults. Run on 910B3 server for "
-                f"accurate values.",
-                file=sys.stderr,
-            )
+        """加载 910B3 硬件参数 (来自华为官方文档 + msprof 仿真验证)。"""
+        # 直接使用硬编码的经过验证的参数
+        self.hardware.saturation_params = {
+            0: {"vpeak": 121.08, "k0": 6.65, "peak_clamp": 80.83},   # GM→UB
+            1: {"vpeak": 190.19, "k0": 10.72, "peak_clamp": 76.67},  # UB→GM
+            2: {"vpeak": 461.0,  "k0": 4.50, "peak_clamp": 404.0},   # VecUnit
+            3: {"vpeak": 37.5,   "k0": 6.65, "peak_clamp": 37.5},    # GM→L1
+            4: {"vpeak": 100.0,  "k0": 6.65, "peak_clamp": 100.0},   # L1→L0
+            5: {"vpeak": 150.0,  "k0": 0,    "peak_clamp": 150.0},   # CubeUnit
+            6: {"vpeak": 37.5,   "k0": 6.65, "peak_clamp": 37.5},    # L0→GM
+        }
+        self.hardware.engine_names = {
+            0: "GM→UB", 1: "UB→GM", 2: "VecUnit",
+            3: "GM→L1", 4: "L1→L0", 5: "CubeUnit", 6: "L0→GM",
+        }
+        self.hardware.memory_capacity_kb = {
+            "UB": 192.0, "L1": 2048.0, "L0": 1024.0, "GM": None,
+        }
 
     def _build_env_info(self) -> Dict[str, Any]:
         """构建环境信息摘要 (打印或日志用)。"""
@@ -826,7 +899,6 @@ class Config:
             "environment": self.paths.env,
             "python": self.paths.python_executable,
             "repo_root": str(self.paths.repo_root),
-            "simulator_available": self.paths.simulator_path.exists(),
             "emulator_available": self.paths.emulator_common_path.exists(),
             "ascend_env": self.paths.check_ascend_env(),
             "hardware_params_loaded": len(self.hardware.saturation_params) > 0,

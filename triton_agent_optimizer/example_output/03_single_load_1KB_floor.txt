@@ -1,0 +1,44 @@
+=== EXECUTION SUMMARY ===
+total_ns: 64.70
+num_ops: 1
+execution_mode: sequential
+
+=== TIME BREAKDOWN ===
+(time_ratio = op duration / total_ns, sorted biggest first; ops overlap so ratios need not sum to 100%)
+op0: gm_to_ub(ub_1, gm_1)  duration_ns=64.70  time_ratio=100.00%  (64.70/64.70 ns)
+
+=== PER-OP STATISTICS ===
+op0: gm_to_ub(ub_1, gm_1)
+  engine: GM¡úUB
+  size: 1 KB
+  cycles_ns: [0.00..64.70]  duration_ns=64.70  time_ratio=100.00%
+  bandwidth: effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor
+  wait_ns_before_start: 0.00
+  blocked_by: none
+
+=== ENGINE UTILIZATION ===
+GM¡úUB: busy=64.70/64.70 ns  utilization=100.00%
+UB¡úGM: busy=0.00/64.70 ns  utilization=0.00%
+VecUnit: busy=0.00/64.70 ns  utilization=0.00%
+GM¡úL1: busy=0.00/64.70 ns  utilization=0.00%
+L1¡úL0: busy=0.00/64.70 ns  utilization=0.00%
+CubeUnit: busy=0.00/64.70 ns  utilization=0.00%
+L0¡úGM: busy=0.00/64.70 ns  utilization=0.00%
+
+=== BANDWIDTH UTILIZATION ===
+(effective_bw / peak_bw per op; bandwidth ramps with size, so small transfers run below peak)
+op0 (GM¡úUB): effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor  k0=6.7KB (half-sat)
+
+=== PARALLELISM ===
+parallel_pairs: 0
+root_cause_of_sequential_execution:
+
+=== CRITICAL PATH ===
+algorithm: topo
+length_ns: 64.70
+fraction_of_makespan: 100%
+path: op0
+edges:
+per_op:
+  op0 gm_to_ub(ub_1, gm_1)  engine=GM¡úUB  ns=[0.00..64.70]  duration_ns=64.70
+

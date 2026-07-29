@@ -1,0 +1,99 @@
+
+  ┌─ Pipeline Execution Graph ───────────────────────────────────────────────────────────────────────┐
+
+  Engine bandwidth ramps with transfer size (small transfers run below peak);
+  duration = size ÷ bandwidth(size), reported in nanoseconds:
+    GM→UB           81 GB/s peak  (saturation: vpeak=121, k0=6.7KB)
+    UB→GM           77 GB/s peak  (saturation: vpeak=190, k0=10.7KB)
+    VecUnit        404 GB/s peak  (saturation: vpeak=461, k0=4.5KB)
+    GM→L1           38 GB/s peak  (saturation: vpeak=38, k0=6.7KB)
+    L1→L0          100 GB/s peak  (saturation: vpeak=100, k0=6.7KB)
+    CubeUnit       150 GB/s  (compute, size-independent)
+    L0→GM           38 GB/s peak  (saturation: vpeak=38, k0=6.7KB)
+
+  Time axis: 90 cols ≈ 39 µs makespan (433 ns/col)
+           ───────────────────────────────────────────────────────────────────────────────────────────
+    GM→UB      │ ··························································································
+    UB→GM      │ ··························································································
+    VecUnit    │ ··························································································
+    GM→L1      │ op0██████████████op1█████████████op6██████████████op7█████████████························
+    L1→L0      │ ·················op2·············op3··············op8·············op9·····················
+    CubeUnit   │ ····································op4█·····························op10·················
+    L0→GM      │ ········································op5██████████████················op11█████████████
+           ───────────────────────────────────────────────────────────────────────────────────────────
+
+  Op   Instruction                    Engine   Size       Time (ns)        BW util    Waits for (hazard)
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  0    gm_to_l1(l1_a1, gm_a1)         GM→L1    256 KB     [0.0..7172.1]    97%        —
+  1    gm_to_l1(l1_b1, gm_b1)         GM→L1    256 KB     [7172.1..14344.2] 97%        —
+  2    l1_to_l0(l0_a1, l1_a1)         L1→L0    128 KB     [7172.1..8550.9] 95%        op0(RAW)
+  3    l1_to_l0(l0_b1, l1_b1)         L1→L0    128 KB     [14344.2..15723.0] 95%        op1(RAW)
+  4    matrixmul(l0_c1, l0_a1, l0_b1) CubeUnit 256 KB     [15723.0..17470.6] 100%       op2(RAW), op3(RAW)
+  5    l0_to_gm(gm_c1, l0_c1)         L0→GM    256 KB     [17470.6..24642.7] 97%        op4(RAW)
+  6    gm_to_l1(l1_a2, gm_a2)         GM→L1    256 KB     [14344.2..21516.3] 97%        —
+  7    gm_to_l1(l1_b2, gm_b2)         GM→L1    256 KB     [21516.3..28688.4] 97%        —
+  8    l1_to_l0(l0_a2, l1_a2)         L1→L0    128 KB     [21516.3..22895.1] 95%        op6(RAW)
+  9    l1_to_l0(l0_b2, l1_b2)         L1→L0    128 KB     [28688.4..30067.2] 95%        op7(RAW)
+  10   matrixmul(l0_c2, l0_a2, l0_b2) CubeUnit 256 KB     [30067.2..31814.8] 100%       op8(RAW), op9(RAW)
+  11   l0_to_gm(gm_c2, l0_c2)         L0→GM    256 KB     [31814.8..38986.9] 97%        op10(RAW)
+
+  Time breakdown (op duration ÷ total time, sorted; ops overlap so the
+  percentages need not sum to 100%):
+    op0  gm_to_l1(l1_a1, gm_a1)         [████                ]  18.4%  (7172.1/38986.9 ns)
+    op1  gm_to_l1(l1_b1, gm_b1)         [████                ]  18.4%  (7172.1/38986.9 ns)
+    op5  l0_to_gm(gm_c1, l0_c1)         [████                ]  18.4%  (7172.1/38986.9 ns)
+    op6  gm_to_l1(l1_a2, gm_a2)         [████                ]  18.4%  (7172.1/38986.9 ns)
+    op7  gm_to_l1(l1_b2, gm_b2)         [████                ]  18.4%  (7172.1/38986.9 ns)
+    op11 l0_to_gm(gm_c2, l0_c2)         [████                ]  18.4%  (7172.1/38986.9 ns)
+    op4  matrixmul(l0_c1, l0_a1, l0_b1) [█                   ]   4.5%  (1747.6/38986.9 ns)
+    op10 matrixmul(l0_c2, l0_a2, l0_b2) [█                   ]   4.5%  (1747.6/38986.9 ns)
+    op2  l1_to_l0(l0_a1, l1_a1)         [█                   ]   3.5%  (1378.8/38986.9 ns)
+    op3  l1_to_l0(l0_b1, l1_b1)         [█                   ]   3.5%  (1378.8/38986.9 ns)
+    op8  l1_to_l0(l0_a2, l1_a2)         [█                   ]   3.5%  (1378.8/38986.9 ns)
+    op9  l1_to_l0(l0_b2, l1_b2)         [█                   ]   3.5%  (1378.8/38986.9 ns)
+
+  Engine utilization:
+    GM→UB       [░░░░░░░░░░░░░░░░░░░░]   0%  (0.0/38986.9 ns busy)
+    UB→GM       [░░░░░░░░░░░░░░░░░░░░]   0%  (0.0/38986.9 ns busy)
+    VecUnit     [░░░░░░░░░░░░░░░░░░░░]   0%  (0.0/38986.9 ns busy)
+    GM→L1       [████████████████████]  73%  (28688.4/38986.9 ns busy)
+    L1→L0       [██████████████░░░░░░]  14%  (5515.3/38986.9 ns busy)
+    CubeUnit    [████████░░░░░░░░░░░░]   8%  (3495.3/38986.9 ns busy)
+    L0→GM       [████████████████████]  36%  (14344.2/38986.9 ns busy)
+
+  Bandwidth utilization (effective ÷ peak):
+    op0  GM→L1    [███████████████████ ]  97%  (36.55/38 GB/s, saturated)
+    op1  GM→L1    [███████████████████ ]  97%  (36.55/38 GB/s, saturated)
+    op2  L1→L0    [███████████████████ ]  95%  (95.06/100 GB/s, saturated)
+    op3  L1→L0    [███████████████████ ]  95%  (95.06/100 GB/s, saturated)
+    op4  CubeUnit [████████████████████] 100%  (150/150 GB/s, flat)
+    op5  L0→GM    [███████████████████ ]  97%  (36.55/38 GB/s, saturated)
+    op6  GM→L1    [███████████████████ ]  97%  (36.55/38 GB/s, saturated)
+    op7  GM→L1    [███████████████████ ]  97%  (36.55/38 GB/s, saturated)
+    op8  L1→L0    [███████████████████ ]  95%  (95.06/100 GB/s, saturated)
+    op9  L1→L0    [███████████████████ ]  95%  (95.06/100 GB/s, saturated)
+    op10 CubeUnit [████████████████████] 100%  (150/150 GB/s, flat)
+    op11 L0→GM    [███████████████████ ]  97%  (36.55/38 GB/s, saturated)
+
+  Parallel overlap (7 pair(s)):
+    op1 ∥ op2  (overlap 7172.1..8550.9 ns)
+    op3 ∥ op6  (overlap 14344.2..15723.0 ns)
+    op4 ∥ op6  (overlap 15723.0..17470.6 ns)
+    op5 ∥ op6  (overlap 17470.6..21516.3 ns)
+    op5 ∥ op7  (overlap 21516.3..24642.7 ns)
+    op5 ∥ op8  (overlap 21516.3..22895.1 ns)
+    op7 ∥ op8  (overlap 21516.3..22895.1 ns)
+
+  Critical path  (algorithm: topo, length = 38986.9 ns = 100% of makespan):
+      op0  ─(engine serialization (GM→L1 reused))→  op1  ─(engine serialization (GM→L1 reused))→  op6  ─(engine serialization (GM→L1 reused))→  op7  ─(RAW on 'l1_b2')→  op9  ─(RAW on 'l0_b2')→  op10  ─(RAW on 'l0_c2')→  op11
+      op0  gm_to_l1(l1_a1, gm_a1)         GM→L1    [0.0..7172.1]  dur=7172.1 ns
+      op1  gm_to_l1(l1_b1, gm_b1)         GM→L1    [7172.1..14344.2]  dur=7172.1 ns
+      op6  gm_to_l1(l1_a2, gm_a2)         GM→L1    [14344.2..21516.3]  dur=7172.1 ns
+      op7  gm_to_l1(l1_b2, gm_b2)         GM→L1    [21516.3..28688.4]  dur=7172.1 ns
+      op9  l1_to_l0(l0_b2, l1_b2)         L1→L0    [28688.4..30067.2]  dur=1378.8 ns
+      op10 matrixmul(l0_c2, l0_a2, l0_b2) CubeUnit [30067.2..31814.8]  dur=1747.6 ns
+      op11 l0_to_gm(gm_c2, l0_c2)         L0→GM    [31814.8..38986.9]  dur=7172.1 ns
+      covers 7/12 ops; 38986.9/38986.9 ns on the critical chain.
+
+  └─────────────────────────────────────────────────────────────────────────────────────────────────────┘
+

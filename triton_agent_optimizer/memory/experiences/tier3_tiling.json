@@ -35,5 +35,18 @@
     "description": "UB 溢出, 无法 double buffer",
     "timestamp": "2026-07-24T10:49:51.882424",
     "decision_reason": "UB capacity 不足"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "increase_tile_size",
+    "speedup": 0.7031,
+    "status": "FAIL",
+    "description": "Tier 3: increase_tile_size",
+    "timestamp": "2026-07-29T10:05:42.891801",
+    "decision_reason": "Speedup 0.703x <= 1.01"
   }
 ]

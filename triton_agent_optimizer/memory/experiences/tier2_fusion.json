@@ -1,1 +1,138 @@
-[]
+[
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "break_war_dependency",
+    "speedup": 1.6489,
+    "status": "SUCCESS",
+    "description": "Tier 2: break_war_dependency",
+    "timestamp": "2026-07-29T09:57:23.978197"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "fuse_elementwise_ops",
+    "speedup": 1.6489,
+    "status": "SUCCESS",
+    "description": "Tier 2: fuse_elementwise_ops",
+    "timestamp": "2026-07-29T09:57:35.160691"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "remove_redundant_load_ops",
+    "speedup": 1.6489,
+    "status": "SUCCESS",
+    "description": "Tier 2: remove_redundant_load_ops",
+    "timestamp": "2026-07-29T09:57:45.104427"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "fuse_elementwise_ops",
+    "speedup": 1.6489,
+    "status": "SUCCESS",
+    "description": "Tier 2: fuse_elementwise_ops",
+    "timestamp": "2026-07-29T09:57:56.694052"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "fuse_elementwise_ops",
+    "speedup": 1.6489,
+    "status": "SUCCESS",
+    "description": "Tier 2: fuse_elementwise_ops",
+    "timestamp": "2026-07-29T09:58:08.091042"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "fuse_elementwise_ops",
+    "speedup": 1.6489,
+    "status": "SUCCESS",
+    "description": "Tier 2: fuse_elementwise_ops",
+    "timestamp": "2026-07-29T09:58:20.662869"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "break_war_dependency",
+    "speedup": 0.7031,
+    "status": "FAIL",
+    "description": "Tier 2: break_war_dependency",
+    "timestamp": "2026-07-29T10:04:56.258346",
+    "decision_reason": "Speedup 0.703x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "fuse_add_mul_chain",
+    "speedup": 0.7031,
+    "status": "FAIL",
+    "description": "Tier 2: fuse_add_mul_chain",
+    "timestamp": "2026-07-29T10:05:07.521178",
+    "decision_reason": "Speedup 0.703x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "fuse_elementwise_ops",
+    "speedup": 0.7031,
+    "status": "FAIL",
+    "description": "Tier 2: fuse_elementwise_ops",
+    "timestamp": "2026-07-29T10:05:18.012110",
+    "decision_reason": "Speedup 0.703x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "fuse_elementwise_ops",
+    "speedup": 0.7031,
+    "status": "FAIL",
+    "description": "Tier 2: fuse_elementwise_ops",
+    "timestamp": "2026-07-29T10:05:32.456534",
+    "decision_reason": "Speedup 0.703x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "break_war_dependency",
+    "speedup": 1.6489,
+    "status": "SUCCESS",
+    "description": "Tier 2: break_war_dependency",
+    "timestamp": "2026-07-29T10:10:51.241639"
+  }
+]

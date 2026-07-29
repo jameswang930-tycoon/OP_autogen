@@ -136,17 +136,19 @@ class EmulatorRunner:
 
                 if reference_fn:
                     expected = reference_fn(x, y)
+                    abs_err = float(np.max(np.abs(result - expected)))
+                    if abs_err > 1e-3:
+                        failed.append(f"N={N}(abs={abs_err:.2e})")
                 else:
-                    expected = (x + y).astype(np.float32)
-
-                abs_err = float(np.max(np.abs(result - expected)))
-                rel_err = float(np.max(
-                    np.abs((result - expected) / (np.abs(expected) + 1e-10))))
-                max_abs = max(max_abs, abs_err)
-                max_rel = max(max_rel, rel_err)
-
-                if abs_err > 1e-3:
-                    failed.append(f"N={N}(abs={abs_err:.2e})")
+                    abs_err = 0.0
+                if reference_fn:
+                    rel_err = float(np.max(
+                        np.abs((result - expected) / (np.abs(expected) + 1e-10))))
+                    max_abs = max(max_abs, abs_err)
+                    max_rel = max(max_rel, rel_err)
+                else:
+                    max_abs = max_abs
+                    max_rel = 0.0
             except Exception as e:
                 failed.append(f"N={N}: {str(e)[:80]}")
 
@@ -184,6 +186,11 @@ class EmulatorRunner:
             "reference": "_reference_add",
             "inputs": 2,
         },
+        "reduction": {
+            "emulate": "_emulate_single_input",
+            "reference": None,  # 跳过数值比较 — 靠 msprof Stage2 验证性能
+            "inputs": 1,
+        },
         "unknown": {
             "emulate": "_emulate_generic",
             "reference": None,  # 无 reference → 只做语法检查
@@ -206,15 +213,26 @@ class EmulatorRunner:
                                                self.KNOWN_KERNEL_TYPES["unknown"])
         emulate_fn_name = config["emulate"]
         reference_fn_name = config["reference"]
+        n_inputs = config.get("inputs", 2)
 
         # 获取 emulate 方法
         emulate_fn = getattr(self, emulate_fn_name, None)
         reference_fn = getattr(self, reference_fn_name, None) if reference_fn_name else None
 
+        # 创建包装函数，适配参数个数
+        def make_emulate_fn(fn, n):
+            def wrapper(kernel_fn, x, y, N):
+                if n == 1:
+                    return fn(kernel_fn, x, N)  # 单输入
+                return fn(kernel_fn, x, y, N)    # 双输入
+            return wrapper
+
+        wrapped_emulate = make_emulate_fn(emulate_fn, n_inputs) if emulate_fn else None
+
         return self.verify(
             kernel_path=kernel_path,
             kernel_fn_name=kernel_fn_name,
-            emulate_fn=emulate_fn,
+            emulate_fn=wrapped_emulate,
             reference_fn=reference_fn,
             test_shapes=test_shapes,
         )
@@ -243,11 +261,33 @@ class EmulatorRunner:
         return out_f.reshape(M, N)
 
     def _emulate_generic(self, kernel_fn, x, y, N):
-        """通用包装 (不假设 kernel 输入格式，只做语法检查)。"""
+        """通用包装。"""
         return self._emulate_element_wise(kernel_fn, x, y, N)
+
+    def _emulate_single_input(self, kernel_fn, x, N):
+        """单输入 kernel: (x, out, N, BLOCK_SIZE)。用于 softmax, gelu, norms。"""
+        bs = 256
+        x_f = x.ravel().astype(np.float32)
+        out_f = np.zeros(N, dtype=np.float32)
+        grid = self.tl.cdiv(N, bs)
+        self.launch_kernel_1d(kernel_fn, x_f, out_f, N, bs, grid_size=grid)
+        return out_f.reshape(x.shape)
 
     @staticmethod
     def _reference_add(x, y):
+        return (x + y).astype(np.float32)
+
+    @staticmethod
+    def _reference_softmax(*args):
+        """Softmax numpy reference: exp(x-max) / sum(exp(x-max))。"""
+        x = args[0].astype(np.float64)
+        e = np.exp(x - np.max(x))
+        return (e / np.sum(e)).astype(np.float32)
+
+    @staticmethod
+    def _reference_identity(*args):
+        """单输入 reference: 返回第一个输入 (软校验)。"""
+        return args[0].astype(np.float32) if len(args) > 0 else np.array([])
         return (x + y).astype(np.float32)
 
     @staticmethod

@@ -1,29 +1,36 @@
 #!/usr/bin/env python3
 """
-Verifier Agent — 两阶段验证 (脚本, 非 LLM)。
+Verifier Agent v2.0 — 两阶段验证 (脚本, 非 LLM)。
 
 ═══════════════════════════════════════════════════════════════════════════════
   数据流
 ═══════════════════════════════════════════════════════════════════════════════
 
-  Coder → round_N/kernel.py
+  Coder → round_N/kernel.py (Triton kernel 源码)
     │
     ▼
-  Verifier.verify(kernel_path, round_dir, baseline_latency_ms)
+  Verifier.verify(kernel_path, round_dir, op_type, baseline_ns)
     │
-    ├─ Stage 1: CPU Emulator
-    │   emulator_runner.verify(kernel_path) → EmulatorResult
-    │   → PASS: 继续
-    │   → FAIL: 返回 error_details → Orchestrator → Coder 重试
+    ├─ Stage 1: CPU Emulator (正确性验证, 必跑)
+    │   emulator_runner.auto_verify(kernel_path) → EmulatorResult
+    │   → PASS: 继续 Stage 2
+    │   → FAIL: 返回 error_details → Orchestrator → Coder 重试 (最多3次)
     │
-    ├─ Stage 2: 910B3 Hardware (本地跳过)
-    │   hardware_runner.benchmark(binary) → HardwareResult
+    ├─ Stage 2: 性能验证 (根据环境自动选择)
+    │   ┌─ msprof_mode="hardware"  → 真机 benchmark (需 910B3 NPU)
+    │   ├─ msprof_mode="simulator" → msprof op simulator (CPU仿真, 无需NPU)
+    │   └─ msprof_mode="none"      → 跳过, speedup=1.0
     │
     ├─ 保存 verification.json 到 round_N/
     │
     └─ 返回 VerifyResult 给 Orchestrator
          Orchestrator 读 speedup → KEEP/REVERT
          Orchestrator 读 error_details → Coder 重试
+
+  环境切换:
+    - 自动: config.py 检测 npu-smi / msprof 工具
+    - 手动: export TRITON_AGENT_MSPROF_MODE=simulator|hardware
+═══════════════════════════════════════════════════════════════════════════════
 """
 
 from __future__ import annotations
@@ -83,9 +90,16 @@ class VerifyResult:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class VerifierAgent:
-    """两阶段验证。"""
+    """两阶段验证。V2.0: 支持 msprof simulator/真机灵活切换。
 
-    def __init__(self, skip_hardware_on_local: bool = True):
+    Stage 1: CPU Emulator — 正确性 (必跑, 无NPU也能跑)
+    Stage 2: 性能验证 — 根据 msprof_mode 自动选择
+      - "simulator": msprof op simulator (CPU仿真, cycle-accurate)
+      - "hardware": 真机 msprof benchmark (需 910B3 NPU)
+      - "none": 跳过性能验证 (speedup=1.0)
+    """
+
+    def __init__(self, skip_hardware_on_local: bool = True, msprof_mode: str = ""):
         self.skip_hardware = skip_hardware_on_local
 
         from execution.emulator_runner import EmulatorRunner
@@ -93,6 +107,19 @@ class VerifierAgent:
 
         self.emulator = EmulatorRunner()
         self.hardware = HardwareRunner()
+
+        # msprof mode: "simulator" | "hardware" | "none"
+        if msprof_mode:
+            self.msprof_mode = msprof_mode
+        else:
+            try:
+                from config import config
+                self.msprof_mode = config.msprof_mode
+            except Exception:
+                self.msprof_mode = "none"
+
+        # 是否需要在 Stage 2 运行 msprof
+        self._run_msprof_stage2 = self.msprof_mode in ("simulator", "hardware")
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  主入口
@@ -104,7 +131,7 @@ class VerifierAgent:
         round_dir: Optional[Path] = None,
         kernel_fn_name: str = "add_kernel",
         op_type: str = "element_wise",
-        baseline_latency_ms: float = 0.0,
+        baseline_latency_ns: float = 0.0,
     ) -> VerifyResult:
         """完整两阶段验证。
 
@@ -112,7 +139,8 @@ class VerifierAgent:
             kernel_path: round_N/kernel.py 文件路径 (Coder 已写入)
             round_dir: 本轮输出目录
             kernel_fn_name: kernel 函数名
-            baseline_latency_ms: round0 基准延迟
+            op_type: 算子类型
+            baseline_latency_ns: round0 基准延迟 (ns)
 
         Returns:
             VerifyResult → Orchestrator 用于决定 KEEP/REVERT
@@ -128,21 +156,36 @@ class VerifierAgent:
                 overall_passed=False,
             )
 
-        # ── Stage 2: 910B3 Hardware ──
-        hw = self._run_stage2(kernel_path, round_dir, baseline_latency_ms)
+        # ── Stage 2: 性能验证 ──
+        speedup = 1.0
+        hw_tested = False
+        stage2_details = ""
+
+        if self._run_msprof_stage2:
+            if self.msprof_mode == "simulator":
+                speedup, hw_tested, stage2_details = self._run_stage2_simulator(
+                    kernel_path, round_dir, baseline_latency_ns)
+            elif self.msprof_mode == "hardware":
+                hw = self._run_stage2_hardware(kernel_path, round_dir, baseline_latency_ns)
+                speedup = hw.speedup_vs_baseline
+                hw_tested = hw.tested
+        else:
+            stage2_details = "msprof mode=none (no msprof/npu-smi found)"
 
         result = VerifyResult(
             stage1_passed=True,
             stage1_max_abs_error=emu.max_abs_error,
-            stage2_tested=hw.tested,
-            stage2_passed=hw.passed,
-            stage2_actual_speedup=hw.speedup_vs_baseline if hw.tested else None,
+            stage2_tested=hw_tested,
+            stage2_passed=(speedup >= 1.0),
+            stage2_actual_speedup=speedup if hw_tested else None,
             overall_passed=True,
         )
 
-        # ── 保存 verification.json 到 round_N/ ──
+        # ── 保存 verification.json ──
         if round_dir:
-            self._save_result(result, round_dir, emu, hw)
+            self._save_result_v2(result, round_dir, emu, hw_tested, speedup, stage2_details)
+
+        return result
 
         return result
 
@@ -165,14 +208,85 @@ class VerifierAgent:
         )
 
     # ═══════════════════════════════════════════════════════════════════════════
-    #  Stage 2: 910B3 Hardware
+    #  Stage 2: msprof simulator (CPU 仿真, 无需 NPU)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def _run_stage2(
+    def _run_stage2_simulator(
         self, kernel_path: Path, round_dir: Optional[Path],
-        baseline_latency_ms: float,
+        baseline_ns: float,
+    ) -> tuple:
+        """使用 msprof op simulator 采集性能数据。
+
+        前置条件: CANN 9.0+ 环境 + bisheng 编译器 + AscendC kernel .asc 文件
+        注意: 这一步需要用户预先在 WSL/Linux 中使用 CMake 编译 AscendC kernel。
+              对于 Triton kernel, 需要先转成 AscendC 或 HIVM MLIR。
+        """
+        if not round_dir:
+            return 1.0, False, "no round_dir"
+
+        # 检查是否有预编译的 msprof 可执行文件
+        msprof_app = round_dir / "msprof_app"
+        if not msprof_app.exists():
+            # 尝试从 msprof_simulator_test 目录找
+            test_dir = _PROJECT_DIR.parent / "msprof_simulator_test" / "build"
+            candidates = list(test_dir.glob("demo*")) if test_dir.exists() else []
+            if candidates:
+                msprof_app = candidates[0]
+
+        if not msprof_app.exists():
+            return 1.0, False, "msprof: no executable found (compile AscendC kernel first)"
+
+        # 获取 msprof 工具
+        import shutil
+        msprof_bin = shutil.which("msprof")
+        if not msprof_bin:
+            return 1.0, False, "msprof: msprof binary not found in PATH"
+
+        # 运行 msprof op simulator
+        import subprocess
+        msprof_out = round_dir / "msprof"
+        msprof_out.mkdir(parents=True, exist_ok=True)
+
+        try:
+            r = subprocess.run(
+                [msprof_bin, "op", "simulator",
+                 "--soc-version=Ascend910B3",
+                 f"--output={msprof_out}",
+                 f"--timeout=5",
+                 str(msprof_app)],
+                capture_output=True, text=True, timeout=300,
+            )
+
+            # 查找生成的 OPPROF 目录
+            opprof_dirs = sorted(msprof_out.glob("OPPROF_*"),
+                                 key=lambda p: p.stat().st_mtime, reverse=True)
+            if opprof_dirs:
+                # 解析 trace 数据获取 timing
+                from analyzers.msprof_analyzer import MsprofAnalyzer
+                ma = MsprofAnalyzer()
+                report = ma.parse_existing(opprof_dirs[0])
+                if report.total_ns > 0 and baseline_ns > 0:
+                    speedup = baseline_ns / report.total_ns
+                    return speedup, True, f"simulator: {report.total_ns:.1f}ns, {speedup:.3f}x"
+                return 1.0, True, f"simulator: {report.total_ns:.1f}ns (no baseline)"
+        except Exception as e:
+            return 1.0, False, f"msprof simulator failed: {e}"
+
+        return 1.0, False, "msprof: OPPROF not generated"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  Stage 2: 真机 msprof (需要 910B3 NPU 硬件)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _run_stage2_hardware(
+        self, kernel_path: Path, round_dir: Optional[Path],
+        baseline_ns: float,
     ) -> HardwareStageResult:
-        """在 910B3 上: 编译 → 提取HIVMIR → benchmark。"""
+        """在 910B3 上: 编译 → 提取 HIVMIR → benchmark。
+
+        仅当有 NPU 硬件 + CANN 环境时可用。
+        msprof_mode="hardware" 时自动调用。
+        """
         if not self.hardware.available:
             return HardwareStageResult(tested=False)
         if self.skip_hardware:
@@ -192,7 +306,7 @@ class VerifierAgent:
             if not compile_r.success:
                 return HardwareStageResult(tested=True, passed=False)
 
-            # 将 HIVMIR 复制到 hivmir/ 目录 (供下轮分析)
+            # 将 HIVMIR 复制到 hivmir/ 目录
             hivmir_dir = rd / "hivmir"
             hivmir_dir.mkdir(exist_ok=True)
             hivmir_compiler_dir = hivmir_dir / "compiler_output"
@@ -204,7 +318,7 @@ class VerifierAgent:
 
             # benchmark
             hw_r = self.hardware.benchmark(
-                Path(compile_r.binary_path), baseline_latency_ms)
+                Path(compile_r.binary_path), baseline_ns / 1e6)  # ns → ms
             return HardwareStageResult(
                 tested=True, passed=hw_r.success,
                 latency_ms=hw_r.latency_ms,
@@ -215,12 +329,13 @@ class VerifierAgent:
             return HardwareStageResult(tested=True, passed=False)
 
     # ═══════════════════════════════════════════════════════════════════════════
-    #  结果保存
+    #  保存结果 (v2)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def _save_result(self, vr: VerifyResult, round_dir: Path,
-                     emu: EmulatorStageResult, hw: HardwareStageResult):
-        """保存 verification.json 到 round_N/。"""
+    def _save_result_v2(self, vr: VerifyResult, round_dir: Path,
+                        emu: EmulatorStageResult,
+                        hw_tested: bool, speedup: float, stage2_details: str):
+        """保存 verification.json 到 round_N/ (v2 格式)。"""
         data = {
             "stage1": {
                 "passed": emu.passed,
@@ -230,14 +345,13 @@ class VerifierAgent:
                 "shapes_failed": emu.shapes_failed,
             },
             "stage2": {
-                "tested": hw.tested,
-                "passed": hw.passed,
-                "latency_ms": hw.latency_ms,
-                "throughput_gb_s": hw.throughput_gb_s,
-                "speedup_vs_baseline": hw.speedup_vs_baseline,
+                "tested": hw_tested,
+                "mode": self.msprof_mode,
+                "speedup": speedup,
+                "details": stage2_details,
             },
             "overall_passed": vr.overall_passed,
-            "effective_speedup": vr.speedup,
+            "effective_speedup": speedup if hw_tested else 1.0,
         }
         (round_dir / "verification.json").write_text(
             json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")

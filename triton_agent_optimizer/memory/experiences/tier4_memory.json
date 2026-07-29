@@ -1,1 +1,15 @@
-[]
+[
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "double_buffering",
+    "speedup": 0.7031,
+    "status": "FAIL",
+    "description": "Tier 4: double_buffering",
+    "timestamp": "2026-07-29T10:05:53.761400",
+    "decision_reason": "Speedup 0.703x <= 1.01"
+  }
+]

@@ -874,6 +874,26 @@ class tl:
         for i in np.where(mask_arr.ravel())[0]:
             base_ptr[safe.ravel()[i]] += vals.ravel()[i]
 
+    # ---- tl.math 子模块 (别名到 tl 自身的函数) ----
+    class math:
+        """tl.math.exp/sqrt/rsqrt 等 — 别名到 tl 静态方法。"""
+        @staticmethod
+        def exp(x):     return tl.exp(x)
+        @staticmethod
+        def log(x):     return tl.log(x)
+        @staticmethod
+        def log2(x):    return tl.log2(x)
+        @staticmethod
+        def sqrt(x):    return tl.sqrt(x)
+        @staticmethod
+        def rsqrt(x):   return 1.0 / np.sqrt(np.asarray(x))
+        @staticmethod
+        def sigmoid(x): return tl.sigmoid(x)
+        @staticmethod
+        def tanh(x):    return tl.tanh(x)
+        @staticmethod
+        def abs(x):     return xarray(np.abs(np.asarray(x)), in_fast_mem=True)
+
     # ---- 调试 ----
     @staticmethod
     def static_print(*args):  print("[tl.static_print]", *args)

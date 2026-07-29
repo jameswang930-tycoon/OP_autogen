@@ -1,0 +1,678 @@
+=== EXECUTION SUMMARY ===
+total_ns: 769.15
+num_ops: 20
+execution_mode: sequential
+
+=== TIME BREAKDOWN ===
+(time_ratio = op duration / total_ns, sorted biggest first; ops overlap so ratios need not sum to 100%)
+op0: gm_to_ub(ub_1, gm_1+0KB)  duration_ns=64.70  time_ratio=8.41%  (64.70/769.15 ns)
+op2: gm_to_ub(ub_1, gm_1+1KB)  duration_ns=64.70  time_ratio=8.41%  (64.70/769.15 ns)
+op4: gm_to_ub(ub_1, gm_1+2KB)  duration_ns=64.70  time_ratio=8.41%  (64.70/769.15 ns)
+op6: gm_to_ub(ub_1, gm_1+3KB)  duration_ns=64.70  time_ratio=8.41%  (64.70/769.15 ns)
+op8: gm_to_ub(ub_1, gm_1+4KB)  duration_ns=64.70  time_ratio=8.41%  (64.70/769.15 ns)
+op10: gm_to_ub(ub_1, gm_1+5KB)  duration_ns=64.70  time_ratio=8.41%  (64.70/769.15 ns)
+op12: gm_to_ub(ub_1, gm_1+6KB)  duration_ns=64.70  time_ratio=8.41%  (64.70/769.15 ns)
+op14: gm_to_ub(ub_1, gm_1+7KB)  duration_ns=64.70  time_ratio=8.41%  (64.70/769.15 ns)
+op16: gm_to_ub(ub_1, gm_1+8KB)  duration_ns=64.70  time_ratio=8.41%  (64.70/769.15 ns)
+op18: gm_to_ub(ub_1, gm_1+9KB)  duration_ns=64.70  time_ratio=8.41%  (64.70/769.15 ns)
+op1: vadd(ub_2, ub_1, 3)  duration_ns=12.22  time_ratio=1.59%  (12.22/769.15 ns)
+op3: vadd(ub_2, ub_1, 3)  duration_ns=12.22  time_ratio=1.59%  (12.22/769.15 ns)
+op5: vadd(ub_2, ub_1, 3)  duration_ns=12.22  time_ratio=1.59%  (12.22/769.15 ns)
+op7: vadd(ub_2, ub_1, 3)  duration_ns=12.22  time_ratio=1.59%  (12.22/769.15 ns)
+op9: vadd(ub_2, ub_1, 3)  duration_ns=12.22  time_ratio=1.59%  (12.22/769.15 ns)
+op11: vadd(ub_2, ub_1, 3)  duration_ns=12.22  time_ratio=1.59%  (12.22/769.15 ns)
+op13: vadd(ub_2, ub_1, 3)  duration_ns=12.22  time_ratio=1.59%  (12.22/769.15 ns)
+op15: vadd(ub_2, ub_1, 3)  duration_ns=12.22  time_ratio=1.59%  (12.22/769.15 ns)
+op17: vadd(ub_2, ub_1, 3)  duration_ns=12.22  time_ratio=1.59%  (12.22/769.15 ns)
+op19: vadd(ub_2, ub_1, 3)  duration_ns=12.22  time_ratio=1.59%  (12.22/769.15 ns)
+
+=== PER-OP STATISTICS ===
+op0: gm_to_ub(ub_1, gm_1+0KB)
+  engine: GM★UB
+  size: 1 KB
+  cycles_ns: [0.00..64.70]  duration_ns=64.70  time_ratio=8.41%
+  bandwidth: effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor
+  wait_ns_before_start: 0.00
+  blocked_by: none
+
+op1: vadd(ub_2, ub_1, 3)
+  engine: VecUnit
+  size: 1 KB
+  cycles_ns: [64.70..76.91]  duration_ns=12.22  time_ratio=1.59%
+  bandwidth: effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor
+  wait_ns_before_start: 64.70
+  blocked_by: op0 via RAW on 'ub_1' ！ ub_1 written by op0, read by op1
+
+op2: gm_to_ub(ub_1, gm_1+1KB)
+  engine: GM★UB
+  size: 1 KB
+  cycles_ns: [76.91..141.61]  duration_ns=64.70  time_ratio=8.41%
+  bandwidth: effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor
+  wait_ns_before_start: 76.91
+  blocked_by: op0 via WAW on 'ub_1' ！ ub_1 written by both op0 and op2
+  blocked_by: op1 via WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op2
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+
+op3: vadd(ub_2, ub_1, 3)
+  engine: VecUnit
+  size: 1 KB
+  cycles_ns: [141.61..153.83]  duration_ns=12.22  time_ratio=1.59%
+  bandwidth: effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor
+  wait_ns_before_start: 141.61
+  blocked_by: op0 via RAW on 'ub_1' ！ ub_1 written by op0, read by op3
+  blocked_by: op1 via WAW on 'ub_2' ！ ub_2 written by both op1 and op3
+  blocked_by: op2 via RAW on 'ub_1' ！ ub_1 written by op2, read by op3
+
+op4: gm_to_ub(ub_1, gm_1+2KB)
+  engine: GM★UB
+  size: 1 KB
+  cycles_ns: [153.83..218.53]  duration_ns=64.70  time_ratio=8.41%
+  bandwidth: effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor
+  wait_ns_before_start: 153.83
+  blocked_by: op0 via WAW on 'ub_1' ！ ub_1 written by both op0 and op4
+  blocked_by: op1 via WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op4
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op2 via WAW on 'ub_1' ！ ub_1 written by both op2 and op4
+  blocked_by: op3 via WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op4
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+
+op5: vadd(ub_2, ub_1, 3)
+  engine: VecUnit
+  size: 1 KB
+  cycles_ns: [218.53..230.74]  duration_ns=12.22  time_ratio=1.59%
+  bandwidth: effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor
+  wait_ns_before_start: 218.53
+  blocked_by: op0 via RAW on 'ub_1' ！ ub_1 written by op0, read by op5
+  blocked_by: op1 via WAW on 'ub_2' ！ ub_2 written by both op1 and op5
+  blocked_by: op2 via RAW on 'ub_1' ！ ub_1 written by op2, read by op5
+  blocked_by: op3 via WAW on 'ub_2' ！ ub_2 written by both op3 and op5
+  blocked_by: op4 via RAW on 'ub_1' ！ ub_1 written by op4, read by op5
+
+op6: gm_to_ub(ub_1, gm_1+3KB)
+  engine: GM★UB
+  size: 1 KB
+  cycles_ns: [230.74..295.44]  duration_ns=64.70  time_ratio=8.41%
+  bandwidth: effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor
+  wait_ns_before_start: 230.74
+  blocked_by: op0 via WAW on 'ub_1' ！ ub_1 written by both op0 and op6
+  blocked_by: op1 via WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op6
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op2 via WAW on 'ub_1' ！ ub_1 written by both op2 and op6
+  blocked_by: op3 via WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op6
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op4 via WAW on 'ub_1' ！ ub_1 written by both op4 and op6
+  blocked_by: op5 via WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op6
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+
+op7: vadd(ub_2, ub_1, 3)
+  engine: VecUnit
+  size: 1 KB
+  cycles_ns: [295.44..307.66]  duration_ns=12.22  time_ratio=1.59%
+  bandwidth: effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor
+  wait_ns_before_start: 295.44
+  blocked_by: op0 via RAW on 'ub_1' ！ ub_1 written by op0, read by op7
+  blocked_by: op1 via WAW on 'ub_2' ！ ub_2 written by both op1 and op7
+  blocked_by: op2 via RAW on 'ub_1' ！ ub_1 written by op2, read by op7
+  blocked_by: op3 via WAW on 'ub_2' ！ ub_2 written by both op3 and op7
+  blocked_by: op4 via RAW on 'ub_1' ！ ub_1 written by op4, read by op7
+  blocked_by: op5 via WAW on 'ub_2' ！ ub_2 written by both op5 and op7
+  blocked_by: op6 via RAW on 'ub_1' ！ ub_1 written by op6, read by op7
+
+op8: gm_to_ub(ub_1, gm_1+4KB)
+  engine: GM★UB
+  size: 1 KB
+  cycles_ns: [307.66..372.36]  duration_ns=64.70  time_ratio=8.41%
+  bandwidth: effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor
+  wait_ns_before_start: 307.66
+  blocked_by: op0 via WAW on 'ub_1' ！ ub_1 written by both op0 and op8
+  blocked_by: op1 via WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op8
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op2 via WAW on 'ub_1' ！ ub_1 written by both op2 and op8
+  blocked_by: op3 via WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op8
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op4 via WAW on 'ub_1' ！ ub_1 written by both op4 and op8
+  blocked_by: op5 via WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op8
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op6 via WAW on 'ub_1' ！ ub_1 written by both op6 and op8
+  blocked_by: op7 via WAR on 'ub_1' ！ ub_1 read by op7, overwritten by op8
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+
+op9: vadd(ub_2, ub_1, 3)
+  engine: VecUnit
+  size: 1 KB
+  cycles_ns: [372.36..384.57]  duration_ns=12.22  time_ratio=1.59%
+  bandwidth: effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor
+  wait_ns_before_start: 372.36
+  blocked_by: op0 via RAW on 'ub_1' ！ ub_1 written by op0, read by op9
+  blocked_by: op1 via WAW on 'ub_2' ！ ub_2 written by both op1 and op9
+  blocked_by: op2 via RAW on 'ub_1' ！ ub_1 written by op2, read by op9
+  blocked_by: op3 via WAW on 'ub_2' ！ ub_2 written by both op3 and op9
+  blocked_by: op4 via RAW on 'ub_1' ！ ub_1 written by op4, read by op9
+  blocked_by: op5 via WAW on 'ub_2' ！ ub_2 written by both op5 and op9
+  blocked_by: op6 via RAW on 'ub_1' ！ ub_1 written by op6, read by op9
+  blocked_by: op7 via WAW on 'ub_2' ！ ub_2 written by both op7 and op9
+  blocked_by: op8 via RAW on 'ub_1' ！ ub_1 written by op8, read by op9
+
+op10: gm_to_ub(ub_1, gm_1+5KB)
+  engine: GM★UB
+  size: 1 KB
+  cycles_ns: [384.57..449.27]  duration_ns=64.70  time_ratio=8.41%
+  bandwidth: effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor
+  wait_ns_before_start: 384.57
+  blocked_by: op0 via WAW on 'ub_1' ！ ub_1 written by both op0 and op10
+  blocked_by: op1 via WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op10
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op2 via WAW on 'ub_1' ！ ub_1 written by both op2 and op10
+  blocked_by: op3 via WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op10
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op4 via WAW on 'ub_1' ！ ub_1 written by both op4 and op10
+  blocked_by: op5 via WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op10
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op6 via WAW on 'ub_1' ！ ub_1 written by both op6 and op10
+  blocked_by: op7 via WAR on 'ub_1' ！ ub_1 read by op7, overwritten by op10
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op8 via WAW on 'ub_1' ！ ub_1 written by both op8 and op10
+  blocked_by: op9 via WAR on 'ub_1' ！ ub_1 read by op9, overwritten by op10
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+
+op11: vadd(ub_2, ub_1, 3)
+  engine: VecUnit
+  size: 1 KB
+  cycles_ns: [449.27..461.49]  duration_ns=12.22  time_ratio=1.59%
+  bandwidth: effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor
+  wait_ns_before_start: 449.27
+  blocked_by: op0 via RAW on 'ub_1' ！ ub_1 written by op0, read by op11
+  blocked_by: op1 via WAW on 'ub_2' ！ ub_2 written by both op1 and op11
+  blocked_by: op2 via RAW on 'ub_1' ！ ub_1 written by op2, read by op11
+  blocked_by: op3 via WAW on 'ub_2' ！ ub_2 written by both op3 and op11
+  blocked_by: op4 via RAW on 'ub_1' ！ ub_1 written by op4, read by op11
+  blocked_by: op5 via WAW on 'ub_2' ！ ub_2 written by both op5 and op11
+  blocked_by: op6 via RAW on 'ub_1' ！ ub_1 written by op6, read by op11
+  blocked_by: op7 via WAW on 'ub_2' ！ ub_2 written by both op7 and op11
+  blocked_by: op8 via RAW on 'ub_1' ！ ub_1 written by op8, read by op11
+  blocked_by: op9 via WAW on 'ub_2' ！ ub_2 written by both op9 and op11
+  blocked_by: op10 via RAW on 'ub_1' ！ ub_1 written by op10, read by op11
+
+op12: gm_to_ub(ub_1, gm_1+6KB)
+  engine: GM★UB
+  size: 1 KB
+  cycles_ns: [461.49..526.19]  duration_ns=64.70  time_ratio=8.41%
+  bandwidth: effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor
+  wait_ns_before_start: 461.49
+  blocked_by: op0 via WAW on 'ub_1' ！ ub_1 written by both op0 and op12
+  blocked_by: op1 via WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op12
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op2 via WAW on 'ub_1' ！ ub_1 written by both op2 and op12
+  blocked_by: op3 via WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op12
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op4 via WAW on 'ub_1' ！ ub_1 written by both op4 and op12
+  blocked_by: op5 via WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op12
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op6 via WAW on 'ub_1' ！ ub_1 written by both op6 and op12
+  blocked_by: op7 via WAR on 'ub_1' ！ ub_1 read by op7, overwritten by op12
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op8 via WAW on 'ub_1' ！ ub_1 written by both op8 and op12
+  blocked_by: op9 via WAR on 'ub_1' ！ ub_1 read by op9, overwritten by op12
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op10 via WAW on 'ub_1' ！ ub_1 written by both op10 and op12
+  blocked_by: op11 via WAR on 'ub_1' ！ ub_1 read by op11, overwritten by op12
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+
+op13: vadd(ub_2, ub_1, 3)
+  engine: VecUnit
+  size: 1 KB
+  cycles_ns: [526.19..538.40]  duration_ns=12.22  time_ratio=1.59%
+  bandwidth: effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor
+  wait_ns_before_start: 526.19
+  blocked_by: op0 via RAW on 'ub_1' ！ ub_1 written by op0, read by op13
+  blocked_by: op1 via WAW on 'ub_2' ！ ub_2 written by both op1 and op13
+  blocked_by: op2 via RAW on 'ub_1' ！ ub_1 written by op2, read by op13
+  blocked_by: op3 via WAW on 'ub_2' ！ ub_2 written by both op3 and op13
+  blocked_by: op4 via RAW on 'ub_1' ！ ub_1 written by op4, read by op13
+  blocked_by: op5 via WAW on 'ub_2' ！ ub_2 written by both op5 and op13
+  blocked_by: op6 via RAW on 'ub_1' ！ ub_1 written by op6, read by op13
+  blocked_by: op7 via WAW on 'ub_2' ！ ub_2 written by both op7 and op13
+  blocked_by: op8 via RAW on 'ub_1' ！ ub_1 written by op8, read by op13
+  blocked_by: op9 via WAW on 'ub_2' ！ ub_2 written by both op9 and op13
+  blocked_by: op10 via RAW on 'ub_1' ！ ub_1 written by op10, read by op13
+  blocked_by: op11 via WAW on 'ub_2' ！ ub_2 written by both op11 and op13
+  blocked_by: op12 via RAW on 'ub_1' ！ ub_1 written by op12, read by op13
+
+op14: gm_to_ub(ub_1, gm_1+7KB)
+  engine: GM★UB
+  size: 1 KB
+  cycles_ns: [538.40..603.10]  duration_ns=64.70  time_ratio=8.41%
+  bandwidth: effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor
+  wait_ns_before_start: 538.40
+  blocked_by: op0 via WAW on 'ub_1' ！ ub_1 written by both op0 and op14
+  blocked_by: op1 via WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op14
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op2 via WAW on 'ub_1' ！ ub_1 written by both op2 and op14
+  blocked_by: op3 via WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op14
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op4 via WAW on 'ub_1' ！ ub_1 written by both op4 and op14
+  blocked_by: op5 via WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op14
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op6 via WAW on 'ub_1' ！ ub_1 written by both op6 and op14
+  blocked_by: op7 via WAR on 'ub_1' ！ ub_1 read by op7, overwritten by op14
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op8 via WAW on 'ub_1' ！ ub_1 written by both op8 and op14
+  blocked_by: op9 via WAR on 'ub_1' ！ ub_1 read by op9, overwritten by op14
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op10 via WAW on 'ub_1' ！ ub_1 written by both op10 and op14
+  blocked_by: op11 via WAR on 'ub_1' ！ ub_1 read by op11, overwritten by op14
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op12 via WAW on 'ub_1' ！ ub_1 written by both op12 and op14
+  blocked_by: op13 via WAR on 'ub_1' ！ ub_1 read by op13, overwritten by op14
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+
+op15: vadd(ub_2, ub_1, 3)
+  engine: VecUnit
+  size: 1 KB
+  cycles_ns: [603.10..615.32]  duration_ns=12.22  time_ratio=1.59%
+  bandwidth: effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor
+  wait_ns_before_start: 603.10
+  blocked_by: op0 via RAW on 'ub_1' ！ ub_1 written by op0, read by op15
+  blocked_by: op1 via WAW on 'ub_2' ！ ub_2 written by both op1 and op15
+  blocked_by: op2 via RAW on 'ub_1' ！ ub_1 written by op2, read by op15
+  blocked_by: op3 via WAW on 'ub_2' ！ ub_2 written by both op3 and op15
+  blocked_by: op4 via RAW on 'ub_1' ！ ub_1 written by op4, read by op15
+  blocked_by: op5 via WAW on 'ub_2' ！ ub_2 written by both op5 and op15
+  blocked_by: op6 via RAW on 'ub_1' ！ ub_1 written by op6, read by op15
+  blocked_by: op7 via WAW on 'ub_2' ！ ub_2 written by both op7 and op15
+  blocked_by: op8 via RAW on 'ub_1' ！ ub_1 written by op8, read by op15
+  blocked_by: op9 via WAW on 'ub_2' ！ ub_2 written by both op9 and op15
+  blocked_by: op10 via RAW on 'ub_1' ！ ub_1 written by op10, read by op15
+  blocked_by: op11 via WAW on 'ub_2' ！ ub_2 written by both op11 and op15
+  blocked_by: op12 via RAW on 'ub_1' ！ ub_1 written by op12, read by op15
+  blocked_by: op13 via WAW on 'ub_2' ！ ub_2 written by both op13 and op15
+  blocked_by: op14 via RAW on 'ub_1' ！ ub_1 written by op14, read by op15
+
+op16: gm_to_ub(ub_1, gm_1+8KB)
+  engine: GM★UB
+  size: 1 KB
+  cycles_ns: [615.32..680.01]  duration_ns=64.70  time_ratio=8.41%
+  bandwidth: effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor
+  wait_ns_before_start: 615.32
+  blocked_by: op0 via WAW on 'ub_1' ！ ub_1 written by both op0 and op16
+  blocked_by: op1 via WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op16
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op2 via WAW on 'ub_1' ！ ub_1 written by both op2 and op16
+  blocked_by: op3 via WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op16
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op4 via WAW on 'ub_1' ！ ub_1 written by both op4 and op16
+  blocked_by: op5 via WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op16
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op6 via WAW on 'ub_1' ！ ub_1 written by both op6 and op16
+  blocked_by: op7 via WAR on 'ub_1' ！ ub_1 read by op7, overwritten by op16
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op8 via WAW on 'ub_1' ！ ub_1 written by both op8 and op16
+  blocked_by: op9 via WAR on 'ub_1' ！ ub_1 read by op9, overwritten by op16
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op10 via WAW on 'ub_1' ！ ub_1 written by both op10 and op16
+  blocked_by: op11 via WAR on 'ub_1' ！ ub_1 read by op11, overwritten by op16
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op12 via WAW on 'ub_1' ！ ub_1 written by both op12 and op16
+  blocked_by: op13 via WAR on 'ub_1' ！ ub_1 read by op13, overwritten by op16
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op14 via WAW on 'ub_1' ！ ub_1 written by both op14 and op16
+  blocked_by: op15 via WAR on 'ub_1' ！ ub_1 read by op15, overwritten by op16
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+
+op17: vadd(ub_2, ub_1, 3)
+  engine: VecUnit
+  size: 1 KB
+  cycles_ns: [680.01..692.23]  duration_ns=12.22  time_ratio=1.59%
+  bandwidth: effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor
+  wait_ns_before_start: 680.01
+  blocked_by: op0 via RAW on 'ub_1' ！ ub_1 written by op0, read by op17
+  blocked_by: op1 via WAW on 'ub_2' ！ ub_2 written by both op1 and op17
+  blocked_by: op2 via RAW on 'ub_1' ！ ub_1 written by op2, read by op17
+  blocked_by: op3 via WAW on 'ub_2' ！ ub_2 written by both op3 and op17
+  blocked_by: op4 via RAW on 'ub_1' ！ ub_1 written by op4, read by op17
+  blocked_by: op5 via WAW on 'ub_2' ！ ub_2 written by both op5 and op17
+  blocked_by: op6 via RAW on 'ub_1' ！ ub_1 written by op6, read by op17
+  blocked_by: op7 via WAW on 'ub_2' ！ ub_2 written by both op7 and op17
+  blocked_by: op8 via RAW on 'ub_1' ！ ub_1 written by op8, read by op17
+  blocked_by: op9 via WAW on 'ub_2' ！ ub_2 written by both op9 and op17
+  blocked_by: op10 via RAW on 'ub_1' ！ ub_1 written by op10, read by op17
+  blocked_by: op11 via WAW on 'ub_2' ！ ub_2 written by both op11 and op17
+  blocked_by: op12 via RAW on 'ub_1' ！ ub_1 written by op12, read by op17
+  blocked_by: op13 via WAW on 'ub_2' ！ ub_2 written by both op13 and op17
+  blocked_by: op14 via RAW on 'ub_1' ！ ub_1 written by op14, read by op17
+  blocked_by: op15 via WAW on 'ub_2' ！ ub_2 written by both op15 and op17
+  blocked_by: op16 via RAW on 'ub_1' ！ ub_1 written by op16, read by op17
+
+op18: gm_to_ub(ub_1, gm_1+9KB)
+  engine: GM★UB
+  size: 1 KB
+  cycles_ns: [692.23..756.93]  duration_ns=64.70  time_ratio=8.41%
+  bandwidth: effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor
+  wait_ns_before_start: 692.23
+  blocked_by: op0 via WAW on 'ub_1' ！ ub_1 written by both op0 and op18
+  blocked_by: op1 via WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op18
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op2 via WAW on 'ub_1' ！ ub_1 written by both op2 and op18
+  blocked_by: op3 via WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op18
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op4 via WAW on 'ub_1' ！ ub_1 written by both op4 and op18
+  blocked_by: op5 via WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op18
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op6 via WAW on 'ub_1' ！ ub_1 written by both op6 and op18
+  blocked_by: op7 via WAR on 'ub_1' ！ ub_1 read by op7, overwritten by op18
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op8 via WAW on 'ub_1' ！ ub_1 written by both op8 and op18
+  blocked_by: op9 via WAR on 'ub_1' ！ ub_1 read by op9, overwritten by op18
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op10 via WAW on 'ub_1' ！ ub_1 written by both op10 and op18
+  blocked_by: op11 via WAR on 'ub_1' ！ ub_1 read by op11, overwritten by op18
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op12 via WAW on 'ub_1' ！ ub_1 written by both op12 and op18
+  blocked_by: op13 via WAR on 'ub_1' ！ ub_1 read by op13, overwritten by op18
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op14 via WAW on 'ub_1' ！ ub_1 written by both op14 and op18
+  blocked_by: op15 via WAR on 'ub_1' ！ ub_1 read by op15, overwritten by op18
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+  blocked_by: op16 via WAW on 'ub_1' ！ ub_1 written by both op16 and op18
+  blocked_by: op17 via WAR on 'ub_1' ！ ub_1 read by op17, overwritten by op18
+  fix: allocate a new destination buffer instead of reusing 'ub_1' to remove this WAR dependency
+
+op19: vadd(ub_2, ub_1, 3)
+  engine: VecUnit
+  size: 1 KB
+  cycles_ns: [756.93..769.15]  duration_ns=12.22  time_ratio=1.59%
+  bandwidth: effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor
+  wait_ns_before_start: 756.93
+  blocked_by: op0 via RAW on 'ub_1' ！ ub_1 written by op0, read by op19
+  blocked_by: op1 via WAW on 'ub_2' ！ ub_2 written by both op1 and op19
+  blocked_by: op2 via RAW on 'ub_1' ！ ub_1 written by op2, read by op19
+  blocked_by: op3 via WAW on 'ub_2' ！ ub_2 written by both op3 and op19
+  blocked_by: op4 via RAW on 'ub_1' ！ ub_1 written by op4, read by op19
+  blocked_by: op5 via WAW on 'ub_2' ！ ub_2 written by both op5 and op19
+  blocked_by: op6 via RAW on 'ub_1' ！ ub_1 written by op6, read by op19
+  blocked_by: op7 via WAW on 'ub_2' ！ ub_2 written by both op7 and op19
+  blocked_by: op8 via RAW on 'ub_1' ！ ub_1 written by op8, read by op19
+  blocked_by: op9 via WAW on 'ub_2' ！ ub_2 written by both op9 and op19
+  blocked_by: op10 via RAW on 'ub_1' ！ ub_1 written by op10, read by op19
+  blocked_by: op11 via WAW on 'ub_2' ！ ub_2 written by both op11 and op19
+  blocked_by: op12 via RAW on 'ub_1' ！ ub_1 written by op12, read by op19
+  blocked_by: op13 via WAW on 'ub_2' ！ ub_2 written by both op13 and op19
+  blocked_by: op14 via RAW on 'ub_1' ！ ub_1 written by op14, read by op19
+  blocked_by: op15 via WAW on 'ub_2' ！ ub_2 written by both op15 and op19
+  blocked_by: op16 via RAW on 'ub_1' ！ ub_1 written by op16, read by op19
+  blocked_by: op17 via WAW on 'ub_2' ！ ub_2 written by both op17 and op19
+  blocked_by: op18 via RAW on 'ub_1' ！ ub_1 written by op18, read by op19
+
+=== ENGINE UTILIZATION ===
+GM★UB: busy=646.98/769.15 ns  utilization=84.12%
+UB★GM: busy=0.00/769.15 ns  utilization=0.00%
+VecUnit: busy=122.17/769.15 ns  utilization=15.88%
+GM★L1: busy=0.00/769.15 ns  utilization=0.00%
+L1★L0: busy=0.00/769.15 ns  utilization=0.00%
+CubeUnit: busy=0.00/769.15 ns  utilization=0.00%
+L0★GM: busy=0.00/769.15 ns  utilization=0.00%
+
+=== BANDWIDTH UTILIZATION ===
+(effective_bw / peak_bw per op; bandwidth ramps with size, so small transfers run below peak)
+op0 (GM★UB): effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor  k0=6.7KB (half-sat)
+op1 (VecUnit): effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor  k0=4.5KB (half-sat)
+op2 (GM★UB): effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor  k0=6.7KB (half-sat)
+op3 (VecUnit): effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor  k0=4.5KB (half-sat)
+op4 (GM★UB): effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor  k0=6.7KB (half-sat)
+op5 (VecUnit): effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor  k0=4.5KB (half-sat)
+op6 (GM★UB): effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor  k0=6.7KB (half-sat)
+op7 (VecUnit): effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor  k0=4.5KB (half-sat)
+op8 (GM★UB): effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor  k0=6.7KB (half-sat)
+op9 (VecUnit): effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor  k0=4.5KB (half-sat)
+op10 (GM★UB): effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor  k0=6.7KB (half-sat)
+op11 (VecUnit): effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor  k0=4.5KB (half-sat)
+op12 (GM★UB): effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor  k0=6.7KB (half-sat)
+op13 (VecUnit): effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor  k0=4.5KB (half-sat)
+op14 (GM★UB): effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor  k0=6.7KB (half-sat)
+op15 (VecUnit): effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor  k0=4.5KB (half-sat)
+op16 (GM★UB): effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor  k0=6.7KB (half-sat)
+op17 (VecUnit): effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor  k0=4.5KB (half-sat)
+op18 (GM★UB): effective=15.83 GB/s  peak=81 GB/s  utilization=19.58%  regime=floor  k0=6.7KB (half-sat)
+op19 (VecUnit): effective=83.82 GB/s  peak=404 GB/s  utilization=20.75%  regime=floor  k0=4.5KB (half-sat)
+
+=== PARALLELISM ===
+parallel_pairs: 0
+root_cause_of_sequential_execution:
+  op0->op1: RAW on 'ub_1' ！ ub_1 written by op0, read by op1
+  op0->op2: WAW on 'ub_1' ！ ub_1 written by both op0 and op2
+  op1->op2: WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op2
+  op0->op3: RAW on 'ub_1' ！ ub_1 written by op0, read by op3
+  op1->op3: WAW on 'ub_2' ！ ub_2 written by both op1 and op3
+  op2->op3: RAW on 'ub_1' ！ ub_1 written by op2, read by op3
+  op0->op4: WAW on 'ub_1' ！ ub_1 written by both op0 and op4
+  op1->op4: WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op4
+  op2->op4: WAW on 'ub_1' ！ ub_1 written by both op2 and op4
+  op3->op4: WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op4
+  op0->op5: RAW on 'ub_1' ！ ub_1 written by op0, read by op5
+  op1->op5: WAW on 'ub_2' ！ ub_2 written by both op1 and op5
+  op2->op5: RAW on 'ub_1' ！ ub_1 written by op2, read by op5
+  op3->op5: WAW on 'ub_2' ！ ub_2 written by both op3 and op5
+  op4->op5: RAW on 'ub_1' ！ ub_1 written by op4, read by op5
+  op0->op6: WAW on 'ub_1' ！ ub_1 written by both op0 and op6
+  op1->op6: WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op6
+  op2->op6: WAW on 'ub_1' ！ ub_1 written by both op2 and op6
+  op3->op6: WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op6
+  op4->op6: WAW on 'ub_1' ！ ub_1 written by both op4 and op6
+  op5->op6: WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op6
+  op0->op7: RAW on 'ub_1' ！ ub_1 written by op0, read by op7
+  op1->op7: WAW on 'ub_2' ！ ub_2 written by both op1 and op7
+  op2->op7: RAW on 'ub_1' ！ ub_1 written by op2, read by op7
+  op3->op7: WAW on 'ub_2' ！ ub_2 written by both op3 and op7
+  op4->op7: RAW on 'ub_1' ！ ub_1 written by op4, read by op7
+  op5->op7: WAW on 'ub_2' ！ ub_2 written by both op5 and op7
+  op6->op7: RAW on 'ub_1' ！ ub_1 written by op6, read by op7
+  op0->op8: WAW on 'ub_1' ！ ub_1 written by both op0 and op8
+  op1->op8: WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op8
+  op2->op8: WAW on 'ub_1' ！ ub_1 written by both op2 and op8
+  op3->op8: WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op8
+  op4->op8: WAW on 'ub_1' ！ ub_1 written by both op4 and op8
+  op5->op8: WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op8
+  op6->op8: WAW on 'ub_1' ！ ub_1 written by both op6 and op8
+  op7->op8: WAR on 'ub_1' ！ ub_1 read by op7, overwritten by op8
+  op0->op9: RAW on 'ub_1' ！ ub_1 written by op0, read by op9
+  op1->op9: WAW on 'ub_2' ！ ub_2 written by both op1 and op9
+  op2->op9: RAW on 'ub_1' ！ ub_1 written by op2, read by op9
+  op3->op9: WAW on 'ub_2' ！ ub_2 written by both op3 and op9
+  op4->op9: RAW on 'ub_1' ！ ub_1 written by op4, read by op9
+  op5->op9: WAW on 'ub_2' ！ ub_2 written by both op5 and op9
+  op6->op9: RAW on 'ub_1' ！ ub_1 written by op6, read by op9
+  op7->op9: WAW on 'ub_2' ！ ub_2 written by both op7 and op9
+  op8->op9: RAW on 'ub_1' ！ ub_1 written by op8, read by op9
+  op0->op10: WAW on 'ub_1' ！ ub_1 written by both op0 and op10
+  op1->op10: WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op10
+  op2->op10: WAW on 'ub_1' ！ ub_1 written by both op2 and op10
+  op3->op10: WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op10
+  op4->op10: WAW on 'ub_1' ！ ub_1 written by both op4 and op10
+  op5->op10: WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op10
+  op6->op10: WAW on 'ub_1' ！ ub_1 written by both op6 and op10
+  op7->op10: WAR on 'ub_1' ！ ub_1 read by op7, overwritten by op10
+  op8->op10: WAW on 'ub_1' ！ ub_1 written by both op8 and op10
+  op9->op10: WAR on 'ub_1' ！ ub_1 read by op9, overwritten by op10
+  op0->op11: RAW on 'ub_1' ！ ub_1 written by op0, read by op11
+  op1->op11: WAW on 'ub_2' ！ ub_2 written by both op1 and op11
+  op2->op11: RAW on 'ub_1' ！ ub_1 written by op2, read by op11
+  op3->op11: WAW on 'ub_2' ！ ub_2 written by both op3 and op11
+  op4->op11: RAW on 'ub_1' ！ ub_1 written by op4, read by op11
+  op5->op11: WAW on 'ub_2' ！ ub_2 written by both op5 and op11
+  op6->op11: RAW on 'ub_1' ！ ub_1 written by op6, read by op11
+  op7->op11: WAW on 'ub_2' ！ ub_2 written by both op7 and op11
+  op8->op11: RAW on 'ub_1' ！ ub_1 written by op8, read by op11
+  op9->op11: WAW on 'ub_2' ！ ub_2 written by both op9 and op11
+  op10->op11: RAW on 'ub_1' ！ ub_1 written by op10, read by op11
+  op0->op12: WAW on 'ub_1' ！ ub_1 written by both op0 and op12
+  op1->op12: WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op12
+  op2->op12: WAW on 'ub_1' ！ ub_1 written by both op2 and op12
+  op3->op12: WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op12
+  op4->op12: WAW on 'ub_1' ！ ub_1 written by both op4 and op12
+  op5->op12: WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op12
+  op6->op12: WAW on 'ub_1' ！ ub_1 written by both op6 and op12
+  op7->op12: WAR on 'ub_1' ！ ub_1 read by op7, overwritten by op12
+  op8->op12: WAW on 'ub_1' ！ ub_1 written by both op8 and op12
+  op9->op12: WAR on 'ub_1' ！ ub_1 read by op9, overwritten by op12
+  op10->op12: WAW on 'ub_1' ！ ub_1 written by both op10 and op12
+  op11->op12: WAR on 'ub_1' ！ ub_1 read by op11, overwritten by op12
+  op0->op13: RAW on 'ub_1' ！ ub_1 written by op0, read by op13
+  op1->op13: WAW on 'ub_2' ！ ub_2 written by both op1 and op13
+  op2->op13: RAW on 'ub_1' ！ ub_1 written by op2, read by op13
+  op3->op13: WAW on 'ub_2' ！ ub_2 written by both op3 and op13
+  op4->op13: RAW on 'ub_1' ！ ub_1 written by op4, read by op13
+  op5->op13: WAW on 'ub_2' ！ ub_2 written by both op5 and op13
+  op6->op13: RAW on 'ub_1' ！ ub_1 written by op6, read by op13
+  op7->op13: WAW on 'ub_2' ！ ub_2 written by both op7 and op13
+  op8->op13: RAW on 'ub_1' ！ ub_1 written by op8, read by op13
+  op9->op13: WAW on 'ub_2' ！ ub_2 written by both op9 and op13
+  op10->op13: RAW on 'ub_1' ！ ub_1 written by op10, read by op13
+  op11->op13: WAW on 'ub_2' ！ ub_2 written by both op11 and op13
+  op12->op13: RAW on 'ub_1' ！ ub_1 written by op12, read by op13
+  op0->op14: WAW on 'ub_1' ！ ub_1 written by both op0 and op14
+  op1->op14: WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op14
+  op2->op14: WAW on 'ub_1' ！ ub_1 written by both op2 and op14
+  op3->op14: WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op14
+  op4->op14: WAW on 'ub_1' ！ ub_1 written by both op4 and op14
+  op5->op14: WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op14
+  op6->op14: WAW on 'ub_1' ！ ub_1 written by both op6 and op14
+  op7->op14: WAR on 'ub_1' ！ ub_1 read by op7, overwritten by op14
+  op8->op14: WAW on 'ub_1' ！ ub_1 written by both op8 and op14
+  op9->op14: WAR on 'ub_1' ！ ub_1 read by op9, overwritten by op14
+  op10->op14: WAW on 'ub_1' ！ ub_1 written by both op10 and op14
+  op11->op14: WAR on 'ub_1' ！ ub_1 read by op11, overwritten by op14
+  op12->op14: WAW on 'ub_1' ！ ub_1 written by both op12 and op14
+  op13->op14: WAR on 'ub_1' ！ ub_1 read by op13, overwritten by op14
+  op0->op15: RAW on 'ub_1' ！ ub_1 written by op0, read by op15
+  op1->op15: WAW on 'ub_2' ！ ub_2 written by both op1 and op15
+  op2->op15: RAW on 'ub_1' ！ ub_1 written by op2, read by op15
+  op3->op15: WAW on 'ub_2' ！ ub_2 written by both op3 and op15
+  op4->op15: RAW on 'ub_1' ！ ub_1 written by op4, read by op15
+  op5->op15: WAW on 'ub_2' ！ ub_2 written by both op5 and op15
+  op6->op15: RAW on 'ub_1' ！ ub_1 written by op6, read by op15
+  op7->op15: WAW on 'ub_2' ！ ub_2 written by both op7 and op15
+  op8->op15: RAW on 'ub_1' ！ ub_1 written by op8, read by op15
+  op9->op15: WAW on 'ub_2' ！ ub_2 written by both op9 and op15
+  op10->op15: RAW on 'ub_1' ！ ub_1 written by op10, read by op15
+  op11->op15: WAW on 'ub_2' ！ ub_2 written by both op11 and op15
+  op12->op15: RAW on 'ub_1' ！ ub_1 written by op12, read by op15
+  op13->op15: WAW on 'ub_2' ！ ub_2 written by both op13 and op15
+  op14->op15: RAW on 'ub_1' ！ ub_1 written by op14, read by op15
+  op0->op16: WAW on 'ub_1' ！ ub_1 written by both op0 and op16
+  op1->op16: WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op16
+  op2->op16: WAW on 'ub_1' ！ ub_1 written by both op2 and op16
+  op3->op16: WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op16
+  op4->op16: WAW on 'ub_1' ！ ub_1 written by both op4 and op16
+  op5->op16: WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op16
+  op6->op16: WAW on 'ub_1' ！ ub_1 written by both op6 and op16
+  op7->op16: WAR on 'ub_1' ！ ub_1 read by op7, overwritten by op16
+  op8->op16: WAW on 'ub_1' ！ ub_1 written by both op8 and op16
+  op9->op16: WAR on 'ub_1' ！ ub_1 read by op9, overwritten by op16
+  op10->op16: WAW on 'ub_1' ！ ub_1 written by both op10 and op16
+  op11->op16: WAR on 'ub_1' ！ ub_1 read by op11, overwritten by op16
+  op12->op16: WAW on 'ub_1' ！ ub_1 written by both op12 and op16
+  op13->op16: WAR on 'ub_1' ！ ub_1 read by op13, overwritten by op16
+  op14->op16: WAW on 'ub_1' ！ ub_1 written by both op14 and op16
+  op15->op16: WAR on 'ub_1' ！ ub_1 read by op15, overwritten by op16
+  op0->op17: RAW on 'ub_1' ！ ub_1 written by op0, read by op17
+  op1->op17: WAW on 'ub_2' ！ ub_2 written by both op1 and op17
+  op2->op17: RAW on 'ub_1' ！ ub_1 written by op2, read by op17
+  op3->op17: WAW on 'ub_2' ！ ub_2 written by both op3 and op17
+  op4->op17: RAW on 'ub_1' ！ ub_1 written by op4, read by op17
+  op5->op17: WAW on 'ub_2' ！ ub_2 written by both op5 and op17
+  op6->op17: RAW on 'ub_1' ！ ub_1 written by op6, read by op17
+  op7->op17: WAW on 'ub_2' ！ ub_2 written by both op7 and op17
+  op8->op17: RAW on 'ub_1' ！ ub_1 written by op8, read by op17
+  op9->op17: WAW on 'ub_2' ！ ub_2 written by both op9 and op17
+  op10->op17: RAW on 'ub_1' ！ ub_1 written by op10, read by op17
+  op11->op17: WAW on 'ub_2' ！ ub_2 written by both op11 and op17
+  op12->op17: RAW on 'ub_1' ！ ub_1 written by op12, read by op17
+  op13->op17: WAW on 'ub_2' ！ ub_2 written by both op13 and op17
+  op14->op17: RAW on 'ub_1' ！ ub_1 written by op14, read by op17
+  op15->op17: WAW on 'ub_2' ！ ub_2 written by both op15 and op17
+  op16->op17: RAW on 'ub_1' ！ ub_1 written by op16, read by op17
+  op0->op18: WAW on 'ub_1' ！ ub_1 written by both op0 and op18
+  op1->op18: WAR on 'ub_1' ！ ub_1 read by op1, overwritten by op18
+  op2->op18: WAW on 'ub_1' ！ ub_1 written by both op2 and op18
+  op3->op18: WAR on 'ub_1' ！ ub_1 read by op3, overwritten by op18
+  op4->op18: WAW on 'ub_1' ！ ub_1 written by both op4 and op18
+  op5->op18: WAR on 'ub_1' ！ ub_1 read by op5, overwritten by op18
+  op6->op18: WAW on 'ub_1' ！ ub_1 written by both op6 and op18
+  op7->op18: WAR on 'ub_1' ！ ub_1 read by op7, overwritten by op18
+  op8->op18: WAW on 'ub_1' ！ ub_1 written by both op8 and op18
+  op9->op18: WAR on 'ub_1' ！ ub_1 read by op9, overwritten by op18
+  op10->op18: WAW on 'ub_1' ！ ub_1 written by both op10 and op18
+  op11->op18: WAR on 'ub_1' ！ ub_1 read by op11, overwritten by op18
+  op12->op18: WAW on 'ub_1' ！ ub_1 written by both op12 and op18
+  op13->op18: WAR on 'ub_1' ！ ub_1 read by op13, overwritten by op18
+  op14->op18: WAW on 'ub_1' ！ ub_1 written by both op14 and op18
+  op15->op18: WAR on 'ub_1' ！ ub_1 read by op15, overwritten by op18
+  op16->op18: WAW on 'ub_1' ！ ub_1 written by both op16 and op18
+  op17->op18: WAR on 'ub_1' ！ ub_1 read by op17, overwritten by op18
+  op0->op19: RAW on 'ub_1' ！ ub_1 written by op0, read by op19
+  op1->op19: WAW on 'ub_2' ！ ub_2 written by both op1 and op19
+  op2->op19: RAW on 'ub_1' ！ ub_1 written by op2, read by op19
+  op3->op19: WAW on 'ub_2' ！ ub_2 written by both op3 and op19
+  op4->op19: RAW on 'ub_1' ！ ub_1 written by op4, read by op19
+  op5->op19: WAW on 'ub_2' ！ ub_2 written by both op5 and op19
+  op6->op19: RAW on 'ub_1' ！ ub_1 written by op6, read by op19
+  op7->op19: WAW on 'ub_2' ！ ub_2 written by both op7 and op19
+  op8->op19: RAW on 'ub_1' ！ ub_1 written by op8, read by op19
+  op9->op19: WAW on 'ub_2' ！ ub_2 written by both op9 and op19
+  op10->op19: RAW on 'ub_1' ！ ub_1 written by op10, read by op19
+  op11->op19: WAW on 'ub_2' ！ ub_2 written by both op11 and op19
+  op12->op19: RAW on 'ub_1' ！ ub_1 written by op12, read by op19
+  op13->op19: WAW on 'ub_2' ！ ub_2 written by both op13 and op19
+  op14->op19: RAW on 'ub_1' ！ ub_1 written by op14, read by op19
+  op15->op19: WAW on 'ub_2' ！ ub_2 written by both op15 and op19
+  op16->op19: RAW on 'ub_1' ！ ub_1 written by op16, read by op19
+  op17->op19: WAW on 'ub_2' ！ ub_2 written by both op17 and op19
+  op18->op19: RAW on 'ub_1' ！ ub_1 written by op18, read by op19
+
+=== CRITICAL PATH ===
+algorithm: topo
+length_ns: 769.15
+fraction_of_makespan: 100%
+path: op0 -> op1 -> op2 -> op3 -> op4 -> op5 -> op6 -> op7 -> op8 -> op9 -> op10 -> op11 -> op12 -> op13 -> op14 -> op15 -> op16 -> op17 -> op18 -> op19
+edges:
+  op0 -> op1: RAW on 'ub_1'
+  op1 -> op2: WAR on 'ub_1'
+  op2 -> op3: RAW on 'ub_1'
+  op3 -> op4: WAR on 'ub_1'
+  op4 -> op5: RAW on 'ub_1'
+  op5 -> op6: WAR on 'ub_1'
+  op6 -> op7: RAW on 'ub_1'
+  op7 -> op8: WAR on 'ub_1'
+  op8 -> op9: RAW on 'ub_1'
+  op9 -> op10: WAR on 'ub_1'
+  op10 -> op11: RAW on 'ub_1'
+  op11 -> op12: WAR on 'ub_1'
+  op12 -> op13: RAW on 'ub_1'
+  op13 -> op14: WAR on 'ub_1'
+  op14 -> op15: RAW on 'ub_1'
+  op15 -> op16: WAR on 'ub_1'
+  op16 -> op17: RAW on 'ub_1'
+  op17 -> op18: WAR on 'ub_1'
+  op18 -> op19: RAW on 'ub_1'
+per_op:
+  op0 gm_to_ub(ub_1, gm_1+0KB)  engine=GM★UB  ns=[0.00..64.70]  duration_ns=64.70
+  op1 vadd(ub_2, ub_1, 3)  engine=VecUnit  ns=[64.70..76.91]  duration_ns=12.22
+  op2 gm_to_ub(ub_1, gm_1+1KB)  engine=GM★UB  ns=[76.91..141.61]  duration_ns=64.70
+  op3 vadd(ub_2, ub_1, 3)  engine=VecUnit  ns=[141.61..153.83]  duration_ns=12.22
+  op4 gm_to_ub(ub_1, gm_1+2KB)  engine=GM★UB  ns=[153.83..218.53]  duration_ns=64.70
+  op5 vadd(ub_2, ub_1, 3)  engine=VecUnit  ns=[218.53..230.74]  duration_ns=12.22
+  op6 gm_to_ub(ub_1, gm_1+3KB)  engine=GM★UB  ns=[230.74..295.44]  duration_ns=64.70
+  op7 vadd(ub_2, ub_1, 3)  engine=VecUnit  ns=[295.44..307.66]  duration_ns=12.22
+  op8 gm_to_ub(ub_1, gm_1+4KB)  engine=GM★UB  ns=[307.66..372.36]  duration_ns=64.70
+  op9 vadd(ub_2, ub_1, 3)  engine=VecUnit  ns=[372.36..384.57]  duration_ns=12.22
+  op10 gm_to_ub(ub_1, gm_1+5KB)  engine=GM★UB  ns=[384.57..449.27]  duration_ns=64.70
+  op11 vadd(ub_2, ub_1, 3)  engine=VecUnit  ns=[449.27..461.49]  duration_ns=12.22
+  op12 gm_to_ub(ub_1, gm_1+6KB)  engine=GM★UB  ns=[461.49..526.19]  duration_ns=64.70
+  op13 vadd(ub_2, ub_1, 3)  engine=VecUnit  ns=[526.19..538.40]  duration_ns=12.22
+  op14 gm_to_ub(ub_1, gm_1+7KB)  engine=GM★UB  ns=[538.40..603.10]  duration_ns=64.70
+  op15 vadd(ub_2, ub_1, 3)  engine=VecUnit  ns=[603.10..615.32]  duration_ns=12.22
+  op16 gm_to_ub(ub_1, gm_1+8KB)  engine=GM★UB  ns=[615.32..680.01]  duration_ns=64.70
+  op17 vadd(ub_2, ub_1, 3)  engine=VecUnit  ns=[680.01..692.23]  duration_ns=12.22
+  op18 gm_to_ub(ub_1, gm_1+9KB)  engine=GM★UB  ns=[692.23..756.93]  duration_ns=64.70
+  op19 vadd(ub_2, ub_1, 3)  engine=VecUnit  ns=[756.93..769.15]  duration_ns=12.22
+

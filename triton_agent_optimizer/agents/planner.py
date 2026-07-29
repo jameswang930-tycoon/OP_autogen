@@ -153,6 +153,7 @@ def _build_system_prompt(tier: int, playbook: str) -> str:
 ## Your Job
 You are at Tier {tier}: {TIER_NAMES.get(tier, 'Unknown')}.
 Generate ONE specific, small optimization change for this round.
+## CRITICAL: When to say algorithm_already_optimal- If kernel has NO ops to optimize at this tier, output: {"strategy": "algorithm_already_optimal"}- Tier 2 (Fusion): no adjacent RAW chains to fuse → algorithm_already_optimal- Tier 3 (Tiling): all BW ops saturated (util>90%) → algorithm_already_optimal- Do NOT invent non-existent ops. Read the per-op list below to see actual ops.
 Output ONLY valid JSON — no explanation, no markdown.
 
 ## Playbook (Tier {tier} reference)
@@ -251,7 +252,11 @@ class PlannerAgent:
 
         # Step 4: 调用 LLM (或 stub)
         if self.use_llm:
-            plan_dict = self._call_llm(system_prompt, full_prompt)
+            try:
+                plan_dict = self._call_llm(system_prompt, full_prompt)
+            except Exception as e:
+                print(f"  [Planner] LLM call failed: {e}, falling back to stub")
+                plan_dict = self._stub_plan(diagnosis, tier)
         else:
             plan_dict = self._stub_plan(diagnosis, tier)
 
@@ -273,27 +278,81 @@ class PlannerAgent:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _call_llm(self, system_prompt: str, user_prompt: str) -> dict:
-        """调用 Anthropic API。"""
-        import anthropic
+        """调用 LLM API (Anthropic 或 DeepSeek/OpenAI 兼容)。"""
+        import os
 
-        client = anthropic.Anthropic()
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2048,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-        text = response.content[0].text
+        # 检测用哪个 API
+        deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
-        # 提取 JSON (可能被 markdown 代码块包裹)
+        if deepseek_key:
+            # DeepSeek API (OpenAI 兼容)
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=deepseek_key,
+                base_url="https://api.deepseek.com",
+            )
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                max_tokens=2048,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            text = response.choices[0].message.content or ""
+            print(f"  [Planner] LLM response: {len(text)} chars")
+        elif anthropic_key:
+            # Anthropic API
+            import anthropic
+            client = anthropic.Anthropic(api_key=anthropic_key)
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=2048,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            text = response.content[0].text
+        else:
+            raise RuntimeError("No API key found. Set DEEPSEEK_API_KEY or ANTHROPIC_API_KEY in .env")
+
+        if not text or not text.strip():
+            print(f"  [Planner] WARNING: LLM returned empty response!")
+            raise ValueError("Empty LLM response")
+
+        # 提取 JSON (容错处理)
         text = text.strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
+        # 去除 markdown 代码块
+        if "```" in text:
+            parts = text.split("```")
+            for p in parts:
+                p = p.strip()
+                if p.startswith("json"):
+                    p = p[4:].strip()
+                if p.startswith("{"):
+                    text = p
+                    break
+        # 找第一个 { 到最后一个 }
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            text = text[start:end + 1]
 
-        return json.loads(text)
+        # 多次尝试修复
+        for attempt in range(3):
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as e:
+                if attempt == 0:
+                    # 尝试1: 修复未闭合字符串引号
+                    import re
+                    text = re.sub(r':\s*([^{}"\s,]+)(?=\s*[,}])', r': "\1"', text)
+                elif attempt == 1:
+                    # 尝试2: 给所有未引号值加引号
+                    text = re.sub(r'(?<=:)\s*([^"{}\[\],\s]+)(?=\s*[,}\]])', r' "\1"', text)
+                else:
+                    raise e
+        return json.loads(text)  # final attempt
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  Stub (本地测试)

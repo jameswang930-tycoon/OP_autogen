@@ -129,6 +129,13 @@ def _trim_text(text: str, max_tokens: int) -> str:
     return text[:head] + f"\n\n...(truncated {len(text) - head - tail} chars)...\n\n" + text[-tail:]
 
 
+def _sf2(v, default=0.0):
+    if isinstance(v, (int, float)): return float(v)
+    if isinstance(v, str):
+        try: return float(str(v).rstrip("%")) / 100.0 if "%" in str(v) else float(v)
+        except: return default
+    return default
+
 def format_diagnosis(diag) -> str:
     """将 BottleneckDiagnosis 格式化为 prompt 文本。"""
     lines = [
@@ -139,8 +146,8 @@ def format_diagnosis(diag) -> str:
         f"- **Type**: {getattr(diag, 'bottleneck_type', '?')} "
         f"({getattr(diag, 'bottleneck_category', '?')})",
         f"- **Headroom**: {getattr(diag, 'optimization_headroom', '?')}",
-        f"- **Time ratio**: {getattr(diag, 'bottleneck_time_ratio', 0):.2%}",
-        f"- **BW utilization**: {getattr(diag, 'bottleneck_bw_utilization', 0):.2%}",
+        f"- **Time ratio**: {_sf2(getattr(diag, 'bottleneck_time_ratio', 0)):.2%}",
+        f"- **BW utilization**: {_sf2(getattr(diag, 'bottleneck_bw_utilization', 0)):.2%}",
         f"- **Regime**: {getattr(diag, 'bottleneck_regime', '?')}",
         f"- **Suggested strategies**: {getattr(diag, 'suggested_strategies', [])}",
         f"- **Structural issues**: {getattr(diag, 'structural_issues', [])}",

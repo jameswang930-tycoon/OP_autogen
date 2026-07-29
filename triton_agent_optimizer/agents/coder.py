@@ -77,20 +77,33 @@ class CoderResult:
 #  Prompt 构建
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _load_coding_guide() -> str:
+    """加载编码指南文档。"""
+    import os
+    guide_path = Path(__file__).resolve().parent.parent / "docx" / "CODING_GUIDE.md"
+    if guide_path.exists():
+        return guide_path.read_text(encoding="utf-8")[:4000]
+    return ""
+
 def _build_system_prompt() -> str:
-    return """You are a precise Triton kernel code modifier for Huawei Ascend 910B3 NPU.
+    guide = _load_coding_guide()
+    return f"""You are a precise Triton kernel code modifier for Huawei Ascend 910B3 NPU.
+
+## Coding Guide (MUST FOLLOW)
+{guide}
 
 ## Rules
 1. Change ONLY what the plan specifies — nothing more, nothing less
-2. Maintain existing code style, indentation, and comments
-3. Output the COMPLETE modified file (not just changed lines)
-4. Keep all existing imports and function signatures unless the plan says to change them
-5. Do NOT add new features, refactoring, or "improvements" beyond the plan
+2. **NEVER change function name, parameter count, or parameter order**
+3. Maintain existing code style, indentation, and comments
+4. Output the COMPLETE modified Python file (not just changed lines)
+5. Keep all existing imports and @triton.jit decorator
 6. If the plan says "BLOCK_SIZE: 256 → 8192", change ONLY that one parameter
+7. If previous error is provided, FIX IT while implementing the plan
 
 ## Output Format
 Return ONLY the complete modified Python code. No markdown, no explanation, no diff.
-The code must be syntactically valid Python."""
+The code must be syntactically valid Python and pass the verifier."""
 
 
 def _build_user_prompt(
@@ -235,18 +248,58 @@ class CoderAgent:
 
     def _call_llm(self, kernel_code: str, plan_text: str,
                   previous_error: str) -> str:
-        import anthropic
-        client = anthropic.Anthropic()
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            system=_build_system_prompt(),
-            messages=[{
-                "role": "user",
-                "content": _build_user_prompt(plan_text, kernel_code, previous_error),
-            }],
-        )
-        return response.content[0].text
+        import os
+
+        # 查错误记忆: 跨所有 kernel 搜索已知解决方案
+        if previous_error:
+            try:
+                from memory.codeerror import CodeErrorMemory
+                mem = CodeErrorMemory(os.path.basename(os.getcwd()) or "kernel")
+                # 当前 kernel 的方案
+                known = mem.find_solution(previous_error)
+                # 跨 kernel 搜索
+                cross = mem.search_all(previous_error)
+                all_fixes = []
+                if known:
+                    all_fixes.append(f"[本kernel] {known}")
+                if cross:
+                    all_fixes.append(cross)
+                if all_fixes:
+                    previous_error = f"{previous_error}\n\n[已知修复方案]\n" + "\n".join(all_fixes)
+            except Exception:
+                pass
+
+        deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+        if deepseek_key:
+            from openai import OpenAI
+            client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com",
+                           timeout=60.0)
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                max_tokens=4096,
+                messages=[
+                    {"role": "system", "content": _build_system_prompt()},
+                    {"role": "user", "content": _build_user_prompt(plan_text, kernel_code, previous_error)},
+                ],
+            )
+            return response.choices[0].message.content
+        elif anthropic_key:
+            import anthropic
+            client = anthropic.Anthropic(api_key=anthropic_key)
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4096,
+                system=_build_system_prompt(),
+                messages=[{
+                    "role": "user",
+                    "content": _build_user_prompt(plan_text, kernel_code, previous_error),
+                }],
+            )
+            return response.content[0].text
+        else:
+            raise RuntimeError("No API key found")
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  Stub

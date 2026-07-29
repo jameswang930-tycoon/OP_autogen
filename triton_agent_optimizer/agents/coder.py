@@ -176,24 +176,18 @@ def _count_lines_changed(diff_text: str) -> int:
 class CoderAgent:
     """编码智能体 — Prompt 编排器。
 
-    只负责改代码, 不改任何其他文件。
-    回退由 Orchestrator 负责 (保持 current_kernel 不变即可回退)。
+    支持 3 种 LLM 调用模式 (通过 LLMClient):
+      - api: DEEPSEEK_API_KEY / ANTHROPIC_API_KEY
+      - cli: LLM_CLI_COMMAND="nga run"
+      - stub: 无配置时返回原代码
 
     Usage:
         coder = CoderAgent()
-        result = coder.apply(
-            kernel_code=current_kernel,
-            plan_text=plan.plan_text,
-            previous_error="",
-        )
+        result = coder.apply(...)
     """
 
-    def __init__(self, use_llm: bool = False):
+    def __init__(self, use_llm: bool = True):
         self.use_llm = use_llm
-        if not use_llm:
-            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-            if api_key:
-                self.use_llm = True
 
     def apply(
         self,
@@ -243,63 +237,31 @@ class CoderAgent:
         )
 
     # ═══════════════════════════════════════════════════════════════════════════
-    #  LLM
+    #  LLM (统一通过 LLMClient)
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _call_llm(self, kernel_code: str, plan_text: str,
                   previous_error: str) -> str:
-        import os
-
-        # 查错误记忆: 跨所有 kernel 搜索已知解决方案
+        # 查错误记忆
         if previous_error:
             try:
                 from memory.codeerror import CodeErrorMemory
                 mem = CodeErrorMemory(os.path.basename(os.getcwd()) or "kernel")
-                # 当前 kernel 的方案
                 known = mem.find_solution(previous_error)
-                # 跨 kernel 搜索
                 cross = mem.search_all(previous_error)
-                all_fixes = []
-                if known:
-                    all_fixes.append(f"[本kernel] {known}")
-                if cross:
-                    all_fixes.append(cross)
+                all_fixes = [f for f in [known, cross] if f]
                 if all_fixes:
                     previous_error = f"{previous_error}\n\n[已知修复方案]\n" + "\n".join(all_fixes)
             except Exception:
                 pass
 
-        deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-
-        if deepseek_key:
-            from openai import OpenAI
-            client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com",
-                           timeout=60.0)
-            response = client.chat.completions.create(
-                model="deepseek-chat",
-                max_tokens=4096,
-                messages=[
-                    {"role": "system", "content": _build_system_prompt()},
-                    {"role": "user", "content": _build_user_prompt(plan_text, kernel_code, previous_error)},
-                ],
-            )
-            return response.choices[0].message.content
-        elif anthropic_key:
-            import anthropic
-            client = anthropic.Anthropic(api_key=anthropic_key)
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=4096,
-                system=_build_system_prompt(),
-                messages=[{
-                    "role": "user",
-                    "content": _build_user_prompt(plan_text, kernel_code, previous_error),
-                }],
-            )
-            return response.content[0].text
-        else:
-            raise RuntimeError("No API key found")
+        from llm_client import LLMClient
+        client = LLMClient()
+        system = _build_system_prompt()
+        user = _build_user_prompt(plan_text, kernel_code, previous_error)
+        print(f"  [Coder] mode={client.mode}, prompt ~{len(system + user):,} chars")
+        text = client.chat(system, user, max_tokens=4096)
+        return text
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  Stub

@@ -191,31 +191,20 @@ def _format_history(history: list) -> str:
 class PlannerAgent:
     """规划智能体 — Prompt 编排器。
 
+    支持 3 种 LLM 调用模式 (通过 LLMClient):
+      - api: DEEPSEEK_API_KEY / ANTHROPIC_API_KEY
+      - cli: LLM_CLI_COMMAND="nga run"
+      - stub: 无配置时返回占位计划
+
     Usage:
         planner = PlannerAgent(playbook_dir=Path("docx"))
-        plan = planner.generate(
-            diagnosis=diag,
-            extracted_text=extracted,
-            tier=2,
-            history=trajectory["history"][-5:],
-            kernel_code=current_kernel,
-            round_num=5,
-        )
+        plan = planner.generate(...)
     """
 
     def __init__(self, playbook_dir: Optional[Path] = None,
-                 use_llm: bool = False):
-        """
-        Args:
-            playbook_dir: docx/ 目录路径
-            use_llm: True = 调用 Anthropic API; False = stub 模式
-        """
+                 use_llm: bool = True):
         self.playbook_dir = playbook_dir or (_PROJECT_DIR / "docx")
         self.use_llm = use_llm
-        if not use_llm:
-            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-            if api_key:
-                self.use_llm = True
 
     def generate(
         self,
@@ -274,85 +263,15 @@ class PlannerAgent:
         )
 
     # ═══════════════════════════════════════════════════════════════════════════
-    #  LLM 调用
+    #  LLM 调用 (统一通过 LLMClient)
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _call_llm(self, system_prompt: str, user_prompt: str) -> dict:
-        """调用 LLM API (Anthropic 或 DeepSeek/OpenAI 兼容)。"""
-        import os
-
-        # 检测用哪个 API
-        deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-
-        if deepseek_key:
-            # DeepSeek API (OpenAI 兼容)
-            from openai import OpenAI
-            client = OpenAI(
-                api_key=deepseek_key,
-                base_url="https://api.deepseek.com",
-            )
-            response = client.chat.completions.create(
-                model="deepseek-chat",
-                max_tokens=2048,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            text = response.choices[0].message.content or ""
-            print(f"  [Planner] LLM response: {len(text)} chars")
-        elif anthropic_key:
-            # Anthropic API
-            import anthropic
-            client = anthropic.Anthropic(api_key=anthropic_key)
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=2048,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            text = response.content[0].text
-        else:
-            raise RuntimeError("No API key found. Set DEEPSEEK_API_KEY or ANTHROPIC_API_KEY in .env")
-
-        if not text or not text.strip():
-            print(f"  [Planner] WARNING: LLM returned empty response!")
-            raise ValueError("Empty LLM response")
-
-        # 提取 JSON (容错处理)
-        text = text.strip()
-        # 去除 markdown 代码块
-        if "```" in text:
-            parts = text.split("```")
-            for p in parts:
-                p = p.strip()
-                if p.startswith("json"):
-                    p = p[4:].strip()
-                if p.startswith("{"):
-                    text = p
-                    break
-        # 找第一个 { 到最后一个 }
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            text = text[start:end + 1]
-
-        # 多次尝试修复
-        for attempt in range(3):
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError as e:
-                if attempt == 0:
-                    # 尝试1: 修复未闭合字符串引号
-                    import re
-                    text = re.sub(r':\s*([^{}"\s,]+)(?=\s*[,}])', r': "\1"', text)
-                elif attempt == 1:
-                    # 尝试2: 给所有未引号值加引号
-                    text = re.sub(r'(?<=:)\s*([^"{}\[\],\s]+)(?=\s*[,}\]])', r' "\1"', text)
-                else:
-                    raise e
-        return json.loads(text)  # final attempt
+        from llm_client import LLMClient, extract_json
+        client = LLMClient()
+        print(f"  [Planner] mode={client.mode}, prompt ~{len(system_prompt + user_prompt):,} chars")
+        text = client.chat(system_prompt, user_prompt, max_tokens=2048)
+        return extract_json(text)
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  Stub (本地测试)

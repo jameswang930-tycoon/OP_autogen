@@ -11,7 +11,8 @@
 # 前置: CANN Toolkit 已安装, NPU 驱动已加载
 # ═════════════════════════════════════════════════════════════════════════════════
 
-set -euo pipefail
+set -eo pipefail
+# 注: 不加 -u, 因为 ASCEND_HOME 等环境变量在 source set_env.sh 前可能未定义
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
 BOLD='\033[1m'; NC='\033[0m'
@@ -58,7 +59,7 @@ fi
 _section "2. CANN Toolkit"
 
 CANN_DIR=""
-for d in "$ASCEND_HOME" "$ASCEND_HOME_PATH" \
+for d in "${ASCEND_HOME:-}" "${ASCEND_HOME_PATH:-}" \
          /usr/local/Ascend/ascend-toolkit/latest \
          /usr/local/Ascend/cann \
          /usr/local/Ascend; do
@@ -97,8 +98,8 @@ _check "bishengir-compile" '[ -n "$BISHENGIR_COMPILE" ]' "$BISHENGIR_COMPILE"
 BISHENGIR_OPT=$(command -v bishengir-opt 2>/dev/null || echo "")
 _check "bishengir-opt" '[ -n "$BISHENGIR_OPT" ]' "$BISHENGIR_OPT"
 
-CANN_VER=$("$BISHENGIR_COMPILE" --version 2>&1 | head -1 || echo "unknown")
-_check "CANN 版本" true "$CANN_VER"
+CANN_VER=$({ "$BISHENGIR_COMPILE" --version 2>&1 || echo "unknown"; } | head -1)
+_check "CANN 版本" true "${CANN_VER:-unknown}"
 
 # msprof
 MSPROF=$(command -v msprof 2>/dev/null || echo "")
@@ -120,7 +121,7 @@ if [ -n "$NPU_SMI" ]; then
     NPU_CHIPS=$(echo "$NPU_INFO" | grep -ci "910B\|910\|950\|Ascend" || echo "0")
     _check "Ascend 910B3 芯片" '[ "$NPU_CHIPS" -gt 0 ]' "${NPU_CHIPS} 个 NPU"
 
-    echo "$NPU_INFO" | head -15 | while read -r line; do _info "$line"; done
+    echo "$NPU_INFO" | head -15 | while read -r line; do _info "$line" || true; done
 else
     _fail "npu-smi 不可用 — NPU 驱动可能未加载"
     exit 1

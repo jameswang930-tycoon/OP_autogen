@@ -54,10 +54,9 @@ triton_agent_optimizer/rounds/
 emulators/test/**/.plan.json
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  msprof simulator test — generated trace data + binaries
+#  msprof simulator test — external clone + generated data
 # ═══════════════════════════════════════════════════════════════════════════
-msprof_simulator_test/output/
-msprof_simulator_test/build/
+msprof_simulator_test/
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Paper reference — external repo copy, not our code

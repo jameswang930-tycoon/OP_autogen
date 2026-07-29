@@ -3,23 +3,26 @@
 Softmax + GELU — Triton-Ascend 完整测试脚本 (多管线通路验证)
 
 ════════════════════════════════════════════════════════════════════════════
-  服务器执行命令 (cd 到目标目录后执行, 产物都在本地):
+  服务器执行命令 (CANN 8.5.1 + triton-ascend 3.5.x):
 ════════════════════════════════════════════════════════════════════════════
-
   # 进入目标目录
   cd triton_agent_optimizer/input/softmax
+
+  # ── 0. 先确认 msprof 语法 (CANN 8.5.1 可能参数名不同) ──
+  msprof --help
+  msprof op --help
 
   # ── 1. 验证正确性 ──
   python3 run_and_profile.py
 
-  # ── 2. 提取 HIVM MLIR (TRITON_DEBUG dump 固定到 ~/.triton/dump/, 手动拷过来)
-  export TRITON_DEBUG=1 TRITON_ALWAYS_COMPILE=1 TRITON_DISABLE_CACHE=1
+  # ── 2. 提取 HIVM MLIR (TRITON_KERNEL_DUMP 支持自定义输出路径) ──
+  export TRITON_KERNEL_DUMP=1
+  export TRITON_DUMP_DIR=./hivmir
+  export TRITON_ALWAYS_COMPILE=1
   python3 run_and_profile.py
-  DUMP_DIR=$(ls -dt ~/.triton/dump/*/ 2>/dev/null | head -1)
-  mkdir -p hivmir && cp $DUMP_DIR/*.npuir.mlir hivmir/ 2>/dev/null
   ls -la hivmir/
 
-  # ── 3. msprof 采集 softmax (msprof 默认输出到当前目录, cwd=softmax/)
+  # ── 3. msprof 采集 softmax ──
   msprof op \
       --application="python3 run_and_profile.py" \
       --kernel-name=softmax_kernel \
@@ -27,7 +30,7 @@ Softmax + GELU — Triton-Ascend 完整测试脚本 (多管线通路验证)
       --output=./msprof_softmax
   ls -la msprof_softmax/OPPROF_*/
 
-  # ── 4. msprof 采集 gelu (同上, 产物在 softmax/msprof_gelu/)
+  # ── 4. msprof 采集 gelu ──
   msprof op \
       --application="python3 run_and_profile.py" \
       --kernel-name=fused_gelu_kernel \

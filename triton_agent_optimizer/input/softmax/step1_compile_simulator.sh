@@ -24,7 +24,7 @@
 #      如 simulator 模式失败, 备选: 分开跑 TRITON_DEBUG + msprof op (真机模式)
 # ═════════════════════════════════════════════════════════════════════════════════
 
-set -e
+# 注: 不使用 set -e, 避免 cp/ls 失败时静默退出
 
 KERNEL="${1:-softmax_kernel}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -62,18 +62,28 @@ TRITON_RC=$?
 
 # 拷贝 dump 产物到项目目录
 DUMP_DIR=$(ls -dt ~/.triton/dump/*/ 2>/dev/null | head -1)
+mkdir -p "$HERE/hivmir"
+
+echo "DUMP_DIR=$DUMP_DIR"
+echo "dump 目录下所有文件:"
 if [ -n "$DUMP_DIR" ]; then
-    mkdir -p "$HERE/hivmir"
-    cp "$DUMP_DIR"/*.mlir "$HERE/hivmir/" 2>/dev/null || true
-    echo "HIVM 源: $DUMP_DIR"
+    find "$DUMP_DIR" -type f 2>/dev/null
+    echo ""
+    echo "--- 拷贝 .mlir / .ttir / .ttadapter / .npuir 文件 ---"
+    find "$DUMP_DIR" -maxdepth 1 -type f \( -name "*.mlir" -o -name "*.ttir" -o -name "*.ttadapter" -o -name "*.npuir" \) 2>/dev/null | while read f; do
+        cp "$f" "$HERE/hivmir/" 2>/dev/null && echo "  已拷贝: $(basename "$f")"
+    done
+    # 如果顶层没有 .mlir, 递归找
+    if ! ls "$HERE/hivmir/"*.mlir 2>/dev/null && ! ls "$HERE/hivmir/"*.ttir 2>/dev/null; then
+        echo "  顶层无 .mlir, 递归搜索..."
+        find "$DUMP_DIR" -type f \( -name "*.mlir" -o -name "*.ttir" \) 2>/dev/null | while read f; do
+            cp "$f" "$HERE/hivmir/" 2>/dev/null && echo "  已拷贝: $(basename "$f")"
+        done
+    fi
     echo "HIVM 产物:"
     ls -la "$HERE/hivmir/"
 else
-    echo "WARNING: TRITON_DEBUG=1 未生成 ~/.triton/dump/ 目录"
-    echo "可能原因:"
-    echo "  - triton-ascend 3.5.x pass 重命名导致 npuir.mlir 未生成"
-    echo "  - 尝试单独运行: TRITON_DEBUG=1 python3 run_and_profile.py"
-    echo "  - 检查 ~/.triton/cache/ 是否有 .o 文件 (编译成功但没 dump)"
+    echo "WARNING: TRITON_DEBUG=1 未生成 dump 目录"
 fi
 
 # ── 1b. msprof op simulator ──

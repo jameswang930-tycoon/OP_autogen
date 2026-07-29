@@ -3,54 +3,72 @@
 Softmax + GELU — Triton-Ascend 完整测试脚本 (多管线通路验证)
 
 ════════════════════════════════════════════════════════════════════════════
-  服务器执行命令 (按顺序):
+  服务器执行命令 (按顺序, 产物全部落到项目目录):
 ════════════════════════════════════════════════════════════════════════════
 
-  # ── 1. 验证正确性 ──
-  python3 run_and_profile.py
+  # 进入项目目录
+  cd triton_agent_optimizer
+  OUT=input/softmax
 
-  # ── 2. 提取 HIVM MLIR ──
+  # ── 1. 验证正确性 ──
+  python3 $OUT/run_and_profile.py
+
+  # ── 2. 提取 HIVM MLIR → 拷贝到项目内 ──
   export TRITON_DEBUG=1 TRITON_ALWAYS_COMPILE=1 TRITON_DISABLE_CACHE=1
-  python3 run_and_profile.py
-  # 产出: ~/.triton/dump/<hash>/softmax_kernel.npuir.mlir
-  #       ~/.triton/dump/<hash>/fused_gelu_kernel.npuir.mlir
+  python3 $OUT/run_and_profile.py
+  # 找到最新 dump
+  DUMP_DIR=$(ls -dt ~/.triton/dump/*/ 2>/dev/null | head -1)
+  mkdir -p $OUT/hivmir
+  cp $DUMP_DIR/*.npuir.mlir $OUT/hivmir/ 2>/dev/null
+  ls -la $OUT/hivmir/
 
   # ── 3. msprof 采集 softmax ──
   msprof op \
-      --application="python3 run_and_profile.py" \
+      --application="python3 $OUT/run_and_profile.py" \
       --kernel-name=softmax_kernel \
       --aic-metrics=PipeUtilization,ResourceConflictRatio,PMSampling \
-      --output=./msprof_out_softmax
-  # 产出: ./msprof_out_softmax/OPPROF_xxx/
+      --output=$OUT/msprof_softmax
+  ls -la $OUT/msprof_softmax/OPPROF_*/
 
   # ── 4. msprof 采集 gelu ──
   msprof op \
-      --application="python3 run_and_profile.py" \
+      --application="python3 $OUT/run_and_profile.py" \
       --kernel-name=fused_gelu_kernel \
       --aic-metrics=PipeUtilization,ResourceConflictRatio,PMSampling \
-      --output=./msprof_out_gelu
-  # 产出: ./msprof_out_gelu/OPPROF_xxx/
+      --output=$OUT/msprof_gelu
+  ls -la $OUT/msprof_gelu/OPPROF_*/
 
 ════════════════════════════════════════════════════════════════════════════
-  HIVM MLIR → 分析流程 (后续步骤, 在 Windows 端执行):
+  服务器产出物 (都在 triton_agent_optimizer/input/softmax/ 下):
 ════════════════════════════════════════════════════════════════════════════
 
-  # 5. HIVM 解析
-  python3 analyzers/hivmir_analyzer.py <path/to/kernel.npuir.mlir>
-  # 产出: hivmir_report.json (11 字段)
+  input/softmax/
+  ├── run_and_profile.py
+  ├── triton_kernel.py
+  ├── hivmir/
+  │   ├── softmax_kernel.npuir.mlir    ← HIVM 语义数据
+  │   └── fused_gelu_kernel.npuir.mlir
+  ├── msprof_softmax/OPPROF_xxx/       ← msprof 时序数据 (softmax)
+  │   ├── PipeUtilization.csv
+  │   ├── Memory.csv
+  │   └── simulator/*/core*_instr_exe.csv
+  └── msprof_gelu/OPPROF_xxx/          ← msprof 时序数据 (gelu)
 
-  # 6. msprof trace 解析
-  python3 analyzers/msprof_analyzer.py <path/to/OPPROF_xxx/>
-  # 产出: pipeline_report.json (14 字段)
+════════════════════════════════════════════════════════════════════════════
+  然后把这些文件打包传回 Windows, 我来跑分析链:
+════════════════════════════════════════════════════════════════════════════
+
+  # 5. HIVM 解析 → 11 字段
+  python3 analyzers/hivmir_analyzer.py input/softmax/hivmir/softmax_kernel.npuir.mlir
+
+  # 6. msprof trace 解析 → 14 字段
+  python3 analyzers/msprof_analyzer.py input/softmax/msprof_softmax/OPPROF_xxx/
 
   # 7. 合并 → 29 字段
-  python3 analyzers/dsl_merger.py hivmir_report.json pipeline_report.json
-  # 产出: merged_report.json (29 字段)
+  python3 analyzers/dsl_merger.py ...
 
-  # 8. 瓶颈诊断 + 数据提取
-  python3 analyzers/bottleneck_diagnoser.py merged_report.json
-  python3 analyzers/data_extractor.py merged_report.json
-  # → 注入 Planner prompt
+  # 8. 瓶颈诊断 → Planner prompt
+  ...
 
 ════════════════════════════════════════════════════════════════════════════
 """

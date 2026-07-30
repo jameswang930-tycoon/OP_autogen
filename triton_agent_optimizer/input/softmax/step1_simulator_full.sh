@@ -152,14 +152,48 @@ msprof op simulator \
     --config="$HERE/sim_build/sim_config.json" \
     --output="$HERE/msprof_sim" \
     > "$LOG_DIR/msprof.log" 2>&1
-R4=$?
-echo "退出码: $R4"
+R3=$?
+echo "退出码: $R3"
 
+# 完整打印 msprof 输出 (退出码0但无产物 = 静默失败)
+echo ""
+echo "=== msprof 完整输出 ==="
+cat "$LOG_DIR/msprof.log"
+
+echo ""
+echo "=== msprof 产物检查 ==="
 OPPROF=$(ls -dt "$HERE/msprof_sim"/OPPROF_*/ 2>/dev/null | head -1)
+echo "OPPROF目录: ${OPPROF:-不存在}"
+echo "msprof_sim 内容:"
+ls -la "$HERE/msprof_sim/" 2>/dev/null || echo "  (目录为空或不存在)"
+echo "当前目录是否有 OPPROF:"
+ls -d OPPROF_* 2>/dev/null || echo "  无"
+
+# 检查常见失败原因
+echo ""
+echo "=== 常见失败原因诊断 ==="
+if grep -qi "Failed to load simulator so\|No profiling data dumped\|cannot find\|LD_LIBRARY_PATH" "$LOG_DIR/msprof.log" 2>/dev/null; then
+    _err "simulator .so 加载失败! 检查 LD_LIBRARY_PATH"
+    grep -i "Failed to load\|No profiling\|LD_LIBRARY" "$LOG_DIR/msprof.log" 2>/dev/null
+elif grep -qi "config\|json\|parse\|invalid\|field" "$LOG_DIR/msprof.log" 2>/dev/null; then
+    _err "config JSON 格式问题"
+    grep -i "config\|json\|parse\|invalid\|field" "$LOG_DIR/msprof.log" 2>/dev/null
+elif grep -qi "kernel\|binary\|format\|unsupported\|not found" "$LOG_DIR/msprof.log" 2>/dev/null; then
+    _err "kernel.o 格式不受支持"
+    grep -i "kernel\|binary\|format\|unsupported\|not found" "$LOG_DIR/msprof.log" 2>/dev/null
+fi
+
 if [ -z "$OPPROF" ]; then
-    _err "OPPROF 未生成"
-    tail -40 "$LOG_DIR/msprof.log"
-    grep -i "error\|fail\|cannot\|UNKNOWN" "$LOG_DIR/msprof.log" 2>/dev/null | head -15
+    _err "OPPROF 未生成 — msprof simulator --config 模式在此环境不可用"
+    echo ""
+    _inf "根本原因: bishengir-compile 产出的 .o 是真实 NPU 二进制"
+    _inf "msprof --config 模式需要 AscendC 项目的 .o (不同格式)"
+    _inf ""
+    _inf "现有可用方案:"
+    _inf "  HIVM语义:   ttadapter.mlir → hivmir_analyzer → 11字段"
+    _inf "  msprof时序: msprof op --kernel-name=xxx python3 run_and_profile.py"
+    _inf "              → PipeUtilization.csv 等 8 个 CSV"
+    _inf "  合并:        dsl_merger.py → 29字段 merged report"
     exit 1
 fi
 

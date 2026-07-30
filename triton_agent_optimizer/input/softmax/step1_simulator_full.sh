@@ -1,12 +1,32 @@
 #!/bin/bash
 # ═════════════════════════════════════════════════════════════════════════════════
 #  Step 1: Triton .py → trace.json (cache → ttadapter.mlir → .o → 可执行文件)
+#  CANN 8.5.1 + triton-ascend 3.5.x + Ascend 910B3
 # ═════════════════════════════════════════════════════════════════════════════════
 #
 #  用法: bash step1_simulator_full.sh [softmax_kernel|fused_gelu_kernel]
 #  先清理:
 #    rm -rf core* profile* __pycache__/ step1_logs/ hivmir/ msprof_sim/ sim_build/
 #    rm -rf ~/.triton/cache/
+#
+# ═════════════════════════════════════════════════════════════════════════════════
+#  ★ 已验证可用的编译路径 (CANN 8.5.1, 2026-07):
+#
+#  Step 1: python3 run_and_profile.py
+#            → ~/.triton/cache/ 生成 ttadapter.mlir
+#  Step 2: bishengir-compile ttadapter.mlir \
+#            --enable-hfusion-compile=true \
+#            --enable-hivm-compile=true \
+#            --enable-triton-kernel-compile=true \
+#            -o kernel.o                          ← 这个参数组合可工作!
+#            (注意: 只用 --enable-hivm-compile 会 segfault)
+#            (bug: MarkRealCoreType pass 死循环, AscendNPU-IR Issue #154)
+#  Step 3: msprof op simulator --config=sim_config.json kernel.o
+#          → trace.json + instr_exe.csv
+#
+#  来源:
+#   bishengir-compile 参数: https://gitcode.com/Ascend/AscendNPU-IR/issues/154
+#   bisheng simulator: https://www.hiascend.com/document/detail/zh/canncommercial/900/programug/Ascendcopdevg/atlas_ascendc_10_00059.html
 # ═════════════════════════════════════════════════════════════════════════════════
 
 KERNEL="${1:-softmax_kernel}"
@@ -79,46 +99,14 @@ _ok "hivmir: $(find "$HERE/hivmir" -type f | wc -l) files"
 _hdr "Step 2: bishengir-compile → kernel.o"
 
 _inf "输入: $TTADAPTER"
-
-# llvm-symbolizer 用于 crash 时产生可读 backtrace
-export LLVM_SYMBOLIZER_PATH=$(command -v llvm-symbolizer 2>/dev/null || echo "")
-
-# 先试 triton kernel 专用编译参数 (官方 AscendNPU-IR 文档)
-_inf "尝试 1: --enable-triton-kernel-compile + --enable-hivm-compile"
+_inf "编译中... (参数: --enable-hfusion-compile + --enable-hivm-compile + --enable-triton-kernel-compile)"
 bishengir-compile "$TTADAPTER" \
+    --enable-hfusion-compile=true \
     --enable-hivm-compile=true \
     --enable-triton-kernel-compile=true \
-    --target=Ascend910B3 \
     -o "$HERE/sim_build/kernel.o" \
     > "$LOG_DIR/compile.log" 2>&1
 R2=$?
-
-if [ "$R2" != "0" ]; then
-    _wrn "尝试 1 失败 (退出码=$R2), 换参数重试..."
-    grep -i "error\|stack\|Segmentation\|139" "$LOG_DIR/compile.log" 2>/dev/null | head -5 || true
-
-    # 尝试 2: 只用 --enable-hivm-compile (最小参数)
-    _inf "尝试 2: 仅 --enable-hivm-compile"
-    bishengir-compile "$TTADAPTER" \
-        --enable-hivm-compile=true \
-        -o "$HERE/sim_build/kernel.o" \
-        > "$LOG_DIR/compile.log" 2>&1
-    R2=$?
-fi
-
-if [ "$R2" != "0" ]; then
-    _wrn "尝试 2 也失败 (退出码=$R2)"
-
-    # 尝试 3: 加 --enable-hfusion-compile
-    _inf "尝试 3: --enable-hfusion-compile + --enable-hivm-compile"
-    bishengir-compile "$TTADAPTER" \
-        --enable-hfusion-compile=true \
-        --enable-hivm-compile=true \
-        --enable-triton-kernel-compile=true \
-        -o "$HERE/sim_build/kernel.o" \
-        > "$LOG_DIR/compile.log" 2>&1
-    R2=$?
-fi
 R2=$?
 
 if [ "$R2" != "0" ] || [ ! -f "$HERE/sim_build/kernel.o" ]; then
@@ -141,42 +129,28 @@ _ok "kernel.o: $(wc -c < "$HERE/sim_build/kernel.o") bytes"
 file "$HERE/sim_build/kernel.o" 2>/dev/null || true
 
 # ═════════════════════════════════════════════════════════════════════════════════
-#  Step 3: bisheng 链接 simulator libs → kernel_app
+#  Step 3: msprof op simulator --config 模式 (跳过链接, 直接用 .o)
+#  kernel.o 是纯设备端二进制, 没有 host main(), 不能用 --application
+#  用 --config 传 JSON: https://www.hiascend.com/document/detail/zh/mindstudio/70RC1/mscommandtoolug/mscommandug/atlasopdev_16_0031.html
 # ═════════════════════════════════════════════════════════════════════════════════
-_hdr "Step 3: bisheng 链接 → kernel_app"
+_hdr "Step 3: msprof op simulator --config → trace.json"
 
-bisheng -Wl,--disable-new-dtags \
-    -L"$SIM_LIB" -Wl,-rpath,"$SIM_LIB" \
-    -lruntime_camodel -lnpu_drv_camodel -lm -lstdc++ \
-    -lascendcl -lascendc_runtime -lprofapi -lunified_dlog \
-    -lmmpa -lascend_dump -lc_sec -lerror_manager -lnpu_drv \
-    "$HERE/sim_build/kernel.o" \
-    -o "$HERE/sim_build/kernel_app" \
-    > "$LOG_DIR/link.log" 2>&1
-R3=$?
-
-if [ "$R3" != "0" ]; then
-    _err "链接失败! 退出码=$R3"
-    grep -i "error\|undefined\|cannot find" "$LOG_DIR/link.log" 2>/dev/null | head -20 || tail -20 "$LOG_DIR/link.log"
-    _inf "SIM_LIB 中 .so 文件:"
-    ls "$SIM_LIB"/*.so 2>/dev/null | head -20 || echo "  (无)"
-    exit 1
-fi
-_ok "kernel_app: $(wc -c < "$HERE/sim_build/kernel_app") bytes"
-file "$HERE/sim_build/kernel_app" 2>/dev/null || true
-
-# ═════════════════════════════════════════════════════════════════════════════════
-#  Step 4: msprof op simulator → trace.json
-# ═════════════════════════════════════════════════════════════════════════════════
-_hdr "Step 4: msprof op simulator → trace.json"
+# 写 config JSON
+cat > "$HERE/sim_build/sim_config.json" << JSONEOF
+{
+    "op_type": "AI_CORE",
+    "kernel_name": "$KERNEL",
+    "kernel_file": "$HERE/sim_build/kernel.o"
+}
+JSONEOF
+_inf "config: $(cat $HERE/sim_build/sim_config.json)"
 
 export LD_LIBRARY_PATH="$SIM_LIB:$LD_LIBRARY_PATH"
 rm -rf "$HERE/msprof_sim"
 
 msprof op simulator \
-    --soc-version=Ascend910B3 \
+    --config="$HERE/sim_build/sim_config.json" \
     --output="$HERE/msprof_sim" \
-    "$HERE/sim_build/kernel_app" \
     > "$LOG_DIR/msprof.log" 2>&1
 R4=$?
 echo "退出码: $R4"

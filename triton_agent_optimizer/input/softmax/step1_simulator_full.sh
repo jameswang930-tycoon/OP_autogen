@@ -1,12 +1,10 @@
 #!/bin/bash
 # ═════════════════════════════════════════════════════════════════════════════════
-#  Step 1: Triton kernel .py → msprof op simulator → trace.json
-#  直接找 cache 里的 .o, 不依赖 TRITON_DEBUG dump (3.5.x 已知 bug)
+#  Step 1: Triton .py → trace.json (cache → ttadapter.mlir → .o → 可执行文件)
 # ═════════════════════════════════════════════════════════════════════════════════
 #
 #  用法: bash step1_simulator_full.sh [softmax_kernel|fused_gelu_kernel]
-#
-#  ★ 先清理:
+#  先清理:
 #    rm -rf core* profile* __pycache__/ step1_logs/ hivmir/ msprof_sim/ sim_build/
 #    rm -rf ~/.triton/cache/
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -17,129 +15,114 @@ cd "$HERE"
 LOG_DIR="$HERE/step1_logs"
 rm -rf "$LOG_DIR" && mkdir -p "$LOG_DIR"
 
-RED='\033[31m'; GRN='\033[32m'; YLW='\033[33m'; CYN='\033[36m'; NC='\033[0m'
+RED='\033[31m'; GRN='\033[32m'; YLW='\033[33m'; NC='\033[0m'
 _err() { echo -e "${RED}[ERR]${NC} $*" | tee -a "$LOG_DIR/summary.log"; }
-_wrn() { echo -e "${YLW}[WARN]${NC} $*" | tee -a "$LOG_DIR/summary.log"; }
+_wrn() { echo -e "${YLW}[WARN]${NC} $*"; }
 _ok()  { echo -e "${GRN}[OK]${NC}  $*" | tee -a "$LOG_DIR/summary.log"; }
-_inf() { echo -e "${CYN}[INFO]${NC} $*"; }
+_inf() { echo -e "[INFO] $*"; }
 _hdr() { echo ""; echo "══════════ $* ══════════"; }
 
-# ── 找工具 ──
-CANN_HOME="${ASCEND_HOME:-${ASCEND_TOOLKIT_HOME}}"
-[ -z "$CANN_HOME" ] && for d in /usr/local/Ascend/ascend-toolkit/latest /usr/local/Ascend/cann; do [ -d "$d" ] && { CANN_HOME="$d"; break; }; done
-
+# ── 环境 ──
+CANN="${ASCEND_HOME:-${ASCEND_TOOLKIT_HOME}}"
+[ -z "$CANN" ] && for d in /usr/local/Ascend/ascend-toolkit/latest /usr/local/Ascend/cann; do [ -d "$d" ] && { CANN="$d"; break; }; done
 BISHENG=$(command -v bisheng 2>/dev/null || echo "")
+BISHENGIR=$(command -v bishengir-compile 2>/dev/null || echo "")
 MSPROF=$(command -v msprof 2>/dev/null || echo "")
 PY=$(command -v python3 2>/dev/null || echo "")
+SIM_LIB=$(dirname "$(find /usr/local/Ascend -name "libruntime_camodel.so" -type f 2>/dev/null | head -1)" 2>/dev/null || echo "")
 
-SIM_LIB=""
-for d in "$CANN_HOME/tools/simulator/Ascend910B3/lib"; do [ -f "$d/libruntime_camodel.so" ] && { SIM_LIB="$d"; break; }; done
-[ -z "$SIM_LIB" ] && SIM_LIB=$(dirname "$(find /usr/local/Ascend -name "libruntime_camodel.so" -type f 2>/dev/null | head -1)" 2>/dev/null || echo "")
+echo "CANN:      ${CANN:-未找到}"
+echo "bisheng:   ${BISHENG:-未找到}"
+echo "bishengir: ${BISHENGIR:-未找到}"
+echo "msprof:    ${MSPROF:-未找到}"
+echo "SIM lib:   ${SIM_LIB:-未找到}"
 
-echo "CANN:    ${CANN_HOME:-未找到}"
-echo "bisheng: ${BISHENG:-未找到}"
-echo "msprof:  ${MSPROF:-未找到}"
-echo "SIM lib: ${SIM_LIB:-未找到}"
-
-[ -z "$BISHENG" ] && { _err "bisheng 未找到!"; exit 1; }
-[ -z "$MSPROF" ] && { _err "msprof 未找到!"; exit 1; }
-[ -z "$SIM_LIB" ] && { _err "SIM lib 未找到!"; exit 1; }
+[ -z "$PY" ] && { _err "python3 未找到"; exit 1; }
+[ -z "$BISHENGIR" ] && { _err "bishengir-compile 未找到"; exit 1; }
+[ -z "$BISHENG" ] && { _err "bisheng 未找到"; exit 1; }
+[ -z "$MSPROF" ] && { _err "msprof 未找到"; exit 1; }
+[ -z "$SIM_LIB" ] && { _err "simulator lib 未找到"; exit 1; }
 
 # ── 清理 ──
 rm -rf "$HERE/hivmir" "$HERE/sim_build" "$HERE/msprof_sim" 2>/dev/null || true
-rm -rf ~/.triton/cache/ 2>/dev/null || true
+rm -rf ~/.triton/cache/ ~/.triton/dump/ 2>/dev/null || true
 mkdir -p "$HERE/hivmir" "$HERE/sim_build"
 
 # ═════════════════════════════════════════════════════════════════════════════════
-#  1. 跑 kernel, 让 triton-ascend JIT 编译产生 .o 在 ~/.triton/cache/
+#  Step 1: 跑 kernel → cache 生成 ttadapter.mlir
 # ═════════════════════════════════════════════════════════════════════════════════
-_hdr "1. 编译 Triton kernel (产生 .o 到 ~/.triton/cache/)"
+_hdr "Step 1: 跑 kernel → 生成 ttadapter.mlir"
 
 export TRITON_ALWAYS_COMPILE=1
-_inf "运行 run_and_profile.py ..."
+export TRITON_DISABLE_LINE_INFO=0
 $PY run_and_profile.py > "$LOG_DIR/run.log" 2>&1
-R=$?
-echo "退出码: $R"
+R1=$?
+echo "退出码: $R1"
 grep "PASS\|FAIL\|max_err" "$LOG_DIR/run.log" 2>/dev/null | head -5 || true
 
-# ═════════════════════════════════════════════════════════════════════════════════
-#  2. 从 cache 找 .o 文件
-# ═════════════════════════════════════════════════════════════════════════════════
-_hdr "2. 从 ~/.triton/cache/ 找 .o 和 .mlir"
-
-CACHE_COUNT=$(find ~/.triton/cache -maxdepth 0 -type d 2>/dev/null | wc -l)
-echo "cache 子目录: $CACHE_COUNT"
-
-if [ "$CACHE_COUNT" -eq 0 ]; then
-    _err "cache 为空! 编译可能失败了"
-    _inf "运行日志:"
-    tail -30 "$LOG_DIR/run.log"
+# ── 找 ttadapter.mlir ──
+TTADAPTER=$(find ~/.triton/cache -name "*ttadapter*" -type f 2>/dev/null | head -1)
+if [ -z "$TTADAPTER" ]; then
+    _err "未找到 ttadapter.mlir! cache 内容:"
+    find ~/.triton/cache -type f 2>/dev/null | head -30
     exit 1
 fi
+_ok "ttadapter: $TTADAPTER ($(wc -c < "$TTADAPTER") bytes)"
 
-# 找并列出所有 .o
-ALL_O=$(find ~/.triton/cache -name "*.o" -type f 2>/dev/null)
-O_COUNT=$(echo "$ALL_O" | grep -c '.' 2>/dev/null || echo 0)
+# 拷贝 mlir 到 hivmir (语义数据用)
+find ~/.triton/cache -name "*.mlir" -o -name "*.ttir" -o -name "*.ttadapter" 2>/dev/null | while read f; do cp "$f" "$HERE/hivmir/" 2>/dev/null; done
+_ok "hivmir: $(find "$HERE/hivmir" -type f | wc -l) files"
 
-echo ""
-if [ "$O_COUNT" -gt 0 ]; then
-    _ok "找到 $O_COUNT 个 .o 文件:"
-    echo "$ALL_O" | while read f; do
-        echo "  $(basename "$f") ($(wc -c < "$f") bytes) → $(dirname "$f")"
-    done
-else
-    _wrn "cache 中无 .o 文件"
-    echo "cache 中的文件类型:"
-    find ~/.triton/cache -type f 2>/dev/null | head -20 | while read f; do
-        echo "  $(basename "$f") ($(wc -c < "$f") bytes)"
-    done
-fi
+# ═════════════════════════════════════════════════════════════════════════════════
+#  Step 2: ttadapter.mlir → bishengir-compile → kernel.o
+# ═════════════════════════════════════════════════════════════════════════════════
+_hdr "Step 2: bishengir-compile → kernel.o"
 
-# 找 .mlir (语义数据用)
-ALL_MLIR=$(find ~/.triton/cache -name "*.mlir" -o -name "*.ttir" -o -name "*.ttadapter" -o -name "*.npuir" 2>/dev/null)
-MLIR_COUNT=$(echo "$ALL_MLIR" | grep -c '.' 2>/dev/null || echo 0)
-[ "$MLIR_COUNT" -gt 0 ] && _ok "MLIR: $MLIR_COUNT 个" || _wrn "MLIR: 0 个"
-echo "$ALL_MLIR" | while read f; do [ -f "$f" ] && cp "$f" "$HERE/hivmir/" 2>/dev/null; done
+_inf "输入: $TTADAPTER"
+bishengir-compile "$TTADAPTER" \
+    --enable-hivm-compile \
+    -o "$HERE/sim_build/kernel.o" \
+    > "$LOG_DIR/compile.log" 2>&1
+R2=$?
 
-if [ "$O_COUNT" -eq 0 ]; then
-    _err "没有 .o 文件, 无法继续"
-    _inf "尝试手动查找整个文件系统:"
-    find / -name "*.o" -newer "$HERE/run_and_profile.py" -type f 2>/dev/null | head -10 || echo "  (未找到)"
+if [ "$R2" != "0" ]; then
+    _err "编译失败! 退出码=$R2"
+    tail -30 "$LOG_DIR/compile.log"
+    grep -i "error\|cannot\|fatal" "$LOG_DIR/compile.log" 2>/dev/null | head -10 || true
     exit 1
 fi
+_ok "kernel.o: $(wc -c < "$HERE/sim_build/kernel.o") bytes"
+file "$HERE/sim_build/kernel.o" 2>/dev/null || true
 
 # ═════════════════════════════════════════════════════════════════════════════════
-#  3. 链接 simulator libs → 可执行文件
+#  Step 3: bisheng 链接 simulator libs → kernel_app
 # ═════════════════════════════════════════════════════════════════════════════════
-_hdr "3. bisheng 链接 → kernel_app"
-
-FIRST_O=$(echo "$ALL_O" | head -1)
-_inf "输入: $FIRST_O"
+_hdr "Step 3: bisheng 链接 → kernel_app"
 
 bisheng -Wl,--disable-new-dtags \
-    -L"$SIM_LIB" \
-    -Wl,-rpath,"$SIM_LIB" \
+    -L"$SIM_LIB" -Wl,-rpath,"$SIM_LIB" \
     -lruntime_camodel -lnpu_drv_camodel -lm -lstdc++ \
     -lascendcl -lascendc_runtime -lprofapi -lunified_dlog \
     -lmmpa -lascend_dump -lc_sec -lerror_manager -lnpu_drv \
-    "$FIRST_O" \
+    "$HERE/sim_build/kernel.o" \
     -o "$HERE/sim_build/kernel_app" \
     > "$LOG_DIR/link.log" 2>&1
-LINK_RC=$?
+R3=$?
 
-if [ "$LINK_RC" != "0" ]; then
-    _err "链接失败! 退出码=$LINK_RC"
-    grep -i "error\|undefined\|cannot find\|fatal" "$LOG_DIR/link.log" 2>/dev/null | head -20 || tail -20 "$LOG_DIR/link.log"
+if [ "$R3" != "0" ]; then
+    _err "链接失败! 退出码=$R3"
+    grep -i "error\|undefined\|cannot find" "$LOG_DIR/link.log" 2>/dev/null | head -20 || tail -20 "$LOG_DIR/link.log"
+    _inf "SIM_LIB 中 .so 文件:"
+    ls "$SIM_LIB"/*.so 2>/dev/null | head -20 || echo "  (无)"
     exit 1
 fi
-
 _ok "kernel_app: $(wc -c < "$HERE/sim_build/kernel_app") bytes"
 file "$HERE/sim_build/kernel_app" 2>/dev/null || true
 
 # ═════════════════════════════════════════════════════════════════════════════════
-#  4. msprof op simulator
+#  Step 4: msprof op simulator → trace.json
 # ═════════════════════════════════════════════════════════════════════════════════
-_hdr "4. msprof op simulator → trace.json"
+_hdr "Step 4: msprof op simulator → trace.json"
 
 export LD_LIBRARY_PATH="$SIM_LIB:$LD_LIBRARY_PATH"
 rm -rf "$HERE/msprof_sim"
@@ -149,21 +132,21 @@ msprof op simulator \
     --output="$HERE/msprof_sim" \
     "$HERE/sim_build/kernel_app" \
     > "$LOG_DIR/msprof.log" 2>&1
-MS_RC=$?
-echo "退出码: $MS_RC"
+R4=$?
+echo "退出码: $R4"
 
 OPPROF=$(ls -dt "$HERE/msprof_sim"/OPPROF_*/ 2>/dev/null | head -1)
 if [ -z "$OPPROF" ]; then
     _err "OPPROF 未生成"
     tail -40 "$LOG_DIR/msprof.log"
+    grep -i "error\|fail\|cannot\|UNKNOWN" "$LOG_DIR/msprof.log" 2>/dev/null | head -15
     exit 1
 fi
 
 _ok "OPPROF: $(basename $OPPROF)"
+echo ""
 echo "=== 全部文件 ==="
-find "$OPPROF" -type f 2>/dev/null | while read f; do
-    echo "  $f ($(wc -c < "$f") bytes)"
-done
+find "$OPPROF" -type f | while read f; do echo "  $f ($(wc -c < "$f") bytes)"; done
 
 TRACES=$(find "$OPPROF" -name "trace.json" 2>/dev/null | wc -l)
 INSTRS=$(find "$OPPROF" -name "*_instr_exe.csv" 2>/dev/null | wc -l)
@@ -172,10 +155,9 @@ if [ "$TRACES" -gt 0 ] || [ "$INSTRS" -gt 0 ]; then
     _ok "★★★ 成功! trace.json: $TRACES, instr_exe.csv: $INSTRS ★★★"
 else
     _err "OPPROF 存在但无 trace/instr_exe"
-    grep -i "error\|fail\|cannot\|assert\|UNKNOWN" "$LOG_DIR/msprof.log" 2>/dev/null | head -15 || echo "(msprof 日志无错误关键词)"
+    grep -i "error\|fail\|cannot\|assert\|UNKNOWN" "$LOG_DIR/msprof.log" 2>/dev/null | head -15
 fi
 
-# ── 汇总 ──
 echo ""
 echo "══════════ 汇总 ══════════"
 echo "hivmir:     $(find "$HERE/hivmir" -type f 2>/dev/null | wc -l) files"

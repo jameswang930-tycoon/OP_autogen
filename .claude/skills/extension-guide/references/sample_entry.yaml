@@ -14,6 +14,9 @@ semantics: >
   placeholder only — not a real primitive.
 signature: async_copy(dst, src, shape, stride)   # illustrative; replace with the real signature
 category: memory_underfilled
+# 可选字段（GLM52 优化指导第二部分：让原语呈现带"模块归属 + 适用场景"，减少幻觉与误用）：
+module: ext_copy                          # 模块归属 → 索引渲染成全限定名 ext_copy.<name>，杜绝模型猜模块
+applies_to: [matmul, conv]                # 适用场景 → 仅这些算子检索时才可见；缺省=通用（不据此隐藏）
 example: |
   # example MUST be a complete, compilable minimal kernel (not a snippet). Replace the
   # illustrative call below with the real primitive; keep the full kernel skeleton.

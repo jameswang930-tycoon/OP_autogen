@@ -14,6 +14,22 @@ primitives here; the public branch ships only the worked sample (`sample_entry.y
 | example    | a COMPLETE, compilable minimal kernel (imports + `@triton.jit` + full fn), not a snippet |
 | pitfalls   | list of common mistakes                                         |
 
+## Optional fields (GLM52 — module attribution + applicable scene)
+
+These are optional; the validator (`check_extension_cheatsheet.py`) ignores them, so existing
+entries keep validating unchanged. Filling them lets the orchestrator present primitives better
+and avoid hallucination / mis-use (GLM52 guide §2):
+
+| field       | meaning                                                                                        |
+|-------------|------------------------------------------------------------------------------------------------|
+| module      | module the primitive lives in. The gen-prompt index renders the fully-qualified `module.name`, so the model does not guess the module (root cause of `tlext1.add`-style hallucinations). Absent → bare `name`. |
+| applies_to  | list of operator kinds this primitive applies to (e.g. `[conv]` for img2col). The orchestrator's scene-based retrieval only surfaces a primitive for matching ops, so a conv-only primitive no longer pollutes element-wise candidates. Absent/empty → treated as general (never hidden on account of missing annotation; the index falls back to full if a scene query yields nothing). |
+
+Evidence priority (GLM52 §2 lesson — "having data ≠ correct data"): the confidential
+`api_inventory.txt` is a name index whose module attribution is unreliable; prefer
+real-kernel usage > manual > inventory when filling `module`. Wrong examples actively teach the
+model bad patterns, so leave `module`/`applies_to` unset rather than guess.
+
 ## Rules
 
 - `category` must be a vocabulary id. `control/check_extension_cheatsheet.py` validates

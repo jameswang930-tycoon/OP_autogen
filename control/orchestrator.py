@@ -18,6 +18,7 @@ import json
 import re
 import sys
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
@@ -148,8 +149,13 @@ def parse_generate_response(resp: str, allowed_extensions: set[str]) -> tuple[st
         if k not in meta:
             raise ParseError(f"meta missing key {k!r}")
     ext = meta["extension_used"]
-    if ext is not None and ext not in allowed_extensions:
-        raise ParseError(f"extension_used {ext!r} not in cheatsheet")
+    if ext is not None:
+        # GLM52 P3：extension index 按模块归属渲染成全限定名 module.name，模型可能在
+        # extension_used 里回写全限定名。校验与存档统一用裸名（canonical id），两种写法都接受。
+        ext = ext.rsplit(".", 1)[-1] if "." in ext else ext
+        if ext not in allowed_extensions:
+            raise ParseError(f"extension_used {ext!r} not in cheatsheet")
+        meta["extension_used"] = ext
     return py[0], meta
 
 
@@ -167,37 +173,90 @@ def parse_lever_response(resp: str, candidates: list[str]) -> str:
     return lever
 
 
-def _primitives_by_category() -> dict[str, list[str]]:
-    """从 extension 速查表读取 {category: [primitive names]}。无条目则空。"""
-    out: dict[str, list[str]] = {}
+def _load_extension_entries() -> list[dict]:
+    """读 EXT_REFS 下全部原语条目的轻量字段（name/module/category/signature/applies_to）。
+
+    读取**路径**与"index 形式"契约不变（仍是 EXT_REFS 下的 yaml、无占位符）；这里只是把
+    每条的可选字段一并读出，供"模块归属 + 按场景检索"用（GLM52 优化指导第二部分）。缺字段
+    按默认处理——必填字段与 category 校验仍由 check_extension_cheatsheet.py 按原契约负责。
+    """
+    out: list[dict] = []
     if not EXT_REFS.is_dir():
         return out
     for f in sorted([*EXT_REFS.glob("*.yaml"), *EXT_REFS.glob("*.yml")]):
         try:
-            entry = yaml.safe_load(f.read_text(encoding="utf-8"))
+            e = yaml.safe_load(f.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001 - 速查表格式问题由 check_extension_cheatsheet 报
             continue
-        if isinstance(entry, dict) and "category" in entry and "name" in entry:
-            out.setdefault(entry["category"], []).append(entry["name"])
+        if isinstance(e, dict) and "category" in e and "name" in e:
+            out.append({
+                "name": e["name"],
+                "module": e.get("module"),                # 可选：模块归属，拼全限定名用
+                "category": e["category"],
+                "signature": e.get("signature"),          # 可选：签名
+                "applies_to": e.get("applies_to") or [],  # 可选：适用算子场景；缺则视为通用
+            })
     return out
 
 
-def extension_index_text() -> str:
-    """速查表短索引文本（注入 triton-gen 的 EXTENSION_INDEX）。"""
-    by_cat = _primitives_by_category()
-    if not by_cat:
-        return "(extension cheatsheet empty — fill references in the confidential env)"
-    lines = []
-    for cat in sorted(by_cat):
-        lines.append(f"{cat}: {by_cat[cat]}")
-    return "\n".join(lines)
+def _primitives_by_category() -> dict[str, list[str]]:
+    """从 extension 速查表读取 {category: [primitive names]}。无条目则空。"""
+    out: dict[str, list[str]] = {}
+    for e in _load_extension_entries():
+        out.setdefault(e["category"], []).append(e["name"])
+    return out
 
 
 def _allowed_extensions() -> set[str]:
-    names = set()
-    for prims in _primitives_by_category().values():
-        names.update(prims)
-    return names
+    """全量合法原语名（parse 闸门用它校验 extension_used，不受场景检索影响）。"""
+    return {e["name"] for e in _load_extension_entries()}
+
+
+def _scene_applies(entry: dict, op_kind: Optional[str]) -> bool:
+    """applies_to 缺省视为通用（不据此隐藏原语）；给出则要求 op_kind 命中。"""
+    scenes = entry.get("applies_to") or []
+    return op_kind in scenes if scenes else True
+
+
+def _relevant_entries(op_kind: Optional[str], bottleneck: Optional[str]) -> list[dict]:
+    """按 (算子场景, 瓶颈) 检索相关原语子集（GLM52 第二部分"按场景检索"）。
+
+    - bottleneck 给定：取该类别原语，再用 applies_to 过滤不适用的（如 img2col 不进 elementwise）。
+    - bottleneck 缺省(round1)：取所有 applies_to 命中当前算子的原语（不限类别）。
+    读的还是 EXT_REFS 下同一份 index，契约不变；只是"读哪些"变智能。
+    """
+    entries = _load_extension_entries()
+    if bottleneck is not None:
+        return [e for e in entries
+                if e["category"] == bottleneck and _scene_applies(e, op_kind)]
+    return [e for e in entries if _scene_applies(e, op_kind)]
+
+
+def _index_line(entry: dict) -> str:
+    """索引行：模块全限定名 + 适用场景标注。有 module 则 `module.name`，杜绝模型猜模块。"""
+    qname = f'{entry["module"]}.{entry["name"]}' if entry.get("module") else entry["name"]
+    scenes = entry.get("applies_to") or []
+    return f"{qname} [applies_to: {','.join(scenes)}]" if scenes else qname
+
+
+def extension_index_text(op_kind: Optional[str] = None,
+                         bottleneck: Optional[str] = None) -> str:
+    """速查表短索引文本（注入 triton-gen 的 EXTENSION_INDEX）。
+
+    GLM52 第二部分：按 (算子场景, 瓶颈) 只给相关子集 + 带模块归属，避免幻觉原语
+    (tlext1.add) 与误归类污染 (img2col 进 elementwise)。检索为空则退回全量索引（永不空、
+    永不因缺标注而隐藏原语）。两参缺省(向后兼容)时给全量索引。
+    """
+    entries = _load_extension_entries()
+    if not entries:
+        return "(extension cheatsheet empty — fill references in the confidential env)"
+    relevant = _relevant_entries(op_kind, bottleneck) if (op_kind or bottleneck) else entries
+    if not relevant:
+        relevant = entries  # 保守退回：无相关标注时不隐藏任何原语
+    by_cat: dict[str, list[str]] = {}
+    for e in relevant:
+        by_cat.setdefault(e["category"], []).append(_index_line(e))
+    return "\n".join(f"{cat}: {by_cat[cat]}" for cat in sorted(by_cat))
 
 
 def pick_lever(candidates: list[str], evidence: dict, exploration: str) -> str:
@@ -440,8 +499,9 @@ class Orchestrator:
             feedback_summary = None
             prior_verdict: Optional[Verdict] = getattr(self, "_last_verdict", None)
 
-            retrieved = self._retrieve_experience()
-            self._progress.emit("retrieve", round_n=n, has_exp=bool(retrieved))
+            retrieved_text, retrieved_ids = self._retrieve_experience(
+                prior_verdict.bottleneck if prior_verdict else None)
+            self._progress.emit("retrieve", round_n=n, has_exp=bool(retrieved_text))
             lever, ext_hint = self._resolve_lever(prior_verdict, t)
 
             # steps 3-5: produce a kernel, launch, ensure it compiled (compile failures
@@ -449,7 +509,8 @@ class Orchestrator:
             kernel_src, meta, raw, sim = self._produce_and_compile(
                 verdict_json=_verdict_json(prior_verdict),
                 feedback_summary=feedback_summary,
-                retrieved_experience=retrieved,
+                retrieved_experience=retrieved_text,
+                bottleneck=prior_verdict.bottleneck if prior_verdict else None,
                 round_n=n, t=t,
             )
             self._progress.emit("result", round_n=n, correct=sim.correct,
@@ -473,7 +534,7 @@ class Orchestrator:
                 t.write("10_summary.txt", out.summary)
 
             # step 8: record (memory)
-            self._record_attempt(n, sim, verdict, meta)
+            self._record_attempt(n, sim, verdict, meta, retrieved_ids=retrieved_ids)
 
             # step 9: controller (stop decision)
             decision = self.controller.update(variant_id=f"r{n}", sim=sim, verdict=verdict)
@@ -506,7 +567,7 @@ class Orchestrator:
 
     # ---- produce + compile (compile failures don't count as a round; T13-3) ----
     def _produce_and_compile(
-        self, *, verdict_json, feedback_summary, retrieved_experience, round_n, t,
+        self, *, verdict_json, feedback_summary, retrieved_experience, bottleneck, round_n, t,
     ) -> tuple[str, dict, dict, SimResult]:
         compile_fails = 0
         compile_log = ""
@@ -515,6 +576,7 @@ class Orchestrator:
                 verdict_json=verdict_json,
                 feedback_summary=feedback_summary,
                 retrieved_experience=retrieved_experience,
+                bottleneck=bottleneck,
                 round_n=round_n,
                 compile_error=compile_log,
                 t=t,
@@ -538,7 +600,7 @@ class Orchestrator:
     def _resolve_lever(self, verdict: Optional[Verdict], t=None) -> tuple[Optional[str], Optional[str]]:
         if verdict is None:
             return None, None
-        cands = _primitives_by_category().get(verdict.bottleneck, [])
+        cands = [e["name"] for e in _relevant_entries(self.job.op, verdict.bottleneck)]
         if not cands:
             # no primitive for this category: vanilla lever from the vocabulary
             return vocabulary.lever_for(verdict.bottleneck), None
@@ -571,7 +633,7 @@ class Orchestrator:
 
     # ---- produce kernel (parse + presim budgets) ----
     def _produce_kernel(
-        self, *, verdict_json, feedback_summary, retrieved_experience, round_n,
+        self, *, verdict_json, feedback_summary, retrieved_experience, bottleneck, round_n,
         compile_error: Optional[str] = None, t=None,
     ) -> tuple[str, dict]:
         allowed = _allowed_extensions()
@@ -586,7 +648,7 @@ class Orchestrator:
                 verdict_json=verdict_json,
                 feedback_summary=feedback_summary,
                 retrieved_experience=retrieved_experience,
-                extension_index=extension_index_text(),
+                extension_index=extension_index_text(self.job.op, bottleneck),
                 compile_error=compile_error,
             )
             resp = self.llm.generate(prompt)
@@ -648,26 +710,59 @@ class Orchestrator:
         raise BudgetExhausted("sim_retries")
 
     # ---- memory ----
-    def _retrieve_experience(self) -> str:
+    def _warn_if_memory_disabled(self) -> None:
+        """核心模块失效不许静默（GLM52 优化指导第五部分）。
+
+        store/log 缺失时显式 warning——否则 memory 全程没工作（retrieve/record 静默 no-op）
+        却无人发现。每实例只报一次，绑在真正用到 memory 的时机（非构造时）。
+        """
+        if getattr(self, "_memory_warned", False):
+            return
+        missing = [name for name, val in (("store", self.store), ("log", self.log))
+                   if val is None]
+        if missing:
+            self._memory_warned = True
+            warnings.warn(
+                f"memory disabled ({'/'.join(missing)} is None): experience retrieve/record "
+                "are silent no-ops; wire store + log if memory is intended to work.",
+                stacklevel=3,
+            )
+
+    def _retrieve_experience(self, bottleneck: Optional[str]) -> tuple[str, list[str]]:
+        """按"算子类型 + 已知瓶颈"检索 top-k 经验（GLM52 优化指导第三部分 Bug1 修复）。
+
+        round2+ 时 bottleneck 取自上一轮 verdict——retrieve 必须用已知瓶颈构造
+        fingerprint，否则 key 落到 "op|unknown"，与 record 存的 "op|<真实瓶颈>"
+        错位、精确匹配永远 miss，只能靠 op_kind 回退、丢掉瓶颈区分度。
+        返回 (注入文本, 命中经验ID)；后者回传 record_attempt 让分数真正迭代（Bug2）。
+        """
+        self._warn_if_memory_disabled()
         if self.store is None:
-            return ""
+            return "", []
         from memory.retrieve import retrieve, format_context
         from memory.schema import Fingerprint
-        fp = Fingerprint(op_kind=self.job.op, bottleneck=None)
+        fp = Fingerprint(op_kind=self.job.op, bottleneck=bottleneck)
         hits = retrieve(self.store, fp, n=3)
         if hits:
             self._last_summary = ""
-            return format_context(hits)
-        return ""
+            return format_context(hits), [e.id for e in hits]
+        return "", []
 
-    def _record_attempt(self, n: int, sim: SimResult, verdict: Optional[Verdict], meta: dict):
+    def _record_attempt(self, n: int, sim: SimResult, verdict: Optional[Verdict], meta: dict,
+                        retrieved_ids: Optional[list[str]] = None):
+        """写回：把 retrieve 实际命中的经验ID 传给 record_attempt（GLM52 Bug2 修复）。
+
+        旧代码硬编码 retrieved_ids=[] → store.bump 永不更新 used/helped → 经验分数恒为
+        初始值、好坏经验无法区分。改用本轮真实命中的 ID，让分数随成败真正迭代。
+        """
+        self._warn_if_memory_disabled()
         if self.store is None or self.log is None:
             return
         from memory.schema import Fingerprint
         from memory.writeback import record_attempt
         fp = Fingerprint(op_kind=self.job.op, bottleneck=verdict.bottleneck if verdict else None)
         record_attempt(
-            self.log, self.store, fp, retrieved_ids=[],
+            self.log, self.store, fp, retrieved_ids=retrieved_ids or [],
             passed=sim.correct, cycles=sim.cycles, compiled=sim.compiled,
             extension_used=meta.get("extension_used"), stage=f"round_{n}",
         )

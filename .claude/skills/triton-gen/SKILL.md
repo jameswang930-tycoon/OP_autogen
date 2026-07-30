@@ -30,7 +30,7 @@ preserved so this skill can still be triggered manually in agent mode.)
 
 ## Step 0: If there is a compile error, fix it first
 
-If `{{COMPILE_ERROR}}` is non-empty, the previous kernel did not compile. **Prioritize
+If the **compile-error** input above is non-empty, the previous kernel did not compile. **Prioritize
 fixing that exact compile error this round, and do NOT introduce any new optimization.**
 A kernel that does not compile cannot be measured; correctness of the build comes before
 performance tuning.
@@ -41,13 +41,13 @@ The compile-error feedback loop (T13-3) made extension tryout cheap: a mis-used
 primitive costs an uncounted compile retry, not an optimization round; the worst case is
 caught by the loop-controller's best-so-far + rollback. So be extension-forward:
 
-1. **When the bottleneck chain points to a primitive, use it — do not hedge.** If
-   `{{VERDICT_JSON}}` resolves to a non-empty `primitives` list for its `bottleneck`,
-   use that primitive this round. Looking it up but retreating to vanilla voids the
+1. **When the bottleneck chain points to a primitive, use it — do not hedge.** If the
+   **Verdict** input names a `bottleneck` whose Extension-index category lists primitives,
+   use one this round. Looking it up but retreating to vanilla voids the
    bottleneck -> lever -> primitives chain.
-2. **First-round policy.** If `{{RETRIEVED_EXPERIENCE}}` hits a memory entry carrying
-   `extension_used`, use that primitive directly. Only when there is neither a hit nor a
-   Verdict to lean on, start from standard Triton — then you genuinely lack the
+2. **First-round policy.** If the **Retrieved-experience** input carries a memory entry
+   with `extension_used`, use that primitive directly. Only when there is neither a hit nor
+   a Verdict to lean on, start from standard Triton — then you genuinely lack the
    information to choose a primitive.
 3. **Vanilla is demoted from "preference" to "structural base".** The module skeleton
    stays standard Triton so it parses and compiles; an extension is a local replacement

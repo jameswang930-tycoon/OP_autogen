@@ -79,18 +79,64 @@ _ok "hivmir: $(find "$HERE/hivmir" -type f | wc -l) files"
 _hdr "Step 2: bishengir-compile → kernel.o"
 
 _inf "输入: $TTADAPTER"
+
+# llvm-symbolizer 用于 crash 时产生可读 backtrace
+export LLVM_SYMBOLIZER_PATH=$(command -v llvm-symbolizer 2>/dev/null || echo "")
+
+# 先试 triton kernel 专用编译参数 (官方 AscendNPU-IR 文档)
+_inf "尝试 1: --enable-triton-kernel-compile + --enable-hivm-compile"
 bishengir-compile "$TTADAPTER" \
-    --enable-hivm-compile \
+    --enable-hivm-compile=true \
+    --enable-triton-kernel-compile=true \
+    --target=Ascend910B3 \
     -o "$HERE/sim_build/kernel.o" \
     > "$LOG_DIR/compile.log" 2>&1
 R2=$?
 
 if [ "$R2" != "0" ]; then
-    _err "编译失败! 退出码=$R2"
-    tail -30 "$LOG_DIR/compile.log"
-    grep -i "error\|cannot\|fatal" "$LOG_DIR/compile.log" 2>/dev/null | head -10 || true
+    _wrn "尝试 1 失败 (退出码=$R2), 换参数重试..."
+    grep -i "error\|stack\|Segmentation\|139" "$LOG_DIR/compile.log" 2>/dev/null | head -5 || true
+
+    # 尝试 2: 只用 --enable-hivm-compile (最小参数)
+    _inf "尝试 2: 仅 --enable-hivm-compile"
+    bishengir-compile "$TTADAPTER" \
+        --enable-hivm-compile=true \
+        -o "$HERE/sim_build/kernel.o" \
+        > "$LOG_DIR/compile.log" 2>&1
+    R2=$?
+fi
+
+if [ "$R2" != "0" ]; then
+    _wrn "尝试 2 也失败 (退出码=$R2)"
+
+    # 尝试 3: 加 --enable-hfusion-compile
+    _inf "尝试 3: --enable-hfusion-compile + --enable-hivm-compile"
+    bishengir-compile "$TTADAPTER" \
+        --enable-hfusion-compile=true \
+        --enable-hivm-compile=true \
+        --enable-triton-kernel-compile=true \
+        -o "$HERE/sim_build/kernel.o" \
+        > "$LOG_DIR/compile.log" 2>&1
+    R2=$?
+fi
+R2=$?
+
+if [ "$R2" != "0" ] || [ ! -f "$HERE/sim_build/kernel.o" ]; then
+    _err "bishengir-compile 三次尝试全部失败! 退出码=$R2"
+    echo ""
+    echo "=== 编译日志关键内容 ==="
+    grep -i "error\|Segmentation\|signal\|stack\|139\|cannot\|fatal\|assert" "$LOG_DIR/compile.log" 2>/dev/null | head -15 || echo "(无关键词)"
+    echo ""
+    echo "=== 编译日志最后20行 ==="
+    tail -20 "$LOG_DIR/compile.log"
+    echo ""
+    _err "这是 bishengir-compile 的已知 bug (AscendNPU-IR Issue #154)"
+    _err "MarkRealCoreType pass 死循环导致栈溢出 → segfault"
+    _inf "解决: 升级 bishengir-compile 到 post-2025年3月 版本"
+    _inf "备选: 跳过 bishengir-compile, 用 HIVM + 真机 msprof PipeUtilization.csv 做分析"
     exit 1
 fi
+
 _ok "kernel.o: $(wc -c < "$HERE/sim_build/kernel.o") bytes"
 file "$HERE/sim_build/kernel.o" 2>/dev/null || true
 

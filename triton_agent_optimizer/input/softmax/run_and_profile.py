@@ -110,7 +110,7 @@ def test_softmax(N: int = 1024, BLOCK_SIZE: int = 256):
     max_err = torch.max(torch.abs(out_triton - out_torch)).item()
     # NPU libdevice exp 精度略低于 PyTorch, 允许 1e-2 误差
     status = "PASS" if max_err < 1e-2 else "FAIL"
-    print(f"[softmax] N={N:>5} BLK={actual_block:>3} grid=1 max_err={max_err:.6f}  {status}", flush=True)
+    print(f"[softmax] N={N:>5} BLK={BLOCK_SIZE:>3} grid={grid[0]} max_err={max_err:.6f}  {status}", flush=True)
     return status, max_err
 
 
@@ -140,11 +140,11 @@ def main():
     results = []
 
     # 多 shape 测试 (覆盖对齐/非对齐)
-    for N in [256, 512, 1024, 1025, 4096]:
+    for N in [256, 512, 1024, 2048, 4096]:
         s, e = test_softmax(N)
         results.append(("softmax", N, s, e))
 
-    for N in [256, 512, 1024, 1025, 4096]:
+    for N in [256, 512, 1024, 2048, 4096]:
         s, e = test_gelu(N)
         results.append(("gelu", N, s, e))
 

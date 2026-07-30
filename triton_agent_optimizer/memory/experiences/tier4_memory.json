@@ -11,5 +11,18 @@
     "description": "Tier 4: double_buffering",
     "timestamp": "2026-07-29T10:05:53.761400",
     "decision_reason": "Speedup 0.703x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "merge_small_transfers",
+    "speedup": 0.7031,
+    "status": "FAIL",
+    "description": "Tier 4: merge_small_transfers",
+    "timestamp": "2026-07-30T11:19:12.038877",
+    "decision_reason": "Verification failed: Cannot import kernel: 'softmax_kernel' not found in kernel.py. Found: ['tl', 'softmax_gelu_fused_ker"
   }
 ]

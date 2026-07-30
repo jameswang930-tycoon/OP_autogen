@@ -11,5 +11,18 @@
     "description": "Tier 5: fuse_gelu_into_softmax_precompute",
     "timestamp": "2026-07-29T10:06:05.197510",
     "decision_reason": "Speedup 0.703x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "vsub",
+      "bottleneck_type": "compute_vec",
+      "engine": "VecUnit"
+    },
+    "strategy": "overlap_compute_transfer",
+    "speedup": 0.6607,
+    "status": "FAIL",
+    "description": "Tier 5: overlap_compute_transfer",
+    "timestamp": "2026-07-30T14:08:43.856158",
+    "decision_reason": "Speedup 0.661x <= 1.01"
   }
 ]

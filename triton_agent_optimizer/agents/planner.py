@@ -153,7 +153,7 @@ def _build_system_prompt(tier: int, playbook: str) -> str:
 ## Your Job
 You are at Tier {tier}: {TIER_NAMES.get(tier, 'Unknown')}.
 Generate ONE specific, small optimization change for this round.
-## CRITICAL: When to say algorithm_already_optimal- If kernel has NO ops to optimize at this tier, output: {"strategy": "algorithm_already_optimal"}- Tier 2 (Fusion): no adjacent RAW chains to fuse → algorithm_already_optimal- Tier 3 (Tiling): all BW ops saturated (util>90%) → algorithm_already_optimal- Do NOT invent non-existent ops. Read the per-op list below to see actual ops.
+## CRITICAL: When to say algorithm_already_optimal- If kernel has NO ops to optimize at this tier, output: {{"strategy": "algorithm_already_optimal"}}- Tier 2 (Fusion): no adjacent RAW chains to fuse → algorithm_already_optimal- Tier 3 (Tiling): all BW ops saturated (util>90%) → algorithm_already_optimal- Do NOT invent non-existent ops. Read the per-op list below to see actual ops.
 Output ONLY valid JSON — no explanation, no markdown.
 
 ## Playbook (Tier {tier} reference)
@@ -263,15 +263,51 @@ class PlannerAgent:
         )
 
     # ═══════════════════════════════════════════════════════════════════════════
-    #  LLM 调用 (统一通过 LLMClient)
+    #  LLM 调用
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _call_llm(self, system_prompt: str, user_prompt: str) -> dict:
-        from llm_client import LLMClient, extract_json
-        client = LLMClient()
-        print(f"  [Planner] mode={client.mode}, prompt ~{len(system_prompt + user_prompt):,} chars")
-        text = client.chat(system_prompt, user_prompt, max_tokens=2048)
-        return extract_json(text)
+        import os
+        deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if deepseek_key:
+            from openai import OpenAI
+            client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com")
+            resp = client.chat.completions.create(
+                model="deepseek-chat", max_tokens=2048,
+                messages=[{"role": "system", "content": system_prompt},
+                          {"role": "user", "content": user_prompt}])
+            text = resp.choices[0].message.content or ""
+        elif anthropic_key:
+            import anthropic
+            client = anthropic.Anthropic(api_key=anthropic_key)
+            resp = client.messages.create(
+                model="claude-sonnet-4-20250514", max_tokens=2048,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}])
+            text = resp.content[0].text
+        else:
+            raise RuntimeError("No API key")
+
+        print(f"  [Planner] LLM response: {len(text)} chars")
+        if not text or not text.strip():
+            raise ValueError("Empty LLM response")
+        text = text.strip()
+        if "```" in text:
+            parts = text.split("```")
+            for p in parts:
+                p = p.strip()
+                if p.startswith("json"): p = p[4:].strip()
+                if p.startswith("{"): text = p; break
+        start = text.find("{"); end = text.rfind("}")
+        if start >= 0 and end > start: text = text[start:end+1]
+        import re, json
+        for attempt in range(3):
+            try: return json.loads(text)
+            except json.JSONDecodeError:
+                if attempt == 0: text = re.sub(r':\s*([^{}"\s,]+)(?=\s*[,}])', r': "\1"', text)
+                elif attempt == 1: text = re.sub(r'(?<=:)\s*([^"{}\[\],\s]+)(?=\s*[,}\]])', r' "\1"', text)
+        return json.loads(text)
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  Stub (本地测试)

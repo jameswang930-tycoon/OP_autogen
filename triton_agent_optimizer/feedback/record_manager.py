@@ -159,9 +159,9 @@ class RecordManager:
         else:
             decision, reason = "KEEP", f"Speedup {verify_result.speedup:.3f}x > 1.01"
 
-        cumulative = s["best_speedup"] * verify_result.speedup
-        if decision == "KEEP" and verify_result.speedup > s["best_speedup"]:
-            s["best_speedup"] = cumulative
+        cumulative = verify_result.speedup  # 本轮 speedup (非乘法累积)
+        if verify_result.speedup > s["best_speedup"]:
+            s["best_speedup"] = verify_result.speedup
 
         # ── 更新 state ──
         s["round"] = rn

@@ -134,5 +134,29 @@
     "status": "SUCCESS",
     "description": "Tier 2: break_war_dependency",
     "timestamp": "2026-07-29T10:10:51.241639"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "break_war_dependency",
+    "speedup": 1.6489,
+    "status": "SUCCESS",
+    "description": "Tier 2: break_war_dependency",
+    "timestamp": "2026-07-30T12:30:48.586835"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "fuse_elementwise_ops",
+    "speedup": 1.1532,
+    "status": "SUCCESS",
+    "description": "Tier 2: fuse_elementwise_ops",
+    "timestamp": "2026-07-30T14:08:03.573160"
   }
 ]

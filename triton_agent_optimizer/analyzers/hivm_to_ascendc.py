@@ -83,7 +83,7 @@ def generate(kernel_name: str, hivm_ops: list, total_elems: int = 256,
     lines.append(f'{{')
     lines.append(f'    AscendC::InitSocState();')
     lines.append(f'    constexpr uint32_t BLK = {total_elems};')
-    lines.append(f'    AscendC::LocalMemAllocator<AscendC::Hardware::UB> ub;')
+    lines.append(f'    AscendC::LocalMemAllocator<AscendC::Hardware::UB> ubAllocator;')
     lines.append('')
 
     buf_count = 0
@@ -112,7 +112,7 @@ def generate(kernel_name: str, hivm_ops: list, total_elems: int = 256,
 
         if ot == "gm_to_ub":
             src = op.get("src", "").lstrip("%")
-            lines.append(f'    AscendC::LocalTensor<{ctype}> {buf_name} = ub.template Alloc<{ctype}, BLK>();')
+            lines.append(f'    AscendC::LocalTensor<{ctype}> {buf_name} = ubAllocator.Alloc<{ctype}, BLK>();')
             lines.append(f'    AscendC::GlobalTensor<{ctype}> gm_{src};')
             lines.append(f'    gm_{src}.SetGlobalBuffer({src} + block_idx * BLK, BLK);')
             lines.append(f'    AscendC::DataCopy({buf_name}, gm_{src}, BLK);')
@@ -128,18 +128,18 @@ def generate(kernel_name: str, hivm_ops: list, total_elems: int = 256,
             if n_inputs == 2:
                 src = op.get("src", "")
                 src_buf = resolve_buf(src, buf_map, buf_name)
-                lines.append(f'    AscendC::LocalTensor<{ctype}> {buf_name} = ub.template Alloc<{ctype}, BLK>();')
+                lines.append(f'    AscendC::LocalTensor<{ctype}> {buf_name} = ubAllocator.Alloc<{ctype}, BLK>();')
                 lines.append(f'    AscendC::{fn_name}({buf_name}, {src_buf}, BLK);')
             elif n_inputs == 3:
                 src = op.get("src", "")
                 src2 = op.get("src2", "")
                 src_buf = resolve_buf(src, buf_map, buf_name)
                 src2_buf = resolve_buf(src2, buf_map, buf_name)
-                lines.append(f'    AscendC::LocalTensor<{ctype}> {buf_name} = ub.template Alloc<{ctype}, BLK>();')
+                lines.append(f'    AscendC::LocalTensor<{ctype}> {buf_name} = ubAllocator.Alloc<{ctype}, BLK>();')
                 lines.append(f'    AscendC::{fn_name}({buf_name}, {src_buf}, {src2_buf}, BLK);')
 
         if ot != "ub_to_gm":
-            lines.append(f'    AscendC::PipeBarrier<AscendC::PIPE_ALL>();')
+            lines.append(f'    AscendC::PipeBarrier<PIPE_ALL>();')
         lines.append('')
 
     lines.append(f'}}')
@@ -204,86 +204,87 @@ def resolve_buf(ssa_name, buf_map, fallback):
 def generate_and_build(kernel_name: str, hivm_ops: list,
                        output_dir: Path, total_elems: int = 256,
                        dtype: str = "f32") -> Path:
-    """生成 AscendC 源码 → bisheng 手动编译 → 可执行文件。
+    """生成 AscendC 源码 → CMake 编译 → 可执行文件。
 
-    使用官方文档推荐的手动编译方式 (不需要 CMake):
-      ① bisheng -c kernel.asc -o kernel.o --npu-arch=dav-2201
-      ② bisheng kernel.o -o app -L simulator/lib -lruntime_camodel -lnpu_drv_camodel -lm -lstdc++
-      ③ msprof op simulator --soc-version=Ascend910B3 ./app
+    使用与 asc-devkit msprof 示例完全相同的 CMake 模式 (已验证能编译):
+      CMakeLists.txt: find_package(ASC) + add_executable
+      cmake -DCMAKE_ASC_ARCHITECTURES=dav-2201 -DCMAKE_ASC_RUN_MODE=sim ..
+      make -j
 
     Returns:
         可执行文件路径, 或 None (编译失败)
     """
-    import subprocess, os, shutil
+    import subprocess, os
 
     work_dir = output_dir / "ascendc_build"
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. 生成 .asc 源码 (包含 kernel + host main)
+    # 1. 生成 .asc 源码
     asc_code = generate(kernel_name, hivm_ops, total_elems, dtype)
     asc_path = work_dir / f"{kernel_name}.asc"
     asc_path.write_text(asc_code, encoding="utf-8")
 
-    # 2. 找 CANN 安装路径和模拟器库
-    ascend_base = os.environ.get("ASCEND_HOME", "/usr/local/Ascend")
-    # 尝试找 cann 安装路径
-    for candidate in [
-        f"{ascend_base}/cann-9.0.0",
-        f"{ascend_base}/cann",
-        f"{ascend_base}/ascend-toolkit/latest",
-        "/usr/local/Ascend/cann-9.0.0",
-        "/usr/local/Ascend/cann",
-    ]:
+    # 2. 生成 CMakeLists.txt (完全对齐 ase-devkit 已验证格式)
+    cmake_content = f"""cmake_minimum_required(VERSION 3.16)
+find_package(ASC)
+project({kernel_name}_proj LANGUAGES ASC CXX)
+add_executable({kernel_name} {kernel_name}.asc)
+set_target_properties({kernel_name} PROPERTIES LINKER_LANGUAGE ASC)
+target_compile_options({kernel_name} PRIVATE
+    $<$<COMPILE_LANGUAGE:ASC>: --npu-arch=dav-2201>
+)
+"""
+    (work_dir / "CMakeLists.txt").write_text(cmake_content, encoding="utf-8")
+
+    # 3. CMake + Make
+    build_dir = work_dir / "build"
+    build_dir.mkdir(exist_ok=True)
+
+    # 设置 CMake 环境变量 (官方要求: ASCEND_HOME_PATH)
+    env = os.environ.copy()
+    cann_base = env.get("ASCEND_HOME", "/usr/local/Ascend")
+    cann_dir = cann_base
+    for candidate in [f"{cann_base}/cann-9.0.0", f"{cann_base}/cann"]:
         if os.path.isdir(candidate):
             cann_dir = candidate
             break
-    else:
-        cann_dir = ascend_base
+    # 关键: ASCEND_HOME_PATH 指向 CANN 根目录
+    env["ASCEND_HOME_PATH"] = cann_dir
+    for candidate in [f"{cann_base}/cann-9.0.0", f"{cann_base}/cann"]:
+        cmake_mod = f"{candidate}/x86_64-linux/tikcpp/ascendc_kernel_cmake"
+        if os.path.isdir(cmake_mod):
+            env["CMAKE_PREFIX_PATH"] = cmake_mod + ":" + env.get("CMAKE_PREFIX_PATH", "")
+            break
 
-    bisheng_bin = shutil.which("bisheng") or f"{cann_dir}/bin/bisheng"
-    sim_lib = f"{cann_dir}/x86_64-linux/simulator/Ascend910B3/lib"
-
-    if not os.path.isdir(sim_lib):
-        # 尝试其他路径
-        import glob
-        sim_dirs = glob.glob(f"{cann_dir}/**/simulator/Ascend910B3/lib", recursive=True)
-        sim_lib = sim_dirs[0] if sim_dirs else ""
-
-    obj_path = work_dir / f"{kernel_name}.o"
-    exe_path = work_dir / kernel_name
-
-    # 3. Step ①: 编译 → .o
     try:
         r = subprocess.run(
-            [bisheng_bin, "-c", str(asc_path), "-o", str(obj_path),
-             "--npu-arch=dav-2201"],
-            capture_output=True, text=True, timeout=60,
+            ["cmake", "..",
+             "-DCMAKE_ASC_ARCHITECTURES=dav-2201",
+             "-DCMAKE_ASC_RUN_MODE=sim",
+             "-DNPU_ARCH=dav-2201"],
+            cwd=str(build_dir), capture_output=True, text=True, timeout=60, env=env,
         )
         if r.returncode != 0:
-            print(f"  [HIVM→AscendC] Compile failed: {r.stderr[:200]}")
+            print(f"  [HIVM→AscendC] CMake failed: {r.stderr[:200]}")
             return None
-    except Exception as e:
-        print(f"  [HIVM→AscendC] Compile error: {e}")
-        return None
 
-    # 4. Step ②: 链接 → executable
-    try:
-        link_cmd = [
-            bisheng_bin, str(obj_path), "-o", str(exe_path),
-            f"-L{sim_lib}", f"-Wl,-rpath,{sim_lib}",
-            "-lruntime_camodel", "-lnpu_drv_camodel",
-            "-lm", "-lstdc++",
-        ]
-        r = subprocess.run(link_cmd, capture_output=True, text=True, timeout=60)
+        r = subprocess.run(
+            ["make", "-j4"],
+            cwd=str(build_dir), capture_output=True, text=True, timeout=120, env=env,
+        )
         if r.returncode != 0:
-            print(f"  [HIVM→AscendC] Link failed: {r.stderr[:200]}")
-            return None
-    except Exception as e:
-        print(f"  [HIVM→AscendC] Link error: {e}")
-        return None
+            # 只报告真正的错误，忽略 WSL 时钟偏移警告
+            real_errs = [l for l in r.stderr.split("\n") if "Error" in l or "error:" in l]
+            if real_errs:
+                print(f"  [HIVM→AscendC] Make failed: {real_errs[0][:200]}")
+                return None
 
-    if exe_path.exists():
-        return exe_path
+        exe_path = build_dir / kernel_name
+        if exe_path.exists():
+            return exe_path
+    except Exception as e:
+        print(f"  [HIVM→AscendC] Build error: {e}")
+
     return None
 
 
@@ -311,7 +312,7 @@ def run_msprof(executable: Path, output_dir: Path,
              f"--output={msprof_out}",
              f"--timeout=5",
              str(executable)],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, timeout=300, env=os.environ.copy(),
         )
         opprof_dirs = sorted(msprof_out.glob("OPPROF_*"),
                             key=lambda p: p.stat().st_mtime, reverse=True)

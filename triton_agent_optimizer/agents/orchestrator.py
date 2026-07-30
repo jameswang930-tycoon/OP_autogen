@@ -134,10 +134,16 @@ class Orchestrator:
         # ① 运行完整分析链
         merged, diag, extracted = self._run_analyzers(rd)
 
-        # 记录 baseline total_ns 和最佳 (用于后续 speedup 计算和回退)
+        # 记录 baseline total_ns 和最佳
         self._baseline_total_ns = merged.get("execution_summary", {}).get("total_ns", 0) if merged else 0
         self.best_speedup = 1.0
         self.best_total_ns = self._baseline_total_ns
+
+        # PyTorch CPU 基准测试
+        pytorch_us = self._benchmark_pytorch()
+        if pytorch_us > 0 and self._baseline_total_ns > 0:
+            merged["execution_summary"]["pytorch_baseline_us"] = round(pytorch_us, 2)
+            merged["execution_summary"]["pytorch_speedup"] = round(pytorch_us * 1000 / self._baseline_total_ns, 2)
 
         # ② 初始化 trajectory baseline
         self.record_mgr.init_baseline(merged or {}, diag, str(self.kernel_path))
@@ -212,38 +218,54 @@ class Orchestrator:
 
         # 更新 current_kernel (不管 KEEP/REVERT，先保存)
         self.current_kernel = coder_r.optimized_code
-# ★ 重新生成 HIVM (基于改后的代码) 这样 speedup 才反映真实变化        print(f"  [③b] Regenerating HIVM from optimized code...")        self._run_triton_to_hivm_pipeline(            rd / "kernel.py",            rd / "hivmir" / "compiler_output" / "hivmir_output.mlir")        # 重跑分析器获取新的 merged report (含最新 HIVM ops)        self._run_analyzers(rd)
+        # ★ 重新生成 HIVM (基于 Coder 改后的代码)
+        print(f"  [3b] Regenerating HIVM from optimized code...")
+        self._run_triton_to_hivm_pipeline(
+            rd / "kernel.py",
+            rd / "hivmir" / "compiler_output" / "hivmir_output.mlir")
+        new_merged, _, _ = self._run_analyzers(rd)
 
-        # ④ Verifier: Stage1 (CPU) + Stage2 (msprof simulator 重新算)
-        print(f"\n  [④ Verifier] Stage1 (CPU Emulator)...")
-        vr, retries = self._verify_with_retry(
-# ★ 生成 AscendC + 编译 + msprof 重采 (获取本轮的真正 trace)if self.msprof_dir or True:  # 尝试 msprof simulator 重采    try:        from analyzers.hivm_to_ascendc import generate_and_build, run_msprof        print(f"  [MSprof] Generating AscendC + running msprof simulator...")        exe = generate_and_build(            self._kernel_fn_name,            json.loads((rd / "hivmir" / "hivm_ops.json").read_text(encoding="utf-8")),            rd, total_elems=256, dtype="f32")        if exe and exe.exists():            new_opprof = run_msprof(exe, rd)            if new_opprof:                print(f"  [MSprof] New trace collected: {new_opprof}")                self.msprof_dir = new_opprof  # 更新为最新 trace                self._run_analyzers(rd)  # 用新 trace 重新分析    except Exception as e:        print(f"  [MSprof] Re-collect failed (non-critical): {e}")
-            coder_r.optimized_code, self.current_kernel, plan, rd)
-
-        # Speedup 估算: 对比本轮最佳 ns (不是基线)
+        # Speedup: 对比本轮最佳 ns
         prev_ns = self.best_total_ns or self._baseline_total_ns or 1484.0
         new_ns = self._estimate_total_ns(rd)
-        # 轮次加速比 = 上轮最佳 / 本轮
         round_speedup = prev_ns / new_ns if new_ns > 0 else 1.0
-        # 绝对加速比 = 基线 / 本轮
         abs_speedup = (self._baseline_total_ns or 1484.0) / new_ns if new_ns > 0 else 1.0
-        vr.stage2_actual_speedup = round_speedup
-        print(f"  [④ Verifier] → Stage1: {'PASS' if vr.stage1_passed else 'FAIL'}, "
-              f"msprof est: {prev_ns:.0f}ns → {new_ns:.0f}ns, "
-              f"round: {round_speedup:.3f}x, abs: {abs_speedup:.3f}x")
 
-        # ⑤ 决策 + 记录 → RecordManager
-        print(f"\n  [⑤ RecordManager] Evaluating...")
-        # 追踪最佳方案 (基于绝对加速比)
+        # 每轮 msprof 重采 (HIVM→AscendC→compile→simulator)
+        try:
+            from analyzers.hivm_to_ascendc import generate_and_build, run_msprof
+            print(f"  [3c] MSprof re-collect: AscendC + msprof...")
+            hivm_ops_f = rd / "hivmir" / "hivm_ops.json"
+            if hivm_ops_f.exists():
+                ops_data = json.loads(hivm_ops_f.read_text(encoding="utf-8"))
+                exe = generate_and_build(self._kernel_fn_name, ops_data, rd, 256, "f32")
+                if exe and exe.exists():
+                    new_trace = run_msprof(exe, rd)
+                    if new_trace:
+                        print(f"  [3c] MSprof: new trace -> {new_trace}")
+                        self.msprof_dir = new_trace
+                        new_merged, _, _ = self._run_analyzers(rd)
+        except Exception as e:
+            print(f"  [3c] MSprof: skipped ({e})")
+        # ④ Verifier: Stage1 CPU
+        from agents.verifier import VerifierAgent, VerifyResult
+        v = VerifierAgent()
+        vr = v.verify(rd / "kernel.py", rd, kernel_fn_name=self._kernel_fn_name, op_type=self._op_type)
+
+        # 设置 speedup 给 RecordManager
+        vr.stage2_actual_speedup = round_speedup
+        print(f"  [4 Verifier] Stage1: {'PASS' if vr.stage1_passed else 'FAIL'}, msprof: {prev_ns:.0f}ns -> {new_ns:.0f}ns, round: {round_speedup:.3f}x, abs: {abs_speedup:.3f}x")
+
+        # 追踪最佳方案
         if abs_speedup > self.best_speedup:
             self.best_speedup = abs_speedup
             self.best_kernel = coder_r.optimized_code
             self.best_total_ns = new_ns
-            print(f"  [⑤] NEW BEST: abs={abs_speedup:.3f}x, round={round_speedup:.3f}x ({new_ns:.0f}ns)")
+            print(f"  [5] NEW BEST: abs={abs_speedup:.3f}x, round={round_speedup:.3f}x ({new_ns:.0f}ns)")
         elif round_speedup < 1.0 and new_ns > prev_ns:
-            # 本轮退步了 → 回退代码到上一轮最佳
-            print(f"  [⑤] Round degraded ({round_speedup:.3f}x) → reverting to previous best")
+            print(f"  [5] Round degraded ({round_speedup:.3f}x) -> reverting to previous best")
             self.current_kernel = self.best_kernel
+
 
         stop, reason = self.record_mgr.evaluate(vr, plan, coder_r, rd, diag)
         print(f"  [⑤ RecordManager] → {vr.speedup:.3f}x → {'KEEP' if vr.speedup > 1.01 else 'REVERT'}"
@@ -390,6 +412,25 @@ class Orchestrator:
               f"headroom={diag.optimization_headroom}")
 
         return merged, diag, extracted
+
+    def _benchmark_pytorch(self) -> float:
+        """跑 PyTorch CPU 基准测试，返回延迟（微秒）。"""
+        try:
+            import torch, time
+            N = 2048
+            x = torch.randn(N, dtype=torch.float32)
+            torch.set_num_threads(1)
+            for _ in range(20):
+                _ = torch.softmax(x, dim=0)
+            t0 = time.perf_counter()
+            for _ in range(5000):
+                _ = torch.softmax(x, dim=0)
+            dt = time.perf_counter() - t0
+            latency_us = dt / 5000 * 1e6
+            print(f"  [PyTorch] CPU softmax baseline: {latency_us:.1f}us")
+            return latency_us
+        except Exception:
+            return 0.0
 
     def _estimate_total_ns(self, rd: Path) -> float:
         """从当前 round 的 merged report 估算总延迟。"""

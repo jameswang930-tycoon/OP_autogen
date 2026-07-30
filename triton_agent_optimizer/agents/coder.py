@@ -255,13 +255,27 @@ class CoderAgent:
             except Exception:
                 pass
 
-        from llm_client import LLMClient
-        client = LLMClient()
+        import os
         system = _build_system_prompt()
         user = _build_user_prompt(plan_text, kernel_code, previous_error)
-        print(f"  [Coder] mode={client.mode}, prompt ~{len(system + user):,} chars")
-        text = client.chat(system, user, max_tokens=4096)
-        return text
+        deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if deepseek_key:
+            from openai import OpenAI
+            client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com", timeout=60.0)
+            resp = client.chat.completions.create(
+                model="deepseek-chat", max_tokens=4096,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": user}])
+            return resp.choices[0].message.content or ""
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if anthropic_key:
+            import anthropic
+            client = anthropic.Anthropic(api_key=anthropic_key)
+            resp = client.messages.create(
+                model="claude-sonnet-4-20250514", max_tokens=4096,
+                system=system, messages=[{"role": "user", "content": user}])
+            return resp.content[0].text
+        raise RuntimeError("No API key")
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  Stub

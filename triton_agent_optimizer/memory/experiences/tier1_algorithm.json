@@ -167,5 +167,29 @@
     "description": "Tier 1: switch_to_online_softmax",
     "timestamp": "2026-07-29T10:04:40.593007",
     "decision_reason": "Speedup 0.703x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "fuse_softmax_gelu",
+    "speedup": 1.6489,
+    "status": "SUCCESS",
+    "description": "Tier 1: fuse_softmax_gelu",
+    "timestamp": "2026-07-30T11:18:47.073114"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "fuse_softmax_gelu",
+    "speedup": 1.1594,
+    "status": "SUCCESS",
+    "description": "Tier 1: fuse_softmax_gelu",
+    "timestamp": "2026-07-30T14:07:11.971237"
   }
 ]

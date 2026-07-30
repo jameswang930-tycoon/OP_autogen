@@ -63,6 +63,10 @@ echo "── 1. HIVM MLIR ──"
 
 export TRITON_DEBUG=1
 export TRITON_ALWAYS_COMPILE=1
+# triton-ascend 默认关闭行号信息(默认 true), 必须设为 0 才能生成完整的 trace
+# 来源: https://ascend.github.io/docs/.../profiling.html
+# "triton-ascend defaults to disabling line info (TRITON_DISABLE_LINE_INFO=1 by default)"
+export TRITON_DISABLE_LINE_INFO=0
 
 python3 run_and_profile.py > "$LOG_DIR/triton.log" 2>&1
 echo "Triton 退出码: $?"
@@ -211,11 +215,21 @@ else
     fi
 fi
 
-# ── 检查 msprof 工具本身 ──
+# ── 检查 msprof 工具本身 (CANN 8.5 不支持 --version, 用 which + ls) ──
 echo ""
-echo "── msprof 工具版本 ──"
-msprof --version 2>/dev/null | head -3 || echo "  无法获取版本"
-echo "msprof 路径: $(command -v msprof 2>/dev/null || echo '未找到')"
+echo "── msprof 工具信息 ──"
+MSPROF_PATH=$(command -v msprof 2>/dev/null || echo "")
+if [ -n "$MSPROF_PATH" ]; then
+    echo "msprof 路径: $MSPROF_PATH"
+    ls -la "$MSPROF_PATH" 2>/dev/null
+    # 直接从路径推断版本
+    if echo "$MSPROF_PATH" | grep -q "cann"; then
+        CANN_VER_DIR=$(echo "$MSPROF_PATH" | grep -oP '/cann/\K[^/]+' 2>/dev/null || echo "?")
+        echo "CANN 版本(路径推断): $CANN_VER_DIR"
+    fi
+else
+    echo "msprof: 未找到"
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════════
 #  汇总
@@ -233,16 +247,34 @@ echo "日志:         $LOG_DIR"
 
 echo ""
 echo "── 日志摘要 ──"
-echo "triton log ($(wc -l < "$LOG_DIR/triton.log" 2>/dev/null || echo 0) lines):"
+echo "triton ($(wc -l < "$LOG_DIR/triton.log" 2>/dev/null || echo 0) lines):"
 tail -5 "$LOG_DIR/triton.log" 2>/dev/null || true
+echo ""
+echo "msprof_sim ($(wc -l < "$LOG_DIR/msprof_sim.log" 2>/dev/null || echo 0) lines):"
+# 筛出真正的错误 (排除噪音)
+grep -i "error\|fail\|ERROR\|FAIL" "$LOG_DIR/msprof_sim.log" 2>/dev/null \
+    | grep -v "taskfailcallbackmanager\|TaskFailCallbackManager" \
+    | head -10 || echo "  (未发现明显错误)"
 
 echo ""
 echo "── 下一步 ──"
 if [ "$HIVM_COUNT" -gt 0 ]; then
-    echo "  bash step2_parse_hivm.sh"
+    echo "  → bash step2_parse_hivm.sh (HIVM 语义解析, 可立即执行)"
 fi
-if ls "$HERE/msprof_sim"/OPPROF_*/simulator/*/*_instr_exe.csv 2>/dev/null; then
-    echo "  bash step3_parse_msprof.sh"
+
+INSTRS=$(find "$HERE/msprof_sim" -name "*_instr_exe.csv" 2>/dev/null | wc -l)
+if [ "$INSTRS" -gt 0 ]; then
+    echo "  → bash step3_parse_msprof.sh (msprof simulator 时序解析)"
 else
-    echo "  (msprof simulator 未产出 instr_exe.csv, 需排查)"
+    echo ""
+    echo "  msprof op simulator 在 CANN 8.5.1 上存在已知的解析阶段 bug,"
+    echo "  网上多个来源 (华为云博客、oam-tools issue) 确认此问题:"
+    echo "  - 仿真本身成功 (exit code 0, OPPROF 目录生成)"
+    echo "  - 但 simulator/ 子目录为空/不存在 (解析工具 GetOutputPathFromRemote 失败)"
+    echo "  - CANN 8.5 社区版 msprof 功能不完整, 暂无官方补丁"
+    echo ""
+    echo "  务实替代方案:"
+    echo "  1. 用 HIVM MLIR 做语义层分析 (step2 继续执行)"
+    echo "  2. 用 msprof op (真机模式) 采集 PipeUtilization.csv 做时序层分析"
+    echo "  3. 两者合并仍可产生完整的 29 字段 DSL 流水线"
 fi

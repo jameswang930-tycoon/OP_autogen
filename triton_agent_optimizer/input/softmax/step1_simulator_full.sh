@@ -1,7 +1,7 @@
 #!/bin/bash
 # ═════════════════════════════════════════════════════════════════════════════════
-#  Step 1: Triton .py → trace.json (cache → ttadapter.mlir → .o → 可执行文件)
-#  CANN 8.5.1 + triton-ascend 3.5.x + Ascend 910B3
+#  Step 1: Triton .py → msprof op simulator → trace.json + instr_exe.csv
+#  参照 matmul kernel 已验证可用的命令格式
 # ═════════════════════════════════════════════════════════════════════════════════
 #
 #  用法: bash step1_simulator_full.sh [softmax_kernel|fused_gelu_kernel]
@@ -10,23 +10,10 @@
 #    rm -rf ~/.triton/cache/
 #
 # ═════════════════════════════════════════════════════════════════════════════════
-#  ★ 已验证可用的编译路径 (CANN 8.5.1, 2026-07):
-#
-#  Step 1: python3 run_and_profile.py
-#            → ~/.triton/cache/ 生成 ttadapter.mlir
-#  Step 2: bishengir-compile ttadapter.mlir \
-#            --enable-hfusion-compile=true \
-#            --enable-hivm-compile=true \
-#            --enable-triton-kernel-compile=true \
-#            -o kernel.o                          ← 这个参数组合可工作!
-#            (注意: 只用 --enable-hivm-compile 会 segfault)
-#            (bug: MarkRealCoreType pass 死循环, AscendNPU-IR Issue #154)
-#  Step 3: msprof op simulator --config=sim_config.json kernel.o
-#          → trace.json + instr_exe.csv
-#
-#  来源:
-#   bishengir-compile 参数: https://gitcode.com/Ascend/AscendNPU-IR/issues/154
-#   bisheng simulator: https://www.hiascend.com/document/detail/zh/canncommercial/900/programug/Ascendcopdevg/atlas_ascendc_10_00059.html
+#  ★ matmul 验证通过的 msprof op simulator 命令 (本脚本参照此格式):
+#    msprof op simulator --application="python3 bench_matmul.py" \
+#       --kernel-name="matmul_kernel" --soc-version=Ascend910B3 \
+#       --launch-count=5 --core-id=0 --output=./sim_result
 # ═════════════════════════════════════════════════════════════════════════════════
 
 KERNEL="${1:-softmax_kernel}"
@@ -40,182 +27,89 @@ _err() { echo -e "${RED}[ERR]${NC} $*" | tee -a "$LOG_DIR/summary.log"; }
 _wrn() { echo -e "${YLW}[WARN]${NC} $*"; }
 _ok()  { echo -e "${GRN}[OK]${NC}  $*" | tee -a "$LOG_DIR/summary.log"; }
 _inf() { echo -e "[INFO] $*"; }
-_hdr() { echo ""; echo "══════════ $* ══════════"; }
 
 # ── 环境 ──
-CANN="${ASCEND_HOME:-${ASCEND_TOOLKIT_HOME}}"
-[ -z "$CANN" ] && for d in /usr/local/Ascend/ascend-toolkit/latest /usr/local/Ascend/cann; do [ -d "$d" ] && { CANN="$d"; break; }; done
-BISHENG=$(command -v bisheng 2>/dev/null || echo "")
-BISHENGIR=$(command -v bishengir-compile 2>/dev/null || echo "")
 MSPROF=$(command -v msprof 2>/dev/null || echo "")
 PY=$(command -v python3 2>/dev/null || echo "")
-SIM_LIB=$(dirname "$(find /usr/local/Ascend -name "libruntime_camodel.so" -type f 2>/dev/null | head -1)" 2>/dev/null || echo "")
-
-echo "CANN:      ${CANN:-未找到}"
-echo "bisheng:   ${BISHENG:-未找到}"
-echo "bishengir: ${BISHENGIR:-未找到}"
-echo "msprof:    ${MSPROF:-未找到}"
-echo "SIM lib:   ${SIM_LIB:-未找到}"
-
-[ -z "$PY" ] && { _err "python3 未找到"; exit 1; }
-[ -z "$BISHENGIR" ] && { _err "bishengir-compile 未找到"; exit 1; }
-[ -z "$BISHENG" ] && { _err "bisheng 未找到"; exit 1; }
+echo "msprof: ${MSPROF:-未找到}"
+echo "python3: ${PY:-未找到}"
 [ -z "$MSPROF" ] && { _err "msprof 未找到"; exit 1; }
-[ -z "$SIM_LIB" ] && { _err "simulator lib 未找到"; exit 1; }
+[ -z "$PY" ] && { _err "python3 未找到"; exit 1; }
 
 # ── 清理 ──
-rm -rf "$HERE/hivmir" "$HERE/sim_build" "$HERE/msprof_sim" 2>/dev/null || true
-rm -rf ~/.triton/cache/ ~/.triton/dump/ 2>/dev/null || true
-mkdir -p "$HERE/hivmir" "$HERE/sim_build"
+rm -rf "$HERE/msprof_sim" "$HERE/hivmir" "$HERE/sim_build" 2>/dev/null || true
+rm -rf ~/.triton/cache/ 2>/dev/null || true
+mkdir -p "$HERE/hivmir"
 
 # ═════════════════════════════════════════════════════════════════════════════════
-#  Step 1: 跑 kernel → cache 生成 ttadapter.mlir
+#  Step 1: msprof op simulator (直接跑, 参照 matmul 验证格式)
 # ═════════════════════════════════════════════════════════════════════════════════
-_hdr "Step 1: 跑 kernel → 生成 ttadapter.mlir"
-
-export TRITON_ALWAYS_COMPILE=1
-export TRITON_DISABLE_LINE_INFO=0
-$PY run_and_profile.py > "$LOG_DIR/run.log" 2>&1
-R1=$?
-echo "退出码: $R1"
-grep "PASS\|FAIL\|max_err" "$LOG_DIR/run.log" 2>/dev/null | head -5 || true
-
-# ── 找 ttadapter.mlir ──
-TTADAPTER=$(find ~/.triton/cache -name "*ttadapter*" -type f 2>/dev/null | head -1)
-if [ -z "$TTADAPTER" ]; then
-    _err "未找到 ttadapter.mlir! cache 内容:"
-    find ~/.triton/cache -type f 2>/dev/null | head -30
-    exit 1
-fi
-_ok "ttadapter: $TTADAPTER ($(wc -c < "$TTADAPTER") bytes)"
-
-# 拷贝 mlir 到 hivmir (语义数据用)
-find ~/.triton/cache -name "*.mlir" -o -name "*.ttir" -o -name "*.ttadapter" 2>/dev/null | while read f; do cp "$f" "$HERE/hivmir/" 2>/dev/null; done
-_ok "hivmir: $(find "$HERE/hivmir" -type f | wc -l) files"
-
-# ═════════════════════════════════════════════════════════════════════════════════
-#  Step 2: ttadapter.mlir → bishengir-compile → kernel.o
-# ═════════════════════════════════════════════════════════════════════════════════
-_hdr "Step 2: bishengir-compile → kernel.o"
-
-_inf "输入: $TTADAPTER"
-_inf "编译中... (参数: --enable-hfusion-compile + --enable-hivm-compile + --enable-triton-kernel-compile)"
-bishengir-compile "$TTADAPTER" \
-    --enable-hfusion-compile=true \
-    --enable-hivm-compile=true \
-    --enable-triton-kernel-compile=true \
-    -o "$HERE/sim_build/kernel.o" \
-    > "$LOG_DIR/compile.log" 2>&1
-R2=$?
-R2=$?
-
-if [ "$R2" != "0" ] || [ ! -f "$HERE/sim_build/kernel.o" ]; then
-    _err "bishengir-compile 三次尝试全部失败! 退出码=$R2"
-    echo ""
-    echo "=== 编译日志关键内容 ==="
-    grep -i "error\|Segmentation\|signal\|stack\|139\|cannot\|fatal\|assert" "$LOG_DIR/compile.log" 2>/dev/null | head -15 || echo "(无关键词)"
-    echo ""
-    echo "=== 编译日志最后20行 ==="
-    tail -20 "$LOG_DIR/compile.log"
-    echo ""
-    _err "这是 bishengir-compile 的已知 bug (AscendNPU-IR Issue #154)"
-    _err "MarkRealCoreType pass 死循环导致栈溢出 → segfault"
-    _inf "解决: 升级 bishengir-compile 到 post-2025年3月 版本"
-    _inf "备选: 跳过 bishengir-compile, 用 HIVM + 真机 msprof PipeUtilization.csv 做分析"
-    exit 1
-fi
-
-_ok "kernel.o: $(wc -c < "$HERE/sim_build/kernel.o") bytes"
-file "$HERE/sim_build/kernel.o" 2>/dev/null || true
-
-# ═════════════════════════════════════════════════════════════════════════════════
-#  Step 3: msprof op simulator --config 模式 (跳过链接, 直接用 .o)
-#  kernel.o 是纯设备端二进制, 没有 host main(), 不能用 --application
-#  用 --config 传 JSON: https://www.hiascend.com/document/detail/zh/mindstudio/70RC1/mscommandtoolug/mscommandug/atlasopdev_16_0031.html
-# ═════════════════════════════════════════════════════════════════════════════════
-_hdr "Step 3: msprof op simulator --config → trace.json"
-
-# 写 config JSON
-cat > "$HERE/sim_build/sim_config.json" << JSONEOF
-{
-    "op_type": "AI_CORE",
-    "kernel_name": "$KERNEL",
-    "kernel_file": "$HERE/sim_build/kernel.o"
-}
-JSONEOF
-_inf "config: $(cat $HERE/sim_build/sim_config.json)"
-
-export LD_LIBRARY_PATH="$SIM_LIB:$LD_LIBRARY_PATH"
-rm -rf "$HERE/msprof_sim"
+echo ""
+echo "══════════ msprof op simulator ══════════"
+echo "kernel: $KERNEL"
 
 msprof op simulator \
-    --config="$HERE/sim_build/sim_config.json" \
+    --application="python3 $HERE/run_and_profile.py" \
+    --kernel-name="$KERNEL" \
+    --soc-version=Ascend910B3 \
+    --launch-count=5 \
+    --core-id=0 \
     --output="$HERE/msprof_sim" \
     > "$LOG_DIR/msprof.log" 2>&1
-R3=$?
-echo "退出码: $R3"
+R1=$?
+echo "退出码: $R1"
 
-# 完整打印 msprof 输出 (退出码0但无产物 = 静默失败)
-echo ""
-echo "=== msprof 完整输出 ==="
-cat "$LOG_DIR/msprof.log"
-
-echo ""
-echo "=== msprof 产物检查 ==="
 OPPROF=$(ls -dt "$HERE/msprof_sim"/OPPROF_*/ 2>/dev/null | head -1)
-echo "OPPROF目录: ${OPPROF:-不存在}"
-echo "msprof_sim 内容:"
-ls -la "$HERE/msprof_sim/" 2>/dev/null || echo "  (目录为空或不存在)"
-echo "当前目录是否有 OPPROF:"
-ls -d OPPROF_* 2>/dev/null || echo "  无"
 
-# 检查常见失败原因
-echo ""
-echo "=== 常见失败原因诊断 ==="
-if grep -qi "Failed to load simulator so\|No profiling data dumped\|cannot find\|LD_LIBRARY_PATH" "$LOG_DIR/msprof.log" 2>/dev/null; then
-    _err "simulator .so 加载失败! 检查 LD_LIBRARY_PATH"
-    grep -i "Failed to load\|No profiling\|LD_LIBRARY" "$LOG_DIR/msprof.log" 2>/dev/null
-elif grep -qi "config\|json\|parse\|invalid\|field" "$LOG_DIR/msprof.log" 2>/dev/null; then
-    _err "config JSON 格式问题"
-    grep -i "config\|json\|parse\|invalid\|field" "$LOG_DIR/msprof.log" 2>/dev/null
-elif grep -qi "kernel\|binary\|format\|unsupported\|not found" "$LOG_DIR/msprof.log" 2>/dev/null; then
-    _err "kernel.o 格式不受支持"
-    grep -i "kernel\|binary\|format\|unsupported\|not found" "$LOG_DIR/msprof.log" 2>/dev/null
-fi
-
-if [ -z "$OPPROF" ]; then
-    _err "OPPROF 未生成 — msprof simulator --config 模式在此环境不可用"
+if [ -n "$OPPROF" ]; then
+    _ok "OPPROF: $(basename $OPPROF)"
     echo ""
-    _inf "根本原因: bishengir-compile 产出的 .o 是真实 NPU 二进制"
-    _inf "msprof --config 模式需要 AscendC 项目的 .o (不同格式)"
-    _inf ""
-    _inf "现有可用方案:"
-    _inf "  HIVM语义:   ttadapter.mlir → hivmir_analyzer → 11字段"
-    _inf "  msprof时序: msprof op --kernel-name=xxx python3 run_and_profile.py"
-    _inf "              → PipeUtilization.csv 等 8 个 CSV"
-    _inf "  合并:        dsl_merger.py → 29字段 merged report"
-    exit 1
-fi
+    echo "=== 全部文件 ==="
+    find "$OPPROF" -type f | while read f; do
+        echo "  $f ($(wc -c < "$f") bytes)"
+    done
 
-_ok "OPPROF: $(basename $OPPROF)"
-echo ""
-echo "=== 全部文件 ==="
-find "$OPPROF" -type f | while read f; do echo "  $f ($(wc -c < "$f") bytes)"; done
+    TRACES=$(find "$OPPROF" -name "trace.json" 2>/dev/null | wc -l)
+    INSTRS=$(find "$OPPROF" -name "*_instr_exe.csv" 2>/dev/null | wc -l)
+    CSV=$(find "$OPPROF" -name "*.csv" 2>/dev/null | wc -l)
 
-TRACES=$(find "$OPPROF" -name "trace.json" 2>/dev/null | wc -l)
-INSTRS=$(find "$OPPROF" -name "*_instr_exe.csv" 2>/dev/null | wc -l)
-
-if [ "$TRACES" -gt 0 ] || [ "$INSTRS" -gt 0 ]; then
-    _ok "★★★ 成功! trace.json: $TRACES, instr_exe.csv: $INSTRS ★★★"
+    echo ""
+    _ok "★★★ trace.json: $TRACES ★★★"
+    _ok "★★★ instr_exe.csv: $INSTRS ★★★"
+    _ok "CSV: $CSV"
 else
-    _err "OPPROF 存在但无 trace/instr_exe"
-    grep -i "error\|fail\|cannot\|assert\|UNKNOWN" "$LOG_DIR/msprof.log" 2>/dev/null | head -15
+    _err "OPPROF 未生成"
+    echo ""
+    echo "=== msprof 日志 ==="
+    cat "$LOG_DIR/msprof.log"
+    echo ""
+    echo "=== 诊断 ==="
+    grep -i "error\|fail\|cannot\|UNKNOWN\|Failed\|invalid\|dumped" "$LOG_DIR/msprof.log" 2>/dev/null | head -15 || echo "(无)"
+    echo ""
+    _wrn "msprof op simulator 对 $KERNEL 不工作"
+    _inf "对比: matmul_kernel (tl.dot, Cube) 可正常产出"
+    _inf "当前 kernel 是纯 Vector + reduction, 模拟器可能不支持此类型"
+    _inf "备选: 用 HIVM MLIR (语义) + msprof op 真机 PipeUtilization.csv (时序) 合并分析"
 fi
+
+# ═════════════════════════════════════════════════════════════════════════════════
+#  Step 2: 顺便提取 HIVM MLIR (语义分析用)
+# ═════════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "══════════ HIVM MLIR 提取 ══════════"
+
+export TRITON_ALWAYS_COMPILE=1
+$PY run_and_profile.py > "$LOG_DIR/hivm_run.log" 2>&1
+
+# 找 .mlir 文件
+MLIRS=$(find ~/.triton/cache -name "*.mlir" -o -name "*.ttir" -o -name "*.ttadapter" 2>/dev/null)
+MLIR_CNT=$(echo "$MLIRS" | grep -c '.' 2>/dev/null || echo 0)
+echo "$MLIRS" | while read f; do [ -f "$f" ] && cp "$f" "$HERE/hivmir/" 2>/dev/null; done
+[ "$MLIR_CNT" -gt 0 ] && _ok "HIVM: $MLIR_CNT 个文件 → hivmir/" || _wrn "HIVM: 0 个"
 
 echo ""
 echo "══════════ 汇总 ══════════"
-echo "hivmir:     $(find "$HERE/hivmir" -type f 2>/dev/null | wc -l) files"
-echo "sim_build:  $(find "$HERE/sim_build" -type f 2>/dev/null | wc -l) files"
 echo "msprof_sim: $(find "$HERE/msprof_sim" -type f 2>/dev/null | wc -l) files"
+echo "hivmir:     $(find "$HERE/hivmir" -type f 2>/dev/null | wc -l) files"
 find "$HERE" -name "trace.json" 2>/dev/null | while read f; do echo "★★★ $f ($(wc -c < "$f") bytes)"; done
 echo "日志: $LOG_DIR"

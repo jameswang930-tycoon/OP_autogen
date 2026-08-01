@@ -175,3 +175,4 @@ Skill 文件在 [.claude/commands/](.claude/commands/)；各 skill 的文档归�
 - 2026-07-20：5 个 slash command 迁移为 Agent Skill（`.claude/skills/`，description 文件态前置条件治理触发），删除 `.claude/commands/`，CLAUDE.md 瘦身；验证链全绿（vadd_fp16 verify PASS + softmax 真触发实测）
 - 2026-07-21：新增 `requirements.txt`（numpy + networkx）固化 emulator 依赖；`.venv` 不进 git，换机器用 `uv venv --python 3.13 && uv pip install -r requirements.txt` 重建
 - 2026-07-30：GLM52 框架优化（P1–P5）提交——prompt 规则/数据分离、修 memory 两 bug（fingerprint 瓶颈错位 + retrieved_ids 硬编码）、extension 索引加模块归属+按场景检索、memory 未接线报 warning、文档卫生；冻结接缝 ext_distill/remote_dsl 零改动，pytest 191 passed；新增 `HANDOFF_GLM52.md`（保密环境交接/适配参照）
+- 2026-08-01：orchestrator CLI `main()` 接通 memory——`store`/`log` 路径与 `output_dir` 对齐（`<out>/memory/`，store/log 同目录自动管 `best_cycles.json`），修复 `store` 默认 None 导致 retrieve/record 全程 no-op、`has_exp` 恒 False；真跑验证 round2 `has_exp=True`、`experience.json` 有内容、无 memory-disabled warning，pytest 191 passed

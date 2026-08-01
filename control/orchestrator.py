@@ -828,8 +828,18 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--output-dir", help="output directory (default outputs/<op>_<ts>)")
     args = ap.parse_args(argv)
     from .job_spec import load_job
+    from memory.store import ExperienceStore
+    from memory.log import RunLog
     job = load_job(args.job, baseline_root=Path(args.job).resolve().parent)
-    orch = Orchestrator(job, output_dir=Path(args.output_dir) if args.output_dir else None)
+
+    # 先定 output_dir，保证 store/log 路径与 orchestrator 输出目录一致（否则经验存到与
+    # 输出目录不一致的地方，has_exp 恒 False）。store/log 同目录自动管 best_cycles.json。
+    out = Path(args.output_dir) if args.output_dir else (Path("outputs") / f"run_{int(time.time())}")
+    mem_dir = out / "memory"
+    store = ExperienceStore(mem_dir / "experience.json")
+    log = RunLog(mem_dir / "runlog.jsonl")
+
+    orch = Orchestrator(job, store=store, log=log, output_dir=out)
     report = orch.run()
     print(json.dumps({"stop": report["stop"], "recommended": report["recommended"]},
                      ensure_ascii=False, indent=2))

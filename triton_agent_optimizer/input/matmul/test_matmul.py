@@ -60,7 +60,9 @@ def main():
     b = torch.rand(K, N, dtype=DTYPE, device="npu") - 0.5
     c = torch.empty(M, N, dtype=DTYPE, device="npu")
 
-    grid = ((M + BLOCK_M - 1) // BLOCK_M) * ((N + BLOCK_N - 1) // BLOCK_N)
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    grid = (grid_m * grid_n,)   # 必须用 tuple: triton-ascend 对 int grid 调 len() 会报 "int has no len()"
     print(f"[info] launch grid={grid}  A({M}x{K}) @ B({K}x{N})  block={BLOCK_M}x{BLOCK_N}x{BLOCK_K}")
 
     matmul_kernel[grid](

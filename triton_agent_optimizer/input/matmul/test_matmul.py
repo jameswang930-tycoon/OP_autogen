@@ -61,123 +61,56 @@ kernel: 同目录 triton_kernel.py 的 matmul_kernel (C = A @ B, 512x512x512)
     注: 只有本命令产出 instr_exe.csv, 是真机 msprof/msprof op 没有的
 
 【方式 4/4 — HIVM IR dump】 (编译中间产物, 静态结构字段来源, 不占 NPU)
-    # 只跑一次即可, 产物在 ~/.triton/dump/, 每次编译会话一个 <hash> 子目录
-    export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
-    python3 test_matmul.py
-    产物: ~/.triton/dump/<hash>/
-        kernel.ttir.mlir        Triton IR (平台无关, 最高层)
-        kernel.ttadapter.mlir   triton-ascend 适配器输出 (转昇腾前)
-        kernel.npuir.mlir       ★ HIVM 级 IR (毕昇编译器产物) — 静态分析要的就是这个
-    编译链路: kernel.py → ttir → ttadapter → bishengir-compile → .o
-    注: TRITON_DISABLE_CACHE=1 必须 — 缓存命中会跳过编译, 不产 dump。
+    机制: TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1 → ~/.triton/dump/<hash>/
+         产 kernel.ttir.mlir + kernel.ttadapter.mlir + host 代码(.h/.cxx)。
+    ★ 关键事实 (本机 3.2.0 已确认):
+        - kernel.npuir.mlir 不生成: 同步 pass 改名 (hivm-inject-sync →
+          hivm-graph-sync-solver) 跟着 CANN 的 bishengir 走, 与 triton-ascend
+          版本无关 (3.2.0 也中招)。
+        - TRITON_DEBUG 有时命中缓存 → 只产 .h/.cxx (host 启动代码, 分析用不到),
+          连 ttir/ttadapter 都不产。
+        → 不再依赖 TRITON_DEBUG dump, 直接手动对 ttadapter.mlir 跑 bishengir
+          打印 HIVM (下方标准流程)。
 
-    ⚠️ 版本坑: BiShengIR 把同步 pass hivm-inject-sync 改名 hivm-graph-sync-solver
-       后 npuir.mlir 不再生成 — 已在服务器(3.2.0)确认: dump 里确实没有
-       kernel.npuir.mlir。改名跟着 CANN 的 bishengir 走, 与 triton-ascend
-       版本无关 (3.2.0 也中招)。兜底 = 下方"服务器实测版本 + 拿真实 HIVM"
-       的 ④⑤ (手动 bishengir 打印), 或"采集/清理/拷回一键流"。
+    拿真实 HIVM 的标准流程 (按序执行; A/B/C 都是给 D 准备输入):
+        # A. 找已有 ttadapter.mlir (之前拷回 ir_dump/ 过可直接复用, 跳过 B)
+        find . -name 'kernel.ttadapter.mlir' -o -name 'kernel.ttir.mlir' 2>/dev/null
 
-    采集/清理/拷回一键流 (npuir 缺失时的实际操作):
-        # ① 清理旧产物 (dump 缓存 + 本目录旧拷贝 + Triton 缓存干扰)
-        rm -rf ~/.triton/dump/* ~/.triton/cache ./ir_dump ./mlir_dump
-        # ② 采集: TRITON_DEBUG 走 ~/.triton/dump; MLIR_ENABLE_DUMP 直接落本目录
+        # B. 没有就强制重编译 (nuke 整个 ~/.triton 才保险; 单清 dump 会命中缓存只产 .h/.cxx)
+        rm -rf ~/.triton
         export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
-        export MLIR_ENABLE_DUMP=1               # 每个 MLIR pass 之前都 dump (兜底)
-        export MLIR_DUMP_PATH=$PWD/mlir_dump    # 按 pass 拆分的 .mlir 落这里 (不设则打到 stderr)
-        python3 test_matmul.py
-        # ③ 拷回本目录 (两个来源都拷)
-        cp -r ~/.triton/dump/* ./ir_dump/       # TRITON_DEBUG 产物 (若有)
-        cp -r ./mlir_dump/* ./ir_dump/          # MLIR_ENABLE_DUMP 产物 (按 pass 名/时间戳命名)
-        # ④ 按内容找 HIVM 级 IR (名字/目录可能不叫 npuir, 以内容为准)
-        grep -rl 'hivm.hir' ./ir_dump/          # 列出含 HIVM 指令的文件
-        grep -c 'hivm.hir' ./ir_dump/*.mlir | grep -v ':0$'   # 挑 HIVM 指令最多的那个
+        python3 test_matmul.py 2>&1 | tee run_debug.txt
+        find ~/.triton -type f | head -30     # 预期: kernel.ttir.mlir + kernel.ttadapter.mlir
 
-    服务器实测产物 = {kernel.ttir.mlir, kernel.ttadapter.mlir} + 生成的 host 代码(.h/.e.cxx):
-        - ttir.mlir           Triton 高层 IR (可兜底静态分析)
-        - ttadapter.mlir      ★ 进毕昇编译器前的 IR, 是手动拿 HIVM 的正确输入 (不含 hivm.hir)
-        - .h / .e.cxx         host 启动代码, 分析用不到
-        - kernel.npuir.mlir   确认未生成
+        # C. 确认 bishengir-compile 在 PATH (不在就 find 定位)
+        which bishengir-compile || find /usr/local/Ascend -name 'bishengir-compile' 2>/dev/null
 
-    结论: ttir.mlir 已够静态结构字段 (依赖边/buffer大小/dtype/op类型),
-          cube 精确通路 (L0A/L0B/L0C) 由 msprof simulator 指令级数据覆盖。
-          → 不必死磕 npuir。优先用下面的"ttir 直出"方案 A。
+        # D. ★核心: 对 ttadapter.mlir 直接跑官方命令打印 HIVM (不依赖 TRITON_DEBUG)
+        cd <A 或 B 里 ttadapter 所在目录>
+        bishengir-compile --target=Ascend910B3 --enable-auto-multi-buffer=True \
+          --enable-auto-bind-sub-block=True --enable-hfusion-compile=true \
+          --enable-hivm-compile=true --enable-triton-kernel-compile=true \
+          --bishengir-print-ir-after=hivm-inject-sync kernel.ttadapter.mlir \
+          -o /tmp/k.o 2>&1 | tee hivm_try.txt
+        grep -c 'hivm.hir' hivm_try.txt      # 预期 >0 即成功; 0 → 换 pass hivm-graph-sync-solver 重跑
+        # 仍 0: 加 --enable-hivm-graph-sync-solver=true (新版同步求解器默认 false, 不开不产 HIVM)
+        # 打印 flag 必须是 --bishengir-print-ir-after=<pass名> (不是 --mlir-print-ir-after-all)
+        # hivm_try.txt 即含 hivm.hir 的完整 IR, 拷回本目录直接喂 hivmir_analyzer
 
-    方案 A (推荐, 立即用): 真机 ttir.mlir 喂现有 ttir_to_hivm() → 直接出结构 JSON
+    方案 A (兜底, D 拿不到 HIVM 时): 真机 ttir.mlir 喂现有 ttir_to_hivm() → 直接出结构 JSON
         python3 -c "
         from analyzers.ttir_to_hivm import ttir_to_hivm
         hivm_text, ops = ttir_to_hivm(open('kernel.ttir.mlir').read(), 'matmul_kernel')
         open('kernel_hivm_fallback.mlir','w').write(hivm_text)
         print('ops:', len(ops))
         "
-        ⚠️ matmul 的 cube 通路 (L0A/L0B/L0C) 是近似的, 但对融合/分块/访存判定够用
+        ⚠️ 局限: matmul 的 cube 通路 (L0A/L0B/L0C) 是近似的; 但依赖边/buffer大小/dtype/op类型
+           (融合/分块/访存判定核心) 是对的
 
-    方案 B (可选增强, 想要真实 HIVM): 对 ttadapter.mlir 跑 bishengir
-        # ⚠️ 正确 flag 是 --bishengir-print-ir-before/after=<pass名>,
-        #    不是 --mlir-print-ir-after-all (之前跑了没输出就是这个原因)
-        bishengir-compile --help 2>&1 | grep -i print-ir      # 先确认真实 flag
-        bishengir-compile kernel.ttadapter.mlir \
-            --bishengir-print-ir-after=hivm-graph-sync-solver -o /dev/null 2>&1 \
-            | grep -E 'hivm.hir'
-        # pass 名不对就逐个试; 需要时补 --target=Ascend910B3 --enable-hivm-compile=true
-        # 注意: 想从 test_matmul.py 打印 bishengir 命令, 必须先
-        #   export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1 (否则缓存命中不打印 cmd_list)
-
-    服务器实测版本 + 拿真实 HIVM 的精确命令 (2026-08-03 已确认):
-        # ① 实测版本 (已跑): triton-ascend 3.2.0 / triton 3.2.0
-        #                    / torch_npu 2.9.0 / ACL (1,16,0,0)
-        #   → 即使 3.2.0, TRITON_DEBUG 也不产 npuir.mlir。
-        #     根因: 同步 pass 改名跟着 CANN 的 bishengir, 不跟 triton-ascend;
-        #     3.2.0 引用老 pass hivm-inject-sync, 但服务器 bishengir 已改名
-        #     hivm-graph-sync-solver → npuir dump 静默失败。两个 pass 名必须都试。
-
-        # ② 定位 toolkit / bishengir / CANN 版本
-        #    (注意: /usr/local/Ascend/ascend-toolkit/latest/version.cfg 实测不存在)
-        echo "TOOLKIT=$ASCEND_TOOLKIT_HOME"
-        ls /usr/local/Ascend/ 2>/dev/null
-        cat $ASCEND_TOOLKIT_HOME/version.cfg 2>/dev/null     # 拿 CANN 版本
-        which msprof bishengir-compile bishengir-opt        # bishengir 若不在 PATH:
-        find /usr/local/Ascend -name 'bishengir-compile' 2>/dev/null
-
-        # ③ 抓 triton-ascend 实际调用的完整 bishengir 命令 (权威, 含全部 target/flags)
-        export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
-        rm -rf ~/.triton/dump/*
-        python3 test_matmul.py 2>&1 | tee run_debug.txt
-        grep -n -i 'bishengir' run_debug.txt
-        #   预期输出: 1~3 行含 bishengir-compile 的命令, 形如:
-        #     bishengir-compile kernel.ttadapter.mlir --enable-hfusion-compile=true \
-        #       --enable-hivm-compile=true --enable-triton-kernel-compile=true -o kernel
-
-        # ④ 复制 ③ 的命令参数, 追加打印 flag, 两个 pass 名都试
-        #    打印 flag 必须是 --bishengir-print-ir-after=<pass名> (白名单只有
-        #    hivm-inject-sync, 但新 bishengir 已改名 → 两者都试)
-        for P in hivm-inject-sync hivm-graph-sync-solver; do
-          echo "===== $P ====="
-          bishengir-compile <③贴出的参数> --bishengir-print-ir-after=$P -o /tmp/k.o 2>&1 \
-            | tee hivm_$P.txt | grep -c 'hivm.hir'
-        done
-        #   预期输出: 成功 → 其中一个 echo 下一行是 >0 的数字 (如 47)
-        #             失败 → 两个都显示 0
-        #   hivm_<P>.txt 即含 hivm.hir 的完整 IR, 拷回本目录直接喂 hivmir_analyzer
-
-        # ⑤ 若 ④ 两个都 0: 官方完整命令直接跑 (AscendNPU-IR issue #216, target 直指 910B3)
-        bishengir-compile --target=Ascend910B3 --enable-auto-multi-buffer=True \
-          --enable-auto-bind-sub-block=True --enable-hfusion-compile=true \
-          --enable-hivm-compile=true --enable-triton-kernel-compile=true \
-          --bishengir-print-ir-after=hivm-inject-sync kernel.ttadapter.mlir \
-          -o /tmp/k.o 2>&1 | tee hivm_try.txt
-        grep -c 'hivm.hir' hivm_try.txt
-        #   预期: >0 即成功。还 0 → 换 hivm-graph-sync-solver, 并加
-        #   --enable-hivm-graph-sync-solver=true (新版同步求解器默认 false, 不开不产 HIVM)
-
-        # ⑥ 成功后的确认 (grep 应 > 0):
-        grep -E 'hivm.hir.matmul|hivm.hir.load' hivm_*.txt | head    # 指令样例
-        grep -c 'hivm.hir' hivm_*.txt                                # 指令总数
-
-    怎么看 (纯查看, 不需要编译):
-        ls ~/.triton/dump/*/                        # 确认有 kernel.npuir.mlir
-        grep -c 'hivm.hir' ~/.triton/dump/*/kernel.npuir.mlir   # 应 > 0
-        grep -n 'memref.alloc'  ~/.triton/dump/*/kernel.npuir.mlir | head   # buffer: size+region+dtype
-        grep -n 'hivm.hir'      ~/.triton/dump/*/kernel.npuir.mlir | head   # 每条指令+操作数
+    怎么看 D 的产物 hivm_try.txt (纯查看, 不需要编译):
+        grep -c 'hivm.hir' hivm_try.txt                      # 指令总数, 应 > 0
+        grep -n 'memref.alloc'  hivm_try.txt | head          # buffer: size+region+dtype
+        grep -E 'hivm.hir.matmul|hivm.hir.load' hivm_try.txt | head   # 指令样例
     真实格式 = hivmir_analyzer 的 Format A, 样例:
         %alloc = memref.alloc() : memref<256x256xf32, #hivm.address_space<ub>>
         hivm.hir.load ins(%arg0 : memref<...>) outs(%alloc : memref<...>)
@@ -188,7 +121,7 @@ kernel: 同目录 triton_kernel.py 的 matmul_kernel (C = A @ B, 512x512x512)
         from pathlib import Path
         from analyzers.hivmir_analyzer import HIVMIRAnalyzer
         a = HIVMIRAnalyzer()
-        rep = a.analyze_file(Path('kernel.npuir.mlir'))
+        rep = a.analyze_file(Path('hivm_try.txt'))
         import json; print(json.dumps(a.to_dict(rep), ensure_ascii=False, indent=2))
         "
         得到: op_id/op_type/instruction/dst/src/src2/size_kb/memory_region/

@@ -162,12 +162,50 @@ def merge(
             if pipe not in ("SCALAR", "ALL", "FLOWCTRL"):
                 msprof_by_pipe.setdefault(pipe, []).append(o)
 
+    # sync op 对齐: 按指令名 (SET_FLAG/WAIT_FLAG/BAR) 而非 pipe
+    # set_flag/wait_flag/pipe_barrier 无 pipe hint, 且真实数据里可能在 SCALAR/FLOWCTRL
+    # 被上面排除 → 用 instr 关键词匹配 (dsl_merger 与 simulator 都数 sync 才对齐正确)
+    SYNC_INSTR_HINT = {
+        "set_flag": "SET_FLAG",
+        "wait_flag": "WAIT_FLAG",
+        "pipe_barrier": "BAR",
+        "sync_block": "SYNC_BLOCK",
+    }
+    msprof_by_instr = {}
+    if has_msprof:
+        for o in msprof_ops:
+            inst = (o.get("instruction") or "").upper()
+            for kw in ("SET_FLAG", "WAIT_FLAG", "BAR", "SYNC_BLOCK"):
+                if kw in inst:
+                    msprof_by_instr.setdefault(kw, []).append(o)
+                    break
+
     for oid in sorted(hivm_ops.keys()):
         hop = dict(hivm_ops[oid])  # copy
         pipe_hint = hivm_pipe_hint.get(oid, "")
+        instr_kw = SYNC_INSTR_HINT.get(hop.get("op_type", ""))
 
         # 填充 msprof timing
-        if has_msprof and pipe_hint and pipe_hint in msprof_by_pipe:
+        if has_msprof and instr_kw and msprof_by_instr.get(instr_kw):
+            mops = msprof_by_instr[instr_kw]
+            idx = 0
+            for mop in mops:
+                if mop.get("_aligned", False):
+                    idx += 1
+                    continue
+                break
+            if idx < len(mops):
+                mop = mops[idx]
+                mop["_aligned"] = True
+                hop["engine"] = "Sync"
+                hop["pipeline_channel"] = mop["pipeline_channel"]
+                hop["duration_ns"] = mop["duration_ns"]
+                hop["start_ns"] = mop.get("start_ns", 0)
+                hop["end_ns"] = mop.get("end_ns", 0)
+                hop["time_ratio"] = mop.get("time_ratio", 0)
+                hop["cycles"] = mop.get("cycles", 0)
+                hop["core_id"] = mop.get("core_id", "")
+        elif has_msprof and pipe_hint and pipe_hint in msprof_by_pipe:
             mops = msprof_by_pipe[pipe_hint]
             if mops:
                 # 取该 pipe 的下一条未使用的指令

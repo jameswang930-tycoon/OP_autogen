@@ -56,6 +56,14 @@ DTYPE_SIZES = {
     "i8": 1, "i16": 2, "i32": 4, "i64": 8,
 }
 
+# #hivm.address_space<值> → 友好区域名 (triton-ascend al.ascend_address_space 对接 hivm::AddressSpace)
+ADDRESS_SPACE_MAP = {
+    "ub": "UB", "cbuf": "L1", "ca": "L0A", "cb": "L0B", "cc": "L0C", "gm": "GM",
+}
+
+# 同步 op (前缀 hivm.hir., 真实数据已确认; 非计算引擎, 计入 op_id 与 simulator SET_FLAG/WAIT_FLAG/BAR 对齐)
+SYNC_OPS = {"set_flag", "wait_flag", "pipe_barrier", "sync_block"}
+
 # IR lowering 后的函数名 → op 类型
 LOWERED_FUNC_MAP = {
     "load_gm_to_ubuf": "gm_to_ub",
@@ -195,10 +203,27 @@ class HIVMIRParser:
                 i += 1
                 continue
 
+            # sync op (非 ins/outs 语法, 计入 op_id 使与 simulator SET_FLAG/WAIT_FLAG/BAR 对齐)
+            sync = re.match(r'hivm\.hir\.(set_flag|wait_flag|pipe_barrier|sync_block)\b', line)
+            if sync:
+                op_name = sync.group(1)
+                op = HIVMIROp(
+                    op_id=op_id, op_type=op_name, engine="Sync",
+                    instruction=line,
+                    dst="", src="", src2="",
+                    size_kb=0.0, memory_region="",
+                    variable_name=f"sync_{op_id}",
+                    dtype="", attrs={},
+                )
+                self.ops.append(op)
+                op_id += 1
+                i += 1
+                continue
+
             # hivm.hir.* ops (可能跨多行)
             if line.startswith("hivm.hir."):
-                # 检查是否已经是一个完整的单行 op
-                if "ins(" in line and "outs(" in line and line.rstrip().endswith(")"):
+                # 检查是否已经是一个完整的单行 op (结尾可能是 ) 或 } 属性)
+                if "ins(" in line and "outs(" in line:
                     full_op = line
                     op = self._try_parse_hir_op(full_op, op_id)
                     if op:
@@ -218,7 +243,8 @@ class HIVMIRParser:
                         continue
                     op_lines.append(next_line)
                     full = " ".join(op_lines)
-                    if "outs(" in full and full.rstrip().endswith(")"):
+                    if "outs(" in full and (full.rstrip().endswith(")")
+                                            or full.rstrip().endswith("}")):
                         break
                     j += 1
 
@@ -234,18 +260,28 @@ class HIVMIRParser:
             i += 1
 
     def _try_parse_alloc(self, line: str) -> Optional[Tuple[str, float, str, str]]:
-        """%buf = memref.alloc() : memref<1024xf16, #hivm.address_space<ub>>"""
+        """%buf = memref.alloc() : memref<1024xf16, #hivm.address_space<ub>>
+        支持 1D/2D/3D (memref<256x256xf32,...>); 动态维 (memref<?x?xf32,...>) → size_kb=0 未知;
+        address_space 值映射为友好区域名 (cbuf→L1, cc→L0C, gm→GM, ...)。"""
         m = re.match(
             r'(%\w+)\s*=\s*memref\.alloc\(\)\s*:\s*'
-            r'memref<(\d+)\s*x\s*(\w+)\s*,\s*#hivm\.address_space<(\w+)>', line)
-        if m:
-            ssa = m.group(1)
-            shape = int(m.group(2))
-            dtype = m.group(3)
-            region = m.group(4)
-            sz = shape * DTYPE_SIZES.get(dtype, 2) / 1024.0
-            return (ssa, sz, region, dtype)
-        return None
+            r'memref<([0-9?]+(?:x[0-9?]+)*)\s*x\s*(\w+)\s*,\s*'
+            r'(?:strided<[^>]*>\s*,\s*)?#hivm\.address_space<(\w+)>', line)
+        if not m:
+            return None
+        ssa = m.group(1)
+        dims_str = m.group(2)
+        dtype = m.group(3)
+        region_raw = m.group(4)
+        region = ADDRESS_SPACE_MAP.get(region_raw, region_raw)
+        if "?" in dims_str:
+            size_kb = 0.0            # 动态维: 编译期尺寸未知
+        else:
+            size_kb = 1.0
+            for d in dims_str.split("x"):
+                size_kb *= int(d)
+            size_kb = size_kb * DTYPE_SIZES.get(dtype, 2) / 1024.0
+        return (ssa, size_kb, region, dtype)
 
     def _try_parse_hir_op(self, line: str, op_id: int) -> Optional[HIVMIROp]:
         """hivm.hir.OP ins(...) outs(...) [{attrs}]"""
@@ -665,6 +701,49 @@ func.func @add_kernel(%x: memref<1024xf16, #hivm.address_space<gm>>,
     raw_chain = [d for d in r3.raw_deps if d["type"] == "RAW"]
     assert len(raw_chain) > 0, "Should have RAW dependencies"
     print(f"  RAW deps: {len(r3.raw_deps)}, WAR: {len(r3.war_deps)}, WAW: {len(r3.waw_deps)}")
+    print("  PASS")
+
+    # Test 5: 真实 matmul 格式 (2026-08-03 服务器 hivm_try.txt 确认):
+    #   cube op = hivm.hir.mmadL1, sync = hivm.hir.set_flag/wait_flag/pipe_barrier,
+    #   2D alloc (memref<128x128xf16, cbuf>), address_space={cbuf,cc,gm}, 动态维 <?x?>
+    mlir_d = """
+func.func @matmul_kernel(%A: memref<256x256xf16, #hivm.address_space<gm>>,
+                          %B: memref<256x256xf16, #hivm.address_space<gm>>,
+                          %C: memref<256x256xf32, #hivm.address_space<gm>>) {
+    %l1_a = memref.alloc() : memref<128x128xf16, #hivm.address_space<cbuf>>
+    %l1_b = memref.alloc() : memref<128x128xf16, #hivm.address_space<cbuf>>
+    %l0c  = memref.alloc() : memref<128x128xf32, #hivm.address_space<cc>>
+    %dyn  = memref.alloc() : memref<?x?xf16, #hivm.address_space<cbuf>>
+    hivm.hir.load ins(%A : memref<256x256xf16, #hivm.address_space<gm>>) outs(%l1_a : memref<128x128xf16, #hivm.address_space<cbuf>>)
+    hivm.hir.load ins(%B : memref<256x256xf16, #hivm.address_space<gm>>) outs(%l1_b : memref<128x128xf16, #hivm.address_space<cbuf>>)
+    hivm.hir.set_flag [set_pipe = #hivm.pipe<mte2>, wait_pipe = #hivm.pipe<cube>, flag_id = 0 : i32]
+    hivm.hir.mmadL1 ins(%l1_a, %l1_b, %c0_i1, %m, %k, %n : memref<128x128xf16, #hivm.address_space<cbuf>>, memref<128x128xf16, #hivm.address_space<cbuf>>, i1, index, index, index) outs(%l0c : memref<128x128xf32, #hivm.address_space<cc>>) {lhs_m = 128 : i32, rhs_n = 128 : i32, l0b_k = 128 : i32}
+    hivm.hir.wait_flag [set_pipe = #hivm.pipe<cube>, wait_pipe = #hivm.pipe<mte3>, flag_id = 0 : i32]
+    hivm.hir.store ins(%l0c : memref<128x128xf32, #hivm.address_space<cc>>) outs(%C : memref<256x256xf32, #hivm.address_space<gm>>)
+    hivm.hir.pipe_barrier [pipe = #hivm.pipe<mte3>]
+    return
+}
+"""
+    r5 = analyzer.analyze(mlir_d)
+    print(f"\nTest 5 (真实 matmul 格式): {r5.num_ops} ops, {len(r5.buffers)} buffers")
+    for op in r5.ops:
+        print(f"  op{op.op_id}: {op.op_type:12s} engine={op.engine:8s} size={op.size_kb:.1f}KB region={op.memory_region}")
+    # 预期 7 ops: 2 load + 1 set_flag + 1 mmadL1 + 1 wait_flag + 1 store + 1 pipe_barrier
+    assert r5.num_ops == 7, f"Expected 7 ops, got {r5.num_ops}"
+    types = [op.op_type for op in r5.ops]
+    assert types == ["gm_to_ub", "gm_to_ub", "set_flag", "mmadL1",
+                     "wait_flag", "ub_to_gm", "pipe_barrier"], f"got {types}"
+    mmad = [op for op in r5.ops if op.op_type == "mmadL1"][0]
+    assert mmad.engine == "CubeUnit", f"mmadL1 engine={mmad.engine}"
+    assert mmad.size_kb == 64.0, f"mmadL1 size={mmad.size_kb}"  # dst %l0c = 128x128xf32 = 64KB
+    # 2D alloc + 区域映射
+    assert r5.buffers["%l1_a"].region == "L1", r5.buffers["%l1_a"].region
+    assert r5.buffers["%l0c"].region == "L0C", r5.buffers["%l0c"].region
+    assert r5.buffers["%l1_a"].size_kb == 32.0, r5.buffers["%l1_a"].size_kb
+    # 动态维 alloc → size_kb 0 (未知), 但仍解析出区域
+    assert r5.buffers["%dyn"].size_kb == 0.0 and r5.buffers["%dyn"].region == "L1"
+    # load op 的区域来自 dst alloc (L1)
+    assert r5.ops[0].memory_region == "L1", r5.ops[0].memory_region
     print("  PASS")
 
     print(f"\n{'=' * 60}")

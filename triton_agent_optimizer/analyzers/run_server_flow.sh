@@ -163,28 +163,30 @@ echo "══ 阶段 5/6: msprof 通用 (任务级 op_summary, 真实每op带宽/
 if [ "${SKIP_TASK:-0}" = "1" ]; then
   echo "  ⚠ SKIP_TASK=1, 跳过"
 else
+  # 输出到 task_prof 子目录 (结构: 05_task/task_prof/PROF_xxx/mindstudio_profiler_output/op_summary)
   TASK_OUT="$OUT/05_task/task_prof"
   rm -rf "$TASK_OUT"
+  mkdir -p "$TASK_OUT"
   # 先试全指标 (才出 main_mem/ub/l1/l2 带宽 + L2 + fops); env 前置传给 msprof 启动的 python
   TASK_AIC_FLAGS="${TASK_AIC_FLAGS:---aic-mode=task-based --task-time=l1 --aic-metrics=PipeUtilization,ArithmeticUtilization,Memory,MemoryL0,MemoryUB,L2Cache,ResourceConflictRatio}"
   MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof --output="$TASK_OUT" \
     --application="$PY test_matmul.py" $TASK_AIC_FLAGS \
     > "$OUT/05_task/task_run.txt" 2>&1
   echo "  全指标退出码=$? (日志 05_task/task_run.txt)"
-  OPSUM=$(find "$TASK_OUT" -name "op_summary*.csv" 2>/dev/null | wc -l)
+  OPSUM=$(find "$OUT/05_task" -name "op_summary*.csv" 2>/dev/null | wc -l)
   # 全指标 flag 可能版本不兼容 → 回退基础 msprof (有 op_summary, 但无带宽/L2 PMU)
   if [ "$OPSUM" -eq 0 ]; then
     echo "  ⚠ 全指标无 op_summary → 回退基础 msprof (无带宽/L2, 但 op_summary 可解析)"
-    rm -rf "$TASK_OUT"
+    rm -rf "$TASK_OUT"; mkdir -p "$TASK_OUT"
     MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof --output="$TASK_OUT" \
       --application="$PY test_matmul.py" \
       > "$OUT/05_task/task_run.txt" 2>&1
     echo "  基础退出码=$?"
-    OPSUM=$(find "$TASK_OUT" -name "op_summary*.csv" 2>/dev/null | wc -l)
+    OPSUM=$(find "$OUT/05_task" -name "op_summary*.csv" 2>/dev/null | wc -l)
     [ "$OPSUM" -gt 0 ] && echo "  (注: 基础模式无带宽/L2 字段, 需 TASK_AIC_FLAGS 全指标)"
   fi
   if [ "$OPSUM" -gt 0 ]; then pass "op_summary_*.csv x$OPSUM ✓ (真机每op指标)"; \
-  else fail "仍无 op_summary → 看 05_task/task_run.txt (需真机可运行 test_matmul.py)"; fi
+  else fail "仍无 op_summary → 看 05_task/task_run.txt (若手动跑 msprof 能出, 贴回该日志我查)"; fi
 fi
 
 # ═══════════════════════ 阶段 6/6: 4 源解析 + 整合诊断 ═══════════════════════
@@ -193,7 +195,7 @@ echo "══ 阶段 6/6: 4 源解析 + 整合 (hivm/sim/task/board → diagnosis
 HAVE=""
 [ -f "$OUT/02_hivm/hivm_try.txt" ] && HAVE="$HAVE hivm"
 [ -d "$OUT/03_sim/sim_prof" ] && HAVE="$HAVE sim"
-[ -d "$OUT/05_task/task_prof" ] && HAVE="$HAVE task"
+[ -n "$(find "$OUT/05_task" -name "op_summary*.csv" 2>/dev/null | head -1)" ] && HAVE="$HAVE task"
 [ -d "$OUT/04_board/board_prof" ] && HAVE="$HAVE board"
 echo "  已有源:${HAVE:- 无}"
 D=$OUT/06_diagnosis
@@ -203,8 +205,8 @@ fi
 if [ -d "$OUT/03_sim/sim_prof" ]; then
   "$PY" "$SCRIPT_DIR/pipeline_parse_sim.py" "$OUT/03_sim/sim_prof" "$D/sim.json" || true
 fi
-if [ -d "$OUT/05_task/task_prof" ]; then
-  "$PY" "$SCRIPT_DIR/pipeline_parse_task.py" "$OUT/05_task/task_prof" "$D/task.json" || true
+if [ -n "$(find "$OUT/05_task" -name "op_summary*.csv" 2>/dev/null | head -1)" ]; then
+  "$PY" "$SCRIPT_DIR/pipeline_parse_task.py" "$OUT/05_task" "$D/task.json" || true
 fi
 if [ -d "$OUT/04_board/board_prof" ]; then
   "$PY" "$SCRIPT_DIR/pipeline_parse_board.py" "$OUT/04_board/board_prof" "$D/board.json" || true

@@ -72,10 +72,24 @@ kernel: 同目录 triton_kernel.py 的 matmul_kernel (C = A @ B, 512x512x512)
     注: TRITON_DISABLE_CACHE=1 必须 — 缓存命中会跳过编译, 不产 dump。
 
     ⚠️ 版本坑 (triton-ascend 3.5.x): BiShengIR 把 pass hivm-inject-sync 改名
-       hivm-graph-sync-solver 后 npuir.mlir 不再生成。3.2.1 大概率没这问题, 但
-       第一次跑必须确认文件存在。缺失时改用:
-         export MLIR_ENABLE_DUMP=1        # 每个 pass 前后都 dump, 挑含 hivm 的
-       或改编译选项 --bishengir-print-ir-after=hivm-graph-sync-solver
+       hivm-graph-sync-solver 后 npuir.mlir 不再生成 — 已在服务器确认:
+       ~/.triton/dump/<hash>/ 里确实没有 kernel.npuir.mlir。兜底方案见下方
+       "采集/清理/拷回一键流" (MLIR_ENABLE_DUMP + MLIR_DUMP_PATH + 按内容找)。
+
+    采集/清理/拷回一键流 (npuir 缺失时的实际操作):
+        # ① 清理旧产物 (dump 缓存 + 本目录旧拷贝 + Triton 缓存干扰)
+        rm -rf ~/.triton/dump/* ~/.triton/cache ./ir_dump ./mlir_dump
+        # ② 采集: TRITON_DEBUG 走 ~/.triton/dump; MLIR_ENABLE_DUMP 直接落本目录
+        export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
+        export MLIR_ENABLE_DUMP=1               # 每个 MLIR pass 之前都 dump (兜底)
+        export MLIR_DUMP_PATH=$PWD/mlir_dump    # 按 pass 拆分的 .mlir 落这里 (不设则打到 stderr)
+        python3 test_matmul.py
+        # ③ 拷回本目录 (两个来源都拷)
+        cp -r ~/.triton/dump/* ./ir_dump/       # TRITON_DEBUG 产物 (若有)
+        cp -r ./mlir_dump/* ./ir_dump/          # MLIR_ENABLE_DUMP 产物 (按 pass 名/时间戳命名)
+        # ④ 按内容找 HIVM 级 IR (名字/目录可能不叫 npuir, 以内容为准)
+        grep -rl 'hivm.hir' ./ir_dump/          # 列出含 HIVM 指令的文件
+        grep -c 'hivm.hir' ./ir_dump/*.mlir | grep -v ':0$'   # 挑 HIVM 指令最多的那个
 
     怎么看 (纯查看, 不需要编译):
         ls ~/.triton/dump/*/                        # 确认有 kernel.npuir.mlir

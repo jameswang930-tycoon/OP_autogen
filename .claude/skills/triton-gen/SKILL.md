@@ -27,6 +27,7 @@ preserved so this skill can still be triggered manually in agent mode.)
 - Retrieved experience (may be empty): {{RETRIEVED_EXPERIENCE}}
 - Extension scene hint (trigger the matching ext-* skill to load primitives): {{EXTENSION_INDEX}}
 - Compile error from the previous attempt (empty unless the last attempt failed to compile): {{COMPILE_ERROR}}
+- Optimization hint (trigger the matching opt-* skill for this bottleneck's techniques; may be empty): {{OPTIMIZATION_HINT}}
 
 ## Rules
 
@@ -61,7 +62,7 @@ EXACTLY one fenced json block:
 <full multi-segment module: kernel / reference / compare>
 ```
 ```json
-{"lever": "<lever id or null>", "extension_used": "<primitive name or null, must be in the extension index>", "notes": "<= 100 chars"}
+{"lever": "<lever id or null>", "extension_used": "<primitive name or null, must be in the extension index>", "opt_technique_ref": "<optional: optimization technique id/name you applied, or null>", "notes": "<= 100 chars"}
 ```
 
 No prose outside those two blocks.

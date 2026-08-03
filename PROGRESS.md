@@ -116,3 +116,10 @@
 > - 接口不变（generate/choose_lever 对 orchestrator）；冻结接缝零改动。
 > - 验证：`tests/test_v2_backend_unified.py`（mock 三路径：配置→CLI 映射 / 结构化解析 / 降级，+ gen prompt 精简断言）；`test_t13_7_nga_backend` config 结构改 options；删 `test_v2_agent_backend`+`test_v2_gen_prompt_mode`（对应 AgentBackend/双模式已删）。`pytest -q` = **222 passed / 0 failed**。
 > - 文档：`V2_ENV_ADAPTATION.md` §A.3 去 dual-mode、§C 加 **C.0 探测 agent 能力**（适配前必做、环境侧）+ C.1 配置填充 + C.3 结构化可选；标注真实命令行/模型名/语料/路径为环境侧保密信息。
+
+> **V2 预埋能力接口（优化知识 + 单元上限/利用率感知）**：框架建接口与骨架、内容/数据环境侧填；**所有预留项缺失时降级为当前行为，不报错、不影响运行**。
+> - **optimization 知识**（与 ext-* 平级）：新增 3 个 `opt-*` skill（`opt-compute-bound`/`opt-memory-bound`/`opt-stall-dependency`，按瓶颈一一对应）+ `references/` 空目录待环境侧填 markdown；`orchestrator` 加 `_optimization_skill_for`/`_optimization_hint`（瓶颈→skill 映射）；gen prompt 新增 `OPTIMIZATION_HINT` 段（`placeholders.py`+`triton-gen/SKILL.md`+`build_gen_prompt`，按瓶颈提示触发 opt-* skill，空段降级）。
+> - **memory 协同优化知识（不合并）**：`Experience` 加可选 `opt_technique_ref`（引用技巧 id/名，不存手册内容）+`utilization`；`AttemptRecord` 加 `opt_technique_ref`；`format_context` 在场则附"关联优化技巧/当时利用率"；`record_attempt`/`add_experience` 透传。缺省→行为同前。
+> - **单元能力上限/利用率感知**：`Event` 加可选 `unit_peak`（带宽速率/算力峰值，环境侧填）；`feedback_adapter` `Reduced.class_capacity` 聚合、`classify(saturation_threshold=)` 加利用率分支——占比大且未饱和=真瓶颈、占比大但已饱和=约束（标记、改选占比次大未饱和者），无 `unit_peak`/无阈值→纯占比（现状）。阈值 `SATURATION_THRESHOLD` env 可配、占位默认不定死。`Verdict`/`Event` 既有字段语义不变，仅新增可选字段 + 判定内分支。
+> - 验证：`tests/test_v2_capability_hooks.py`（8 测：opt skill 骨架+映射 / opt_technique_ref 读写+降级 / OPTIMIZATION_HINT 填充+降级 / unit_peak 缺省纯占比 / 利用率分支饱和标约束且改选未饱和 / 未饱和仍作真瓶颈 / 无阈值降级）；`test_t8` EXPECTED +3 opt。`pytest -q` = **239 passed / 0 failed**，冻结接缝零改动。
+> - 文档：`V2_ENV_ADAPTATION.md` 加 §G（优化知识对接）+ §H（单元上限/利用率对接），标注环境侧待办（填 opt markdown、填 `Event.unit_peak`、校准 `SATURATION_THRESHOLD`）且均为环境侧保密信息。

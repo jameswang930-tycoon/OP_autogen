@@ -52,6 +52,8 @@ class Experience:
     failed: int = 0                        # 预留:在场且该次未通过(中性负向;bump 在 passed=False 时 +1)
     harmed: int = 0                        # 预留:被证实有害/误导次数(第一版恒 0,归因机制待引入)
     extension_used: Optional[str] = None   # 该经验推荐的 extension 原语(架构文档 §5.4)
+    opt_technique_ref: Optional[str] = None  # 预留(V2):关联的优化技巧 id/名(引用 optimization 知识,不存手册内容)
+    utilization: Optional[float] = None     # 预留(V2):应用该技巧时的单元利用率(区分饱和/未饱和同类瓶颈)
     id: str = field(default_factory=lambda: _new_id("exp"))
     created_at: str = field(default_factory=_now)
 
@@ -81,6 +83,7 @@ class AttemptRecord:
     kernel_ref: Optional[str] = None       # 生成产物的存放位置
     cycles: Optional[int] = None           # 实测 cycles（correct=False 时为空，性能作废，架构文档 §3.6）
     extension_used: Optional[str] = None   # 本轮用的 extension 原语（架构文档 §5.4）
+    opt_technique_ref: Optional[str] = None  # 预留(V2):本轮应用的优化技巧 id/名(引用 optimization 知识)
     failure_kind: Optional[str] = None     # 负面经验分类（T13-5）：'compile' / 'semantic' / None
     stage: str = "drafting"
     run_id: str = field(default_factory=lambda: _new_id("run"))

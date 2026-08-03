@@ -16,6 +16,7 @@ TRITON_GEN_PLACEHOLDERS = frozenset({
     "RETRIEVED_EXPERIENCE",
     "EXTENSION_INDEX",
     "COMPILE_ERROR",       # empty unless the previous attempt failed to compile (T13-3)
+    "OPTIMIZATION_HINT",   # 预留(V2):按瓶颈指向 optimization skill 的优化知识提示；空则降级（无内容）
 })
 
 # sim-analyze (llm_choose_lever) template placeholders.

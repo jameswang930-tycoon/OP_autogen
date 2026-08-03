@@ -23,6 +23,7 @@ def record_attempt(
     extension_used: Optional[str] = None,
     compiled: bool = True,
     stage: str = "drafting",
+    opt_technique_ref: Optional[str] = None,
 ) -> AttemptRecord:
     """写回点:在仿真给出正确性结果之后调用。
 
@@ -51,6 +52,7 @@ def record_attempt(
         kernel_ref=kernel_ref,
         cycles=record_cycles,
         extension_used=extension_used,
+        opt_technique_ref=opt_technique_ref,
         failure_kind=failure_kind,
         stage=stage,
     )
@@ -66,6 +68,7 @@ def add_experience(
     text: str,
     source_run: Optional[str] = None,
     extension_used: Optional[str] = None,
+    opt_technique_ref: Optional[str] = None,
 ) -> str:
     """新增经验(最小版:手工或用固定模板调用)。
 
@@ -75,5 +78,6 @@ def add_experience(
     exp = Experience(
         text=text, applies_to=fp.key(),
         source_run=source_run, extension_used=extension_used,
+        opt_technique_ref=opt_technique_ref,
     )
     return store.add(exp)

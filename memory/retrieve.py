@@ -27,10 +27,19 @@ def retrieve(store: ExperienceStore, fp: Fingerprint, n: int = 3) -> list[Experi
 
 
 def format_context(experiences: list[Experience]) -> str:
-    """把检索到的经验拼成一段可注入提示词的文本(注入点用)。"""
+    """把检索到的经验拼成一段可注入提示词的文本(注入点用)。
+
+    V2 预留字段（opt_technique_ref / utilization）在场时附注，让 agent 结合
+    '手册通用技巧 + 该技巧在此算子的实测效果'；缺省则不附（行为与原一致）。"""
     if not experiences:
         return ""
     lines = ["以下是相关的历史经验,供参考:"]
     for e in experiences:
-        lines.append(f"- [{e.id}] {e.text}")
+        extras = []
+        if e.opt_technique_ref:
+            extras.append(f"关联优化技巧: {e.opt_technique_ref}")
+        if e.utilization is not None:
+            extras.append(f"当时利用率: {round(float(e.utilization), 2)}")
+        tail = f" ({'; '.join(extras)})" if extras else ""
+        lines.append(f"- [{e.id}] {e.text}{tail}")
     return "\n".join(lines)

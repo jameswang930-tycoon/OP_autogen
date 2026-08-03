@@ -101,6 +101,7 @@ def build_gen_prompt(
     job: NormalizedJob, *, baseline_src: Optional[str], verdict_json: Optional[str],
     feedback_summary: Optional[str], retrieved_experience: Optional[str],
     extension_index: str, compile_error: Optional[str] = None,
+    optimization_hint: Optional[str] = None,
 ) -> str:
     values = {
         "OP": job.op,
@@ -112,6 +113,7 @@ def build_gen_prompt(
         "RETRIEVED_EXPERIENCE": retrieved_experience or "(none)",
         "EXTENSION_INDEX": extension_index,
         "COMPILE_ERROR": compile_error or "",
+        "OPTIMIZATION_HINT": optimization_hint or "",
     }
     assert set(values) == set(placeholders.TRITON_GEN_PLACEHOLDERS), (
         f"gen prompt keys {set(values)} != template {set(placeholders.TRITON_GEN_PLACEHOLDERS)}"
@@ -258,6 +260,31 @@ def _extension_scene_hint(op_kind: Optional[str], bottleneck: Optional[str]) -> 
     return (f"(精简：不在此塞全量 index) 当前算子 {op_kind}、瓶颈 {bn}；"
             f"按需触发对应 ext-* skill（ext-reduction/activation/matmul/shape/quant）"
             f"lazy-load 该场景原语。")
+
+
+# V2 预埋：optimization 知识按瓶颈指向 opt-* skill（references/ 环境侧填，空→降级）
+_OPT_SKILL_BY_BOTTLENECK = {
+    "compute_bound_at_peak": "opt-compute-bound",
+    "memory_underfilled": "opt-memory-bound",
+    "stall_dependency": "opt-stall-dependency",
+}
+
+
+def _optimization_skill_for(bottleneck: Optional[str]) -> Optional[str]:
+    """瓶颈类别 → 对应的 optimization skill 名；无匹配返回 None。"""
+    return _OPT_SKILL_BY_BOTTLENECK.get(bottleneck) if bottleneck else None
+
+
+def _optimization_hint(op_kind: Optional[str], bottleneck: Optional[str]) -> str:
+    """gen prompt 的 OPTIMIZATION_HINT：按瓶颈指向 optimization skill（V2 预埋）。
+
+    references/ 空（公开分支）→ 只提示触发 skill；环境侧填内容后 agent 加载真实优化技巧。
+    无瓶颈/无匹配 skill → 空串（降级，prompt 段为空，不影响运行）。"""
+    skill = _optimization_skill_for(bottleneck)
+    if not skill:
+        return ""
+    return (f"当前瓶颈 {bottleneck}；按需触发 {skill} skill 获取该类瓶颈的优化技巧/规范，"
+            f"结合检索经验里的 opt_technique_ref（应用过则复用/调整）。")
 
 
 def extension_index_text(op_kind: Optional[str] = None,
@@ -707,6 +734,7 @@ class Orchestrator:
                 feedback_summary=feedback_summary,
                 retrieved_experience=retrieved_aug or None,
                 extension_index=_extension_scene_hint(self.job.op, bottleneck),
+                optimization_hint=_optimization_hint(self.job.op, bottleneck),
                 compile_error=compile_error,
             )
             resp = self.llm.generate(prompt)
@@ -822,7 +850,8 @@ class Orchestrator:
         record_attempt(
             self.log, self.store, fp, retrieved_ids=retrieved_ids or [],
             passed=sim.correct, cycles=sim.cycles, compiled=sim.compiled,
-            extension_used=meta.get("extension_used"), stage=f"round_{n}",
+            extension_used=meta.get("extension_used"),
+            opt_technique_ref=meta.get("opt_technique_ref"), stage=f"round_{n}",
         )
 
     # ---- outputs / report ----

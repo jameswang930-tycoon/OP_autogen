@@ -46,6 +46,23 @@ launchable 模板的 ref_func / operator 两种验证示范，当前 prompt 两�
 ### F. memory 端到端验证（拉回环境后）
 框架 memory 三职责已验证（mock）。环境上真实跑，确认：round1 后 experience.json 有内容、round2 `has_exp=True`、best-so-far 作迭代基准、失败原语进避坑清单、多轮 used/helped 分数更新。
 
+### G. 优化知识对接（V2 预埋接口，环境侧填内容）
+
+框架已建**优化知识 skill 骨架**（与 ext-* 平级）：`opt-compute-bound` / `opt-memory-bound` / `opt-stall-dependency`，按瓶颈类别一一对应；gen prompt 预留 `OPTIMIZATION_HINT` 段（按当前 verdict 瓶颈提示 agent 触发对应 opt-* skill）。memory 预留 `opt_technique_ref` 字段（记录"应用了哪条优化技巧"，引用知识条目 id/名，**不存手册内容本身**）。**所有预留项缺失时框架降级为当前行为，不报错。**
+
+环境侧待办（均为环境侧保密信息，不出现在开源仓库）：
+1. **填优化知识内容**：把转置的优化手册 markdown 按瓶颈归入对应 `opt-*/references/`（一文件一技巧/规范；可选 frontmatter 标 `applies_to: <bottleneck id>`）。references/ 为空时 → 加载返回空、prompt 段为空（降级，不报错）。
+2. **memory 关联优化技巧**：蒸馏经验时给 `opt_technique_ref`（引用优化知识条目）；retrieve 时框架自动附"上次用了哪条技巧、效果如何"，让 agent 结合"手册通用技巧 + 该技巧在此算子的实测效果"。
+
+### H. 单元能力上限 / 利用率对接（V2 预埋接口，环境侧填数据）
+
+框架预埋**利用率感知的瓶颈判定分支**，修正"取占时最大=瓶颈"在"某单元已达能力上限但仍占比大"时的误导（死磕已饱和无空间的单元）。机制：占比大且**未饱和**=真瓶颈（引导优化）；占比大但**已饱和**=约束（标记、不死磕，转向占比次大但有空间的单元）。**无上限数据时降级为纯占比判定，行为与现状完全一致。**
+
+- 数据载体：`Event.unit_peak`（可选字段，缺省 None）——具体某搬运/计算单元的能力上限（带宽速率 B/cyc 或算力峰值），粒度到单元实例。
+- 触发开关：环境变量 `SATURATION_THRESHOLD`（饱和利用率阈值，如 0.9）；未设 → 不启用利用率分支（纯占比）。
+- 环境侧待办（保密数据，不进开源仓库）：① `parse_raw` 把真实单元能力上限填进 `Event.unit_peak`；② 按真实带宽数据**校准** `SATURATION_THRESHOLD`（框架只留占位默认，现在不定死）；③ 真实算力单元若需利用率，需在 Event 上补"工作量"度量（当前框架仅对带 bytes 的搬运单元算 `(bytes/duration)/unit_peak`，算力侧待扩展）。
+- 不改冻结契约：`Verdict`/`Event` 既有字段语义不变，只新增可选字段 + 判定内部"有数据则用、无数据则降级"分支。
+
 ## 进展更新位置
 
 - **环境侧适配进度**：5.1 追加到环境本地 `PROGRESS.md`（只追加，不删历史；不新建中间 md）。

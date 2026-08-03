@@ -15,8 +15,9 @@ Event 字段已冻结（见 control/contracts.py），4.7 不得更改。
 from __future__ import annotations
 
 import json
+import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -63,6 +64,7 @@ class Reduced:
     by_class: dict[str, int]       # stall_class -> 总 duration
     by_unit: dict[str, int]        # unit -> 总 duration
     mem_events: list[Event]        # 带 bytes 的事件（带宽视角）
+    class_capacity: dict[str, dict]  # 预留(V2): stall_class -> {bytes, capacity=Σduration·unit_peak}（仅有 unit_peak 的事件计入；空→降级纯占比）
 
 
 def _critical_path(events: list[Event]) -> list[Event]:
@@ -105,6 +107,13 @@ def reduce_events(events: list[Event], k: int = TOP_K) -> Reduced:
         by_unit[e.unit] = by_unit.get(e.unit, 0) + e.duration
     dominant = sorted(events, key=lambda e: e.duration, reverse=True)[:k]
     mem = [e for e in events if e.bytes is not None]
+    # 预留(V2)：单元能力上限聚合到 class（仅有 bytes+unit_peak 的事件计入；缺省空→判定降级）
+    class_capacity: dict[str, dict] = {}
+    for e in events:
+        if e.bytes and e.unit_peak and e.duration:
+            cap = class_capacity.setdefault(e.stall_class, {"bytes": 0, "capacity": 0.0})
+            cap["bytes"] += e.bytes
+            cap["capacity"] += e.duration * e.unit_peak
     return Reduced(
         makespan=makespan,
         total_duration=total,
@@ -114,6 +123,7 @@ def reduce_events(events: list[Event], k: int = TOP_K) -> Reduced:
         by_class=by_class,
         by_unit=by_unit,
         mem_events=mem,
+        class_capacity=class_capacity,
     )
 
 
@@ -126,10 +136,28 @@ class Classification:
     cycles: int                   # = makespan（实测总 cycles）
     expected_gain: float          # 该类时长占比 = 消除它的上界 headroom（§3.4）
     class_shares: dict[str, float]
+    constraints: list[str] = field(default_factory=list)  # 预留(V2):已饱和(占比大但无空间)的类——约束而非真瓶颈
 
 
-def classify(r: Reduced) -> Classification:
-    bn = max(r.by_class, key=lambda c: r.by_class[c])
+def classify(r: Reduced, *, saturation_threshold: Optional[float] = None) -> Classification:
+    """判定瓶颈。默认纯占比（max share）。
+
+    V2 预留利用率分支（仅当事件带 unit_peak 且给出 saturation_threshold）：
+    占比大但利用率≥阈值 = 已饱和(约束，标记不死磕)；改选"占比次大但未饱和、有空间"的类作真瓶颈。
+    无 unit_peak 数据 / 无阈值 → 降级为纯占比，行为与现状完全一致。"""
+    ranked = sorted(r.by_class.items(), key=lambda kv: kv[1], reverse=True)
+    bn = ranked[0][0]
+    constraints: list[str] = []
+    has_capacity = any((r.class_capacity.get(c) or {}).get("capacity", 0) > 0 for c in r.by_class)
+    if saturation_threshold is not None and has_capacity:
+        for c, _dur in ranked:
+            cap = r.class_capacity.get(c) or {}
+            capacity = cap.get("capacity", 0.0)
+            if capacity > 0 and (cap.get("bytes", 0) / capacity) >= saturation_threshold:
+                constraints.append(c)   # 饱和 → 约束，跳过不死磕
+            else:
+                bn = c                  # 未饱和（或无上限数据无法判饱和）→ 真瓶颈
+                break
     share = (r.by_class[bn] / r.total_duration) if r.total_duration else 0.0
     shares = (
         {c: round(d / r.total_duration, 3) for c, d in r.by_class.items()}
@@ -141,6 +169,7 @@ def classify(r: Reduced) -> Classification:
         cycles=r.makespan,
         expected_gain=round(min(share, 1.0), 3),
         class_shares=shares,
+        constraints=constraints,
     )
 
 
@@ -171,6 +200,9 @@ def render(r: Reduced, c: Classification) -> str:
         f"makespan={r.makespan} cycles over {r.n_events} events. "
         f"bottleneck={c.bottleneck} (lever: {c.lever}); expected_gain={c.expected_gain}."
     )
+    if c.constraints:
+        lines.append(
+            f"  (saturated constraints, not targeted: {', '.join(c.constraints)})")
 
     lines.append("# Time Breakdown")
     for cls, dur in sorted(r.by_class.items(), key=lambda kv: kv[1], reverse=True)[:TOP_K]:
@@ -218,11 +250,17 @@ class AdapterOutput:
     verdict: Verdict    # 机器可读结论（喂给 loop-controller / memory）
 
 
-def adapt(events: list[Event], k: int = TOP_K) -> AdapterOutput:
-    """全链路：events -> (7 段摘要, Verdict)。"""
+def adapt(events: list[Event], k: int = TOP_K,
+          saturation_threshold: Optional[float] = None) -> AdapterOutput:
+    """全链路：events -> (7 段摘要, Verdict)。
+
+    saturation_threshold 缺省读 env SATURATION_THRESHOLD；未设 → None → classify 降级纯占比。"""
+    if saturation_threshold is None:
+        env = os.environ.get("SATURATION_THRESHOLD")
+        saturation_threshold = float(env) if env else None
     validate_events(events)
     r = reduce_events(events, k=k)
-    c = classify(r)
+    c = classify(r, saturation_threshold=saturation_threshold)
     summary = render(r, c)
     if len(summary) > MAX_OUTPUT_CHARS:
         raise ValueError(

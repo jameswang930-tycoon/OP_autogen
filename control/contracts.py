@@ -48,6 +48,7 @@ class Event:
     unit: str
     stall_class: str
     bytes: Optional[int] = None
+    unit_peak: Optional[float] = None      # 预留（V2）：该单元能力上限（带宽速率 B/cyc 或算力峰值），环境侧填；缺省 None→判定降级为纯占比
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -61,6 +62,11 @@ class Event:
             raise ValueError("Event.unit must be a non-empty str")
         if self.bytes is not None:
             _check_nonneg_int(self.bytes, "Event.bytes")
+        if self.unit_peak is not None:
+            if not isinstance(self.unit_peak, (int, float)) or isinstance(self.unit_peak, bool):
+                raise TypeError("Event.unit_peak must be a number")
+            if self.unit_peak < 0:
+                raise ValueError(f"Event.unit_peak must be >= 0, got {self.unit_peak}")
         vocabulary.assert_label(self.stall_class)
 
 

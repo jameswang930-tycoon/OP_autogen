@@ -19,7 +19,8 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILLS = REPO_ROOT / ".claude" / "skills"
 EXPECTED = ["sim-analyze", "triton-gen", "extension-guide",
-            "ext-reduction", "ext-activation", "ext-matmul", "ext-shape", "ext-quant"]
+            "ext-reduction", "ext-activation", "ext-matmul", "ext-shape", "ext-quant",
+            "opt-compute-bound", "opt-memory-bound", "opt-stall-dependency"]
 
 
 def _parse(skill: str):

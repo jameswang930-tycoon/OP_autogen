@@ -11,8 +11,8 @@ from control.llm_backend import NgaBackend, LLMInvocationError, LLMTimeout
 from control.orchestrator import NoLLMBackend, parse_generate_response
 
 CONFIG = {
-    "generate": {"model": "strong/model", "variant": "high", "timeout_s": 180},
-    "choose_lever": {"model": "w3/GLM-4.7", "variant": None, "timeout_s": 60},
+    "generate": {"model": "strong/model", "options": {"variant": "high"}, "timeout_s": 180},
+    "choose_lever": {"model": "w3/GLM-4.7", "options": {}, "timeout_s": 60},
 }
 
 # real nga output shape: a '> ...' header line + fenced python + json blocks

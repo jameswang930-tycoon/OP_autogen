@@ -17,17 +17,21 @@
 ### A. 配置对接（env.sh）
 1. **P1 配套**：`NGA_CHOOSE_LEVER_MODEL=<小模型，如 MiniMax-M2.7>`（choose_lever 只返回一行 json，不用大模型）；`NGA_CHOOSE_LEVER_TIMEOUT_S=180`（余量调宽，实测 85s、默认 120 太紧）。
 2. `NGA_GENERATE_MODEL` / `NGA_GENERATE_TIMEOUT_S` 按环境模型能力设。
-3. **P5.2 双模式开关**：`GEN_PROMPT_MODE=agent`（走 agent 精简 prompt，靠 skill lazy-load）或留空/`nga`（哑后端塞全量 index）。先决定环境用哪种模式（见 C）。
+3. **backend 配置（无双模式）**：V2 backend 重构后只剩**一个** backend（`NgaBackend`，配置驱动），gen prompt 统一精简（场景提示 + ext-* skill lazy-load）——不存在"哑后端/双模式"开关（`GEN_PROMPT_MODE` 已删）。环境侧按 C.0 探测结果填 backend config（cmd 前缀、options、extra_args、是否结构化输出）。
 4. SIM_* 系列（SIM_ROOT/SIM_SCRIPT/SIM_INPUT_DIR/SIM_RESULT_DIR/SIM_TIMEOUT）、PRESIM_SIGNATURE_TABLE、LAUNCHABLE_TEMPLATE_PATH——沿用环境现有稳定值，不动。
 
 ### B. 稳定接缝对接（沿用，仅确认）
 1. 远端仿真：launch 实现、raw_sim_output schema、结果目录约定、SSH/conda 激活——沿用现状，仅确认路径有效。
 2. 编译手册原语 / 转置 txt / triton 扩展包接口与调用范例——环境准备好，框架按契约消费。
 
-### C. P5 agent 模式落地（本次 v2 的架构升级，环境侧核心工作）
-1. **AgentBackend 接真实 agent CLI**：框架已留 `AgentBackend`（接口同 NgaBackend，runner 可注入）。5.1 把 runner 换成真实 agent 的命令行格式（`agent "query"` 形式）、配置模型名/variant/skill 目录路径。
-2. **验证 skill 真实触发**（关键，不能只看代码）：用 agent 命令行描述一个符合某 ext-* skill description 的任务，确认终端显示触发了**预期的那一个** skill（如 reduce_sum 任务触发 ext-reduction，不触发 ext-activation）。这是"按场景过滤治 softmax"能否从根上生效的验证。
-3. **决定生产模式**：若环境 agent 稳定触发 skill → 用 `GEN_PROMPT_MODE=agent`（prompt 精简、原语按需 lazy-load）；若暂不稳 → 先用 nga 哑后端模式（塞 index），两种框架都支持。
+### C. backend 落地（V2 重构：配置驱动，**无哑后端/双模式**）
+
+框架侧只剩**一个** backend（`NgaBackend`，`control/llm_backend.py`）——配置驱动 + 可扩展，不预设 agent 能力；generate/choose_lever 对 orchestrator 不变。环境侧只填配置，不改框架。
+
+- **C.0 探测 agent 能力（适配前必做，环境侧）**：用 `agent --help`、官方文档、实际试调，摸清目标 agent 支持的命令行选项（指定模型 / 思考开关 / 输出格式 / skill 触发方式 / ...）及确切写法，产出**能力清单**。这是后续填配置的依据，框架侧不参与、不假设 agent 支持哪些。
+- **C.1 填 backend config（按 C.0 清单）**：`NgaBackend(config)` 的 config 结构——`cmd`（命令前缀，如 `["xxx","run"]`）、`generate`/`choose_lever` 各自 `{model, options:{...}, extra_args:[...], timeout_s}`、可选 `structured`。框架只提供 options→命令行的**通用映射**（`{key:value}→--key value`、`True→--key`、`False/None→省略`）+ `extra_args` 原样透传；**具体 key/value 由环境侧填真实值**。agent 新增选项时只加 config、不改框架代码。**真实 agent 命令行、模型名、语料、路径均为环境侧保密信息，不出现在开源仓库。**
+- **C.2 验证 skill 真实触发**（关键，不能只看代码）：用配置好的 backend 命令行描述一个符合某 ext-* skill description 的任务，确认终端显示触发了**预期的那一个** skill（如 reduce_sum 任务触发 ext-reduction，不触发 ext-activation）。这是"按场景过滤治 softmax"能否从根上生效的验证。
+- **C.3 结构化输出（可选）**：若 C.0 探明 agent 支持结构化输出（如 json），在 config 声明 `structured={enabled, request, kernel_key, meta_key}`——backend 会要求结构化输出并把结果规范成 fenced block（比从自由文本抠可靠、解决 kernel/json 混排）。未声明则用自由文本解析（默认降级）。是否启用由配置决定，框架不假设 agent 一定支持。
 
 ### D. extension 语料（治本，5.1 重点）
 1. **P5.3 拆分落地**：框架已建 5 个 `ext-*` skill 目录（ext-reduction/activation/matmul/shape/quant），references/ 为空待填。把真实原语 yaml 按场景归入对应 skill 的 references/。

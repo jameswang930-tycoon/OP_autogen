@@ -25,7 +25,7 @@ preserved so this skill can still be triggered manually in agent mode.)
 - Prior-round Verdict (empty on the first round): {{VERDICT_JSON}}
 - Prior-round feedback summary (empty on the first round): {{FEEDBACK_SUMMARY}}
 - Retrieved experience (may be empty): {{RETRIEVED_EXPERIENCE}}
-- Extension index (primitive -> bottleneck category): {{EXTENSION_INDEX}}
+- Extension scene hint (trigger the matching ext-* skill to load primitives): {{EXTENSION_INDEX}}
 - Compile error from the previous attempt (empty unless the last attempt failed to compile): {{COMPILE_ERROR}}
 
 ## Rules
@@ -33,10 +33,11 @@ preserved so this skill can still be triggered manually in agent mode.)
 1. **Compile error first.** If the compile-error input above is non-empty, fix that exact
    error this round and introduce no new optimization — a non-compiling kernel cannot be
    measured.
-2. **Extension-forward — do not hedge.** If the Verdict input names a `bottleneck` whose
-   Extension-index category lists primitives, use one this round. Looking it up then
-   retreating to vanilla voids the bottleneck -> lever -> primitives chain; a mis-used
-   primitive only costs an uncounted compile retry, caught by best-so-far + rollback.
+2. **Extension-forward — do not hedge.** If the Verdict input names a `bottleneck`, trigger
+   the matching `ext-*` skill (ext-reduction/activation/matmul/shape/quant) to load a
+   primitive for this scene and use one this round. Retreating to vanilla voids the
+   bottleneck -> lever -> primitives chain; a mis-used primitive only costs an uncounted
+   compile retry, caught by best-so-far + rollback.
 3. **First-round policy.** If the Retrieved-experience input carries a memory entry with
    `extension_used`, use that primitive directly. With neither a hit nor a Verdict, start
    from standard Triton — you then genuinely lack the information to choose a primitive.

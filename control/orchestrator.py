@@ -15,7 +15,6 @@ LLM 调用点全流程仅两个：
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
 import time
@@ -250,19 +249,15 @@ def _index_line(entry: dict) -> str:
     return f"{qname} [applies_to: {','.join(scenes)}]" if scenes else qname
 
 
-def _agent_gen_mode() -> bool:
-    """V2-P5.2：agent 模式下 gen prompt 不塞全量 extension index、只给场景提示——原语靠
-    agent 触发 extension-guide skill lazy-load（哑后端 nga 模式仍塞全量 index）。env 开关。"""
-    return os.environ.get("GEN_PROMPT_MODE", "").lower() == "agent"
+def _extension_scene_hint(op_kind: Optional[str], bottleneck: Optional[str]) -> str:
+    """gen prompt 的 EXTENSION_INDEX：精简场景提示（V2 backend 重构后**唯一路径**，无哑后端/双模式）。
 
-
-def _gen_extension_index(op_kind: Optional[str], bottleneck: Optional[str]) -> str:
-    """gen prompt 的 EXTENSION_INDEX 内容：agent 模式给场景提示、nga 模式给按场景检索的子集。"""
-    if _agent_gen_mode():
-        bn = bottleneck or "(首轮未知)"
-        return (f"(agent 模式：不在此塞全量 index) 当前算子 {op_kind}、瓶颈 {bn}；"
-                f"按需查 extension-guide skill 获取该场景原语并 lazy-load。")
-    return extension_index_text(op_kind, bottleneck)
+    单轮命令行 run 本就触发 skill——不在此塞全量 index，只提示按算子/瓶颈触发对应 ext-* skill
+    lazy-load 原语。原语具体内容靠环境侧填的 ext-* skill references/。"""
+    bn = bottleneck or "(首轮未知)"
+    return (f"(精简：不在此塞全量 index) 当前算子 {op_kind}、瓶颈 {bn}；"
+            f"按需触发对应 ext-* skill（ext-reduction/activation/matmul/shape/quant）"
+            f"lazy-load 该场景原语。")
 
 
 def extension_index_text(op_kind: Optional[str] = None,
@@ -711,7 +706,7 @@ class Orchestrator:
                 verdict_json=verdict_json,
                 feedback_summary=feedback_summary,
                 retrieved_experience=retrieved_aug or None,
-                extension_index=_gen_extension_index(self.job.op, bottleneck),
+                extension_index=_extension_scene_hint(self.job.op, bottleneck),
                 compile_error=compile_error,
             )
             resp = self.llm.generate(prompt)

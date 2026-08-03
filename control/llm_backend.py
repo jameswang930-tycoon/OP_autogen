@@ -18,7 +18,6 @@ import os
 import subprocess
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 from typing import Callable, Optional
 
 
@@ -88,19 +87,13 @@ class LLMTimeout(Exception):
     """nga run exceeded the configured timeout."""
 
 
-@dataclass
-class NgaCallConfig:
-    model: str
-    variant: Optional[str]
-    timeout_s: float
-
-
 def _default_runner(cmd: list[str], *, timeout: float):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
 def _parse_model_echo(stdout: str) -> Optional[str]:
-    """从 nga 输出的 '> build · <model 回显> · <session>' 头行解析 model 回显名。"""
+    """从 nga 输出的 '> build · <model 回显> · <session>' 头行解析 model 回显名。
+    非 nga agent（无此头行）返回 None——backend 对输出格式不作假设。"""
     first = stdout.splitlines()[0] if stdout else ""
     if first.startswith(">") and "·" in first:
         parts = [p.strip() for p in first.split("·")]
@@ -109,109 +102,84 @@ def _parse_model_echo(stdout: str) -> Optional[str]:
     return None
 
 
-class NgaBackend:
-    """LLMProvider via `nga run` subprocess (OpenCode CLI; no HTTP API exists).
+def _map_options_to_cli(opts: dict) -> list[str]:
+    """通用 options→命令行映射（**不硬编码任何具体选项名**，V2 重构）：
+    {key: value} → ['--key', 'value']（key 中 `_`→`-`）；True → ['--key']；False/None → 省略。
+    具体 key 由环境侧 config 决定，框架不假设 agent 支持哪些选项。"""
+    args: list[str] = []
+    for k, v in opts.items():
+        flag = "--" + str(k).replace("_", "-")
+        if v is True:
+            args.append(flag)
+        elif v is False or v is None:
+            continue
+        else:
+            args += [flag, str(v)]
+    return args
 
-    - 模型 / variant / timeout 全部配置驱动（config dict 或环境变量），不硬编码。
-    - generate 与 choose_lever 各自可配（难任务配强模型+高 variant，易任务配轻量模型）。
-    - 无状态：绝不传 --continue / --session。
-    - 解析只认 fenced block、忽略 '>' 头；model 回显名记录到 last_model_echo 供溯源。
-    - 失败抛可识别异常（LLMInvocationError / LLMTimeout），不在内部重试（重试归编排器）。
+
+class NgaBackend:
+    """单轮命令行 LLM backend（V2 重构：配置驱动 + 可扩展，**不预设 agent 能力**）。
+
+    nga 与目标 agent 调用形式本质一致（`xxx run --model xxx` 单轮命令行），单轮 run 本就
+    能触发 skill——**只有一个 backend，无"哑后端/双模式"**。不硬编码 agent 支持哪些命令行选项
+    （model/thinking/output_format/...）；环境侧探测能力后填 config，框架只提供 options→命令行的
+    通用映射 + extra_args 透传口 + 可选结构化输出路径。generate/choose_lever 对 orchestrator 不变。
+
+    config（dict 或 env；generate/choose_lever 各自可配）：
+      cmd            命令前缀 list，默认 ["nga","run"]，或 env AGENT_CMD（空格分隔）。
+      generate/choose_lever: {"model", "options": {...}, "extra_args": [...], "timeout_s"}
+      structured     {"enabled", "request": {...}, "kernel_key", "meta_key"}  可选结构化输出路径。
+      timeout_s      全局默认（被 per-kind 覆盖）。
+    环境变量：AGENT_CMD（命令前缀）、NGA_GENERATE_MODEL / NGA_CHOOSE_LEVER_MODEL（兼容）。
+    未填任何 options→仅 cmd + model + prompt 的最基础调用（不报错，mock/开源可跑）。
     """
 
     def __init__(self, config: Optional[dict] = None, *, runner: Callable = _default_runner):
-        self.generate_cfg = self._mk_cfg("generate", config)
-        self.choose_lever_cfg = self._mk_cfg("choose_lever", config)
+        cfg = config or {}
+        self.cmd = self._cmd_prefix(cfg)
+        self.generate_cfg = self._kind_cfg(cfg, "generate")
+        self.choose_lever_cfg = self._kind_cfg(cfg, "choose_lever")
+        self.structured: dict = cfg.get("structured") or {}
         self.runner = runner
         self.last_model_echo: Optional[str] = None
         self.call_count = 0
 
     @staticmethod
-    def _mk_cfg(kind: str, config: Optional[dict]) -> NgaCallConfig:
-        section = (config or {}).get(kind, {}) if config else {}
-        env_kind = kind.upper()
-        model = section.get("model") or os.environ.get(f"NGA_{env_kind}_MODEL")
-        if not model:
-            raise ValueError(
-                f"NgaBackend: {kind} model not configured "
-                f"(set config llm.{kind}.model or env NGA_{env_kind}_MODEL)"
-            )
-        variant = section.get("variant", None)
-        if variant is None:
-            variant = os.environ.get(f"NGA_{env_kind}_VARIANT") or None
-        timeout = float(section.get(
-            "timeout_s", os.environ.get(f"NGA_{env_kind}_TIMEOUT_S", 120),
-        ))
-        return NgaCallConfig(model=model, variant=variant or None, timeout_s=timeout)
-
-    def _run(self, prompt: str, cfg: NgaCallConfig) -> str:
-        # list-form args: 避免 shell 注入；绝不传 --continue / --session
-        cmd = ["nga", "run", "--model", cfg.model]
-        if cfg.variant:
-            cmd += ["--variant", cfg.variant]
-        cmd.append(prompt)
-        try:
-            result = self.runner(cmd, timeout=cfg.timeout_s)
-        except subprocess.TimeoutExpired as exc:
-            raise LLMTimeout(f"nga run timed out after {cfg.timeout_s}s") from exc
-        self.call_count += 1
-        if result.returncode != 0:
-            raise LLMInvocationError(
-                f"nga run exited {result.returncode}: {(result.stderr or '').strip()}"
-            )
-        stdout = result.stdout or ""
-        self.last_model_echo = _parse_model_echo(stdout)
-        return stdout
-
-    def generate(self, prompt: str) -> str:
-        return self._run(prompt, self.generate_cfg)
-
-    def choose_lever(self, prompt: str) -> str:
-        return self._run(prompt, self.choose_lever_cfg)
-
-
-# ---------------- AgentBackend (V2-P5.1, claude-code-like agent subprocess) ----------------
-
-class AgentBackend:
-    """类 claude-code agent：单次命令行调用会按 skill 的 description 隐式触发 skill。
-
-    与 NgaBackend 接口一致（generate/choose_lever 返回 str），但内部调 agent 子进程，
-    让它自主 lazy-load extension-guide 等 skill——orchestrator 给精简任务描述即可，不必
-    把全量 extension index 塞进 prompt（V2-P5）。
-
-    配置全部走 config/env，公开分支不硬编码真实 agent 命令行；真实 agent CLI 格式、模型名、
-    variant、skill 目录路径由保密环境适配（P5.4）。runner 可注入，便于公开分支 mock 验证。
-
-    环境变量：``AGENT_CMD``（命令前缀，空格分隔；缺省 ``agent``）/ ``AGENT_GENERATE_MODEL``
-    / ``AGENT_CHOOSE_LEVER_MODEL`` / ``AGENT_TIMEOUT_S``。
-    """
-
-    def __init__(self, config: Optional[dict] = None, *, runner: Callable = _default_runner):
-        cfg = config or {}
+    def _cmd_prefix(cfg: dict) -> list[str]:
         cmd = cfg.get("cmd")
         if cmd is None:
-            cmd_env = os.environ.get("AGENT_CMD")
-            cmd = cmd_env.split() if cmd_env else ["agent"]
-        self.cmd = list(cmd)
-        sec_gen = cfg.get("generate", {}) or {}
-        sec_lev = cfg.get("choose_lever", {}) or {}
-        self.generate_model = sec_gen.get("model") or os.environ.get("AGENT_GENERATE_MODEL")
-        self.choose_lever_model = sec_lev.get("model") or os.environ.get("AGENT_CHOOSE_LEVER_MODEL")
-        self.timeout_s = float(cfg.get("timeout_s", os.environ.get("AGENT_TIMEOUT_S", 600)))
-        self.runner = runner
-        self.last_model_echo: Optional[str] = None
-        self.call_count = 0
+            env = os.environ.get("AGENT_CMD")
+            cmd = env.split() if env else ["nga", "run"]
+        return list(cmd)
 
-    def _run(self, prompt: str, model: Optional[str]) -> str:
-        # 命令前缀 + (可选)模型 + prompt。真实 agent 的 flag/顺序由环境侧 AGENT_CMD 适配。
-        cmd = list(self.cmd)
-        if model:
-            cmd += ["--model", model]
-        cmd.append(prompt)
+    @staticmethod
+    def _kind_cfg(cfg: dict, kind: str) -> dict:
+        sec = cfg.get(kind) or {}
+        return {
+            "model": sec.get("model") or os.environ.get(f"NGA_{kind.upper()}_MODEL"),
+            "options": dict(sec.get("options") or {}),
+            "extra_args": list(sec.get("extra_args") or []),
+            "timeout_s": float(sec.get("timeout_s", cfg.get("timeout_s", 120))),
+        }
+
+    def _build_cmd(self, prompt: str, kcfg: dict) -> list[str]:
+        opts = {}
+        if kcfg["model"]:
+            opts["model"] = kcfg["model"]
+        opts.update(kcfg["options"])                      # 环境侧填的真实选项透传
+        if self.structured.get("enabled"):                # 结构化输出请求选项
+            opts.update(self.structured.get("request") or {})
+        # list-form args 避免 shell 注入；绝不传 --continue / --session（无状态）
+        return (list(self.cmd) + _map_options_to_cli(opts)
+                + list(kcfg["extra_args"]) + [prompt])
+
+    def _invoke(self, prompt: str, kcfg: dict) -> str:
+        cmd = self._build_cmd(prompt, kcfg)
         try:
-            result = self.runner(cmd, timeout=self.timeout_s)
+            result = self.runner(cmd, timeout=kcfg["timeout_s"])
         except subprocess.TimeoutExpired as exc:
-            raise LLMTimeout(f"agent timed out after {self.timeout_s}s") from exc
+            raise LLMTimeout(f"agent timed out after {kcfg['timeout_s']}s") from exc
         self.call_count += 1
         if result.returncode != 0:
             raise LLMInvocationError(
@@ -220,8 +188,27 @@ class AgentBackend:
         self.last_model_echo = _parse_model_echo(result.stdout or "")
         return result.stdout or ""
 
+    def _maybe_normalize_structured(self, raw: str) -> str:
+        """结构化输出路径（config 声明 agent 支持时启用）：把 agent 返回的 json 规范成
+        orchestrator 期望的 fenced-block 形式——比从自由文本抠可靠、解决 kernel/json 混排。
+        未启用 / json 解析失败 / schema 不符 → 原样返回（降级到自由文本 fenced-block 解析）。"""
+        if not self.structured.get("enabled"):
+            return raw
+        try:
+            data = json.loads(raw)
+        except Exception:  # noqa: BLE001 - 解析失败则降级
+            return raw
+        if not isinstance(data, dict):
+            return raw
+        kk = self.structured.get("kernel_key", "kernel")
+        mk = self.structured.get("meta_key", "meta")
+        if kk in data and mk in data:                     # generate 形式：kernel + meta
+            return (f"```python\n{data[kk]}\n```\n"
+                    f"```json\n{json.dumps(data[mk], ensure_ascii=False)}\n```")
+        return f"```json\n{json.dumps(data, ensure_ascii=False)}\n```"  # 单 json 块（choose_lever 等）
+
     def generate(self, prompt: str) -> str:
-        return self._run(prompt, self.generate_model)
+        return self._maybe_normalize_structured(self._invoke(prompt, self.generate_cfg))
 
     def choose_lever(self, prompt: str) -> str:
-        return self._run(prompt, self.choose_lever_model)
+        return self._maybe_normalize_structured(self._invoke(prompt, self.choose_lever_cfg))

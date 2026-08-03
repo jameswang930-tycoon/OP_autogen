@@ -63,7 +63,7 @@ echo "M=$M N=$N K=$K"
 echo "仓库根     = $REPO_ROOT   (脚本在: $SCRIPT_DIR)"
 echo "用例/产物  = $MATMUL_DIR  (test_matmul.py + e2e_run/)"
 echo "输出目录   = $OUT"
-mkdir -p "$OUT"/01_compile "$OUT"/02_hivm "$OUT"/03_sim "$OUT"/04_board "$OUT"/05_merged
+mkdir -p "$OUT"/01_compile "$OUT"/02_hivm "$OUT"/03_sim "$OUT"/04_board "$OUT"/05_task "$OUT"/06_diagnosis
 if command -v conda >/dev/null 2>&1; then
   CONDA_BASE=$(conda info --base 2>/dev/null || echo "")
   [ -n "$CONDA_BASE" ] && source "$CONDA_BASE/etc/profile.d/conda.sh" 2>/dev/null
@@ -150,26 +150,70 @@ else
   else fail "缺 OpBasicInfo/PipeUtilization → 看 04_board/board_run.txt"; fi
 fi
 
-# ═══════════════════════ 阶段 5/5: 解析 + 合并 ═══════════════════════
+# ═══════════════════════ 阶段 5/5: 真机 msprof 通用 (任务级 op_summary) ═══════════════════════
 echo ""
-echo "══ 阶段 5/5: 三源解析 + 合并 (run_all.sh) ══"
-if [ -f "$OUT/02_hivm/hivm_try.txt" ] && [ -d "$OUT/03_sim/sim_prof" ] && [ -d "$OUT/04_board/board_prof" ]; then
-  bash "$SCRIPT_DIR/run_all.sh" "$OUT/02_hivm/hivm_try.txt" \
-    "$OUT/03_sim/sim_prof" "$OUT/04_board/board_prof" "$OUT/05_merged"
-  if [ -f "$OUT/05_merged/merged.json" ]; then pass "merged.json 生成 ✓"; else fail "merged.json 未生成"; fi
+echo "══ 阶段 5/5: msprof 通用 (任务级 op_summary, 真实每op带宽/L2/算力) ══"
+if [ "${SKIP_TASK:-0}" = "1" ]; then
+  echo "  ⚠ SKIP_TASK=1, 跳过"
 else
-  echo "  ⚠ 缺前置产物, 跳过合并 (hivm/sim/board 都通过后再跑)"
-  fail "缺前置 (需阶段2/3/4 都 ✅)"
+  TASK_OUT="$OUT/05_task/task_prof"
+  rm -rf "$TASK_OUT"
+  # 全指标才出 main_mem/ub/l1/l2 带宽 + L2 + fops
+  TASK_METRICS="${TASK_METRICS:-PipeUtilization,ArithmeticUtilization,Memory,MemoryL0,MemoryUB,L2Cache,ResourceConflictRatio}"
+  msprof --output="$TASK_OUT" \
+    --application="MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K $PY test_matmul.py" \
+    --aic-mode=task-based --task-time=l1 --aic-metrics="$TASK_METRICS" \
+    > "$OUT/05_task/task_run.txt" 2>&1
+  echo "  退出码=$?"
+  OPSUM=$(ls "$TASK_OUT"/PROF_*/mindstudio_profiler_output/op_summary*.csv 2>/dev/null | wc -l)
+  if [ "$OPSUM" -gt 0 ]; then pass "op_summary_*.csv x$OPSUM ✓ (真机每op指标)"; \
+  else fail "无 op_summary → 看 05_task/task_run.txt (全指标需 --aic-mode=task-based --task-time=l1)"; fi
+fi
+
+# ═══════════════════════ 阶段 6/6: 4 源解析 + 整合诊断 ═══════════════════════
+echo ""
+echo "══ 阶段 6/6: 4 源解析 + 整合 (hivm/sim/task/board → diagnosis.json) ══"
+HAVE=""
+[ -f "$OUT/02_hivm/hivm_try.txt" ] && HAVE="$HAVE hivm"
+[ -d "$OUT/03_sim/sim_prof" ] && HAVE="$HAVE sim"
+[ -d "$OUT/05_task/task_prof" ] && HAVE="$HAVE task"
+[ -d "$OUT/04_board/board_prof" ] && HAVE="$HAVE board"
+echo "  已有源:${HAVE:- 无}"
+D=$OUT/06_diagnosis
+if [ -f "$OUT/02_hivm/hivm_try.txt" ]; then
+  "$PY" "$SCRIPT_DIR/pipeline_parse_hivm.py" "$OUT/02_hivm/hivm_try.txt" "$D/hivm.json" || true
+fi
+if [ -d "$OUT/03_sim/sim_prof" ]; then
+  "$PY" "$SCRIPT_DIR/pipeline_parse_sim.py" "$OUT/03_sim/sim_prof" "$D/sim.json" || true
+fi
+if [ -d "$OUT/05_task/task_prof" ]; then
+  "$PY" "$SCRIPT_DIR/pipeline_parse_task.py" "$OUT/05_task/task_prof" "$D/task.json" || true
+fi
+if [ -d "$OUT/04_board/board_prof" ]; then
+  "$PY" "$SCRIPT_DIR/pipeline_parse_board.py" "$OUT/04_board/board_prof" "$D/board.json" || true
+fi
+# 整合 (缺的源用空占位文件; integrate 对空源自动跳过)
+if [ -f "$D/hivm.json" ] || [ -f "$D/sim.json" ] || [ -f "$D/task.json" ] || [ -f "$D/board.json" ]; then
+  echo '{}' > "$D/empty.json"
+  for f in hivm sim task board; do
+    [ -f "$D/$f.json" ] || cp "$D/empty.json" "$D/$f.json"
+  done
+  "$PY" "$SCRIPT_DIR/integrate.py" \
+    "$D/hivm.json" "$D/sim.json" "$D/task.json" "$D/board.json" "$D/diagnosis.json"
+  if [ -f "$D/diagnosis.json" ]; then pass "diagnosis.json 生成 ✓ (4源整合, 按优化策略组织)"; else fail "diagnosis.json 未生成"; fi
+else
+  fail "无任何源产物 (阶段2/3/4/5 至少一个 ✅ 才能整合)"
 fi
 
 # ═══════════════════════ 检查清单 ═══════════════════════
 echo ""
 echo "══════════════ 检查清单 (PASS=$PASS FAIL=$FAIL) ══════════════"
-echo "  阶段1 编译   : [ttir/ttadapter]   → 看 01_compile/"
-echo "  阶段2 HIVM   : [hivm_try.txt]     → grep -c 'hivm.hir' 02_hivm/hivm_try.txt"
-echo "  阶段3 sim    : [instr_exe+trace]  → ls 03_sim/sim_prof/OPPROF_*/simulator/"
-echo "  阶段4 board  : [OpBasic/PipeUtil] → ls 04_board/board_prof/OPPROF_*/"
-echo "  阶段5 合并   : [merged.json]      → python3 -m json.tool 05_merged/merged.json"
+echo "  阶段1 编译   : [ttir/ttadapter]      → 看 01_compile/"
+echo "  阶段2 HIVM   : [hivm_try.txt]        → grep -c 'hivm.hir' 02_hivm/hivm_try.txt"
+echo "  阶段3 sim    : [instr_exe+trace]     → ls 03_sim/sim_prof/OPPROF_*/simulator/"
+echo "  阶段4 board  : [OpBasic/PipeUtil]    → ls 04_board/board_prof/OPPROF_*/"
+echo "  阶段5 task   : [op_summary]          → ls 05_task/task_prof/PROF_*/mindstudio_profiler_output/"
+echo "  阶段6 诊断   : [diagnosis.json]      → python3 -m json.tool 06_diagnosis/diagnosis.json"
 echo ""
 echo "  全部 ✅ → 把 run_all.sh 末尾「验证摘要」的 4 行数字读回来"
 echo "  有 ❌ → 按阶段日志排查 (每个阶段日志文件见上方提示), 单独重跑该阶段"

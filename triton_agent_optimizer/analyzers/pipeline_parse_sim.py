@@ -29,11 +29,54 @@ def find_sim_dir(base):
     return None
 
 
+# AI Core 频率 (MHz) — duration 用 cycles 换算的时钟; 910B3 ≈ 1900 MHz (可用 AIC_FREQ_MHZ 覆盖)
+AIC_FREQ_MHZ = 1900.0
+
+
 def parse_instr_csv(path):
+    """鲁棒解析 instr_exe.csv: 表头列名可能随版本变, 按子串匹配列位置。
+
+    真实数据 (Ascend910B3) 常见: 指令的 running_time(us)=0, 只有 cycles 有值。
+    因此每条指令的 duration 优先 running_time(us), 为 0 时用 cycles/freq 换算。
+    """
     rows = []
     with open(path, encoding="utf-8", newline="") as f:
-        for rec in csv.DictReader(f):
-            rows.append(rec)
+        reader = csv.reader(f)
+        header = next(reader, [])
+        col = {}
+        for i, h in enumerate(header):
+            hl = (h or "").strip().lower()
+            for key in ("instr", "addr", "pipe", "call_count", "cycles", "running", "detail"):
+                if key in hl and key not in col:
+                    col[key] = i
+
+        def g(r, k):
+            i = col.get(k)
+            return r[i].strip() if i is not None and i < len(r) else ""
+
+        for r in reader:
+            if len(r) < 3:
+                continue
+            cyc = g(r, "cycles")
+            rt = g(r, "running")
+            dur_ns = 0.0
+            try:
+                rt_us = float(rt)
+                if rt_us > 0:
+                    dur_ns = rt_us * 1000.0
+            except ValueError:
+                pass
+            if dur_ns == 0.0:
+                try:
+                    dur_ns = int(cyc) * 1000.0 / AIC_FREQ_MHZ
+                except ValueError:
+                    dur_ns = 0.0
+            rows.append({
+                "instr": g(r, "instr"), "pipe": g(r, "pipe"),
+                "call_count": g(r, "call_count") or "1",
+                "cycles": cyc, "duration_ns": dur_ns,
+                "detail": g(r, "detail"),
+            })
     return rows
 
 
@@ -71,21 +114,22 @@ def parse(base):
                 key = (inst, pipe)
                 a = agg.setdefault(key, {
                     "instr": inst, "pipe": pipe, "call_count": 0,
-                    "cycles": 0, "running_time_us": 0.0, "cores": set(), "detail": "",
+                    "cycles": 0, "duration_ns_total": 0.0, "cores": set(), "detail": "",
                 })
-                a["call_count"] += int(rec.get("call_count") or 0)
-                a["cycles"] += int(rec.get("cycles") or 0)
-                a["running_time_us"] += float(rec.get("running_time(us)") or 0)
+                a["call_count"] += int(rec["call_count"] or 1)
+                a["cycles"] += int(rec["cycles"] or 0)
+                a["duration_ns_total"] += rec["duration_ns"]
                 a["cores"].add(core_dir.name)
                 if not a["detail"]:
-                    a["detail"] = rec.get("detail", "")
+                    a["detail"] = rec["detail"]
 
     ops = []
     for key in sorted(agg.keys()):
         a = agg[key]
         data_bytes, dtype = parse_detail(a["detail"])
-        per_call_us = a["running_time_us"] / max(1, a["call_count"])
-        per_call_cyc = a["cycles"] // max(1, a["call_count"])
+        n = max(1, a["call_count"])
+        per_call_ns = a["duration_ns_total"] / n
+        per_call_cyc = a["cycles"] // n
         o = empty_op()
         o.update({
             "op_id": len(ops),
@@ -94,11 +138,11 @@ def parse(base):
             "engine": PIPE_TO_ENGINE.get(a["pipe"], a["pipe"]),
             "instruction": f"{a['instr']} (pipe={a['pipe']})",
             "pipeline_channel": a["pipe"],
-            # duration_ns = 单次调用平均耗时 (对齐语义 op 用); 总量在 total_duration_ns
-            "duration_ns": round(per_call_us * 1000.0, 2),
+            # duration_ns = 单次调用平均耗时 (running_time 优先, 0 时用 cycles/freq 换算)
+            "duration_ns": round(per_call_ns, 2),
             "cycles": per_call_cyc,
             "call_count": a["call_count"],
-            "total_duration_ns": round(a["running_time_us"] * 1000.0, 2),
+            "total_duration_ns": round(a["duration_ns_total"], 2),
             "total_cycles": a["cycles"],
             "core_id": f"{len(a['cores'])} cores",
             "data_size_bytes": data_bytes,

@@ -127,11 +127,12 @@ class NgaBackend:
     通用映射 + extra_args 透传口 + 可选结构化输出路径。generate/choose_lever 对 orchestrator 不变。
 
     config（dict 或 env；generate/choose_lever 各自可配）：
-      cmd            命令前缀 list，默认 ["nga","run"]，或 env AGENT_CMD（空格分隔）。
+      cmd            命令前缀 list，默认 ["agent","run"]，或 env AGENT_CMD（空格分隔）。
       generate/choose_lever: {"model", "options": {...}, "extra_args": [...], "timeout_s"}
       structured     {"enabled", "request": {...}, "kernel_key", "meta_key"}  可选结构化输出路径。
       timeout_s      全局默认（被 per-kind 覆盖）。
-    环境变量：AGENT_CMD（命令前缀）、NGA_GENERATE_MODEL / NGA_CHOOSE_LEVER_MODEL（兼容）。
+    环境变量（统一 AGENT_* 前缀）：AGENT_CMD（命令前缀）、AGENT_GENERATE_MODEL /
+    AGENT_CHOOSE_LEVER_MODEL。
     未填任何 options→仅 cmd + model + prompt 的最基础调用（不报错，mock/开源可跑）。
     """
 
@@ -150,14 +151,14 @@ class NgaBackend:
         cmd = cfg.get("cmd")
         if cmd is None:
             env = os.environ.get("AGENT_CMD")
-            cmd = env.split() if env else ["nga", "run"]
+            cmd = env.split() if env else ["agent", "run"]
         return list(cmd)
 
     @staticmethod
     def _kind_cfg(cfg: dict, kind: str) -> dict:
         sec = cfg.get(kind) or {}
         return {
-            "model": sec.get("model") or os.environ.get(f"NGA_{kind.upper()}_MODEL"),
+            "model": sec.get("model") or os.environ.get(f"AGENT_{kind.upper()}_MODEL"),
             "options": dict(sec.get("options") or {}),
             "extra_args": list(sec.get("extra_args") or []),
             "timeout_s": float(sec.get("timeout_s", cfg.get("timeout_s", 120))),

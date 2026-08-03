@@ -79,7 +79,7 @@ def test_degrade_minimal_config_basic_call(monkeypatch):
     r = FakeRunner(stdout="ok")
     NgaBackend(runner=r).generate("p")                # 完全无 config
     cmd = r.calls[0]
-    assert cmd == ["nga", "run", "p"]                 # 仅默认前缀 + prompt，无 model/options
+    assert cmd == ["agent", "run", "p"]               # 仅默认前缀 + prompt，无 model/options
     assert "--model" not in cmd
 
 

@@ -49,7 +49,7 @@ lever_retries: int = 3     # choose_lever 超时/失败重试，不计入轮数�
         return chosen, chosen
 ```
 
-**环境侧配套（env.sh）：** `NGA_CHOOSE_LEVER_MODEL=<小模型如 MiniMax-M2.7>`（choose_lever 只返回一行 json，不需要大模型）、`NGA_CHOOSE_LEVER_TIMEOUT_S=180`（调宽余量，实测 85s、默认 120 余量太小）。
+**环境侧配套（env.sh）：** `AGENT_CHOOSE_LEVER_MODEL=<小模型如 MiniMax-M2.7>`（choose_lever 只返回一行 json，不需要大模型）、choose_lever 超时走 backend config `choose_lever.timeout_s=180`（调宽余量，实测 85s、默认 120 余量太小）。环境变量统一 `AGENT_*` 前缀（`AGENT_CMD` / `AGENT_GENERATE_MODEL` / `AGENT_CHOOSE_LEVER_MODEL`）。
 
 ---
 

@@ -63,7 +63,7 @@ def test_command_per_call_type_and_stateless():
     b.generate("gp")
     b.choose_lever("cp")
     gen_cmd, choose_cmd = r.calls[0], r.calls[1]
-    assert gen_cmd[0] == "nga" and gen_cmd[1] == "run"
+    assert gen_cmd[0] == "agent" and gen_cmd[1] == "run"
     assert "strong/model" in gen_cmd and "high" in gen_cmd
     assert "w3/GLM-4.7" in choose_cmd and "--variant" not in choose_cmd
     for cmd in r.calls:
@@ -88,7 +88,7 @@ def test_nonzero_exit_raises_and_no_self_retry():
 
 
 def test_timeout_raises():
-    r = FakeRunner(raise_exc=subprocess.TimeoutExpired(cmd=["nga"], timeout=1))
+    r = FakeRunner(raise_exc=subprocess.TimeoutExpired(cmd=["agent"], timeout=1))
     b = NgaBackend(CONFIG, runner=r)
     with pytest.raises(LLMTimeout):
         b.generate("p")

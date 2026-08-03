@@ -20,18 +20,21 @@ EXAMPLE_VOCAB = {"compute_bound_at_peak", "memory_underfilled", "stall_dependenc
 
 
 def _check_llm(env):
-    g = env.get("NGA_GENERATE_MODEL")
-    c = env.get("NGA_CHOOSE_LEVER_MODEL")
+    g = env.get("AGENT_GENERATE_MODEL")
+    c = env.get("AGENT_CHOOSE_LEVER_MODEL")
     if g and c:
         return ("llm", "OK", f"generate={g} choose_lever={c}")
     missing = [k for k, v in (("generate", g), ("choose_lever", c)) if not v]
-    return ("llm", "STUB", f"models not set: {missing} (set NGA_GENERATE_MODEL / NGA_CHOOSE_LEVER_MODEL)")
+    return ("llm", "STUB", f"models not set: {missing} (set AGENT_GENERATE_MODEL / AGENT_CHOOSE_LEVER_MODEL)")
 
 
-def _check_nga():
-    if shutil.which("nga"):
-        return ("nga", "OK", "available")
-    return ("nga", "STUB", "nga not on PATH (confidential-env only)")
+def _check_agent(env):
+    # agent 命令前缀首 token（AGENT_CMD 首词，缺省 "agent"）——不写死具体后端名
+    cmd = env.get("AGENT_CMD")
+    binname = cmd.split()[0] if cmd else "agent"
+    if shutil.which(binname):
+        return ("agent", "OK", f"{binname} available")
+    return ("agent", "STUB", f"{binname} not on PATH (confidential-env only)")
 
 
 def _check_signature_table(env):
@@ -119,7 +122,7 @@ def run_checks(env=None) -> list[tuple[str, str, str]]:
     env = os.environ if env is None else env
     return [
         _check_llm(env),
-        _check_nga(),
+        _check_agent(env),
         _check_signature_table(env),
         _check_template(env),
         _check_vocab(),

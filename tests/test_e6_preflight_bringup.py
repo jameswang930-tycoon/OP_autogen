@@ -22,13 +22,13 @@ def _states(env=None):
 def test_preflight_all_placeholder_env_marks_stub_example():
     st = _states(env={})  # nothing configured
     assert st["llm"] == "STUB"
-    assert st["nga"] == "STUB"            # dev machine has no nga
+    assert st["agent"] == "STUB"          # dev machine has no agent binary
     assert st["parse_raw"] == "STUB"      # slot still NotImplementedError
     assert st["vocabulary"] == "EXAMPLE"  # still the 3 example entries
 
 
 def test_preflight_llm_ok_when_model_configured():
-    st = _states(env={"NGA_GENERATE_MODEL": "real/model", "NGA_CHOOSE_LEVER_MODEL": "w3/GLM-4.7"})
+    st = _states(env={"AGENT_GENERATE_MODEL": "real/model", "AGENT_CHOOSE_LEVER_MODEL": "w3/GLM-4.7"})
     assert st["llm"] == "OK"
 
 

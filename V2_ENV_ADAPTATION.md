@@ -14,9 +14,10 @@
 
 ## 环境侧适配清单（5.1 执行）
 
-### A. 配置对接（env.sh）
-1. **P1 配套**：`NGA_CHOOSE_LEVER_MODEL=<小模型，如 MiniMax-M2.7>`（choose_lever 只返回一行 json，不用大模型）；`NGA_CHOOSE_LEVER_TIMEOUT_S=180`（余量调宽，实测 85s、默认 120 太紧）。
-2. `NGA_GENERATE_MODEL` / `NGA_GENERATE_TIMEOUT_S` 按环境模型能力设。
+### A. 配置对接（env.sh / backend config）
+> 环境变量统一 `AGENT_*` 前缀（不写死具体后端名）；命令前缀走 `AGENT_CMD`，模型走 `AGENT_GENERATE_MODEL`/`AGENT_CHOOSE_LEVER_MODEL`。其余选项（超时/思考开关/输出格式等）走 backend config dict（per-kind `options`/`extra_args`/`timeout_s`）——见 §C。
+1. **P1 配套**：`AGENT_CHOOSE_LEVER_MODEL=<小模型，如 MiniMax-M2.7>`（choose_lever 只返回一行 json，不用大模型）；choose_lever 超时走 backend config `choose_lever.timeout_s`（如 180，实测 85s、默认 120 太紧）。
+2. `AGENT_GENERATE_MODEL`（env）+ `generate.timeout_s`（config）按环境模型能力设。
 3. **backend 配置（无双模式）**：V2 backend 重构后只剩**一个** backend（`NgaBackend`，配置驱动），gen prompt 统一精简（场景提示 + ext-* skill lazy-load）——不存在"哑后端/双模式"开关（`GEN_PROMPT_MODE` 已删）。环境侧按 C.0 探测结果填 backend config（cmd 前缀、options、extra_args、是否结构化输出）。
 4. SIM_* 系列（SIM_ROOT/SIM_SCRIPT/SIM_INPUT_DIR/SIM_RESULT_DIR/SIM_TIMEOUT）、PRESIM_SIGNATURE_TABLE、LAUNCHABLE_TEMPLATE_PATH——沿用环境现有稳定值，不动。
 

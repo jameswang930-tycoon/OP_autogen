@@ -314,8 +314,11 @@ class HIVMIRParser:
 
         engine = OP_TO_ENGINE.get(op_type, TBD)
 
-        # size_kb: 从 alloc_sizes 查
+        # size_kb: 优先 alloc_sizes, 否则从 op 的 ins/outs 类型签名提取
+        # (真实 HIVM 尺寸在 tensor<MxNxdtype>/memref<MxNxdtype> 里, 见 _size_from_type)
         size_kb = self._alloc_sizes.get(dst, self._alloc_sizes.get(src, 0.0))
+        if not size_kb:
+            size_kb = self._size_from_type(outs_str) or self._size_from_type(ins_str)
 
         # memory_region: 从 buffers 查询 (alloc 时存储)
         mem_region = ""
@@ -339,6 +342,25 @@ class HIVMIRParser:
             variable_name=dst if dst else src,
             dtype="f16", attrs=attrs,
         )
+
+    @staticmethod
+    def _size_from_type(type_str: str) -> float:
+        """从 op 的 ins/outs 类型串提取 size_kb。
+
+        真实 HIVM (AscendNPU-IR 文档确认) 尺寸在 op 类型签名里:
+          tensor<16x32xf32> / memref<256x256xf16, #hivm.address_space<ub>>
+        含 ? 动态维 → 返回 0 (未知)。
+        """
+        m = re.search(r'(?:tensor|memref)<([0-9x?]+)x(\w+)', type_str or "")
+        if not m:
+            return 0.0
+        dims_str, dtype = m.group(1), m.group(2)
+        if "?" in dims_str:
+            return 0.0
+        total = 1
+        for d in dims_str.split("x"):
+            total *= int(d)
+        return total * DTYPE_SIZES.get(dtype, 2) / 1024.0
 
     def _parse_first_operand(self, s: str) -> str:
         """从 '(%buf : type)' 或 '%buf, ... : type, type' 提取第一个操作数"""

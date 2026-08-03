@@ -3,6 +3,20 @@
 > 2026-08-03 新建。目标：在 910B3 服务器上，把三源真实产物解析成**统一格式**的 3 个 JSON，再合并成 1 个 merged.json，供后续 dsl_merger/诊断/LLM 使用。
 > 命令与环境说明见 `input/matmul/test_matmul.py` 头注释（三源采集命令）与 `PIPELINE_FIELDS.md`（字段来源/用途）。
 
+## 一键脚本（推荐）
+
+`run_server_flow.sh` — 服务器端 5 阶段采集+解析+合并，所有产物收进 `input/matmul/e2e_run/`：
+
+```bash
+bash run_server_flow.sh          # 小尺寸 64³ (默认, simulator 不会卡)
+bash run_server_flow.sh 128 128 128
+# 可选: SKIP_SIM=1 跳过仿真 / SKIP_BOARD=1 跳过真机 / SIM_TIMEOUT=秒 改超时
+#       BOARD_METRICS=PipeUtilization,ResourceConflictRatio 真机指标降级
+```
+
+- 每阶段跑完自动 ✅/❌ 检查产物；末尾打印「检查清单」
+- 各阶段产物固定位置：`e2e_run/01_compile` `02_hivm` `03_sim` `04_board` `05_merged`
+
 ---
 
 ## 脚本清单

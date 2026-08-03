@@ -262,7 +262,11 @@ from triton_kernel import matmul_kernel
 # ---------- 配置 (与 input/matmul/config.json 对齐) ----------
 # 注意: 不传 num_warps/num_stages — triton-ascend 后端自动管理 tiling/流水,
 #       传了会报 "please do not tune args ['num_warps','num_stages']"
-M, N, K = 512, 512, 512
+# 尺寸可用环境变量覆盖 (simulator 指令级仿真, 大尺寸会极慢/卡):
+#   MATMUL_M=64 MATMUL_N=64 MATMUL_K=64 python3 test_matmul.py
+M  = int(os.environ.get("MATMUL_M", 512))
+N  = int(os.environ.get("MATMUL_N", 512))
+K  = int(os.environ.get("MATMUL_K", 512))
 BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
 DTYPE = torch.float32
 

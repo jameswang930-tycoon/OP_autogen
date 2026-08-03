@@ -34,10 +34,8 @@
 #    SKIP_SIM=1            跳过 simulator (不想等)
 #    SKIP_BOARD=1          跳过真机 msprof op
 #    SKIP_TASK=1           跳过真机 msprof 通用 (op_summary)
-#    BOARD_METRICS=...     msprof op 指标 (默认全指标出 cube占比+带宽;
-#                          若失败降级: BOARD_METRICS=PipeUtilization,ResourceConflictRatio)
-#    TASK_AIC_METRICS=...  通用 msprof 的 aic-metrics (默认全指标出带宽/L2;
-#                          逐级降级: 全指标→Memory,L2Cache→Memory→基础)
+#    msprof op (04_board) 默认全量 8 CSV (带宽/L2/cube), 不要指定 --aic-metrics (会限制/报错), 已加 --warm-up=10
+#    通用 msprof (05_task) 固定 --ai-core=on (8.5.1 不认 --aic-metrics, 已实测), 拿 op_summary
 #  字段解析依据: analyzers/PIPELINE_FIELDS.md (字段来源/用途) + PIPELINE_README.md
 # ═══════════════════════════════════════════════════════════════════════════════
 set -u
@@ -145,16 +143,23 @@ if [ "${SKIP_BOARD:-0}" = "1" ]; then
 else
   BOARD_OUT="$OUT/04_board/board_prof"
   rm -rf "$BOARD_OUT"
-  # 全指标才出 ArithmeticUtilization(Memory(MemoryL0/UB/L2Cache → board.json 的 cube 占比+带宽)
-  BOARD_METRICS="${BOARD_METRICS:-PipeUtilization,ResourceConflictRatio,ArithmeticUtilization,Memory,MemoryL0,MemoryUB,L2Cache}"
+  # ★ msprof op 默认采集全部指标 (8 个 CSV: OpBasic/PipeUtil/Arithmetic/Memory/MemoryL0/MemoryUB/L2Cache/ResourceConflict)
+  #   不要指定 --aic-metrics (指定会限制或报错); --warm-up=10 防 DVFS 降频
   MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof op --kernel-name=matmul_kernel \
-    --aic-metrics="$BOARD_METRICS" --output="$BOARD_OUT" \
+    --output="$BOARD_OUT" --warm-up=10 \
     $PY test_matmul.py > "$OUT/04_board/board_run.txt" 2>&1
-  echo "  退出码=$? (若全指标失败, 设 BOARD_METRICS=PipeUtilization,ResourceConflictRatio 重跑)"
+  echo "  退出码=$? (日志 04_board/board_run.txt)"
+  MEM=$(ls "$BOARD_OUT"/OPPROF_*/Memory.csv 2>/dev/null | wc -l)
+  L2=$(ls "$BOARD_OUT"/OPPROF_*/L2Cache.csv 2>/dev/null | wc -l)
+  AR=$(ls "$BOARD_OUT"/OPPROF_*/ArithmeticUtilization.csv 2>/dev/null | wc -l)
   OBI=$(ls "$BOARD_OUT"/OPPROF_*/OpBasicInfo.csv 2>/dev/null | wc -l)
-  PU=$(ls "$BOARD_OUT"/OPPROF_*/PipeUtilization.csv 2>/dev/null | wc -l)
-  if [ "$OBI" -gt 0 ] && [ "$PU" -gt 0 ]; then pass "OpBasicInfo.csv + PipeUtilization.csv ✓"; \
-  else fail "缺 OpBasicInfo/PipeUtilization → 看 04_board/board_run.txt"; fi
+  if [ "$OBI" -gt 0 ] && [ "$MEM" -gt 0 ]; then
+    pass "OpBasicInfo+Memory ✓ (真实带宽) L2Cache x$L2 Arithmetic x$AR"
+  elif [ "$OBI" -gt 0 ]; then
+    pass "OpBasicInfo ✓ 但缺 Memory/L2 (带宽未拿到) → 看 04_board/board_run.txt"
+  else
+    fail "缺 OpBasicInfo → 看 04_board/board_run.txt"
+  fi
 fi
 
 # ═══════════════════════ 阶段 5/6: 真机 msprof 通用 (任务级 op_summary) ═══════════════════════
@@ -165,33 +170,23 @@ if [ "${SKIP_TASK:-0}" = "1" ]; then
 else
   # 输出到 task_prof 子目录 (结构: 05_task/task_prof/PROF_xxx/mindstudio_profiler_output/op_summary)
   TASK_OUT="$OUT/05_task/task_prof"
-  # 逐级降级: 全指标 → Memory,L2Cache → Memory → 基础 (碰到能出 op_summary 的停)
-  # 注意: --task-time 取值 on/off; --aic-metrics 需 --ai-core=on
-  FULL_METRICS="${TASK_AIC_METRICS:-PipeUtilization,ArithmeticUtilization,Memory,MemoryL0,MemoryUB,L2Cache,ResourceConflictRatio}"
-  OPSUM=0; USED=""
-  for METRICS in "$FULL_METRICS" "Memory,L2Cache" "Memory" ""; do
-    rm -rf "$TASK_OUT"; mkdir -p "$TASK_OUT"
-    FLAGS=""
-    # 已验证模式 (CANN 8.5 910B3 成功案例): 只 --ai-core=on + --aic-metrics, 不显式 task-time/aic-mode (默认 on/task-based)
-    [ -n "$METRICS" ] && FLAGS="--ai-core=on --aic-metrics=$METRICS"
-    MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof --output="$TASK_OUT" \
-      --application="$PY test_matmul.py" $FLAGS \
-      > "$OUT/05_task/task_run.txt" 2>&1
-    RC=$?
-    OPSUM=$(find "$OUT/05_task" -name "op_summary*.csv" 2>/dev/null | wc -l)
-    echo "  try metrics=[${METRICS:-basic}] rc=$RC op_summary x$OPSUM"
-    if [ "$OPSUM" -gt 0 ]; then USED="${METRICS:-basic}"; break; fi
-  done
+  rm -rf "$TASK_OUT"; mkdir -p "$TASK_OUT"
+  # 8.5.1 通用 msprof 不认 --aic-metrics (实测全 255); 用 --ai-core=on (实测可用) 拿 op_summary (每 kernel 真实耗时/核数)
+  # 详细字段 (带宽/L2/cube) 由 stage 4 的 msprof op --aic-metrics 提供 (CANN 8.5 单算子工具支持)
+  MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof --output="$TASK_OUT" \
+    --application="$PY test_matmul.py" --ai-core=on \
+    > "$OUT/05_task/task_run.txt" 2>&1
+  RC=$?
+  OPSUM=$(find "$OUT/05_task" -name "op_summary*.csv" 2>/dev/null | wc -l)
+  echo "  通用 msprof (--ai-core=on) rc=$RC op_summary x$OPSUM"
   if [ "$OPSUM" -gt 0 ]; then
-    pass "op_summary x$OPSUM ✓ (metrics=[$USED])"
-    [ "$USED" = "basic" ] && echo "  ⚠ 基础模式无带宽/L2 → 需定位全指标 flag (上面 t1~t5 命令)"
+    pass "op_summary x$OPSUM ✓ (每kernel真实耗时/核数)"
+    echo "  (带宽/L2/cube 详细字段来自 stage 4 msprof op, 见 board.json)"
   else
-    echo "  ❌ 所有 metrics 均无 op_summary → 诊断:"
-    echo "    --- task_run.txt 末尾 20 行 ---"
+    echo "  ❌ 无 op_summary → 诊断:"
     tail -20 "$OUT/05_task/task_run.txt" 2>/dev/null
-    echo "    --- msprof 有效 flags (aic/task/metrics) ---"
-    msprof --help 2>&1 | grep -iE 'aic|task-time|metric' | head -15
-    fail "无 op_summary (诊断贴回给我, 即可定位)"
+    msprof --help 2>&1 | grep -iE 'ai-core|metric' | head -10
+    fail "无 op_summary"
   fi
 fi
 

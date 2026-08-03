@@ -45,6 +45,28 @@ run "06_memub" msprof --output="$OUT/06_memub" --application="$PY test_matmul.py
 run "07_cflt" msprof --output="$OUT/07_cflt" --application="$PY test_matmul.py" --ai-core=on --aic-metrics="ArithmeticUtilization,PipeUtilization,Memory,ResourceConflictRatio"
 run "08_all" msprof --output="$OUT/08_all" --application="$PY test_matmul.py" --ai-core=on --aic-metrics="ArithmeticUtilization,PipeUtilization,Memory,L2Cache,MemoryL0,MemoryUB,ResourceConflictRatio"
 
-echo "══════ 3. 结论 ══════"
-echo "  每个 rc=0 且 op_summary>0 的组合可用; 第一个 rc!=0 的就是问题 flag/metric。"
-echo "  把本脚本输出整体贴回, 我据此改 run_server_flow.sh 的默认 TASK_AIC_METRICS。"
+echo "══════ 3. msprof op 详细指标 (带宽/L2/cube) ══════"
+# 关键: msprof op 默认全量 8 CSV, 不要指定 --aic-metrics (指定会限制/报错)
+oprun() {
+  local name="$1"; shift
+  rm -rf "$OUT/$name"
+  "$@" > "$OUT/$name.log" 2>&1
+  local rc=$?
+  local n8=$(ls "$OUT/$name"/OPPROF_*/*.csv 2>/dev/null | wc -l)
+  local mem=$(ls "$OUT/$name"/OPPROF_*/Memory.csv 2>/dev/null | wc -l)
+  local l2=$(ls "$OUT/$name"/OPPROF_*/L2Cache.csv 2>/dev/null | wc -l)
+  local arith=$(ls "$OUT/$name"/OPPROF_*/ArithmeticUtilization.csv 2>/dev/null | wc -l)
+  echo "  [$name] rc=$rc csv x$n8  Memory x$mem  L2Cache x$l2  ArithmeticUtilization x$arith"
+  [ "$rc" -ne 0 ] && echo "     log尾: $(tail -3 "$OUT/$name.log" 2>/dev/null | tr '\n' ' ')"
+  echo ""
+}
+# 默认全量 (推荐, 应出 8 个 CSV)
+oprun "op_default" msprof op --kernel-name=matmul_kernel --output="$OUT/op_default" $PY test_matmul.py
+# 加 --warm-up (防降频, run_server_flow.sh 用它)
+oprun "op_warmup"  msprof op --kernel-name=matmul_kernel --output="$OUT/op_warmup" --warm-up=10 $PY test_matmul.py
+
+echo "══════ 4. 结论 ══════"
+echo "  第2节: 通用 msprof 用 00/01 (--ai-core=on) 拿 op_summary。"
+echo "  第3节: msprof op 默认全量 → 应出 8 个 CSV (Memory=带宽/L2Cache=L2/ArithmeticUtilization=cube)"
+echo "    Memory>0 → 真实带宽; L2Cache>0 → L2; Arithmetic>0 → cube/vec 算力 → board.json 就全了"
+echo "  把本脚本输出整体贴回, 我据此确认 stage4/5 命令。"

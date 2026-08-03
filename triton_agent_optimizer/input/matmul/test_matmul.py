@@ -81,12 +81,13 @@ kernel: 同目录 triton_kernel.py 的 matmul_kernel (C = A @ B, 512x512x512)
         export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
         python3 test_matmul.py 2>&1 | tee run_debug.txt
         find ~/.triton -type f | head -30     # 预期: kernel.ttir.mlir + kernel.ttadapter.mlir
+        cp ~/.triton/dump/*/kernel.*.mlir ./  # ★ 拷回当前目录, D 才有输入文件
 
         # C. 确认 bishengir-compile 在 PATH (不在就 find 定位)
         which bishengir-compile || find /usr/local/Ascend -name 'bishengir-compile' 2>/dev/null
 
         # D. ★核心: 对 ttadapter.mlir 直接跑官方命令打印 HIVM (不依赖 TRITON_DEBUG)
-        cd <A 或 B 里 ttadapter 所在目录>
+        #    (ttadapter.mlir 必须在当前目录 — B 末尾已拷回; 不在就 ls /root/.triton/dump/*/ 找)
         bishengir-compile --target=Ascend910B3 --enable-auto-multi-buffer=True \
           --enable-auto-bind-sub-block=True --enable-hfusion-compile=true \
           --enable-hivm-compile=true --enable-triton-kernel-compile=true \

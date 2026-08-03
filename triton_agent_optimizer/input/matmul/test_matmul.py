@@ -32,14 +32,21 @@ kernel: 同目录 triton_kernel.py 的 matmul_kernel (C = A @ B, 512x512x512)
 
 【真机命令 2/3 — msprof 通用任务级】 (真实硬件, 算子汇总, 产出 op_summary):
     msprof --output=./task_prof --application="python3 test_matmul.py"
-    产物: ./task_prof/PROF_xxx/mindstudio_profiler_output/
-        op_summary_*.csv     AI Core/AI CPU 算子数据 (按 Task Duration 排序找热点)
-        op_statistic_*.csv   算子调用次数/总耗时统计
-        msprof_*.json        timeline 主表
-        task_time_*.csv      Task Scheduler 调度信息
-        api_statistic_*.csv  CANN 层 API 耗时
-        fusion_op_*.csv      算子融合信息
-    注意: 通用 msprof 不采集 Python 调用栈 / PyTorch 框架层数据
+    产物: ./task_prof/PROF_xxx/
+        host/data/                          Host 侧原始数据 (无需关注)
+        device_{id}/data/                   Device 侧原始数据 (无需关注)
+        mindstudio_profiler_output/         ★ 性能数据分析推荐目录
+            op_summary_*.csv     AI Core/AI CPU 算子数据, 关键列:
+                                 Task Duration(us) / Task Type(AI_CORE|AI_VECTOR_CORE|AI_CPU)
+                                 / aicore_time(us) / aiv_time(us) / total_cycles
+                                 / Block Dim / Task Start Time(us) / Stream ID / Device ID
+            op_statistic_*.csv   算子调用次数/总耗时统计
+            msprof_*.json        timeline 主表 (Chrome tracing 打开)
+            task_time_*.csv      Task Scheduler 调度信息
+            api_statistic_*.csv  CANN 层 API 耗时
+            fusion_op_*.csv      算子融合信息
+    注意: 通用 msprof 不采集 Python 调用栈 / PyTorch 框架层数据; 具体列名以
+          服务器上 head -1 mindstudio_profiler_output/op_summary_*.csv 为准
 
 【仿真命令 3/3 — msprof op simulator】 (CPU 指令级仿真, 不占 NPU):
     export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/tools/simulator/Ascend910B3/lib:$LD_LIBRARY_PATH
@@ -53,9 +60,50 @@ kernel: 同目录 triton_kernel.py 的 matmul_kernel (C = A @ B, 512x512x512)
         dump/aicore_binary.o  算子二进制
     注: 只有本命令产出 instr_exe.csv, 是真机 msprof/msprof op 没有的
 
-(可选) 让 trace 关联源码行 / 同时 dump HIVM IR:
-    export TRITON_DISABLE_LINE_INFO=false          # 消除 "kernel missed debug_line" 警告
-    export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1   # -> ~/.triton/dump/<hash>/kernel.npuir.mlir
+【方式 4/4 — HIVM IR dump】 (编译中间产物, 静态结构字段来源, 不占 NPU)
+    # 只跑一次即可, 产物在 ~/.triton/dump/, 每次编译会话一个 <hash> 子目录
+    export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
+    python3 test_matmul.py
+    产物: ~/.triton/dump/<hash>/
+        kernel.ttir.mlir        Triton IR (平台无关, 最高层)
+        kernel.ttadapter.mlir   triton-ascend 适配器输出 (转昇腾前)
+        kernel.npuir.mlir       ★ HIVM 级 IR (毕昇编译器产物) — 静态分析要的就是这个
+    编译链路: kernel.py → ttir → ttadapter → bishengir-compile → .o
+    注: TRITON_DISABLE_CACHE=1 必须 — 缓存命中会跳过编译, 不产 dump。
+
+    ⚠️ 版本坑 (triton-ascend 3.5.x): BiShengIR 把 pass hivm-inject-sync 改名
+       hivm-graph-sync-solver 后 npuir.mlir 不再生成。3.2.1 大概率没这问题, 但
+       第一次跑必须确认文件存在。缺失时改用:
+         export MLIR_ENABLE_DUMP=1        # 每个 pass 前后都 dump, 挑含 hivm 的
+       或改编译选项 --bishengir-print-ir-after=hivm-graph-sync-solver
+
+    怎么看 (纯查看, 不需要编译):
+        ls ~/.triton/dump/*/                        # 确认有 kernel.npuir.mlir
+        grep -c 'hivm.hir' ~/.triton/dump/*/kernel.npuir.mlir   # 应 > 0
+        grep -n 'memref.alloc'  ~/.triton/dump/*/kernel.npuir.mlir | head   # buffer: size+region+dtype
+        grep -n 'hivm.hir'      ~/.triton/dump/*/kernel.npuir.mlir | head   # 每条指令+操作数
+    真实格式 = hivmir_analyzer 的 Format A, 样例:
+        %alloc = memref.alloc() : memref<256x256xf32, #hivm.address_space<ub>>
+        hivm.hir.load ins(%arg0 : memref<...>) outs(%alloc : memref<...>)
+        hivm.hir.matmul ins(%A, %B : ...) outs(%C : ...) {a_transpose, block_sizes=[16,16,16]}
+
+    怎么解析并映射到 29 字段 (纯 Python, 可在 WSL2/任意机器跑):
+        python3 -c "
+        from pathlib import Path
+        from analyzers.hivmir_analyzer import HIVMIRAnalyzer
+        a = HIVMIRAnalyzer()
+        rep = a.analyze_file(Path('kernel.npuir.mlir'))
+        import json; print(json.dumps(a.to_dict(rep), ensure_ascii=False, indent=2))
+        "
+        得到: op_id/op_type/instruction/dst/src/src2/size_kb/memory_region/
+              dependencies(RAW/WAR/WAW)/buffers(producers/consumers)/dtype/attrs(block_sizes)
+        ⚠️ timing 字段 (duration_ns/start/end/带宽) 仍是 "待补充" — 由 方式1/2/3 的
+           msprof 数据填, dsl_merger 按 op_id 对齐。
+
+    ⚠️ hivmir_analyzer 对真实 dump 有 3 个待补点 (见 analyzers/hivmir_analyzer.py):
+        1) 2D memref alloc (memref<256x256xf32,...>) 不解析 → size_kb 变 0, 需加 2D 分支
+        2) address_space 值 cbuf/ca/cb/cc (=L1/L0A/L0B/L0C) 未映射 → L0 通路 region 判错
+        3) sync/barrier op (hivm.barrier, 非 hivm.hir.*) 被跳过 → 丢失依赖/串行证据
 
 常见提示说明:
     - "not selected via --kernel-name" 是 reference 的 torch.matmul 被过滤, 正常;

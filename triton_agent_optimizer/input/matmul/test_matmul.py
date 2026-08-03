@@ -21,12 +21,18 @@ kernel: 同目录 triton_kernel.py 的 matmul_kernel (C = A @ B, 512x512x512)
         --output=./sim_prof python3 test_matmul.py
 
 (可选) 让 trace 关联源码行 / 同时 dump HIVM IR:
-    export TRITON_DISABLE_LINE_INFO=false
+    export TRITON_DISABLE_LINE_INFO=false          # 消除 "kernel missed debug_line" 警告
     export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1   # -> ~/.triton/dump/<hash>/kernel.npuir.mlir
 
 产物:
     <output>/OPPROF_xxx/simulator/core*.veccore*/instr_exe.csv + trace.json
     (真机模式下 OPPROF_xxx 顶层还有 op_summary_*.csv / PipeUtilization.csv)
+
+常见提示说明:
+    - "not selected via --kernel-name" 是 reference 的 torch.matmul 被过滤, 正常;
+      若担心 matmul_kernel 没采到, 检查 OPPROF_xxx/simulator/ 是否有 instr_exe.csv
+    - "terminate called after throwing 'std::bad_weak_ptr'" 是仿真器退出时 teardown
+      崩溃, 通常 OPPROF 数据已写盘; 已默认关闭正确性校验降低触发概率
 ================================================================
 """
 import os
@@ -77,13 +83,15 @@ def main():
     torch.npu.synchronize()
     print("[info] kernel launched & synced OK")
 
-    # 轻量正确性校验: 真机下有效; 仿真下仅作参考(CAModel 不做精度比对), 失败不中断
-    try:
-        ref = torch.matmul(a, b)
-        diff = (c - ref).abs().max().item()
-        print(f"[info] result check: {'PASS' if diff < 0.05 else 'CHECK'}  max|C-ref| = {diff:.5f}")
-    except Exception as e:
-        print(f"[warn] result check skipped: {e}")
+    # 正确性校验默认关闭(仿真下多跑一个 torch.matmul 会触发退出时 bad_weak_ptr 且拖慢仿真)。
+    # 真机上想校验: MATMUL_VERIFY=1 python3 test_matmul.py
+    if os.environ.get("MATMUL_VERIFY", "0") == "1":
+        try:
+            ref = torch.matmul(a, b)
+            diff = (c - ref).abs().max().item()
+            print(f"[info] result check: {'PASS' if diff < 0.05 else 'CHECK'}  max|C-ref| = {diff:.5f}")
+        except Exception as e:
+            print(f"[warn] result check skipped: {e}")
 
 
 if __name__ == "__main__":

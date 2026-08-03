@@ -81,16 +81,21 @@ TIER_NAMES = {
 
 
 def _load_playbook(tier: int, playbook_dir: Optional[Path] = None) -> str:
-    """加载当前 Tier 对应的 Playbook 文档。"""
+    """加载当前 Tier 对应的 Playbook + CODING_GUIDE。"""
     if playbook_dir is None:
         playbook_dir = _PROJECT_DIR / "docx"
     fname = PLAYBOOK_FILES.get(tier)
-    if fname is None:
-        return "(no playbook for this tier)"
-    fpath = playbook_dir / fname
-    if fpath.exists():
-        return fpath.read_text(encoding="utf-8")
-    return f"(playbook not found: {fpath})"
+    parts = []
+    # CODING_GUIDE (所有 Tier 都读)
+    guide_path = playbook_dir / "CODING_GUIDE.md"
+    if guide_path.exists():
+        parts.append("## Coding Guide (MUST FOLLOW)\n" + guide_path.read_text(encoding="utf-8")[:3000])
+    # 主 Playbook
+    if fname:
+        fpath = playbook_dir / fname
+        if fpath.exists():
+            parts.append(fpath.read_text(encoding="utf-8"))
+    return "\n\n".join(parts) if parts else "(no playbook for this tier)"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -139,35 +144,28 @@ def _retrieve_similar_cases(diagnosis, max_cases: int = 3) -> str:
 
 def _build_system_prompt(tier: int, playbook: str) -> str:
     """构建 System Prompt。"""
-    return f"""You are an expert Triton kernel optimizer for the Huawei Ascend 910B3 NPU.
+    return f"""You are a Triton kernel optimizer for Ascend 910B3 NPU (triton 3.4.0, CANN 9.0).
+Generate ONE concrete optimization change for Tier {tier}: {TIER_NAMES.get(tier, 'Unknown')}.
 
-## Hardware Context
-- 20 AI Cores (transfer) + 40 Vec Cores (compute) @ 1.8 GHz
-- UB = 192 KB per core, L2 = 192 MB shared, HBM = 64 GB
-- 7 engines: GM→UB(80.83 GB/s), UB→GM(76.67), VecUnit(404),
-  GM→L1(37.5 placeholder), L1→L0(100 placeholder),
-  CubeUnit(150 placeholder), L0→GM(37.5 placeholder)
-- Only GM→UB, UB→GM, VecUnit have MEASURED parameters
-- Placeholder engines: optimization advice MUST be marked UNCERTAIN
+## Rules
+1. ALWAYS output a real strategy name — NOT "algorithm_already_optimal"
+2. "algorithm_already_optimal" ONLY allowed if ALL of these are true:
+   - Tier 3+: bw_util > 90% on ALL ops AND
+   - Tier 2: 0 RAW dependency chains AND
+   - Tier 1: num_ops <= 3
+3. Give exact code change (e.g. "change BLOCK_SIZE from 256 to 1024 on line 15")
+4. Target speedup must be realistic (1.05-1.5x)
 
-## Your Job
-You are at Tier {tier}: {TIER_NAMES.get(tier, 'Unknown')}.
-Generate ONE specific, small optimization change for this round.
-## CRITICAL: When to say algorithm_already_optimal- If kernel has NO ops to optimize at this tier, output: {{"strategy": "algorithm_already_optimal"}}- Tier 2 (Fusion): no adjacent RAW chains to fuse → algorithm_already_optimal- Tier 3 (Tiling): all BW ops saturated (util>90%) → algorithm_already_optimal- Do NOT invent non-existent ops. Read the per-op list below to see actual ops.
-Output ONLY valid JSON — no explanation, no markdown.
+## Hardware
+910B3: 20 AI Core + 40 Vec Core @ 1.8GHz, UB=192KB/core
+GM→UB: 80.8 GB/s, UB→GM: 76.7 GB/s, VecUnit: 404 GB/s, CubeUnit: 150 GB/s
 
-## Playbook (Tier {tier} reference)
+## Playbook (Tier {tier})
 {playbook}
 
-## Output Format
+## Output JSON only:
 ```json
-{{
-  "strategy": "<strategy name>",
-  "target_speedup": <float, e.g. 1.10>,
-  "specific_change": "<exact code change, parameter change, or structural change>",
-  "expected_impact": "<which ops improve, by how much, and why>",
-  "verification_method": "<what tests to run to verify this optimization>"
-}}
+{{"strategy":"xxx","target_speedup":1.1,"specific_change":"...","expected_impact":"...","verification_method":"msprof"}}
 ```"""
 
 
@@ -274,7 +272,8 @@ class PlannerAgent:
             from openai import OpenAI
             client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com")
             resp = client.chat.completions.create(
-                model="deepseek-chat", max_tokens=2048,
+                model="deepseek-v4-pro", max_tokens=2048,
+                extra_body={"thinking": {"type": "disabled"}},
                 messages=[{"role": "system", "content": system_prompt},
                           {"role": "user", "content": user_prompt}])
             text = resp.choices[0].message.content or ""

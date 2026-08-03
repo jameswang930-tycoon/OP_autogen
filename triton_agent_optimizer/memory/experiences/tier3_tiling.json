@@ -48,5 +48,57 @@
     "description": "Tier 3: increase_tile_size",
     "timestamp": "2026-07-29T10:05:42.891801",
     "decision_reason": "Speedup 0.703x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "increase_tile_size",
+    "speedup": 0.7275,
+    "status": "FAIL",
+    "description": "Tier 3: increase_tile_size",
+    "timestamp": "2026-07-31T10:28:18.445028",
+    "decision_reason": "Verification failed: Failed shapes: [\"N=1: fused_add_mul_kernel() missing 1 required positional argument: 'BLOCK_SIZE'\", "
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "tune_block_config",
+    "speedup": 0.9622,
+    "status": "FAIL",
+    "description": "Tier 3: tune_block_config",
+    "timestamp": "2026-07-31T10:38:51.527024",
+    "decision_reason": "Verification failed: Failed shapes: [\"N=1: fused_add_mul_kernel() missing 1 required positional argument: 'BLOCK_SIZE'\", "
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "reduce_tile_size_from_2X_to_1X_with_alignment_hint",
+    "speedup": 0.9785,
+    "status": "FAIL",
+    "description": "Tier 3: reduce_tile_size_from_2X_to_1X_with_alignment_hint",
+    "timestamp": "2026-07-31T17:40:14.421925",
+    "decision_reason": "Speedup 0.978x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "increase_tile_size_double_pipeline_depth",
+    "speedup": 0.9754,
+    "status": "FAIL",
+    "description": "Tier 3: increase_tile_size_double_pipeline_depth",
+    "timestamp": "2026-07-31T17:40:56.792029",
+    "decision_reason": "Speedup 0.975x <= 1.01"
   }
 ]

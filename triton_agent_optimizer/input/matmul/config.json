@@ -1,0 +1,60 @@
+{
+  "scenario": {
+    "name": "matmul_small",
+    "description": "C = A @ B^T, small matrices for rapid iteration",
+    "M": 512,
+    "N": 512,
+    "K": 512,
+    "dtype": "float32"
+  },
+  "kernel_config": {
+    "function_name": "matmul_kernel",
+    "op_type": "matmul",
+    "num_warps": 4,
+    "num_stages": 2,
+    "block_params": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "BLOCK_K": 32
+    }
+  },
+  "grid": {
+    "grid_m": "cdiv(M, BLOCK_M) = 8",
+    "grid_n": "cdiv(N, BLOCK_N) = 8",
+    "total_blocks": 64
+  },
+  "optimization_targets": {
+    "tier1_algorithm": {
+      "current": "standard tiled matmul with K-loop",
+      "alternatives": ["split-k", "persistent kernel"]
+    },
+    "tier2_fusion": {
+      "opportunities": ["ReLU", "GELU", "bias_add"],
+      "current_raw_chains": 2
+    },
+    "tier3_tiling": {
+      "current": { "BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32 },
+      "ub_usage_kb_approx": 32,
+      "headroom_kb": 160,
+      "optimal_candidates": [
+        { "BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32 },
+        { "BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 64 },
+        { "BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64 }
+      ]
+    },
+    "tier4_memory": {
+      "current_load_pattern": "row-major A + transposed B",
+      "issues": ["B loads are strided -> needs coalescing optimization"]
+    },
+    "tier5_compute": {
+      "current_dot_dtype": "fp32 accumulator from fp32 inputs",
+      "alternatives": ["fp16 inputs with fp32 accum"]
+    },
+    "tier6_910b3": {
+      "current_grid_blocks": 64,
+      "cores_available": 20,
+      "blocks_per_core": 3.2,
+      "l2_residency_opportunity": true
+    }
+  }
+}

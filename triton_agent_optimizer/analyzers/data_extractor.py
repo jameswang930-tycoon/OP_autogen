@@ -36,6 +36,13 @@ from __future__ import annotations
 from typing import List, Dict, Optional, Set
 from dataclasses import dataclass, field
 
+TBD = "待补充"
+
+def _safe_float(v, default=0.0):
+    if v is None or v == TBD: return default
+    try: return float(v)
+    except (ValueError, TypeError): return default
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Tier 提取配置
@@ -341,7 +348,7 @@ def _filter_ops(ops: list, cp_path: set, cfg: TierExtractConfig) -> list:
         result = [op for op in ops
                   if op.get("engine") in ("VecUnit", "CubeUnit")]
     elif cfg.op_filter == "top10":
-        result = sorted(ops, key=lambda o: o.get("time_ratio", 0), reverse=True)
+        result = sorted(ops, key=lambda o: _safe_float(o.get("time_ratio", 0)), reverse=True)
     else:
         result = list(ops)
 
@@ -438,7 +445,7 @@ def _compute_aggregated(ops: list, cp_path: set, total_ns: float) -> list:
             g["avg_bw_util"] = 0.0
         result.append(g)
 
-    result.sort(key=lambda g: g["total_time_ratio"], reverse=True)
+    result.sort(key=lambda g: _safe_float(g.get("total_time_ratio", 0)), reverse=True)
     return result
 
 

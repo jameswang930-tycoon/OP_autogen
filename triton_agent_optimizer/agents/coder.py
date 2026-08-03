@@ -85,25 +85,47 @@ def _load_coding_guide() -> str:
         return guide_path.read_text(encoding="utf-8")[:4000]
     return ""
 
-def _build_system_prompt() -> str:
+def _build_system_prompt(plan_text: str = "", tier: int = 1) -> str:
     guide = _load_coding_guide()
-    return f"""You are a precise Triton kernel code modifier for Huawei Ascend 910B3 NPU.
 
-## Coding Guide (MUST FOLLOW)
-{guide}
+    # 加载当前 Tier 的 Playbook
+    playbook = ""
+    tier_files = {
+        1: "playbook_tier1_algorithm.md", 2: "playbook_tier2_fusion.md",
+        3: "playbook_tier3_tiling.md", 4: "playbook_tier4_memory.md",
+        5: "playbook_tier5_compute.md", 6: "playbook_tier6_architecture.md",
+    }
+    pb_path = Path(__file__).resolve().parent.parent / "docx" / tier_files.get(tier, "")
+    if pb_path.exists():
+        playbook = pb_path.read_text(encoding="utf-8")[:2000]
 
-## Rules
-1. Change ONLY what the plan specifies — nothing more, nothing less
-2. **NEVER change function name, parameter count, or parameter order**
-3. Maintain existing code style, indentation, and comments
-4. Output the COMPLETE modified Python file (not just changed lines)
-5. Keep all existing imports and @triton.jit decorator
-6. If the plan says "BLOCK_SIZE: 256 → 8192", change ONLY that one parameter
-7. If previous error is provided, FIX IT while implementing the plan
+    parts = []
+    parts.append("You are a Triton kernel code modifier. Output the COMPLETE modified Python file.")
 
-## Output Format
-Return ONLY the complete modified Python code. No markdown, no explanation, no diff.
-The code must be syntactically valid Python and pass the verifier."""
+    # ★ 注入 CODING_GUIDE + Tier Playbook
+    if guide:
+        parts.append(f"## Coding Guide (MUST READ)\n{guide[:3000]}")
+    if playbook:
+        parts.append(f"## Tier {tier} Optimization Strategy (MUST READ)\n{playbook}")
+
+    parts.append(f"""## CRITICAL: Your output MUST be DIFFERENT from the input code.
+Make at least ONE concrete change from this list:
+- Increase BLOCK_SIZE to next power-of-2 (256→512→1024→2048)
+- Fuse two adjacent simple ops into one expression
+- Eliminate a redundant tl.load (same pointer loaded twice)
+- Reorder operations to reduce intermediate variables
+
+## IRON RULES (violating any = FAILURE)
+1. NEVER put num_warps or num_stages inside @triton.jit() — these do NOT go there
+2. NEVER use @triton.autotune — ONLY plain @triton.jit
+3. NEVER change function name, parameter names, or parameter count
+4. NEVER modify the mathematical formula
+5. NEVER add new imports (no torch, numpy, etc.)
+6. Keep exact indentation and code style
+
+## Output: COMPLETE modified Python code. No markdown, no explanation.""")
+
+    return "\n\n".join(parts)
 
 
 def _build_user_prompt(
@@ -194,6 +216,7 @@ class CoderAgent:
         kernel_code: str,
         plan_text: str = "",
         previous_error: str = "",
+        tier: int = 1,
     ) -> CoderResult:
         """应用优化计划到代码。
 
@@ -208,12 +231,22 @@ class CoderAgent:
 
         # Step 1: 调用 LLM (或 stub)
         if self.use_llm:
-            optimized = self._call_llm(kernel_code, plan_text, previous_error)
+            optimized = self._call_llm(kernel_code, plan_text, previous_error, tier)
         else:
             optimized = self._stub_apply(kernel_code, plan_text)
 
         # Step 2: 清理 LLM 输出
         optimized = self._clean_output(optimized, kernel_code)
+
+        # 如果之前有错误，且这次成功了 (代码不同)，记录解决方案
+        if previous_error and optimized.strip() != kernel_code.strip():
+            try:
+                from memory.codeerror import CodeErrorMemory
+                mem = CodeErrorMemory(os.path.basename(os.getcwd()) or "kernel")
+                mem.record_solution(previous_error[:200],
+                    f"成功修改: {plan_text[:100]}")
+            except Exception:
+                pass
 
         # Step 3: Python 语法检查
         valid, err = _validate_python(optimized)
@@ -225,7 +258,17 @@ class CoderAgent:
                 error_message=err,
             )
 
-        # Step 4: 生成 diff
+        # Step 4: 检查是否实际有变更
+        if self._is_noop_change(optimized, kernel_code):
+            return CoderResult(
+                success=False,
+                optimized_code=kernel_code,
+                diff="",
+                lines_changed=0,
+                error_message="LLM returned code identical to original (no-op)",
+            )
+
+        # Step 5: 生成 diff
         diff = _generate_diff(kernel_code, optimized)
         lines = _count_lines_changed(diff)
 
@@ -241,12 +284,15 @@ class CoderAgent:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _call_llm(self, kernel_code: str, plan_text: str,
-                  previous_error: str) -> str:
-        # 查错误记忆
+                  previous_error: str, tier: int = 1) -> str:
+        # 查错误记忆 + 记录新错误
         if previous_error:
             try:
                 from memory.codeerror import CodeErrorMemory
                 mem = CodeErrorMemory(os.path.basename(os.getcwd()) or "kernel")
+                # 记录本次错误
+                mem.record_error(previous_error[:200])
+                # 检索已知方案
                 known = mem.find_solution(previous_error)
                 cross = mem.search_all(previous_error)
                 all_fixes = [f for f in [known, cross] if f]
@@ -256,14 +302,15 @@ class CoderAgent:
                 pass
 
         import os
-        system = _build_system_prompt()
+        system = _build_system_prompt(plan_text, tier)
         user = _build_user_prompt(plan_text, kernel_code, previous_error)
         deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
         if deepseek_key:
             from openai import OpenAI
             client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com", timeout=60.0)
             resp = client.chat.completions.create(
-                model="deepseek-chat", max_tokens=4096,
+                model="deepseek-v4-flash", max_tokens=4096,
+                extra_body={"thinking": {"type": "disabled"}},
                 messages=[{"role": "system", "content": system},
                           {"role": "user", "content": user}])
             return resp.choices[0].message.content or ""
@@ -305,7 +352,18 @@ class CoderAgent:
         if len(text) < 10:
             return original
 
+        # 如果清理后和原代码一模一样, 说明 LLM 没改
+        if text.strip() == original.strip():
+            return original
+
         return text
+
+    def _is_noop_change(self, optimized: str, original: str) -> bool:
+        """检查是否实际有代码变更 (忽略空白和注释差异)。"""
+        import re
+        def normalize(s):
+            return re.sub(r'\s+', ' ', s).strip()
+        return normalize(optimized) == normalize(original)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

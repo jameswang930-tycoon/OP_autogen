@@ -204,12 +204,28 @@ class HIVMGenerator:
         self.ub_buffers: Dict[str, str] = {}   # TTIR SSA名 → UB buffer名
         self.hivm_lines: List[str] = []
         self.hivm_ops: List[dict] = []          # 结构化 HIVM op 列表
+        self._declared_mlir_values: set = set() # 已声明 SSA 值 (用于检测未声明引用)
+        self._first_ub: str = ""                # 第一个 UB buffer (fallback)
+
+    def _get_fallback_ub(self) -> str:
+        """返回一个已声明的 UB buffer 作为未解析引用的 fallback。"""
+        if self._first_ub:
+            return self._first_ub
+        return "%ub_buf_0"
+
+    def _declare_value(self, val: str):
+        """记录 SSA 值为已声明。"""
+        self._declared_mlir_values.add(val)
+        if val.startswith("%ub_buf_") and not self._first_ub:
+            self._first_ub = val
 
     def generate(self, parsed: dict, kernel_name: str = "triton_kernel") -> str:
         self.alloc_count = 0
         self.ub_buffers = {}
         self.hivm_lines = []
         self.hivm_ops = []
+        self._declared_mlir_values = set()
+        self._first_ub = ""
 
         func_name = parsed["func_name"] or kernel_name
         args = parsed["args"]
@@ -252,6 +268,10 @@ class HIVMGenerator:
             f'func.func @{func_name}_hivm({gm_str}) '
             f'attributes {{hacc.entry, hacc.function_kind = #hacc.function_kind<DEVICE>}} {{'
         )
+
+        # 声明所有函数参数为已知 SSA 值
+        for i, _ in enumerate(gm_args):
+            self._declare_value(f"%arg{i}")
 
         # ── 处理每条 TTIR op ──
         for op in ops:
@@ -322,6 +342,9 @@ class HIVMGenerator:
         parts = [p.strip() for p in args_raw.split(",")]
         val_name = parts[1] if len(parts) > 1 else ""
         ub_buf = self.ub_buffers.get(val_name, val_name)
+        # 如果 val_name 未映射 (如 scalar arith 的产物), 用第一个 UB buffer
+        if ub_buf not in self._declared_mlir_values:
+            ub_buf = self._get_fallback_ub()
 
         # Store 使用最后一个 GM arg (output)
         gm_name = self._gm_args[-1] if self._gm_args else "out"
@@ -364,10 +387,19 @@ class HIVMGenerator:
 
         src_a = self.ub_buffers.get(parts[0], parts[0])
         src_b = self.ub_buffers.get(parts[1], parts[1])
+        # 关键: 只有当 BOTH operands 都是 UB buffer 时才生成 HIVM op。
+        # scalar 操作数 (如 %11, %13) 来自地址计算, 不产生硬件指令。
+        if src_a not in self.ub_buffers.values() or src_b not in self.ub_buffers.values():
+            # scalar-only 操作, 跳过 (不生成 HIVM op)
+            # 但仍然将 result 映射到一个现有 UB buffer, 以便下游引用能解析
+            if result and self._first_ub:
+                self.ub_buffers[result] = self._first_ub
+            return
 
         # alloc result buffer
         buf_out = f"%ub_buf_{self.alloc_count}"
         self.alloc_count += 1
+        self._declare_value(buf_out)
         self.hivm_lines.append(
             f"    {buf_out} = memref.alloc() : "
             f"memref<{total_elements}x{dtype}, #hivm.address_space<ub>>"
@@ -453,6 +485,7 @@ class HIVMGenerator:
 
         buf_out = f"%ub_buf_{self.alloc_count}"
         self.alloc_count += 1
+        self._declare_value(buf_out)
         self.hivm_lines.append(
             f"    {buf_out} = memref.alloc() : "
             f"memref<{total_elements}x{dtype}, #hivm.address_space<ub>>"
@@ -482,6 +515,7 @@ class HIVMGenerator:
         # 规约结果通常只有一个标量或小向量
         buf_out = f"%ub_buf_{self.alloc_count}"
         self.alloc_count += 1
+        self._declare_value(buf_out)
         self.hivm_lines.append(
             f"    {buf_out} = memref.alloc() : memref<1x{dtype}, #hivm.address_space<ub>>"
         )

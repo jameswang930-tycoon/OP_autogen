@@ -30,6 +30,11 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Tuple, Optional
 
+# triton 3.4: 必须在任何 triton import 之前 mock driver (防止 hang)
+from unittest.mock import MagicMock
+import triton.runtime.driver as _trdrv
+_trdrv.active = MagicMock(get_current_target=lambda: ("cuda", 90))
+
 _PROJECT = Path(__file__).resolve().parent
 if str(_PROJECT) not in sys.path:
     sys.path.insert(0, str(_PROJECT))
@@ -77,7 +82,7 @@ def get_kernel_name(kernel_path: Path) -> str:
         idx = list(kernel_path.parts).index("input")
         if idx + 1 < len(kernel_path.parts):
             return kernel_path.parts[idx + 1]
-    stem = kernel_path.stem
+    stem = f"k_{kernel_path.stem}_{os.urandom(4).hex()}"
     if stem.endswith("_kernel"):
         stem = stem[:-7]
     return stem
@@ -90,6 +95,9 @@ def init_output_dir(kernel_path: Path, kernel_name: str) -> Path:
     round0 = kernel_dir / "round0"
     round0.mkdir(exist_ok=True)
     shutil.copy2(kernel_path, round0 / kernel_path.name)
+    # 同时创建 kernel.py (orchestrator 期望这个名字)
+    if kernel_path.name != "kernel.py":
+        shutil.copy2(kernel_path, round0 / "kernel.py")
     tiers = [
         "01_algorithmic_structure", "02_operator_fusion",
         "03_tiling_block_config", "04_memory_access",
@@ -108,20 +116,14 @@ def run_triton_to_hivm(kernel_path: Path, round_dir: Path,
     需要: triton 2.3.1 + LD_PRELOAD stub (WSL2)
     """
     try:
-        from unittest.mock import MagicMock
         os.environ["TRITON_ALWAYS_COMPILE"] = "1"
-        import triton.runtime.driver as _drv
-        _drv._obj = MagicMock(get_current_target=lambda: ("cuda", 90))
-        import triton.compiler.compiler as _comp
-        _comp.CompiledKernel = MagicMock()
-        import triton
-        from triton.compiler import ASTSource
-        from types import SimpleNamespace
+        from triton.backends.compiler import GPUTarget
+        from triton.compiler import ASTSource, compile as triton_compile
 
         # 加载 kernel
         import importlib.util
         spec = importlib.util.spec_from_file_location(
-            kernel_path.stem, str(kernel_path))
+            f"k_{kernel_path.stem}_{os.urandom(4).hex()}", str(kernel_path))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
 
@@ -131,44 +133,54 @@ def run_triton_to_hivm(kernel_path: Path, round_dir: Path,
             return None
 
         # 生成 TTIR — 智能推断签名
-        n_args = len(kernel_fn.arg_names)
         sig = {}
         consts = {}
-        ptr_count = 0
-        for i, name in enumerate(kernel_fn.arg_names):
-            name_upper = name.upper()
-            if "BLOCK_SIZE" in name_upper or name.startswith("BLOCK"):
-                consts[name] = 256
-            elif "EPS" in name_upper or "eps" == name:
+        for name in kernel_fn.arg_names:
+            nu = name.upper()
+            if "BLOCK" in nu or nu.startswith("BLOCK"):
+                # matmul tile 用 64 (256³ 编译太慢), 普通 kernel 用 256
+                is_matmul = any(k.endswith("_M") or k.endswith("_N") or k.endswith("_K")
+                               for k in kernel_fn.arg_names if "BLOCK" in k.upper())
+                consts[name] = 64 if is_matmul else 256
+            elif "DIM" in nu or "HIDDEN" in nu:
+                consts[name] = 4096
+            elif "EPS" in nu or "eps" == name:
                 consts[name] = 1e-5
-            elif name_upper in ("N", "M", "K", "DIM", "LEN", "SIZE", "STRIDE",
-                               "HIDDEN_DIM", "NUM_ELEMENTS"):
-                sig[i] = "i32"
-            elif name_upper.endswith("_PTR") or name_upper.endswith("_ptr") or ptr_count < n_args - 2:
-                sig[i] = "*fp32"
-                ptr_count += 1
+            elif nu.endswith("_PTR") or nu.endswith("_ptr") or name.lower() in (
+                    "x_ptr", "y_ptr", "a_ptr", "b_ptr", "c_ptr", "out_ptr",
+                    "weight_ptr", "residual_ptr"):
+                sig[name] = "*fp32"
             else:
-                sig[i] = "i32"  # 默认标量
+                sig[name] = "i32"
 
-        # 确保至少一个 i32 参数或者全是 ptr
-        if not any(v == "i32" for v in sig.values()) and len(consts) == 0:
-            # 最后一个非 const 参数设为 i32
-            last_idx = n_args - 1
-            while last_idx >= 0 and last_idx in consts:
-                last_idx -= 1
-            if last_idx >= 0:
-                sig[last_idx] = "i32"
-
-        src = ASTSource(fn=kernel_fn, signature=sig, constants=consts)
-        opts = SimpleNamespace(num_warps=4, num_stages=1, debug=False)
-        ttir_module = src.make_ir(opts)
-        ttir_text = str(ttir_module)
+        src = ASTSource(fn=kernel_fn, signature=sig, constexprs=consts)
+        target = GPUTarget("cuda", 90, 32)
+        result = triton_compile(src, target=target,
+                               options={"num_warps": 4, "num_stages": 1, "debug": False})
+        ttir_text = str(result.asm["ttir"])
         print(f"  TTIR: {len(ttir_text)} chars")
 
         # TTIR → HIVM
         from analyzers.ttir_to_hivm import ttir_to_hivm
         hivm_text, hivm_ops = ttir_to_hivm(ttir_text, kernel_fn_name)
         print(f"  HIVM: {len(hivm_ops)} ops")
+
+        # 保存 kernel 配置信息
+        import json
+        config_info = {
+            "kernel_name": kernel_fn_name,
+            "arg_names": kernel_fn.arg_names,
+            "constexprs": consts,
+            "signature": sig,
+            "num_warps": 4,
+            "num_stages": 1,
+            "dtype": "fp32",
+            "total_elements": "N (dynamic)",
+        }
+        config_dir = round_dir / "hivmir"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "kernel_config.json").write_text(
+            json.dumps(config_info, indent=2, ensure_ascii=False), encoding="utf-8")
 
         # 保存
         hivm_dir = round_dir / "hivmir" / "compiler_output"
@@ -211,8 +223,7 @@ def run_analyzers(round_dir: Path, tier: int = 1) -> Optional[dict]:
     ma = MsprofAnalyzer()
     msprof_dict = {}
     opprof_dir = ma.find_latest_opprof(round_dir / "msprof")
-    if not opprof_dir:
-        opprof_dir = ma.find_latest_opprof(Path("/home/hjkc2/msprof_out2"))
+    # msprof data already copied to round0/msprof/ by main() above
     if opprof_dir and opprof_dir.exists():
         mr = ma.parse_existing(opprof_dir)
         msprof_dict = ma.to_dict(mr)

@@ -326,7 +326,7 @@ def _aggregate_by_type(ops: list, cp_ops: set, total_ns: float) -> list:
             g["avg_bw_util"] = sum(g["bw_utils"]) / len(g["bw_utils"])
         result.append(g)
 
-    result.sort(key=lambda g: g["total_time_ratio"], reverse=True)
+    result.sort(key=lambda g: float(g.get("total_time_ratio", 0) or 0), reverse=True)
     return result
 
 

@@ -31,6 +31,13 @@ if str(_PROJECT_DIR) not in sys.path:
 
 TBD = "待补充"
 
+def _safe_float(v, default=0.0):
+    """安全转 float, TBD 字符串返回 default"""
+    if v is None or v == TBD:
+        return default
+    try: return float(v)
+    except (ValueError, TypeError): return default
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  硬件参数 (从华为 Ascend 910B3 官方文档, CANN 9.0 + msprof 仿真验证)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -246,9 +253,10 @@ def merge(
         },
         "time_breakdown": sorted(
             [{"op_id": op["op_id"], "op_type": op["op_type"], "engine": op.get("engine", "?"),
-              "duration_ns": op.get("duration_ns", 0), "time_ratio": op.get("time_ratio", 0)}
+              "duration_ns": _safe_float(op.get("duration_ns", 0)),
+              "time_ratio": _safe_float(op.get("time_ratio", 0))}
              for op in merged_ops],
-            key=lambda x: x.get("time_ratio", 0) or 0, reverse=True,
+            key=lambda x: _safe_float(x.get("time_ratio", 0)), reverse=True,
         ),
         "per_op_statistics": merged_ops,
         "engine_utilization": engine_util,

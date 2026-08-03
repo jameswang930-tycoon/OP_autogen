@@ -1,1 +1,79 @@
-[]
+[
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "adjust_grid_count",
+    "speedup": 1.0726,
+    "status": "SUCCESS",
+    "description": "Tier 6: adjust_grid_count",
+    "timestamp": "2026-07-31T11:18:21.074065"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "adjust_grid_count",
+    "speedup": 0.9615,
+    "status": "FAIL",
+    "description": "Tier 6: adjust_grid_count",
+    "timestamp": "2026-07-31T11:36:05.118739",
+    "decision_reason": "Verification failed: Failed shapes: [\"N=1: rms_norm_kernel() missing 3 required positional arguments: 'N', 'BLOCK_SIZE', "
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "adjust_grid_count",
+    "speedup": 0.8755,
+    "status": "FAIL",
+    "description": "Tier 6: adjust_grid_count",
+    "timestamp": "2026-07-31T11:43:50.979279",
+    "decision_reason": "Verification failed: Failed shapes: [\"N=1: rms_norm_kernel() missing 3 required positional arguments: 'N', 'BLOCK_SIZE', "
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "l2_residency",
+    "speedup": 0.9651,
+    "status": "FAIL",
+    "description": "Tier 6: l2_residency",
+    "timestamp": "2026-07-31T15:10:07.560460",
+    "decision_reason": "Speedup 0.965x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "halve_tile_size_to_1X_BLOCK_SIZE",
+    "speedup": 0.9718,
+    "status": "FAIL",
+    "description": "Tier 6: halve_tile_size_to_1X_BLOCK_SIZE",
+    "timestamp": "2026-07-31T17:44:48.071571",
+    "decision_reason": "Speedup 0.972x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "broadcast_mask_precomputation",
+    "speedup": 0.9744,
+    "status": "FAIL",
+    "description": "Tier 6: broadcast_mask_precomputation",
+    "timestamp": "2026-07-31T17:56:16.830037",
+    "decision_reason": "Speedup 0.974x <= 1.01"
+  }
+]

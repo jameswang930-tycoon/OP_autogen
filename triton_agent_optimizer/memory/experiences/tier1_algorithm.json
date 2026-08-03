@@ -191,5 +191,57 @@
     "status": "SUCCESS",
     "description": "Tier 1: fuse_softmax_gelu",
     "timestamp": "2026-07-30T14:07:11.971237"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "reduce_redundant_gm_loads",
+    "speedup": 0.9713,
+    "status": "FAIL",
+    "description": "Tier 1: reduce_redundant_gm_loads",
+    "timestamp": "2026-07-31T17:48:59.706846",
+    "decision_reason": "Speedup 0.971x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "matmul_4gmload_to_2gmload_fusion",
+    "speedup": 0.9722,
+    "status": "FAIL",
+    "description": "Tier 1: matmul_4gmload_to_2gmload_fusion",
+    "timestamp": "2026-07-31T17:50:42.998377",
+    "decision_reason": "Speedup 0.972x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "merge_identical_loads",
+    "speedup": 0.9599,
+    "status": "FAIL",
+    "description": "Tier 1: merge_identical_loads",
+    "timestamp": "2026-07-31T17:52:00.725419",
+    "decision_reason": "Speedup 0.960x <= 1.01"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "matmul_pointer_pred_fusion",
+    "speedup": 0.961,
+    "status": "FAIL",
+    "description": "Tier 1: matmul_pointer_pred_fusion",
+    "timestamp": "2026-07-31T17:53:25.797514",
+    "decision_reason": "Speedup 0.961x <= 1.01"
   }
 ]

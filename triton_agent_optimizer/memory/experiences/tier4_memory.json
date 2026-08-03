@@ -24,5 +24,31 @@
     "description": "Tier 4: merge_small_transfers",
     "timestamp": "2026-07-30T11:19:12.038877",
     "decision_reason": "Verification failed: Cannot import kernel: 'softmax_kernel' not found in kernel.py. Found: ['tl', 'softmax_gelu_fused_ker"
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "merge_small_transfers",
+    "speedup": 0.959,
+    "status": "FAIL",
+    "description": "Tier 4: merge_small_transfers",
+    "timestamp": "2026-07-31T10:54:01.329090",
+    "decision_reason": "Verification failed: Failed shapes: [\"N=1: fused_add_mul_kernel() missing 1 required positional argument: 'BLOCK_SIZE'\", "
+  },
+  {
+    "fingerprint": {
+      "op_type": "gm_to_ub",
+      "bottleneck_type": "memory_bandwidth",
+      "engine": "GM→UB"
+    },
+    "strategy": "fuse_pointer_advance_into_load",
+    "speedup": 0.9594,
+    "status": "FAIL",
+    "description": "Tier 4: fuse_pointer_advance_into_load",
+    "timestamp": "2026-07-31T17:55:24.182089",
+    "decision_reason": "Speedup 0.959x <= 1.01"
   }
 ]

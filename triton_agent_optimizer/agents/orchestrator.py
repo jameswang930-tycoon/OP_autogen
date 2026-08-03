@@ -131,21 +131,32 @@ class Orchestrator:
         self.current_kernel = self.kernel_path.read_text(encoding="utf-8")
         self.best_kernel = self.current_kernel
 
-        # ① 运行完整分析链
+        # ① 先生成 HIVM
+        print(f"  [0a] Generating HIVM from original kernel...")
+        kernel_py = rd / "kernel.py"
+        if not kernel_py.exists():
+            # main.py 复制的是 triton_kernel.py
+            alt = rd / "triton_kernel.py"
+            if alt.exists():
+                kernel_py = alt
+        self._run_triton_to_hivm_pipeline(
+            kernel_py,
+            rd / "hivmir" / "compiler_output" / "hivmir_output.mlir")
+
+        # ② ★ 跑 msprof 获取本 kernel 的真实 baseline ★
+        print(f"  [0b] Running msprof for REAL baseline trace...")
+        msprof_ok = self._per_round_msprof_pipeline(rd)
+        if not msprof_ok:
+            print(f"  [0b] WARN: msprof baseline failed")
+
+        # ③ 用真实 trace 做完整分析
         merged, diag, extracted = self._run_analyzers(rd)
 
-        # 记录 baseline total_ns 和最佳
         self._baseline_total_ns = merged.get("execution_summary", {}).get("total_ns", 0) if merged else 0
         self.best_speedup = 1.0
         self.best_total_ns = self._baseline_total_ns
 
-        # PyTorch CPU 基准测试
-        pytorch_us = self._benchmark_pytorch()
-        if pytorch_us > 0 and self._baseline_total_ns > 0:
-            merged["execution_summary"]["pytorch_baseline_us"] = round(pytorch_us, 2)
-            merged["execution_summary"]["pytorch_speedup"] = round(pytorch_us * 1000 / self._baseline_total_ns, 2)
-
-        # ② 初始化 trajectory baseline
+        # 初始化 trajectory
         self.record_mgr.init_baseline(merged or {}, diag, str(self.kernel_path))
         ops_count = merged.get("execution_summary", {}).get("num_ops", 0) if merged else 0
         has_timing = merged.get("meta", {}).get("has_msprof_timing", False) if merged else False
@@ -216,52 +227,112 @@ class Orchestrator:
         (rd / "kernel.py").write_text(coder_r.optimized_code, encoding="utf-8")
         (rd / "diff.patch").write_text(coder_r.diff, encoding="utf-8")
 
-        # 更新 current_kernel (不管 KEEP/REVERT，先保存)
+        # Coder 改了 0 行 → 重试一次，要求更强地执行计划
+        if coder_r.lines_changed == 0:
+            print(f"  [③ Coder] WARNING: 0 lines changed! Retrying with stronger prompt...")
+            stronger_plan = plan.plan_text + (
+                "\n\n## ⚠️ CRITICAL: Previous attempt changed 0 lines!\n"
+                "The previous Coder attempt returned the ORIGINAL code unchanged.\n"
+                "You MUST make the code change specified in the plan above.\n"
+                "The code MUST be DIFFERENT from the original. Modify at least 1 line.")
+            coder_r = self._call_coder(self.current_kernel, plan, prev_err="Previous attempt: 0 lines changed")
+            print(f"  [③ Coder] Retry: → {coder_r.lines_changed} lines changed")
+            if coder_r.lines_changed == 0:
+                print(f"  [③ Coder] FAILED: Still 0 lines after retry → REVERT")
+                self.current_kernel = self.best_kernel or self.current_kernel
+                from agents.verifier import VerifyResult
+                vr = VerifyResult(stage1_passed=True, overall_passed=False,
+                                stage1_error_details="Coder produced no change (0 lines)")
+                from agents.coder import CoderResult
+                cr = CoderResult(success=False, optimized_code=self.current_kernel,
+                               diff="", lines_changed=0,
+                               error_message="Coder could not modify kernel")
+                return self.record_mgr.evaluate(vr, plan, cr, rd, diag)
+            (rd / "kernel.py").write_text(coder_r.optimized_code, encoding="utf-8")
+            (rd / "diff.patch").write_text(coder_r.diff, encoding="utf-8")
+
+        # 更新 current_kernel
         self.current_kernel = coder_r.optimized_code
-        # ★ 重新生成 HIVM (基于 Coder 改后的代码)
+
+        # ──── 3b: 重新生成 HIVM (基于 Coder 改后的代码) ────
         print(f"  [3b] Regenerating HIVM from optimized code...")
-        self._run_triton_to_hivm_pipeline(
-            rd / "kernel.py",
-            rd / "hivmir" / "compiler_output" / "hivmir_output.mlir")
+        try:
+            self._run_triton_to_hivm_pipeline(
+                rd / "kernel.py",
+                rd / "hivmir" / "compiler_output" / "hivmir_output.mlir")
+        except Exception as e:
+            print(f"  [3b] ERROR: HIVM regeneration failed: {str(e)[:150]}")
+            print(f"  [3b] → Coder broke the kernel. Reverting.")
+            self.current_kernel = self.best_kernel or self.current_kernel
+            from agents.verifier import VerifyResult
+            vr = VerifyResult(stage1_passed=False,
+                            stage1_error_details=f"Coder broke kernel: {str(e)[:200]}",
+                            overall_passed=False)
+            from agents.coder import CoderResult
+            cr = CoderResult(success=False, optimized_code=self.current_kernel,
+                           diff="", error_message=f"triton compilation failed: {str(e)[:200]}")
+            return self.record_mgr.evaluate(vr, plan, cr, rd, diag)
+
+        # ──── 3c: ★ 每轮强制 msprof 重采 (HIVM→AscendC→compile→msprof simulator) ★ ────
+        print(f"  [3c] MSprof re-collect: HIVM→AscendC→compile→msprof simulator...")
+        msprof_success = self._per_round_msprof_pipeline(rd)
+        if not msprof_success:
+            print(f"  [3c] ERROR: Per-round msprof pipeline FAILED!")
+            print(f"  [3c] Cannot calculate speedup without per-round trace data.")
+            # 回退 kernel，本轮不记录
+            self.current_kernel = self.best_kernel or self.current_kernel
+            from agents.verifier import VerifyResult
+            vr = VerifyResult(stage1_passed=True,
+                            stage1_error_details="msprof re-collect failed",
+                            overall_passed=False)
+            from agents.coder import CoderResult
+            cr = CoderResult(success=False, optimized_code=self.current_kernel,
+                           diff="", error_message="per-round msprof pipeline failed")
+            return self.record_mgr.evaluate(vr, plan, cr, rd, diag)
+
+        # ──── 重新运行 Analyzer (使用新 trace) ────
         new_merged, _, _ = self._run_analyzers(rd)
 
-        # Speedup: 对比本轮最佳 ns
-        prev_ns = self.best_total_ns or self._baseline_total_ns or 1484.0
-        new_ns = self._estimate_total_ns(rd)
-        round_speedup = prev_ns / new_ns if new_ns > 0 else 1.0
-        abs_speedup = (self._baseline_total_ns or 1484.0) / new_ns if new_ns > 0 else 1.0
+        # Speedup: 从新 merged report 取真实 total_ns
+        if not self._baseline_total_ns or self._baseline_total_ns <= 0:
+            print(f"  [3c] ERROR: No baseline total_ns available!")
+            self.current_kernel = self.best_kernel or self.current_kernel
+            from agents.verifier import VerifyResult
+            vr = VerifyResult(stage1_passed=True,
+                            stage1_error_details="no baseline total_ns",
+                            overall_passed=False)
+            from agents.coder import CoderResult
+            cr = CoderResult(success=False, optimized_code=self.current_kernel,
+                           diff="", error_message="no baseline total_ns")
+            return self.record_mgr.evaluate(vr, plan, cr, rd, diag)
 
-        # 每轮 msprof 重采 (HIVM→AscendC→compile→simulator)
-        try:
-            from analyzers.hivm_to_ascendc import generate_and_build, run_msprof
-            print(f"  [3c] MSprof re-collect: AscendC + msprof...")
-            hivm_ops_f = rd / "hivmir" / "hivm_ops.json"
-            if hivm_ops_f.exists():
-                ops_data = json.loads(hivm_ops_f.read_text(encoding="utf-8"))
-                exe = generate_and_build(self._kernel_fn_name, ops_data, rd, 256, "f32")
-                if exe and exe.exists():
-                    new_trace = run_msprof(exe, rd)
-                    if new_trace:
-                        print(f"  [3c] MSprof: new trace -> {new_trace}")
-                        self.msprof_dir = new_trace
-                        new_merged, _, _ = self._run_analyzers(rd)
-        except Exception as e:
-            print(f"  [3c] MSprof: skipped ({e})")
-        # ④ Verifier: Stage1 CPU
-        from agents.verifier import VerifierAgent, VerifyResult
-        v = VerifierAgent()
-        vr = v.verify(rd / "kernel.py", rd, kernel_fn_name=self._kernel_fn_name, op_type=self._op_type)
+        prev_ns = self.best_total_ns or self._baseline_total_ns
+        new_ns = self._estimate_total_ns(rd)
+        round_speedup = prev_ns / new_ns if (new_ns > 0 and prev_ns > 0) else 1.0
+        abs_speedup = self._baseline_total_ns / new_ns if (new_ns > 0 and self._baseline_total_ns > 0) else 1.0
+
+        # 验证 trace 是否与 baseline 不同 (msprof 重采是否真的产生了新数据)
+        if new_ns == self._baseline_total_ns:
+            print(f"  [3c] WARNING: new_ns == baseline_ns ({new_ns:.0f}ns) — trace may not have been regenerated!")
+        # ④ Verifier: Stage1 CPU — 失败则回传 Coder 修复重试 (同轮内, 最多5次)
+        vr, retry_count = self._verify_with_retry(
+            coder_r.optimized_code, self.best_kernel or self.current_kernel, plan, rd)
+        if retry_count > 0:
+            print(f"  [4 Verifier] Fixed after {retry_count} Coder retries")
 
         # 设置 speedup 给 RecordManager
         vr.stage2_actual_speedup = round_speedup
         print(f"  [4 Verifier] Stage1: {'PASS' if vr.stage1_passed else 'FAIL'}, msprof: {prev_ns:.0f}ns -> {new_ns:.0f}ns, round: {round_speedup:.3f}x, abs: {abs_speedup:.3f}x")
 
-        # 追踪最佳方案
-        if abs_speedup > self.best_speedup:
+        # 追踪最佳方案 — Stage1 必须 PASS 才接受
+        if vr.stage1_passed and abs_speedup > self.best_speedup:
             self.best_speedup = abs_speedup
             self.best_kernel = coder_r.optimized_code
             self.best_total_ns = new_ns
             print(f"  [5] NEW BEST: abs={abs_speedup:.3f}x, round={round_speedup:.3f}x ({new_ns:.0f}ns)")
+        elif not vr.stage1_passed:
+            print(f"  [5] Emulator FAIL → reverting to previous best")
+            self.current_kernel = self.best_kernel or self.current_kernel
         elif round_speedup < 1.0 and new_ns > prev_ns:
             print(f"  [5] Round degraded ({round_speedup:.3f}x) -> reverting to previous best")
             self.current_kernel = self.best_kernel
@@ -341,15 +412,15 @@ class Orchestrator:
         print(f"  [Step 3/5] Parsing msprof trace...")
         ma = MsprofAnalyzer()
         msprof_dict = {}
-        # 优先: self.msprof_dir (用户指定的 OPPROF 目录)
-        # 次选: 当前 round 下的 msprof/
-        # 最后: round0/msprof/
+        # Round 0: 从用户指定或 round0/msprof/ 找
+        # Round N: ★ 只从当前轮找，不回退到 round0 ★
         opprof_dir = None
         if self.msprof_dir and Path(self.msprof_dir).exists():
             opprof_dir = Path(self.msprof_dir)
         if not opprof_dir or not opprof_dir.exists():
             opprof_dir = ma.find_latest_opprof(rd / "msprof")
-        if not opprof_dir:
+        if not opprof_dir and next_rd_name == "round0":
+            # 仅 round0 允许用 kernel_dir 级别 fallback
             opprof_dir = ma.find_latest_opprof(self.kernel_dir / "round0" / "msprof")
         if opprof_dir and opprof_dir.exists():
             mr = ma.parse_existing(opprof_dir)
@@ -433,39 +504,101 @@ class Orchestrator:
             return 0.0
 
     def _estimate_total_ns(self, rd: Path) -> float:
-        """从当前 round 的 merged report 估算总延迟。"""
+        """从当前 round 的 merged report 估算总延迟。
+
+        预期 merged report 来自 per-round msprof trace，包含真实 timing 数据。
+        如果 merged report 不存在或无 timing 数据，返回 0 (调用者会报错)。
+        """
         merged_file = rd / "merged" / "merged_report.json"
         if not merged_file.exists():
-            return self._baseline_total_ns or 1484.0
+            # 尝试从 execution_summary 获取
+            return self._baseline_total_ns or 0.0
         import json
         merged = json.loads(merged_file.read_text(encoding="utf-8"))
+        # 优先使用 execution_summary 中的 total_ns
+        summary = merged.get("execution_summary", {})
+        summary_ns = summary.get("total_ns", 0)
+        if isinstance(summary_ns, (int, float)) and summary_ns > 0:
+            return float(summary_ns)
+        # Fallback: 从 per_op_statistics 累加
         ops = merged.get("per_op_statistics", [])
-        if not ops:
-            return self._baseline_total_ns or 1484.0
         total = 0.0
         for op in ops:
             d = op.get("duration_ns", 0)
             if isinstance(d, (int, float)) and d > 0:
                 total += float(d)
-        return total if total > 0 else (self._baseline_total_ns or 1484.0)
+        if total > 0:
+            return total
+        return self._baseline_total_ns or 0.0
+
+    def _per_round_msprof_pipeline(self, rd: Path) -> bool:
+        """★ 每轮强制 msprof 重采 — 完整链路 ★
+
+        Triton kernel.py → HIVM ops → AscendC .asc + host.cpp
+        → CMake+bisheng compile → executable
+        → msprof op simulator → OPPROF_xxx/ (新 trace 数据)
+
+        每轮必须成功。失败返回 False，不允许绕路或使用旧数据。
+        """
+        from analyzers.hivm_to_ascendc import generate_and_build, run_msprof
+
+        # Step 1: 读取当前 kernel 的 HIVM ops
+        hivm_ops_f = rd / "hivmir" / "hivm_ops.json"
+        if not hivm_ops_f.exists():
+            print(f"  [3c] ERROR: No HIVM ops at {hivm_ops_f}")
+            print(f"  [3c] → Run _run_triton_to_hivm_pipeline() first!")
+            return False
+
+        try:
+            ops_data = json.loads(hivm_ops_f.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"  [3c] ERROR: Failed to parse HIVM ops: {e}")
+            return False
+
+        if not ops_data:
+            print(f"  [3c] ERROR: Empty HIVM ops list")
+            return False
+
+        print(f"  [3c] HIVM ops: {len(ops_data)}, types: {[o.get('op_type','?') for o in ops_data[:5]]}...")
+
+        # Step 2: AscendC 代码生成 + CMake 编译
+        print(f"  [3c] Generating AscendC + compiling...")
+        exe = generate_and_build(self._kernel_fn_name, ops_data, rd, 256, "f32")
+        if not exe or not exe.exists():
+            print(f"  [3c] ERROR: Build failed — no executable produced")
+            return False
+
+        # Step 3: msprof op simulator
+        print(f"  [3c] Running msprof op simulator...")
+        new_trace = run_msprof(exe, rd)
+        if not new_trace:
+            print(f"  [3c] ERROR: msprof simulator produced no trace data")
+            return False
+
+        # Step 4: 验证 trace 包含预期文件
+        csv_files = list(new_trace.glob("**/*instr_exe.csv"))
+        json_files = list(new_trace.glob("**/trace.json"))
+        if not csv_files:
+            print(f"  [3c] ERROR: No instr_exe.csv found in {new_trace}")
+            return False
+
+        print(f"  [3c] MSprof OK: {len(csv_files)} instr_exe.csv, {len(json_files)} trace.json")
+        print(f"  [3c] New trace: {new_trace}")
+
+        # Step 5: 更新 msprof_dir 指向新 trace (后续 _run_analyzers 会读)
+        self.msprof_dir = new_trace
+        return True
 
     def _run_triton_to_hivm_pipeline(self, kernel_py: Path, output_mlir: Path):
         """从 kernel.py 运行完整 Triton→TTIR→HIVM 流水线, 保存 HIVM MLIR。"""
         from analyzers.ttir_to_hivm import ttir_to_hivm
         import os, importlib.util
-        from unittest.mock import MagicMock
-
         os.environ.setdefault("TRITON_ALWAYS_COMPILE", "1")
-
+        from unittest.mock import MagicMock
         import triton.runtime.driver as _drv
-        if not hasattr(_drv, '_patched'):
-            _drv._obj = MagicMock(get_current_target=lambda: ("cuda", 90))
-            _drv._patched = True
-        import triton.compiler.compiler as _comp
-        _comp.CompiledKernel = MagicMock()
-        import triton
-        from triton.compiler import ASTSource
-        from types import SimpleNamespace
+        _drv.active = MagicMock(get_current_target=lambda: ("cuda", 90))
+        from triton.backends.compiler import GPUTarget
+        from triton.compiler import ASTSource, compile as triton_compile
 
         spec = importlib.util.spec_from_file_location(
             f"k_{kernel_py.stem}", str(kernel_py))
@@ -473,7 +606,6 @@ class Orchestrator:
         spec.loader.exec_module(mod)
 
         kernel_fn = None
-        # 优先用指定的 kernel 名
         if self._kernel_fn_name:
             obj = getattr(mod, self._kernel_fn_name, None)
             if obj and hasattr(obj, "fn"):
@@ -483,27 +615,48 @@ class Orchestrator:
                 obj = getattr(mod, name)
                 if hasattr(obj, "fn") and hasattr(obj, "arg_names"):
                     kernel_fn = obj; break
-
         if not kernel_fn:
             raise ValueError(f"No @triton.jit function in {kernel_py}")
 
-        n_args = len(kernel_fn.arg_names)
         sig, consts = {}, {}
-        for i, n in enumerate(kernel_fn.arg_names):
-            nu = n.upper()
-            if "BLOCK" in nu: consts[n] = 256
-            elif nu in ("N","M","K","DIM","LEN"): sig[i] = "i32"
-            elif i == n_args - 1 and not consts: sig[i] = "i32"
-            else: sig[i] = "*fp32"
+        for nm in kernel_fn.arg_names:
+            nu = nm.upper()
+            if "BLOCK" in nu:
+                is_matmul = any(k.endswith("_M") or k.endswith("_N") or k.endswith("_K")
+                               for k in kernel_fn.arg_names if "BLOCK" in k.upper())
+                consts[nm] = 64 if is_matmul else 256
+            elif "DIM" in nu or "HIDDEN" in nu:
+                consts[nm] = 4096
+            elif nu.endswith("_PTR") or nu.endswith("_ptr") or nm.lower() in (
+                    "x_ptr", "y_ptr", "a_ptr", "b_ptr", "c_ptr", "out_ptr",
+                    "weight_ptr", "residual_ptr"):
+                sig[nm] = "*fp32"
+            else:
+                sig[nm] = "i32"
 
-        src = ASTSource(fn=kernel_fn, signature=sig, constants=consts)
-        opts = SimpleNamespace(num_warps=4, num_stages=1, debug=False)
-        ttir_text = str(src.make_ir(opts))
+        src = ASTSource(fn=kernel_fn, signature=sig, constexprs=consts)
+        target = GPUTarget("cuda", 90, 32)
+        result = triton_compile(src, target=target,
+                               options={"num_warps": 4, "num_stages": 1, "debug": False})
+        ttir_text = str(result.asm["ttir"])
 
-        hivm_text, hivm_ops = ttir_to_hivm(ttir_text, kernel_fn.arg_names[0])
+        hivm_text, hivm_ops = ttir_to_hivm(ttir_text, self._kernel_fn_name or kernel_fn.__name__)
 
         output_mlir.parent.mkdir(parents=True, exist_ok=True)
         output_mlir.write_text(hivm_text, encoding="utf-8")
+
+        # 保存 kernel 配置
+        import json as _json
+        config = {
+            "kernel_name": self._kernel_fn_name or (kernel_fn.__name__ if hasattr(kernel_fn, '__name__') else "kernel"),
+            "arg_names": kernel_fn.arg_names,
+            "constexprs": consts,
+            "num_warps": 4, "num_stages": 1,
+            "dtype": "fp32",
+        }
+        (output_mlir.parent / "kernel_config.json").write_text(
+            _json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+
         print(f"    → {len(hivm_ops)} HIVM ops from {len(ttir_text)} chars TTIR")
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -523,7 +676,8 @@ class Orchestrator:
         """调用 Coder. 铁律: 只改 kernel.py, 不改任何其他文件。"""
         if self._has_api:
             from agents.coder import CoderAgent
-            return CoderAgent().apply(code, plan.plan_text, prev_err)
+            tier = self.record_mgr.get_tier()
+            return CoderAgent().apply(code, plan.plan_text, prev_err, tier=tier)
         return self._wait_for_code_file(code, plan, prev_err)
 
     def _verify_with_retry(self, opt_code, orig_code, plan, rd):

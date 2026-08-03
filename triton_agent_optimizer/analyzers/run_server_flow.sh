@@ -168,7 +168,8 @@ else
   rm -rf "$TASK_OUT"
   mkdir -p "$TASK_OUT"
   # 先试全指标 (才出 main_mem/ub/l1/l2 带宽 + L2 + fops); env 前置传给 msprof 启动的 python
-  TASK_AIC_FLAGS="${TASK_AIC_FLAGS:---aic-mode=task-based --task-time=l1 --aic-metrics=PipeUtilization,ArithmeticUtilization,Memory,MemoryL0,MemoryUB,L2Cache,ResourceConflictRatio}"
+  # 注意: --task-time 取值是 on/off (不是 l1!); --aic-metrics 需 --ai-core=on 前提
+  TASK_AIC_FLAGS="${TASK_AIC_FLAGS:---task-time=on --ai-core=on --aic-mode=task-based --aic-metrics=PipeUtilization,ArithmeticUtilization,Memory,MemoryL0,MemoryUB,L2Cache,ResourceConflictRatio}"
   MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof --output="$TASK_OUT" \
     --application="$PY test_matmul.py" $TASK_AIC_FLAGS \
     > "$OUT/05_task/task_run.txt" 2>&1
@@ -186,7 +187,16 @@ else
     [ "$OPSUM" -gt 0 ] && echo "  (注: 基础模式无带宽/L2 字段, 需 TASK_AIC_FLAGS 全指标)"
   fi
   if [ "$OPSUM" -gt 0 ]; then pass "op_summary_*.csv x$OPSUM ✓ (真机每op指标)"; \
-  else fail "仍无 op_summary → 看 05_task/task_run.txt (若手动跑 msprof 能出, 贴回该日志我查)"; fi
+  else
+    echo "  ❌ 仍无 op_summary → 诊断:"
+    echo "    --- 05_task 实际目录树 (前 40) ---"
+    find "$OUT/05_task" -maxdepth 5 2>/dev/null | head -40
+    echo "    --- task_run.txt 末尾 20 行 ---"
+    tail -20 "$OUT/05_task/task_run.txt" 2>/dev/null
+    echo "    --- msprof 有效 flags (aic/task/metrics) ---"
+    msprof --help 2>&1 | grep -iE 'aic|task-time|metric' | head -15
+    fail "无 op_summary (上面诊断贴回给我, 即可定位)"
+  fi
 fi
 
 # ═══════════════════════ 阶段 6/6: 4 源解析 + 整合诊断 ═══════════════════════

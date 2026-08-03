@@ -42,6 +42,8 @@ import triton.language as tl
 from triton_kernel import matmul_kernel
 
 # ---------- 配置 (与 input/matmul/config.json 对齐) ----------
+# 注意: 不传 num_warps/num_stages — triton-ascend 后端自动管理 tiling/流水,
+#       传了会报 "please do not tune args ['num_warps','num_stages']"
 M, N, K = 512, 512, 512
 BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
 DTYPE = torch.float32
@@ -68,7 +70,7 @@ def main():
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=4, num_stages=2,
+        # ⚠️ 不要传 num_warps/num_stages: triton-ascend 禁止 tune 这两个参数
     )
     torch.npu.synchronize()
     print("[info] kernel launched & synced OK")

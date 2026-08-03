@@ -113,87 +113,109 @@ kernel: 同目录 triton_kernel.py 的 matmul_kernel (C = A @ B, 512x512x512)
         grep -n 'memref.alloc'  hivm_try.txt | head          # buffer: size+region+dtype
         grep -E 'hivm.hir.matmul|hivm.hir.load' hivm_try.txt | head   # 指令样例
 
-    产物自动核验 (标准字段匹配 → PASS/ERROR; 保密服务器专用, 只输出判定+短字段名):
-        依据 = 网上核实的 Ascend910B3 标准 (triton-ascend 3.2.0 / msopprof / msprof op):
-            - instr_exe.csv 表头: instr,addr,pipe,call_count,cycles,running_time(us),detail
-            - OpBasicInfo 关键列: Op Name / Op Type / Task Duration(us) / Block Dim
-            - PipeUtilization 关键列: aic_cube_time / aiv_vec_time / aic_mte1~3_time
-                                      / aic_total_cycles / aiv_total_cycles
-            - address_space 映射: cbuf=L1, ca=L0A, cb=L0B, cc=L0C, ub=UB, gm=GM
-            - cube op 家族: mix_matmul / mmadL1 / batchMmadL1 (matmul=0 疑点在这三个里)
-            - sync op: hivm.set_flag / wait_flag / pipe_barrier / sync_block
-        规则: 匹配 → 只打 PASS; 不匹配 → ERROR + 实际字段名 (无原始 IR 内容)。
-             全部无反斜杠写法, 可直接复制到服务器跑。
+    # 产物自动核验 (标准字段匹配 → PASS/ERROR; 保密服务器专用, 只输出判定+短字段名):
+        # 依据 = 网上核实的 Ascend910B3 标准 (triton-ascend 3.2.0 / msopprof / msprof op):
+        #   - instr_exe.csv 表头: instr,addr,pipe,call_count,cycles,running_time(us),detail
+        #   - OpBasicInfo 关键列: Op Name / Op Type / Task Duration(us) / Block Dim
+        #   - PipeUtilization 关键列: aic_cube_time / aiv_vec_time / aic_mte1~3_time
+        #                             / aic_total_cycles / aiv_total_cycles
+        #   - address_space 映射: cbuf=L1, ca=L0A, cb=L0B, cc=L0C, ub=UB, gm=GM
+        #   - cube op 家族: mix_matmul / mmadL1 / batchMmadL1
+        #   - sync op: set_flag / wait_flag / pipe_barrier / sync_block (hivm. 或 hivm.hir. 前缀都兼容)
+        # 规则: 匹配 → 只打 PASS + 短名; 不匹配 → ERROR + 实际字段名。
+        #       所有非命令行都以 # 开头 (整体粘贴到 bash 不会 syntax error), 无反斜杠。
 
         # ── 第 1 组: HIVM 结构 (hivm_try.txt) ─────────────────────────────
-        [1] hivm.hir op 分布 + cube op 判定:
-            grep -oE 'hivm.hir.[a-z_]+' hivm_try.txt | sort | uniq -c   # 先看分布
-            cube=$(grep -oE 'hivm.hir.(mix_matmul|mmadL1|batchMmadL1|matmul)' hivm_try.txt | sort | uniq -c)
-            [ -n "$cube" ] && echo "[1] PASS $cube" || echo "[1] ERROR 无已知cube op, 看上面分布"
-        [2] sync op 分布 (预期 hivm.set_flag/wait_flag/pipe_barrier/sync_block):
-            sync=$(grep -oE 'hivm.(set_flag|wait_flag|pipe_barrier|sync_block)' hivm_try.txt | sort | uniq -c)
-            [ -n "$sync" ] && echo "[2] PASS $sync" || echo "[2] ERROR 无 sync op"
-        [3] matmul/mmad 家族关键词 (cube op 在不在, 叫什么):
-            m=$(grep -oE '(mix_matmul|mmadL1|batchMmadL1|matmul|mmad|tl.dot)' hivm_try.txt | sort | uniq -c)
-            [ -n "$m" ] && echo "[3] PASS $m" || echo "[3] ERROR 无任何 cube/矩阵关键词"
-        [4] 2D alloc 数 (matmul 必有 2D memref, size_kb 靠它算):
-            n2d=$(grep -oE 'memref<[0-9]+x[0-9]+x[a-z0-9]+' hivm_try.txt | wc -l)
-            [ "$n2d" -gt 0 ] && echo "[4] PASS 2D_alloc=$n2d" || echo "[4] ERROR 无 2D alloc"
-        [5] address_space 白名单校验 (合法值 ub/cbuf/ca/cb/cc/gm):
-            bad=$(grep -oE '#hivm.address_space<[a-z0-9_]+>' hivm_try.txt | sort -u | grep -vE '^(ub|cbuf|ca|cb|cc|gm)$')
-            [ -z "$bad" ] && echo "[5] PASS" || echo "[5] ERROR 未知值=$bad"
-        [6] sync op 分隔符语法 (op 名后是 [ 还是 { 还是 ():
-            syn=$(grep -oE 'hivm.(set_flag|wait_flag|pipe_barrier|sync_block)[^a-z_]*' hivm_try.txt | sort | uniq -c)
-            [ -n "$syn" ] && echo "[6] PASS $syn" || echo "[6] ERROR 无 sync"
+        # [1] hivm.hir op 分布 + cube op 判定 (PASS 时把 cube= 后的名字读回):
+        grep -oE 'hivm.hir.[a-z_]+' hivm_try.txt | sort | uniq -c   # 先看分布
+        cube=$(grep -oE 'hivm.hir.(mix_matmul|mmadL1|batchMmadL1|matmul)' hivm_try.txt | sort | uniq -c)
+        [ -n "$cube" ] && echo "[1] PASS cube=$cube" || echo "[1] ERROR 无已知cube op, 看上面分布"
+
+        # [2] sync op 分布 (hivm. 和 hivm.hir. 两种前缀都匹配):
+        sync=$(grep -oE 'hivm.hir.(set_flag|wait_flag|pipe_barrier|sync_block)|hivm.(set_flag|wait_flag|pipe_barrier|sync_block)' hivm_try.txt | sort | uniq -c)
+        [ -n "$sync" ] && echo "[2] PASS $sync" || echo "[2] ERROR 无 sync op"
+
+        # [3] matmul/mmad 家族关键词 (cube op 在不在, 叫什么):
+        m=$(grep -oE '(mix_matmul|mmadL1|batchMmadL1|matmul|mmad|tl.dot)' hivm_try.txt | sort | uniq -c)
+        [ -n "$m" ] && echo "[3] PASS $m" || echo "[3] ERROR 无任何 cube/矩阵关键词"
+
+        # [4] 2D alloc 数 (matmul 必有 2D memref, size_kb 靠它算):
+        n2d=$(grep -oE 'memref<[0-9]+x[0-9]+x[a-z0-9]+' hivm_try.txt | wc -l)
+        [ "$n2d" -gt 0 ] && echo "[4] PASS 2D_alloc=$n2d" || echo "[4] ERROR 无 2D alloc"
+
+        # [5] address_space 白名单 (匹配整个 #hivm.address_space<值> 外壳):
+        bad=$(grep -oE '#hivm.address_space<[a-z0-9_]+>' hivm_try.txt | sort -u | grep -vE '^#hivm.address_space<(ub|cbuf|ca|cb|cc|gm)>$')
+        [ -z "$bad" ] && echo "[5] PASS" || echo "[5] ERROR 未知值=$bad"
+
+        # [6] sync op 语法 (前缀 + 分隔符是 [ 还是 { 还是 ():
+        syn=$(grep -oE '(hivm.hir.)?(set_flag|wait_flag|pipe_barrier|sync_block)[^a-z_]*' hivm_try.txt | sort | uniq -c)
+        [ -n "$syn" ] && echo "[6] PASS $syn" || echo "[6] ERROR 无 sync"
 
         # ── 第 2 组: simulator 指令级 (sim_prof) ───────────────────────────
-        [7] cubecore 核目录数:
-            n=$(ls sim_prof/OPPROF_*/simulator/core*.cubecore* 2>/dev/null | wc -l)
-            [ "$n" -gt 0 ] && echo "[7] PASS cubecore_dir=$n" || echo "[7] ERROR 无 cubecore 目录"
-        [8] cubecore/veccore instr_exe 数量:
-            nc=$(ls sim_prof/OPPROF_*/simulator/core*.cubecore*/*instr_exe.csv 2>/dev/null | wc -l)
-            nv=$(ls sim_prof/OPPROF_*/simulator/core*.veccore*/*instr_exe.csv 2>/dev/null | wc -l)
-            [ "$nc" -gt 0 ] && echo "[8] PASS cubecore=$nc veccore=$nv" || echo "[8] ERROR cubecore=$nc veccore=$nv"
-        [9] ★instr_exe 表头 (预期含 instr,addr,pipe,call_count,cycles,running_time,detail):
-            f=$(ls sim_prof/OPPROF_*/simulator/core*.cubecore*/*instr_exe.csv 2>/dev/null | head -1)
-            hdr=$(head -1 "$f" 2>/dev/null)
-            ok=1
-            for k in instr addr pipe call_count cycles running_time detail; do
-              echo "$hdr" | grep -q "$k" || { ok=0; echo "[9] 缺字段=$k"; }
-            done
-            [ "$ok" -eq 1 ] && echo "[9] PASS" || echo "[9] ERROR 实际表头=$hdr"
-        [10] instr_exe 总行数:
-            n=$(cat sim_prof/OPPROF_*/simulator/core*.cubecore*/*instr_exe.csv 2>/dev/null | wc -l)
-            [ "$n" -gt 0 ] && echo "[10] PASS 指令行=$n" || echo "[10] ERROR 0 行"
-        [11] trace.json:
-            t=$(ls sim_prof/OPPROF_*/simulator/trace.json 2>/dev/null | wc -l)
-            [ "$t" -gt 0 ] && echo "[11] PASS" || echo "[11] ERROR 无 trace.json"
-        [12] instr_exe pipe 分布 (第3列, 预期含 CUBE/VECTOR/MTE1/MTE2/MTE3):
-            p=$(cut -d',' -f3 sim_prof/OPPROF_*/simulator/core*.cubecore*/*instr_exe.csv 2>/dev/null | sort | uniq -c)
-            echo "$p"
-            echo "$p" | grep -qiE 'cube|vector|mte' && echo "[12] PASS" || echo "[12] ERROR 无计算/搬运 pipe"
+        # [7] cubecore 核目录数:
+        n=$(ls sim_prof/OPPROF_*/simulator/core*.cubecore* 2>/dev/null | wc -l)
+        [ "$n" -gt 0 ] && echo "[7] PASS cubecore_dir=$n" || echo "[7] ERROR 无 cubecore 目录"
+
+        # [8] cubecore/veccore instr_exe 数量:
+        nc=$(ls sim_prof/OPPROF_*/simulator/core*.cubecore*/*instr_exe.csv 2>/dev/null | wc -l)
+        nv=$(ls sim_prof/OPPROF_*/simulator/core*.veccore*/*instr_exe.csv 2>/dev/null | wc -l)
+        [ "$nc" -gt 0 ] && echo "[8] PASS cubecore=$nc veccore=$nv" || echo "[8] ERROR cubecore=$nc veccore=$nv"
+
+        # [9] instr_exe 表头 (预期含 instr,addr,pipe,call_count,cycles,running_time,detail):
+        f=$(ls sim_prof/OPPROF_*/simulator/core*.cubecore*/*instr_exe.csv 2>/dev/null | head -1)
+        hdr=$(head -1 "$f" 2>/dev/null)
+        ok=1
+        for k in instr addr pipe call_count cycles running_time detail; do
+          echo "$hdr" | grep -q "$k" || { ok=0; echo "[9] 缺字段=$k"; }
+        done
+        [ "$ok" -eq 1 ] && echo "[9] PASS" || echo "[9] ERROR 实际表头=$hdr"
+
+        # [10] instr_exe 总行数:
+        n=$(cat sim_prof/OPPROF_*/simulator/core*.cubecore*/*instr_exe.csv 2>/dev/null | wc -l)
+        [ "$n" -gt 0 ] && echo "[10] PASS 指令行=$n" || echo "[10] ERROR 0 行"
+
+        # [11] trace.json:
+        t=$(ls sim_prof/OPPROF_*/simulator/trace.json 2>/dev/null | wc -l)
+        [ "$t" -gt 0 ] && echo "[11] PASS" || echo "[11] ERROR 无 trace.json"
+
+        # [12] instr_exe pipe 分布 (第3列, 预期含 CUBE/VECTOR/MTE1/MTE2/MTE3):
+        p=$(cut -d',' -f3 sim_prof/OPPROF_*/simulator/core*.cubecore*/*instr_exe.csv 2>/dev/null | sort | uniq -c)
+        echo "$p"
+        echo "$p" | grep -qiE 'cube|vector|mte' && echo "[12] PASS" || echo "[12] ERROR 无计算/搬运 pipe"
 
         # ── 第 3 组: 真机 msprof op 校准 (board_prof, 补 peak_bw/L2) ──────
-        [13] OpBasicInfo.csv 表头 (预期含 Op Name/Op Type/Task Duration/Block Dim):
-            hdr=$(head -1 board_prof/OPPROF_*/OpBasicInfo.csv 2>/dev/null)
-            ok=1
-            for k in 'Op Name' 'Op Type' 'Task Duration' 'Block Dim'; do
-              echo "$hdr" | grep -q "$k" || { ok=0; echo "[13] 缺字段=$k"; }
-            done
-            [ "$ok" -eq 1 ] && echo "[13] PASS" || echo "[13] ERROR 实际表头=$hdr"
-        [14] PipeUtilization.csv 表头 (预期含 aic_cube_time/aiv_vec_time/mte1~3/aic_total_cycles):
-            hdr=$(head -1 board_prof/OPPROF_*/PipeUtilization.csv 2>/dev/null)
-            ok=1
-            for k in aic_time aiv_time aic_cube_time aiv_vec_time aic_mte1_time aic_mte2_time aic_mte3_time aic_total_cycles aiv_total_cycles; do
-              echo "$hdr" | grep -q "$k" || { ok=0; echo "[14] 缺字段=$k"; }
-            done
-            [ "$ok" -eq 1 ] && echo "[14] PASS" || echo "[14] ERROR 实际表头=$hdr"
-        [15] Memory 系列 csv (peak_bw 校准):
-            m=$(ls board_prof/OPPROF_*/Memory*.csv 2>/dev/null | wc -l)
-            [ "$m" -gt 0 ] && echo "[15] PASS Memory_csv=$m" || echo "[15] ERROR 无 Memory csv"
+        # [13] OpBasicInfo.csv 表头 (预期含 Op Name/Op Type/Task Duration/Block Dim):
+        hdr=$(head -1 board_prof/OPPROF_*/OpBasicInfo.csv 2>/dev/null)
+        ok=1
+        for k in 'Op Name' 'Op Type' 'Task Duration' 'Block Dim'; do
+          echo "$hdr" | grep -q "$k" || { ok=0; echo "[13] 缺字段=$k"; }
+        done
+        [ "$ok" -eq 1 ] && echo "[13] PASS" || echo "[13] ERROR 实际表头=$hdr"
 
-        汇总: 全 PASS → 数据齐, 按标准字段直接修 analyzer; 有 ERROR → 把该编号的
-        ERROR 行 (只含字段名) 贴回, 按实际字段调命令/解析器。
+        # [14] PipeUtilization.csv 表头 (预期含 aic_cube_time/aiv_vec_time/mte1~3/aic_total_cycles):
+        hdr=$(head -1 board_prof/OPPROF_*/PipeUtilization.csv 2>/dev/null)
+        ok=1
+        for k in aic_time aiv_time aic_cube_time aiv_vec_time aic_mte1_time aic_mte2_time aic_mte3_time aic_total_cycles aiv_total_cycles; do
+          echo "$hdr" | grep -q "$k" || { ok=0; echo "[14] 缺字段=$k"; }
+        done
+        [ "$ok" -eq 1 ] && echo "[14] PASS" || echo "[14] ERROR 实际表头=$hdr"
+
+        # [15] Memory 系列 csv (peak_bw 校准):
+        m=$(ls board_prof/OPPROF_*/Memory*.csv 2>/dev/null | wc -l)
+        [ "$m" -gt 0 ] && echo "[15] PASS Memory_csv=$m" || echo "[15] ERROR 无 Memory csv"
+
+        # [16] 文件里大量 ? 的判据 (MLIR 合法 ? vs 编码问题):
+        file hivm_try.txt
+        echo -n "字面?总数: "; grep -oF '?' hivm_try.txt | wc -l
+        echo -n "?紧贴数字: "; grep -oE '[0-9][?]|[?][0-9]' hivm_try.txt | wc -l
+        echo -n "动态维<?x: "; grep -oF '<?x' hivm_try.txt | wc -l
+        echo -n "memref形状分布: "; grep -oE 'memref<[0-9?x]+[a-z0-9]+' hivm_try.txt | sort | uniq -c
+        # 判定: file=ASCII 且 ?紧贴数字=0 → 问号是 MLIR 合法占位(动态维), 数字完好
+        #       file=ASCII 且 动态维<?x>0 → memref 动态维, analyzer 需加 ? 分支
+        #       file 非 ASCII → 查看器/编码问题, 数字实际在文件里
+
+        # 汇总: 全 PASS → 数据齐, 按标准字段直接修 analyzer; 有 ERROR → 把该编号的
+        # ERROR 行 (只含字段名) 贴回, 按实际字段调命令/解析器。
 
     真实格式 = hivmir_analyzer 的 Format A, 样例:
         %alloc = memref.alloc() : memref<256x256xf32, #hivm.address_space<ub>>

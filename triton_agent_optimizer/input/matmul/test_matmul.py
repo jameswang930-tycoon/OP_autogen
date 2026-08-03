@@ -112,6 +112,21 @@ kernel: 同目录 triton_kernel.py 的 matmul_kernel (C = A @ B, 512x512x512)
         grep -c 'hivm.hir' hivm_try.txt                      # 指令总数, 应 > 0
         grep -n 'memref.alloc'  hivm_try.txt | head          # buffer: size+region+dtype
         grep -E 'hivm.hir.matmul|hivm.hir.load' hivm_try.txt | head   # 指令样例
+
+    产物自检 (只输出数字/短清单 — 保密服务器不能贴回内容时, 跑这个读数字报回):
+        echo "== HIVM 结构 =="
+        echo -n "hivm.hir 指令数: "; grep -oE 'hivm.hir.[a-z_]+' hivm_try.txt | wc -l
+        echo -n "sync op 数: "; grep -oE '(set_flag|wait_flag|pipe_barrier|sync_block)' hivm_try.txt | wc -l
+        echo -n "2D alloc 数: "; grep -oE 'memref<[0-9]+x[0-9]+x[a-z0-9]+' hivm_try.txt | wc -l
+        echo -n "matmul 数: "; grep -c 'hivm.hir.matmul' hivm_try.txt
+        echo "address_space 值: "; grep -oE '#hivm.address_space<[a-z0-9_]+>' hivm_try.txt | sort -u
+        echo "== simulator 产物 =="
+        ls sim_prof/OPPROF_*/simulator/ 2>/dev/null
+        echo -n "cubecore instr_exe 数: "; ls sim_prof/OPPROF_*/simulator/core*.cubecore*/*instr_exe.csv 2>/dev/null | wc -l
+        echo -n "trace.json: "; ls sim_prof/OPPROF_*/simulator/trace.json 2>/dev/null | wc -l
+        # 判定: sync op 数>0 (同步证据在文件里) + 2D alloc 数>0 (matmul size_kb 能算)
+        #       + cubecore instr_exe ≥1 (simulator 指令级数据到位) → 数据齐, 可报数字回
+
     真实格式 = hivmir_analyzer 的 Format A, 样例:
         %alloc = memref.alloc() : memref<256x256xf32, #hivm.address_space<ub>>
         hivm.hir.load ins(%arg0 : memref<...>) outs(%alloc : memref<...>)

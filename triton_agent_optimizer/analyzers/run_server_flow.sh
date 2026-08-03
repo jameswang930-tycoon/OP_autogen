@@ -16,19 +16,40 @@
 #  每个阶段跑完自动检查产物 → 打 ✅/❌; 末尾打印「检查清单」汇总全部 PASS/FAIL。
 #  任何阶段失败不中断后续 (清单里看哪步没过, 单独重跑该阶段)。
 #
+#  ★ 路径解析 = 完全基于仓库结构 (不依赖服务器绝对位置):
+#      脚本在 <仓库根>/analyzers/, 用例/产物在 <仓库根>/input/matmul/,
+#      输出在 <仓库根>/input/matmul/e2e_run/。
+#      同一仓库克隆到任何路径都能跑, 从任何目录调用均可 (BASH_SOURCE 解析)。
+#      运行时会打印解析出的 仓库根/用例目录/输出目录, 先核对再继续。
+#      仓库结构不对 (缺 test_matmul.py / run_all.sh) 会第一时间报错退出。
+#
+#  尺寸: 默认 64³ (simulator 指令级仿真, 大尺寸会极慢/卡)。
+#       test_matmul.py 支持 MATMUL_M/N/K 环境变量覆盖 (本脚本自动传)。
+#
 #  前置: 脚本会尝试激活 conda triton-npu + set_env.sh; 失败就手动激活后再跑。
 #  环境变量可调:
-#    SIM_TIMEOUT=秒     simulator 超时 (默认 1800 = 30分钟, 64³ 通常几十秒内)
-#    SKIP_SIM=1         跳过 simulator (不想等)
-#    SKIP_BOARD=1       跳过真机
+#    SIM_TIMEOUT=秒        simulator 超时 (默认 1800 = 30分钟, 64³ 通常几十秒内)
+#    SKIP_SIM=1            跳过 simulator (不想等)
+#    SKIP_BOARD=1          跳过真机
+#    BOARD_METRICS=...     真机 msprof op 指标 (默认全指标出 cube占比+带宽;
+#                          若失败降级: BOARD_METRICS=PipeUtilization,ResourceConflictRatio)
+#  字段解析依据: analyzers/PIPELINE_FIELDS.md (字段来源/用途) + PIPELINE_README.md
 # ═══════════════════════════════════════════════════════════════════════════════
 set -u
 
 M=${1:-64}; N=${2:-64}; K=${3:-64}
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MATMUL_DIR="$(cd "$SCRIPT_DIR/../input/matmul" && pwd)"
-OUT="$MATMUL_DIR/e2e_run"
+
+# ── 路径全部基于仓库结构解析 (不依赖服务器绝对位置, 任何目录可跑) ──
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"      # 仓库根/analyzers
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"                       # 仓库根
+MATMUL_DIR="$REPO_ROOT/input/matmul"                            # 产物/用例目录
+OUT="$MATMUL_DIR/e2e_run"                                       # 采集输出目录
+RUN_ALL="$SCRIPT_DIR/run_all.sh"
 SIM_TIMEOUT=${SIM_TIMEOUT:-1800}
+
+# 守卫: 仓库结构必须含 input/matmul (test_matmul.py) 和 analyzers/run_all.sh
+[ -f "$MATMUL_DIR/test_matmul.py" ] || { echo "❌ 找不到 $MATMUL_DIR/test_matmul.py — 仓库结构不对, 请在正确仓库下运行"; exit 1; }
+[ -f "$RUN_ALL" ] || { echo "❌ 找不到 $RUN_ALL — 脚本应与 run_all.sh 同目录"; exit 1; }
 
 if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
 
@@ -38,7 +59,10 @@ fail(){ echo "  ❌ $1"; FAIL=$((FAIL+1)); }
 
 # ── 环境 ──
 echo "══════ 环境 ══════"
-echo "M=$M N=$N K=$K  输出=$OUT"
+echo "M=$M N=$N K=$K"
+echo "仓库根     = $REPO_ROOT   (脚本在: $SCRIPT_DIR)"
+echo "用例/产物  = $MATMUL_DIR  (test_matmul.py + e2e_run/)"
+echo "输出目录   = $OUT"
 mkdir -p "$OUT"/01_compile "$OUT"/02_hivm "$OUT"/03_sim "$OUT"/04_board "$OUT"/05_merged
 if command -v conda >/dev/null 2>&1; then
   CONDA_BASE=$(conda info --base 2>/dev/null || echo "")

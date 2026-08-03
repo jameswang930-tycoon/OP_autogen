@@ -168,3 +168,60 @@ class NgaBackend:
 
     def choose_lever(self, prompt: str) -> str:
         return self._run(prompt, self.choose_lever_cfg)
+
+
+# ---------------- AgentBackend (V2-P5.1, claude-code-like agent subprocess) ----------------
+
+class AgentBackend:
+    """类 claude-code agent：单次命令行调用会按 skill 的 description 隐式触发 skill。
+
+    与 NgaBackend 接口一致（generate/choose_lever 返回 str），但内部调 agent 子进程，
+    让它自主 lazy-load extension-guide 等 skill——orchestrator 给精简任务描述即可，不必
+    把全量 extension index 塞进 prompt（V2-P5）。
+
+    配置全部走 config/env，公开分支不硬编码真实 agent 命令行；真实 agent CLI 格式、模型名、
+    variant、skill 目录路径由保密环境适配（P5.4）。runner 可注入，便于公开分支 mock 验证。
+
+    环境变量：``AGENT_CMD``（命令前缀，空格分隔；缺省 ``agent``）/ ``AGENT_GENERATE_MODEL``
+    / ``AGENT_CHOOSE_LEVER_MODEL`` / ``AGENT_TIMEOUT_S``。
+    """
+
+    def __init__(self, config: Optional[dict] = None, *, runner: Callable = _default_runner):
+        cfg = config or {}
+        cmd = cfg.get("cmd")
+        if cmd is None:
+            cmd_env = os.environ.get("AGENT_CMD")
+            cmd = cmd_env.split() if cmd_env else ["agent"]
+        self.cmd = list(cmd)
+        sec_gen = cfg.get("generate", {}) or {}
+        sec_lev = cfg.get("choose_lever", {}) or {}
+        self.generate_model = sec_gen.get("model") or os.environ.get("AGENT_GENERATE_MODEL")
+        self.choose_lever_model = sec_lev.get("model") or os.environ.get("AGENT_CHOOSE_LEVER_MODEL")
+        self.timeout_s = float(cfg.get("timeout_s", os.environ.get("AGENT_TIMEOUT_S", 600)))
+        self.runner = runner
+        self.last_model_echo: Optional[str] = None
+        self.call_count = 0
+
+    def _run(self, prompt: str, model: Optional[str]) -> str:
+        # 命令前缀 + (可选)模型 + prompt。真实 agent 的 flag/顺序由环境侧 AGENT_CMD 适配。
+        cmd = list(self.cmd)
+        if model:
+            cmd += ["--model", model]
+        cmd.append(prompt)
+        try:
+            result = self.runner(cmd, timeout=self.timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            raise LLMTimeout(f"agent timed out after {self.timeout_s}s") from exc
+        self.call_count += 1
+        if result.returncode != 0:
+            raise LLMInvocationError(
+                f"agent exited {result.returncode}: {(result.stderr or '').strip()}"
+            )
+        self.last_model_echo = _parse_model_echo(result.stdout or "")
+        return result.stdout or ""
+
+    def generate(self, prompt: str) -> str:
+        return self._run(prompt, self.generate_model)
+
+    def choose_lever(self, prompt: str) -> str:
+        return self._run(prompt, self.choose_lever_model)

@@ -17,6 +17,15 @@ DEFAULT_REFS = (
     Path(__file__).resolve().parent.parent
     / ".claude" / "skills" / "extension-guide" / "references"
 )
+# V2-P5.3：extension 原语按场景拆到 ext-* skill，校验需遍历多个 references 目录。
+SKILLS_DIR = DEFAULT_REFS.parent.parent
+
+
+def all_references_dirs() -> list[Path]:
+    """extension-guide/references + ext-*/references（按场景拆分后多目录）。"""
+    dirs = [DEFAULT_REFS]
+    dirs += sorted(p for p in SKILLS_DIR.glob("ext-*/references") if p.is_dir())
+    return dirs
 
 
 def validate_entry(entry: dict, source: str) -> list[str]:
@@ -34,13 +43,13 @@ def validate_entry(entry: dict, source: str) -> list[str]:
 
 
 def main(refs_dir: str | Path | None = None) -> int:
-    refs = Path(refs_dir) if refs_dir else DEFAULT_REFS
-    if not refs.is_dir():
-        print(f"FAIL: references dir not found: {refs}")
-        return 1
-    files = sorted([*refs.glob("*.yaml"), *refs.glob("*.yml")])
+    refs_dirs = [Path(refs_dir)] if refs_dir else all_references_dirs()
+    files: list[Path] = []
+    for refs in refs_dirs:
+        if refs.is_dir():
+            files.extend(sorted([*refs.glob("*.yaml"), *refs.glob("*.yml")]))
     if not files:
-        print(f"FAIL: no YAML entries under {refs}")
+        print(f"FAIL: no YAML entries under {refs_dirs}")
         return 1
     problems: list[str] = []
     for f in files:

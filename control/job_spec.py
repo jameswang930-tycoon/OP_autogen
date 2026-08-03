@@ -20,6 +20,7 @@ class Budget:
     presim_retries: int = 2    # 未过静态闸门重试，不计入轮数
     sim_retries: int = 3       # 仿真设施故障退避重试，不计入轮数
     compile_retries: int = 3   # 编译失败重试（T13-3），不计入轮数；耗尽 -> BUDGET_COMPILE
+    lever_retries: int = 3     # choose_lever 超时/失败重试，不计入轮数；耗尽 -> 回退 vocabulary lever（V2-P1）
     exploration: str = "mild"  # 多候选杠杆的探索偏好（T13-5 渠道⑥）：off|mild|aggressive
 
     @classmethod
@@ -32,6 +33,7 @@ class Budget:
             presim_retries=int(d.get("presim_retries", 2)),
             sim_retries=int(d.get("sim_retries", 3)),
             compile_retries=int(d.get("compile_retries", 3)),
+            lever_retries=int(d.get("lever_retries", 3)),
             exploration=str(d.get("exploration", "mild")),
         )
 

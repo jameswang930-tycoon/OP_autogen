@@ -15,6 +15,7 @@ LLM 调用点全流程仅两个：
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -30,6 +31,7 @@ from .contracts import SimResult, Verdict
 from .feedback_adapter import adapt as _default_adapt
 from .feedback_adapter import parse_raw as _default_parse_raw
 from .job_spec import Budget, NormalizedJob
+from .llm_backend import LLMInvocationError, LLMTimeout
 from .launch_template import (
     build_sim_result, launch as _default_launch,
     RemoteConnectionError, RemoteTimeout, RemoteScriptError, ResultNotFound, ResultMismatch,
@@ -212,24 +214,33 @@ def _allowed_extensions() -> set[str]:
     return {e["name"] for e in _load_extension_entries()}
 
 
-def _scene_applies(entry: dict, op_kind: Optional[str]) -> bool:
-    """applies_to 缺省视为通用（不据此隐藏原语）；给出则要求 op_kind 命中。"""
+def _scene_applies(entry: dict, op_kind, *, strict: bool = False) -> bool:
+    """applies_to 缺省视为通用；给出则要求 op_kind 命中。
+
+    strict=True（choose_lever 候选池，V2-P2）：applies_to 缺省的原语**不进候选**——
+    "要 LLM 选一个去用"的候选池宁可漏（漏标的选不到）也不能错（漏标专用原语被误选，
+    如 img2col 归 memory 类却卷积专用、softmax 混进 reduce_sum）。index 展示仍宽松
+    （strict=False，信息多点无害）。"""
     scenes = entry.get("applies_to") or []
-    return op_kind in scenes if scenes else True
+    if scenes:
+        return op_kind in scenes
+    return not strict
 
 
-def _relevant_entries(op_kind: Optional[str], bottleneck: Optional[str]) -> list[dict]:
+def _relevant_entries(op_kind: Optional[str], bottleneck: Optional[str], *,
+                      strict: bool = False) -> list[dict]:
     """按 (算子场景, 瓶颈) 检索相关原语子集（GLM52 第二部分"按场景检索"）。
 
     - bottleneck 给定：取该类别原语，再用 applies_to 过滤不适用的（如 img2col 不进 elementwise）。
     - bottleneck 缺省(round1)：取所有 applies_to 命中当前算子的原语（不限类别）。
+    strict=True 时 applies_to 缺省的原语不进结果（choose_lever 候选池严格，见 _scene_applies）。
     读的还是 EXT_REFS 下同一份 index，契约不变；只是"读哪些"变智能。
     """
     entries = _load_extension_entries()
     if bottleneck is not None:
         return [e for e in entries
-                if e["category"] == bottleneck and _scene_applies(e, op_kind)]
-    return [e for e in entries if _scene_applies(e, op_kind)]
+                if e["category"] == bottleneck and _scene_applies(e, op_kind, strict=strict)]
+    return [e for e in entries if _scene_applies(e, op_kind, strict=strict)]
 
 
 def _index_line(entry: dict) -> str:
@@ -237,6 +248,21 @@ def _index_line(entry: dict) -> str:
     qname = f'{entry["module"]}.{entry["name"]}' if entry.get("module") else entry["name"]
     scenes = entry.get("applies_to") or []
     return f"{qname} [applies_to: {','.join(scenes)}]" if scenes else qname
+
+
+def _agent_gen_mode() -> bool:
+    """V2-P5.2：agent 模式下 gen prompt 不塞全量 extension index、只给场景提示——原语靠
+    agent 触发 extension-guide skill lazy-load（哑后端 nga 模式仍塞全量 index）。env 开关。"""
+    return os.environ.get("GEN_PROMPT_MODE", "").lower() == "agent"
+
+
+def _gen_extension_index(op_kind: Optional[str], bottleneck: Optional[str]) -> str:
+    """gen prompt 的 EXTENSION_INDEX 内容：agent 模式给场景提示、nga 模式给按场景检索的子集。"""
+    if _agent_gen_mode():
+        bn = bottleneck or "(首轮未知)"
+        return (f"(agent 模式：不在此塞全量 index) 当前算子 {op_kind}、瓶颈 {bn}；"
+                f"按需查 extension-guide skill 获取该场景原语并 lazy-load。")
+    return extension_index_text(op_kind, bottleneck)
 
 
 def extension_index_text(op_kind: Optional[str] = None,
@@ -600,7 +626,7 @@ class Orchestrator:
     def _resolve_lever(self, verdict: Optional[Verdict], t=None) -> tuple[Optional[str], Optional[str]]:
         if verdict is None:
             return None, None
-        cands = [e["name"] for e in _relevant_entries(self.job.op, verdict.bottleneck)]
+        cands = [e["name"] for e in _relevant_entries(self.job.op, verdict.bottleneck, strict=True)]
         if not cands:
             # no primitive for this category: vanilla lever from the vocabulary
             return vocabulary.lever_for(verdict.bottleneck), None
@@ -614,11 +640,39 @@ class Orchestrator:
         )
         if t is not None:
             t.write("01b_prompt_lever.txt", prompt)
-        resp = self.llm.choose_lever(prompt)
+        # V2-P1：choose_lever 超时/失败按 lever_retries 重试（不计轮数）；耗尽则回退 vocabulary lever，
+        # 不让一次 nga 子进程超时炸掉整个 run。
+        resp = None
+        for _ in range(max(1, self.job.budget.lever_retries)):
+            try:
+                resp = self.llm.choose_lever(prompt)
+                break
+            except (LLMTimeout, LLMInvocationError):
+                continue
+        if resp is None:
+            if t is not None:
+                t.write("02b_lever_fallback.txt",
+                        "choose_lever retries exhausted -> vocabulary lever")
+            return vocabulary.lever_for(verdict.bottleneck), None
         if t is not None:
             t.write("02b_response_lever.txt", resp)
         chosen = parse_lever_response(resp, cands)
         return chosen, chosen
+
+    def _avoided_primitives(self) -> set[str]:
+        """V2-P4 职责③：曾导致失败的 extension 原语黑名单。
+
+        信号 (helped==0 and failed>0)：推荐该原语的经验在场时从未通过、且失败过——
+        提示生成侧避开（schema 字段 helped/failed/extension_used 都已存在，无需扩 schema）。
+        """
+        if self.store is None:
+            return set()
+        avoid: set[str] = set()
+        for exp in self.store.all():
+            eu = getattr(exp, "extension_used", None)
+            if eu and getattr(exp, "helped", 0) == 0 and getattr(exp, "failed", 0) > 0:
+                avoid.add(eu)
+        return avoid
 
     def _evidence_by_primitive(self, candidates: list[str]) -> dict:
         """每个候选原语的历史使用次数（来自经验库 extension_used）。无 store 则空。"""
@@ -642,13 +696,22 @@ class Orchestrator:
         kernel_src: Optional[str] = None
         meta: dict = {}
         while True:
+            # V2-P4 职责②：迭代基准用 best-so-far kernel（有则用，无则原始 baseline）——不再每轮
+            # 都从原始 baseline 重生成，浪费 best-so-far。
+            iter_basis = self._best[2] if self._best is not None else self.job.baseline_src
+            # V2-P4 职责③：避坑清单——历史失败过的 extension 原语，提示 LLM 避开。
+            avoid = self._avoided_primitives()
+            retrieved_aug = retrieved_experience or ""
+            if avoid:
+                retrieved_aug = (retrieved_aug + "\n" if retrieved_aug else "") + \
+                    "避免以下曾导致失败的原语/用法（除非有确切正确用法）：" + ", ".join(sorted(avoid))
             prompt = build_gen_prompt(
                 self.job,
-                baseline_src=self.job.baseline_src,
+                baseline_src=iter_basis,
                 verdict_json=verdict_json,
                 feedback_summary=feedback_summary,
-                retrieved_experience=retrieved_experience,
-                extension_index=extension_index_text(self.job.op, bottleneck),
+                retrieved_experience=retrieved_aug or None,
+                extension_index=_gen_extension_index(self.job.op, bottleneck),
                 compile_error=compile_error,
             )
             resp = self.llm.generate(prompt)

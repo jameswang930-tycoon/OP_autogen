@@ -1,11 +1,12 @@
-"""T8 gate: 三个 SKILL.md 正文（sim-analyze / triton-gen / extension-guide）。
+"""T8 gate: SKILL.md 正文——核心三个（sim-analyze / triton-gen / extension-guide）
++ V2-P5.3 五个按场景拆分的 ext-* skill（ext-reduction/activation/matmul/shape/quant）。
 
 Structural checks (plan §3 T8). NOTE: whether a description cross-triggers is a
 human judgment (manual review at stop-point ②); here we only assert structure.
   - frontmatter valid, name == dir
   - no $ARGUMENTS leftover, body English (no CJK), < 500 lines
   - every backtick path in the body exists in the repo
-  - exactly the 3 skills present
+  - exactly the expected skills present
   - descriptions are pairwise distinct
   - extension cheatsheet validator runs green on the sample entry
 """
@@ -17,7 +18,8 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILLS = REPO_ROOT / ".claude" / "skills"
-EXPECTED = ["sim-analyze", "triton-gen", "extension-guide"]
+EXPECTED = ["sim-analyze", "triton-gen", "extension-guide",
+            "ext-reduction", "ext-activation", "ext-matmul", "ext-shape", "ext-quant"]
 
 
 def _parse(skill: str):

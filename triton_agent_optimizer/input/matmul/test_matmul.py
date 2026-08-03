@@ -10,23 +10,52 @@ kernel: 同目录 triton_kernel.py 的 matmul_kernel (C = A @ B, 512x512x512)
     conda activate triton-npu
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
-【命令 1/2 — 真机采集】 (真实硬件时序, 含 CUBE 流水):
+【真机命令 1/3 — msprof op 单算子调优】 (真实硬件时序, 单算子粒度):
+    全指标版 (产出所有 csv):
+    msprof op --kernel-name=matmul_kernel \
+        --aic-metrics=PipeUtilization,ResourceConflictRatio,ArithmeticUtilization,Memory,MemoryL0,MemoryUB,L2Cache \
+        --output=./board_prof python3 test_matmul.py
+    精简版 (只产 PipeUtilization + ResourceConflictRatio):
     msprof op --kernel-name=matmul_kernel \
         --aic-metrics=PipeUtilization,ResourceConflictRatio \
         --output=./board_prof python3 test_matmul.py
+    产物: ./board_prof/OPPROF_xxx/
+        OpBasicInfo.csv              算子基础信息 (端到端耗时, 真实延迟)
+        PipeUtilization.csv          计算/搬运单元耗时占比
+        ArithmeticUtilization.csv    Cube/Vector 指令周期占比
+        ResourceConflictRatio.csv    UB bank 冲突率
+        Memory.csv / MemoryL0.csv / MemoryUB.csv   各级读写带宽率
+        L2Cache.csv                  L2 命中率
+        visualize_data.bin           MindStudio Insight 可视化
+        dump/                        原始数据 + aicore_binary.o
+    注意: 单算子模式不产出 op_summary_*.csv, 那是通用 msprof 的产物
 
-【命令 2/2 — CPU 仿真】 (指令级流水, 无真实硬件, CAModel 建议单核):
+【真机命令 2/3 — msprof 通用任务级】 (真实硬件, 算子汇总, 产出 op_summary):
+    msprof --output=./task_prof --application="python3 test_matmul.py"
+    产物: ./task_prof/PROF_xxx/mindstudio_profiler_output/
+        op_summary_*.csv     AI Core/AI CPU 算子数据 (按 Task Duration 排序找热点)
+        op_statistic_*.csv   算子调用次数/总耗时统计
+        msprof_*.json        timeline 主表
+        task_time_*.csv      Task Scheduler 调度信息
+        api_statistic_*.csv  CANN 层 API 耗时
+        fusion_op_*.csv      算子融合信息
+    注意: 通用 msprof 不采集 Python 调用栈 / PyTorch 框架层数据
+
+【仿真命令 3/3 — msprof op simulator】 (CPU 指令级仿真, 不占 NPU):
     export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/tools/simulator/Ascend910B3/lib:$LD_LIBRARY_PATH
     msprof op simulator --kernel-name=matmul_kernel --soc-version=Ascend910B3 \
         --output=./sim_prof python3 test_matmul.py
+    产物: ./sim_prof/OPPROF_xxx/
+        simulator/trace.json              全核汇总指令流水 (Chrome tracing)
+        simulator/core*.veccore*/         每核一目录 (含 cubecore)
+            *_instr_exe.csv   ★ 指令级时序 (pipe/cycles/running_time)
+            *_code_exe.csv    代码行耗时
+        dump/aicore_binary.o  算子二进制
+    注: 只有本命令产出 instr_exe.csv, 是真机 msprof/msprof op 没有的
 
 (可选) 让 trace 关联源码行 / 同时 dump HIVM IR:
     export TRITON_DISABLE_LINE_INFO=false          # 消除 "kernel missed debug_line" 警告
     export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1   # -> ~/.triton/dump/<hash>/kernel.npuir.mlir
-
-产物:
-    <output>/OPPROF_xxx/simulator/core*.veccore*/instr_exe.csv + trace.json
-    (真机模式下 OPPROF_xxx 顶层还有 op_summary_*.csv / PipeUtilization.csv)
 
 常见提示说明:
     - "not selected via --kernel-name" 是 reference 的 torch.matmul 被过滤, 正常;

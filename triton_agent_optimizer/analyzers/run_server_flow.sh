@@ -36,8 +36,8 @@
 #    SKIP_TASK=1           跳过真机 msprof 通用 (op_summary)
 #    BOARD_METRICS=...     msprof op 指标 (默认全指标出 cube占比+带宽;
 #                          若失败降级: BOARD_METRICS=PipeUtilization,ResourceConflictRatio)
-#    TASK_AIC_FLAGS=...    通用 msprof 的 aic flags (默认全指标出带宽/L2;
-#                          若失败自动回退基础 msprof, 但无带宽/L2)
+#    TASK_AIC_METRICS=...  通用 msprof 的 aic-metrics (默认全指标出带宽/L2;
+#                          逐级降级: 全指标→Memory,L2Cache→Memory→基础)
 #  字段解析依据: analyzers/PIPELINE_FIELDS.md (字段来源/用途) + PIPELINE_README.md
 # ═══════════════════════════════════════════════════════════════════════════════
 set -u
@@ -165,37 +165,33 @@ if [ "${SKIP_TASK:-0}" = "1" ]; then
 else
   # 输出到 task_prof 子目录 (结构: 05_task/task_prof/PROF_xxx/mindstudio_profiler_output/op_summary)
   TASK_OUT="$OUT/05_task/task_prof"
-  rm -rf "$TASK_OUT"
-  mkdir -p "$TASK_OUT"
-  # 先试全指标 (才出 main_mem/ub/l1/l2 带宽 + L2 + fops); env 前置传给 msprof 启动的 python
-  # 注意: --task-time 取值是 on/off (不是 l1!); --aic-metrics 需 --ai-core=on 前提
-  TASK_AIC_FLAGS="${TASK_AIC_FLAGS:---task-time=on --ai-core=on --aic-mode=task-based --aic-metrics=PipeUtilization,ArithmeticUtilization,Memory,MemoryL0,MemoryUB,L2Cache,ResourceConflictRatio}"
-  MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof --output="$TASK_OUT" \
-    --application="$PY test_matmul.py" $TASK_AIC_FLAGS \
-    > "$OUT/05_task/task_run.txt" 2>&1
-  echo "  全指标退出码=$? (日志 05_task/task_run.txt)"
-  OPSUM=$(find "$OUT/05_task" -name "op_summary*.csv" 2>/dev/null | wc -l)
-  # 全指标 flag 可能版本不兼容 → 回退基础 msprof (有 op_summary, 但无带宽/L2 PMU)
-  if [ "$OPSUM" -eq 0 ]; then
-    echo "  ⚠ 全指标无 op_summary → 回退基础 msprof (无带宽/L2, 但 op_summary 可解析)"
+  # 逐级降级: 全指标 → Memory,L2Cache → Memory → 基础 (碰到能出 op_summary 的停)
+  # 注意: --task-time 取值 on/off; --aic-metrics 需 --ai-core=on
+  FULL_METRICS="${TASK_AIC_METRICS:-PipeUtilization,ArithmeticUtilization,Memory,MemoryL0,MemoryUB,L2Cache,ResourceConflictRatio}"
+  OPSUM=0; USED=""
+  for METRICS in "$FULL_METRICS" "Memory,L2Cache" "Memory" ""; do
     rm -rf "$TASK_OUT"; mkdir -p "$TASK_OUT"
+    FLAGS=""
+    # 已验证模式 (CANN 8.5 910B3 成功案例): 只 --ai-core=on + --aic-metrics, 不显式 task-time/aic-mode (默认 on/task-based)
+    [ -n "$METRICS" ] && FLAGS="--ai-core=on --aic-metrics=$METRICS"
     MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof --output="$TASK_OUT" \
-      --application="$PY test_matmul.py" \
+      --application="$PY test_matmul.py" $FLAGS \
       > "$OUT/05_task/task_run.txt" 2>&1
-    echo "  基础退出码=$?"
+    RC=$?
     OPSUM=$(find "$OUT/05_task" -name "op_summary*.csv" 2>/dev/null | wc -l)
-    [ "$OPSUM" -gt 0 ] && echo "  (注: 基础模式无带宽/L2 字段, 需 TASK_AIC_FLAGS 全指标)"
-  fi
-  if [ "$OPSUM" -gt 0 ]; then pass "op_summary_*.csv x$OPSUM ✓ (真机每op指标)"; \
+    echo "  try metrics=[${METRICS:-basic}] rc=$RC op_summary x$OPSUM"
+    if [ "$OPSUM" -gt 0 ]; then USED="${METRICS:-basic}"; break; fi
+  done
+  if [ "$OPSUM" -gt 0 ]; then
+    pass "op_summary x$OPSUM ✓ (metrics=[$USED])"
+    [ "$USED" = "basic" ] && echo "  ⚠ 基础模式无带宽/L2 → 需定位全指标 flag (上面 t1~t5 命令)"
   else
-    echo "  ❌ 仍无 op_summary → 诊断:"
-    echo "    --- 05_task 实际目录树 (前 40) ---"
-    find "$OUT/05_task" -maxdepth 5 2>/dev/null | head -40
+    echo "  ❌ 所有 metrics 均无 op_summary → 诊断:"
     echo "    --- task_run.txt 末尾 20 行 ---"
     tail -20 "$OUT/05_task/task_run.txt" 2>/dev/null
     echo "    --- msprof 有效 flags (aic/task/metrics) ---"
     msprof --help 2>&1 | grep -iE 'aic|task-time|metric' | head -15
-    fail "无 op_summary (上面诊断贴回给我, 即可定位)"
+    fail "无 op_summary (诊断贴回给我, 即可定位)"
   fi
 fi
 

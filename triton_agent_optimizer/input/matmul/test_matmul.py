@@ -91,6 +91,35 @@ kernel: 同目录 triton_kernel.py 的 matmul_kernel (C = A @ B, 512x512x512)
         grep -rl 'hivm.hir' ./ir_dump/          # 列出含 HIVM 指令的文件
         grep -c 'hivm.hir' ./ir_dump/*.mlir | grep -v ':0$'   # 挑 HIVM 指令最多的那个
 
+    服务器实测产物 = {kernel.ttir.mlir, kernel.ttadapter.mlir} + 生成的 host 代码(.h/.e.cxx):
+        - ttir.mlir           Triton 高层 IR (可兜底静态分析)
+        - ttadapter.mlir      ★ 进毕昇编译器前的 IR, 是手动拿 HIVM 的正确输入 (不含 hivm.hir)
+        - .h / .e.cxx         host 启动代码, 分析用不到
+        - kernel.npuir.mlir   确认未生成
+
+    从 ttadapter.mlir 拿 HIVM IR (npuir 缺失的正式补法):
+        # ① 看 triton-ascend 实际调用的 bishengir-compile 命令 (TRITON_DEBUG 打印 cmd_list)
+        export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
+        python3 test_matmul.py 2>&1 | grep -B2 -A8 'bishengir-compile'
+        # ② 复制那条命令, 追加 --mlir-print-ir-after-all, 输出到文件
+        #    形如: bishengir-compile kernel.ttadapter.mlir -o /tmp/x.o [其它参数]
+        #          --mlir-print-ir-after-all 2>&1 | tee bishengir_all.txt
+        grep -c 'hivm.hir' bishengir_all.txt     # 应 > 0
+        grep -E 'hivm.hir.matmul|hivm.hir.load' bishengir_all.txt | head
+        # --mlir-print-ir-after-all 不识别就换 --print-ir-after-all, 或 --mlir-print-ir-after=<pass名>
+        #   (3.5.x 同步 pass 改名 hivm-graph-sync-solver)
+
+    兜底 (没有 HIVM 时): 真机 ttir.mlir 喂现有 ttir_to_hivm() 生成 HIVM
+        python3 -c "
+        from analyzers.ttir_to_hivm import ttir_to_hivm
+        text = open('kernel.ttir.mlir').read()
+        hivm_text, ops = ttir_to_hivm(text, 'matmul_kernel')
+        open('kernel_hivm_fallback.mlir','w').write(hivm_text)
+        print('ops:', len(ops))
+        "
+        ⚠️ 兜底只能给依赖/buffer/op 类型, matmul 的 cube 通路 (L0A/L0B/L0C) 是错的,
+           必须用上面 bishengir 的正规 HIVM 才能做准确的 cube 分析
+
     怎么看 (纯查看, 不需要编译):
         ls ~/.triton/dump/*/                        # 确认有 kernel.npuir.mlir
         grep -c 'hivm.hir' ~/.triton/dump/*/kernel.npuir.mlir   # 应 > 0

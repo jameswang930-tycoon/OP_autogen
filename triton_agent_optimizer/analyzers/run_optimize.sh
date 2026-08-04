@@ -93,11 +93,12 @@ D="$OUT/06_diagnosis"
 
 # 1a. 通用 msprof 先跑 (任务级 op_summary → distinct kernel 名 → 骨架)
 TASK_OUT="$OUT/05_task/task_prof"; rm -rf "$TASK_OUT"; mkdir -p "$TASK_OUT"
+APP_ABS="$RUN_DIR/$RUN_PY"    # 绝对路径, 避免 msprof 从别的 cwd 解析不到
 MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof --output="$TASK_OUT" \
-  --application="$PY $RUN_PY" --ai-core=on > "$OUT/05_task/task_run.txt" 2>&1
+  --application="$PY $APP_ABS" --ai-core=on > "$OUT/05_task/task_run.txt" 2>&1
 OPSUM=$(find "$OUT/05_task" -name 'op_summary*.csv' 2>/dev/null | wc -l)
-echo "  通用 msprof 退出码=$? op_summary x$OPSUM (8.5.1 用 --ai-core=on)"
-[ "$OPSUM" -gt 0 ] && pass "op_summary (骨架/kernel 数)" || fail "无 op_summary"
+echo "  通用 msprof 退出码=$? op_summary x$OPSUM (app=$APP_ABS)"
+[ "$OPSUM" -gt 0 ] && pass "op_summary (骨架/kernel 数)" || fail "无 op_summary (看 $OUT/05_task/task_run.txt)"
 "$PY" "$SCRIPT_DIR/pipeline_parse_task.py" "$TASK_OUT" "$D/task.json" || true
 [ -f "$D/task.json" ] || echo '{}' > "$D/task.json"
 
@@ -134,7 +135,7 @@ for KNAME in "${KERNELS[@]}"; do
   BOUT="$OUT/04_board/op_${IDX}"
   rm -rf "$BOUT"; mkdir -p "$BOUT"
   MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof op --kernel-name="$KNAME" \
-    --output="$BOUT" --warm-up=10 $PY "$RUN_PY" > "$OUT/04_board/board_${IDX}.txt" 2>&1
+    --output="$BOUT" --warm-up=10 $PY "$APP_ABS" > "$OUT/04_board/board_${IDX}.txt" 2>&1
   MC=$(find "$BOUT" -name 'Memory.csv' 2>/dev/null | head -1)
   if [ -n "$MC" ]; then
     pass "msprof op [$KNAME] 8 CSV"

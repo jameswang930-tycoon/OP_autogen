@@ -172,7 +172,7 @@ class Scheduler:
 
     def __init__(self, op_dir: Path, max_rounds: int = 200,
                  target_speedup: float = 1.5, use_llm: bool = True,
-                 stub: bool = False):
+                 stub: bool = False, resume: bool = False):
         self.op_dir = op_dir
         self.max_rounds = max_rounds
         self.target_speedup = target_speedup
@@ -180,10 +180,24 @@ class Scheduler:
         self.outputs = _PROJECT / "outputs"
         self.kernel_name = op_dir.name
         self.kernel_dir = self.outputs / self.kernel_name
-        # ★当前 kernel 链: round1 读原始源文件, 后续轮读上一轮成功输出 (不修改源文件)
-        self.current_kernel = op_dir / "kernel_op.py"
         self.traj_path = self.kernel_dir / "optimization_trajectory.json"
         self.traj = self._load_traj()
+        # ★默认每次初始化 (round1/tier1 重来, 避免读旧路径错位); --resume 才续跑
+        if not resume or not self.traj.get("state", {}).get("current_kernel"):
+            self._reset_state()
+        else:
+            ck = Path(self.traj["state"]["current_kernel"])
+            self.current_kernel = ck if ck.exists() else (op_dir / "kernel_op.py")
+            print(f"  [Scheduler] 续跑: 从 tier{self.traj['state'].get('tier')} "
+                  f"round{self.traj['state'].get('round')} 继续, kernel={self.current_kernel}")
+
+    def _reset_state(self):
+        """初始化: 从头开始 (round1/tier1 读源文件)。"""
+        self.traj = {"v": 4, "state": {"tier": 1, "round": 1, "best_speedup": 1.0,
+                                       "baseline_ns": None, "num_kernels": None,
+                                       "current_kernel": str(self.op_dir / "kernel_op.py")},
+                     "history": []}
+        self.current_kernel = self.op_dir / "kernel_op.py"
 
     # ── 轨迹 ──
     def _load_traj(self) -> dict:
@@ -383,8 +397,10 @@ class Scheduler:
                 # ⑥ 验证 (只 msprof 端到端, 验证本轮新 kernel)
                 v = self._verify(round_dir, st.get("baseline_ns"))
                 if v.get("ok"):
-                    # ★成功 → 提交为下一轮的当前 kernel (失败则保留上一个成功的)
+                    # ★成功 → 提交为下一轮的当前 kernel (失败则保留上一个成功的), 并持久化
                     self.current_kernel = round_kernel
+                    st["current_kernel"] = str(round_kernel)
+                    self._save_traj()
                     break
                 prev_err = v.get("error", "unknown error")
                 print(f"  ⚠ 运行失败(第{attempt+1}次): {prev_err[:200]}... 回传 Coder 同轮改")

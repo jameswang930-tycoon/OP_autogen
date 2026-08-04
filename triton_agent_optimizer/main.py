@@ -65,6 +65,8 @@ def main():
     p.add_argument("--remerge", action="store_true", help="强制重新合并单文件 (会覆盖 coder 改动)")
     p.add_argument("--fresh", action="store_true",
                    help="清空 outputs/<op>/ 旧产物 + 重置 trajectory, 从头开始")
+    p.add_argument("--resume", action="store_true",
+                   help="从上次 trajectory 续跑 (默认每次都初始化, 从 round1 重来)")
     args = p.parse_args()
 
     op_dir = Path(args.op_dir)
@@ -100,10 +102,10 @@ def main():
         return 1
     print(f"[main] 单文件: {kernel_op}")
 
-    # ② Scheduler 循环
+    # ② Scheduler 循环 (默认每次初始化; --resume 续跑)
     from agents.scheduler import Scheduler
     s = Scheduler(op_dir, max_rounds=args.max_rounds,
-                  target_speedup=args.target, stub=args.stub)
+                  target_speedup=args.target, stub=args.stub, resume=args.resume)
     return s.run()
 
 

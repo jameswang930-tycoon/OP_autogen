@@ -118,10 +118,11 @@ class LLMClient:
             def _drain(stream, sink, tag):
                 for line in stream:
                     sink.append(line)
+                    # stderr 用中性标签 (nga 常写日志/警告到 stderr, 不等于错误)
                     print(f"  [nga|{tag}] {line.rstrip()}", flush=True)
 
             t_out = threading.Thread(target=_drain, args=(proc.stdout, out_lines, "out"), daemon=True)
-            t_err = threading.Thread(target=_drain, args=(proc.stderr, err_lines, "err"), daemon=True)
+            t_err = threading.Thread(target=_drain, args=(proc.stderr, err_lines, "stderr"), daemon=True)
             t_out.start(); t_err.start()
             try:
                 proc.wait(timeout=timeout)

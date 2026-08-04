@@ -382,50 +382,72 @@ if __name__ == "__main__":
 #  v4: 只跑 msprof 端到端 (整文件) → 端到端耗时 → 加速比
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def verify_end_to_end(kernel_op: Path, round_dir: Path,
-                      baseline_ns: Optional[float] = None) -> dict:
-    """v4 验证: 只跑一次 msprof 端到端 (整文件), 不提取字段、不跑 msprof op。
-
-    返回:
-      ok=True  → {"ok": True, "ns": 端到端ns, "speedup": baseline/ns}
-      ok=False → {"ok": False, "error": 报错文本}  (回传 Coder 同轮改)
-    """
-    import subprocess
-    msprof_out = round_dir / "msprof"
-    msprof_out.mkdir(parents=True, exist_ok=True)
-    py = "python3" if (msprof_out and True) else "python"
-    cmd = ["msprof", f"--output={msprof_out}",
-           f"--application={py} {kernel_op}", "--ai-core=on"]
-    print(f"  [Verify] {' '.join(cmd)}")
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-    except Exception as e:
-        return {"ok": False, "error": f"msprof run failed: {e}"}
-
-    # 找 op_summary (在 mindstudio_profiler_output/ 下)
-    summaries = sorted(msprof_out.rglob("op_summary*.csv"))
-    if not summaries:
-        tail = (r.stderr or "")[-1500:] + (r.stdout or "")[-1500:]
-        return {"ok": False, "error": tail.strip() or "op_summary not generated"}
-
-    # 读目标 kernel 的 Task Duration(us) (非 aclnn 框架)
+def _read_target_duration(prof_out: Path) -> Optional[float]:
+    """读 op_summary, 取目标 kernel (非 aclnn) 的最大 Task Duration(us)。"""
     import csv as _csv
+    summaries = sorted(prof_out.rglob("op_summary*.csv"))
+    if not summaries:
+        return None
     try:
         with open(summaries[0], encoding="utf-8") as f:
             rows = list(_csv.DictReader(f))
-    except Exception as e:
-        return {"ok": False, "error": f"op_summary parse failed: {e}"}
-
-    ns = None
+    except Exception:
+        return None
+    dur_us = None
     for row in rows:
         dur = row.get("Task Duration(us)") or row.get("TaskDuration")
         op = row.get("Op Name") or row.get("OpName") or ""
         if dur and not op.lower().startswith("aclnn"):
             try:
-                ns = max(ns or 0, float(dur) * 1000)
+                dur_us = max(dur_us or 0, float(dur))
             except ValueError:
                 pass
-    if ns is None:
-        return {"ok": False, "error": "no target kernel Task Duration found in op_summary"}
+    return dur_us
+
+
+def verify_end_to_end(kernel_op: Path, round_dir: Path,
+                      baseline_ns: Optional[float] = None) -> dict:
+    """v4 验证: warmup + 多轮 msprof 端到端取平均 (整文件), 不提取字段、不跑 msprof op。
+
+    策略:
+      warmup = VERIFY_WARMUP (默认1): 先裸跑 kernel_op.py N 次 (JIT 编译/冷cache 预热)
+      runs   = VERIFY_RUNS (默认3):   跑 N 次 msprof, 每次读目标 kernel Task Duration(us),
+                                       取各轮 max 的平均 (去抖动)
+
+    返回:
+      ok=True  → {"ok": True, "ns": 平均端到端ns, "speedup": baseline/ns}
+      ok=False → {"ok": False, "error": 报错文本}  (回传 Coder 同轮改)
+    """
+    import os as _os
+    import subprocess
+    warmup = int(_os.environ.get("VERIFY_WARMUP", "1"))
+    runs = int(_os.environ.get("VERIFY_RUNS", "3"))
+    py = "python3"
+
+    # warmup: 裸跑预热 (不 profile)
+    for i in range(warmup):
+        subprocess.run([py, str(kernel_op)], capture_output=True, text=True, timeout=1800)
+    print(f"  [Verify] warmup x{warmup} done, 测 {runs} 轮 msprof...")
+
+    # measure: runs 次 msprof, 每次独立输出目录
+    durations_us = []
+    for i in range(runs):
+        msprof_out = round_dir / f"msprof_run{i}"
+        msprof_out.mkdir(parents=True, exist_ok=True)
+        cmd = ["msprof", f"--output={msprof_out}",
+               f"--application={py} {kernel_op}", "--ai-core=on"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        except Exception as e:
+            return {"ok": False, "error": f"msprof run failed: {e}"}
+        d = _read_target_duration(msprof_out)
+        if d is None:
+            tail = (r.stderr or "")[-800:] + (r.stdout or "")[-800:]
+            return {"ok": False, "error": tail.strip() or f"msprof_run{i} 无 op_summary/目标kernel"}
+        durations_us.append(d)
+        print(f"    run{i}: {d:.1f}us")
+
+    ns = sum(durations_us) / len(durations_us) * 1000   # 平均 (us→ns)
     speedup = (baseline_ns / ns) if baseline_ns else 1.0
-    return {"ok": True, "ns": round(ns, 1), "speedup": round(speedup, 4)}
+    return {"ok": True, "ns": round(ns, 1), "speedup": round(speedup, 4),
+            "runs": runs, "durations_us": durations_us}

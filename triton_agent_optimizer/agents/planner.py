@@ -83,20 +83,20 @@ TIER_NAMES = {
 
 
 def _load_playbook(tier: int, playbook_dir: Optional[Path] = None) -> str:
-    """加载当前 Tier 对应的 Playbook + CODING_GUIDE。"""
+    """加载当前 Tier 对应的 Playbook + CODING_GUIDE (裁剪, 控制 prompt 大小)。"""
     if playbook_dir is None:
         playbook_dir = _PROJECT_DIR / "docx"
     fname = PLAYBOOK_FILES.get(tier)
     parts = []
-    # CODING_GUIDE (所有 Tier 都读)
+    # CODING_GUIDE (所有 Tier 都读, 只取前 1500)
     guide_path = playbook_dir / "CODING_GUIDE.md"
     if guide_path.exists():
-        parts.append("## Coding Guide (MUST FOLLOW)\n" + guide_path.read_text(encoding="utf-8")[:3000])
-    # 主 Playbook
+        parts.append("## Coding Guide (MUST FOLLOW)\n" + guide_path.read_text(encoding="utf-8")[:1500])
+    # 主 Playbook (只取前 2500, 含优化内容表 + 决策依据; 避免 18KB 全文拖慢 nga)
     if fname:
         fpath = playbook_dir / fname
         if fpath.exists():
-            parts.append(fpath.read_text(encoding="utf-8"))
+            parts.append(fpath.read_text(encoding="utf-8")[:2500])
     return "\n\n".join(parts) if parts else "(no playbook for this tier)"
 
 
@@ -169,6 +169,16 @@ GM→UB: 80.8 GB/s, UB→GM: 76.7 GB/s, VecUnit: 404 GB/s, CubeUnit: 150 GB/s
 ```json
 {{"strategy":"xxx","target_speedup":1.1,"specific_change":"...","expected_impact":"...","verification_method":"msprof"}}
 ```"""
+
+
+def _extract_kernel_section(code: str, max_chars: int = 2500) -> str:
+    """只取 config ① + kernel ② 区 (跳过测试 main ③), 控制 prompt 大小。"""
+    # 以真正的函数 def main(): 为截断点 (避免头部注释里提到"测试 main"提前截断)
+    for marker in ("def main():", "if __name__", "#  ③ 测试 main"):
+        idx = code.find(marker)
+        if idx > 0:
+            return code[:idx].rstrip()[:max_chars]
+    return code[:max_chars]
 
 
 def _extract_config_constants(kernel_code: str) -> str:
@@ -293,49 +303,53 @@ class PlannerAgent:
         round_num: int,
         op_dir: Optional[Path] = None,
         fusion_analysis: Optional[dict] = None,
+        round_dir: Optional[Path] = None,
     ) -> RoundPlan:
-        """v4 Planner: 输入 = 当前 tier 提取的字段段 (不是全部字段) + 单文件 + config + 融合分析。
+        """v4 Planner: 输入 = 小指令 + 读文件路径 + 内联小字段 → plan + 晋升决策。
 
+        ★不嵌入 playbook/kernel 全文, 让 nga run 自己读文件 (避免 prompt 超限/卡顿)。
         额外输出 promote: bool + promote_reason (当前瓶颈是否属于本 tier, 决定晋升)。"""
-        playbook = _load_playbook(tier, self.playbook_dir)
         history_text = _format_history(history)
         config_text = _extract_config_constants(kernel_code)   # ★从单文件 config 区提取
-        if not config_text and op_dir:
-            cfg = Path(op_dir) / "config.json"                  # 旧式兜底
-            if cfg.exists():
-                config_text = cfg.read_text(encoding="utf-8")[:2000]
-        fusion_text = (json.dumps(fusion_analysis, ensure_ascii=False)[:2000]
+        fusion_text = (json.dumps(fusion_analysis, ensure_ascii=False)[:600]
                        if fusion_analysis else "(无融合分析)")
 
+        # 读文件路径 (绝对路径, nga run 自己读)
+        skill_path = self.playbook_dir.parent / "skills" / "triton-op-planner" / "SKILL.md"
+        pb_fname = PLAYBOOK_FILES.get(tier, "")
+        playbook_path = self.playbook_dir / pb_fname if pb_fname else self.playbook_dir
+        d7_path = ""
+        if round_dir:
+            d7_path = round_dir / f"07_tier{tier}_fields" / f"tier{tier}_fields.txt"
+
         system_prompt = (
-            f"You are a Triton kernel optimizer for Ascend 910B3 (v4 flow).\n"
-            f"Current strategy: Tier {tier} — {TIER_NAMES.get(tier, '?')}.\n"
-            f"Only the current-tier data segments below are available. Do NOT reason about fields not given.\n"
-            f"## 当前 tier 提取的字段 (只看这些)\n{extracted}\n\n"
-            f"## 优化策略文档\n{playbook}\n\n"
-            f"## 规则\n"
-            f"1. 先判断: 当前瓶颈是否属于 Tier{tier} 的优化范畴?\n"
-            f"   - 属于 → promote=false, 给出具体改法 (哪一行/把什么改成什么/为什么)\n"
+            f"你是 Triton 优化 Planner。按下面步骤执行, 只输出 JSON。\n\n"
+            f"执行步骤 (调用 skill / 读文件, 不要复述大段内容):\n"
+            f"1. 调用 skill: {skill_path}\n"
+            f"2. 读优化策略文档: {playbook_path}  (只看『优化内容』表 + 『决策依据』段)\n"
+            f"3. 读当前单文件: {op_dir / 'kernel_op.py' if op_dir else '(未给)'}  (重点 ② kernel 区)\n"
+            f"4. 读诊断字段文件: {d7_path or '(未给, 用下面内联字段)'}\n\n"
+            f"## 内联诊断字段 (当前 tier 筛好的, 若第4步文件读不到就用这些):\n{extracted}\n\n"
+            f"## config 常量:\n{config_text or '(无)'}\n"
+            f"## 历史 (最近几轮):\n{history_text}\n"
+            f"## 融合分析 (Tier2 才有):\n{fusion_text}\n\n"
+            f"## 任务:\n"
+            f"1. 先判断: 当前瓶颈是否属于 Tier{tier}({TIER_NAMES.get(tier,'?')}) 的优化范畴?\n"
+            f"   - 属于 → promote=false, 给出 changes[]\n"
             f"   - 不属于 → promote=true, promote_reason 说明该晋升到哪个 tier\n"
-            f"2. 改法必须具体: '把第X行 BLOCK_K 从 32 改成 64' 级别\n"
-            f"3. 只改单文件 kernel_op.py, 不碰其他文件\n"
-            f"4. 目标加速比 1.05~1.5x, 预期影响写具体指标\n"
-            f"## 历史 (最近几轮)\n{history_text}\n"
-            f"## 当前单文件 kernel_op.py\n{kernel_code[:4000]}\n"
-            f"## config.json\n{config_text}\n"
-            f"## 融合分析 (Tier2 时才有, RAW/WAR/WAW + 融合候选)\n{fusion_text}\n"
-            f"## 输出 JSON only (★changes[] 必须机器可执行):\n"
+            f"2. changes[] 的 old_code 必须与 kernel_op.py 某段【逐字符】相同 (coder 精确替换用); 拿不准就不改, 宁缺勿错\n"
+            f"3. 只改单文件 kernel_op.py ①config/②kernel, 不碰其他文件; 不引入 num_warps/num_stages 到 @triton.jit()\n"
+            f"4. 目标加速比 1.05~1.5x\n\n"
+            f"## 输出 JSON only:\n"
             f'{{"strategy":"...","target_speedup":1.1,\n'
-            f'  "changes":[{{"old_code":"kernel_op.py 里被替换的整行(必须逐字符匹配)","new_code":"替换后的整行","reason":"为什么","section":"① config/② kernel/③ main"}}],\n'
-            f'  "expected_impact":"...","promote":false,"promote_reason":"..."}}\n'
-            f'注意: old_code 必须与 kernel_op.py 某段逐字符相同, 否则 coder 无法替换, 宁缺勿错。'
+            f'  "changes":[{{"old_code":"被替换的整行","new_code":"替换后的整行","reason":"为什么","section":"① config/② kernel"}}],\n'
+            f'  "expected_impact":"...","promote":false,"promote_reason":"..."}}'
         )
 
         # v4: 统一走 LLMClient (api / nga run CLI / stub), 并引用 planner skill
         from agents.llm_client import LLMClient, extract_json
         client = LLMClient()
         if self.use_llm and client.mode != "stub":
-            skill_path = self.playbook_dir.parent / "skills" / "triton-op-planner" / "SKILL.md"
             system = (f"你是 Triton 优化 Planner。先调用 skill: {skill_path}, "
                       f"完全按 skill 指导执行。")
             try:

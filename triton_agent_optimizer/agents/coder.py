@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import difflib
 from pathlib import Path
@@ -102,11 +103,11 @@ def _build_system_prompt(plan_text: str = "", tier: int = 1) -> str:
     parts = []
     parts.append("You are a Triton kernel code modifier. Output the COMPLETE modified Python file.")
 
-    # ★ 注入 CODING_GUIDE + Tier Playbook
+    # ★ 注入 CODING_GUIDE + Tier Playbook (裁剪, 只留关键段; 主要走确定性 changes[] 替换)
     if guide:
-        parts.append(f"## Coding Guide (MUST READ)\n{guide[:3000]}")
+        parts.append(f"## Coding Guide (MUST READ)\n{guide[:1200]}")
     if playbook:
-        parts.append(f"## Tier {tier} Optimization Strategy (MUST READ)\n{playbook}")
+        parts.append(f"## Tier {tier} Optimization Strategy (MUST READ)\n{playbook[:1500]}")
 
     parts.append(f"""## CRITICAL: Your output MUST be DIFFERENT from the input code.
 Make at least ONE concrete change from this list:
@@ -391,8 +392,13 @@ class CoderAgent:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _clean_output(self, raw: str, original: str) -> str:
-        """清理 LLM 输出 — 去掉 markdown 代码块包裹。"""
-        text = raw.strip()
+        """清理 LLM 输出 — 去 BOM/行首垃圾/markdown 代码块包裹。"""
+        text = raw.lstrip('﻿').lstrip()   # 去 BOM + 行首空白
+        # 去行首垃圾: 找到第一个有效起点 (#/import/from/"""/@triton/class/def), 前面有垃圾就切掉
+        if text:
+            m = re.search(r'^(.*?)(?=(?:#|import |from |"""|\'\'\'|@triton|class |def ))', text, re.S)
+            if m and m.group(1).strip():
+                text = text[m.end(1):]
         # 去掉 ```python ... ``` 包裹
         if text.startswith("```"):
             lines = text.split("\n")

@@ -20,6 +20,12 @@ import json
 import os
 import subprocess
 import sys
+import time
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -174,7 +180,8 @@ class Scheduler:
         self.outputs = _PROJECT / "outputs"
         self.kernel_name = op_dir.name
         self.kernel_dir = self.outputs / self.kernel_name
-        self.kernel_op = op_dir / "kernel_op.py"
+        # ★当前 kernel 链: round1 读原始源文件, 后续轮读上一轮成功输出 (不修改源文件)
+        self.current_kernel = op_dir / "kernel_op.py"
         self.traj_path = self.kernel_dir / "optimization_trajectory.json"
         self.traj = self._load_traj()
 
@@ -204,8 +211,9 @@ class Scheduler:
         """调 run_optimize.sh <op_dir> <round_dir> → 读 diagnosis.json。
         TIER 环境变量传给 run_optimize, 让它解析完自动产出 07_tier<N>_fields。"""
         run_sh = (_PROJECT / "analyzers" / "run_optimize.sh").as_posix()
-        cmd = ["bash", run_sh, str(self.op_dir), str(round_dir)]
-        print(f"  [Scheduler] {' '.join(cmd)} (TIER={tier})")
+        input_dir = self.current_kernel.parent    # round1=源目录; 后续=上一轮输出目录
+        cmd = ["bash", run_sh, str(input_dir), str(round_dir)]
+        print(f"  [Scheduler] {' '.join(cmd)} (TIER={tier}, kernel={self.current_kernel})")
         env = dict(os.environ)
         env["TIER"] = str(tier)
         subprocess.run(cmd, check=False, timeout=1800, env=env)
@@ -239,17 +247,17 @@ class Scheduler:
         """Tier2 独有: 生成 hivm MLIR + nga run 融合分析, 写 round_dir/08_fusion/。"""
         from analyzers.run_hivm_fusion import run_fusion
         print("  [Scheduler] Tier2 融合: 编译 HIVM MLIR → nga run 分析依赖 → 08_fusion/")
-        return run_fusion(self.kernel_op, round_dir, use_llm=self.use_llm)
+        return run_fusion(self.current_kernel, round_dir, use_llm=self.use_llm)
 
     # ── ④ Planner (只喂当前阶段筛好的字段 + 融合分析) ──
     def _plan(self, diagnosis: dict, extracted: str, tier: int, rn: int, round_dir: Path,
               fusion_analysis: Optional[dict] = None):
         from agents.planner import PlannerAgent, _extract_config_constants
-        kernel_code = self.kernel_op.read_text(encoding="utf-8") if self.kernel_op.exists() else ""
+        kernel_code = self.current_kernel.read_text(encoding="utf-8") if self.current_kernel.exists() else ""
         skill = (_PROJECT / "skills" / "triton-op-planner" / "SKILL.md")
         cfg = _extract_config_constants(kernel_code)
         print(f"  [Planner] 输入: 07字段({len(extracted.splitlines())}行) + playbook_tier{tier} "
-              f"+ kernel_op.py({len(kernel_code)}字符) + config[{cfg.splitlines()[0] if cfg else '?'}] "
+              f"+ {self.current_kernel}({len(kernel_code)}字符) + config[{cfg.splitlines()[0] if cfg else '?'}] "
               f"+ 历史{len(self.traj.get('history', []))}轮")
         print(f"  [Planner] 调 skill: {skill}")
         planner = PlannerAgent(use_llm=self.use_llm)
@@ -260,6 +268,7 @@ class Scheduler:
             round_num=rn,
             op_dir=self.op_dir,
             fusion_analysis=fusion_analysis,
+            round_dir=round_dir,
         )
         round_dir.mkdir(parents=True, exist_ok=True)
         plan_md = (f"# Tier{tier} Round{rn} Plan\n\n{plan.plan_text}\n\n"
@@ -272,12 +281,12 @@ class Scheduler:
               f"promote={plan.promote}")
         return plan
 
-    # ── ⑤ Coder (读 round_dir/plan.md, 精确应用 changes[]) ──
+    # ── ⑤ Coder (读 current_kernel, 精确应用 changes[], 输出 round_dir/kernel_op.py) ──
     def _code(self, plan, rn: int, round_dir: Path, prev_err: str = "") -> str:
         from agents.coder import CoderAgent
-        original = self.kernel_op.read_text(encoding="utf-8") if self.kernel_op.exists() else ""
+        original = self.current_kernel.read_text(encoding="utf-8") if self.current_kernel.exists() else ""
         skill = _PROJECT / "skills" / "triton-op-coder" / "SKILL.md"
-        print(f"  [Coder] 读 {round_dir}/plan.md 的 changes[] (精确替换) + skill {skill}")
+        print(f"  [Coder] 读 {self.current_kernel} 的 changes[] (精确替换) + skill {skill}")
         coder = CoderAgent(use_llm=self.use_llm)
         result = coder.apply(original, plan.plan_text, prev_err, plan.tier)
         round_dir.mkdir(parents=True, exist_ok=True)
@@ -290,13 +299,14 @@ class Scheduler:
             print(f"  [Coder] ⚠ 未成功: {result.error_message[:200]}")
         return result.optimized_code
 
-    # ── ⑥ 验证: 只跑 msprof 端到端 ──
+    # ── ⑥ 验证: 只跑 msprof 端到端 (验证本轮新 kernel) ──
     def _verify(self, round_dir: Path, baseline_ns: Optional[float]) -> dict:
         """只跑一次 msprof 端到端 → 端到端耗时 → 加速比。
-        真机跑; 本地/无 NPU 时返回 stub (需 --stub 或诊断文件里有耗时)。"""
+        验证的是 round_dir/kernel_op.py (本轮 coder 的新输出)。"""
+        kernel = round_dir / "kernel_op.py"
         try:
             from agents.verifier import verify_end_to_end
-            return verify_end_to_end(self.kernel_op, round_dir, baseline_ns)
+            return verify_end_to_end(kernel, round_dir, baseline_ns)
         except Exception as e:
             print(f"  [Scheduler] verify stub: {e}")
             return {"ok": True, "ns": None, "speedup": 1.0, "note": "stub(无真机)"}
@@ -321,15 +331,19 @@ class Scheduler:
             except Exception as e:
                 print(f"  [Warm-up] ⚠ 预热失败: {str(e)[:120]} (继续, 后续调用再试)")
 
+        total_start = time.time()
         while rn <= self.max_rounds:
             round_dir = self._round_dir(tier, rn)
+            round_start = time.time()
             print(f"\n══ Tier{tier}({TIER_LABEL.get(tier)}) Round{rn} ══")
 
             # ① 采集+解析 (run_optimize 自动产出 07_tier{N}_fields)
+            _t0 = time.time()
             diagnosis = self._run_optimize(round_dir, tier)
             if not diagnosis:
                 print("  ⚠ 采集失败, 停止")
                 break
+            print(f"  ⏱ ①采集+解析: {time.time()-_t0:.1f}s")
             # 诊断摘要
             ks0 = diagnosis.get("summary", {})
             k0 = (diagnosis.get("kernels") or [{}])[0]
@@ -344,24 +358,33 @@ class Scheduler:
                 print(f"  [基准] 首轮采集 total_ns={ks0.get('total_ns')} kernels={ks0.get('num_kernels')} (加速比基准)")
 
             # ③ 诊断: 按当前阶段筛选字段 → 写 07
+            _t0 = time.time()
             extracted = self._diagnose(diagnosis, tier, round_dir)
+            print(f"  ⏱ ②诊断筛字段: {time.time()-_t0:.1f}s")
 
             # ③.5 Tier2 融合: 多走一步 — 编译 HIVM MLIR → nga run 分析依赖 → 08_fusion/
             fusion_analysis = None
             if tier == 2:
+                _t0 = time.time()
                 fusion_analysis = self._run_fusion(round_dir)
+                print(f"  ⏱ ③融合分析: {time.time()-_t0:.1f}s")
 
             # ④ Planner → plan + 晋升决策 (只喂 07 筛好的字段 + 融合分析)
+            _t0 = time.time()
             plan = self._plan(diagnosis, extracted, tier, rn, round_dir, fusion_analysis)
+            print(f"  ⏱ ④Planner: {time.time()-_t0:.1f}s")
 
-            # ⑤ Coder → 改单文件 (报错同轮重改, ≤3次)
+            # ⑤ Coder → 改代码, 输出到 round_dir/kernel_op.py (不碰源文件) (报错同轮重改, ≤3次)
             prev_err, new_code = "", ""
+            round_kernel = round_dir / "kernel_op.py"
             for attempt in range(3):
                 new_code = self._code(plan, rn, round_dir, prev_err)
-                self.kernel_op.write_text(new_code, encoding="utf-8")
-                # ⑥ 验证 (只 msprof 端到端)
+                round_kernel.write_text(new_code, encoding="utf-8")
+                # ⑥ 验证 (只 msprof 端到端, 验证本轮新 kernel)
                 v = self._verify(round_dir, st.get("baseline_ns"))
                 if v.get("ok"):
+                    # ★成功 → 提交为下一轮的当前 kernel (失败则保留上一个成功的)
+                    self.current_kernel = round_kernel
                     break
                 prev_err = v.get("error", "unknown error")
                 print(f"  ⚠ 运行失败(第{attempt+1}次): {prev_err[:200]}... 回传 Coder 同轮改")
@@ -369,6 +392,8 @@ class Scheduler:
             speedup = v.get("speedup", 1.0)
             ns = v.get("ns")
             print(f"  加速比: {speedup:.3f}x (ns={ns})")
+            print(f"  ⏱ ⑤Coder+验证: {time.time()-_t0:.1f}s")
+            print(f"  ⏱ 本轮总时: {time.time()-round_start:.1f}s  (总用时 {time.time()-total_start:.1f}s)")
 
             # ⑦ 记录 + 晋升决策
             hist = {"round": rn, "tier": tier, "strategy": plan.strategy,

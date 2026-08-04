@@ -100,26 +100,44 @@ class LLMClient:
         import shlex
         shell_cmd = f"echo {shlex.quote(full_prompt)} | {cmd}"
 
-        print(f"\n──────────────── [LLM/CLI] 调用 nga run ────────────────")
-        print(f"  命令: {cmd}  (timeout={timeout}s)")
-        print(f"  发送内容 {len(full_prompt)} 字符:")
-        print(full_prompt if len(full_prompt) <= 1500 else full_prompt[:1500] + "\n  ...(截断, 共" + str(len(full_prompt)) + "字符)")
-        print(f"──────────────────────────────────────────────────────")
+        print(f"\n──────────────── [LLM/CLI] 调用 nga run ────────────────", flush=True)
+        print(f"  命令: {cmd}  (timeout={timeout}s)", flush=True)
+        print(f"  发送内容 {len(full_prompt)} 字符:", flush=True)
+        print(full_prompt if len(full_prompt) <= 1500 else full_prompt[:1500] + "\n  ...(截断, 共" + str(len(full_prompt)) + "字符)", flush=True)
+        print(f"──────────────────────────────────────────────────────", flush=True)
 
         try:
-            # 显式 bash -c (服务器也是 bash; echo 引号语义一致); 显式 utf-8 避免系统编码差异
-            result = subprocess.run(["bash", "-c", shell_cmd], capture_output=True, text=True,
-                                    encoding="utf-8", errors="replace", timeout=timeout)
-            if result.returncode != 0:
-                stderr = result.stderr[:500] if result.stderr else ""
+            # 显式 bash -c + 实时流式打印 (输出/报错即时可见, 不吞)
+            import threading
+            proc = subprocess.Popen(["bash", "-c", shell_cmd],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, encoding="utf-8", errors="replace")
+
+            out_lines, err_lines = [], []
+
+            def _drain(stream, sink, tag):
+                for line in stream:
+                    sink.append(line)
+                    print(f"  [nga|{tag}] {line.rstrip()}", flush=True)
+
+            t_out = threading.Thread(target=_drain, args=(proc.stdout, out_lines, "out"), daemon=True)
+            t_err = threading.Thread(target=_drain, args=(proc.stderr, err_lines, "err"), daemon=True)
+            t_out.start(); t_err.start()
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                raise RuntimeError(f"CLI command '{cmd}' timed out ({timeout}s)")
+            t_out.join(); t_err.join()
+
+            if proc.returncode != 0:
                 raise RuntimeError(
-                    f"CLI command '{cmd}' exited with {result.returncode}: {stderr}"
+                    f"CLI command '{cmd}' exited with {proc.returncode}: {''.join(err_lines)[-500:]}"
                 )
-            output = result.stdout.strip()
+            output = "".join(out_lines).strip()
             if not output:
                 raise RuntimeError(f"CLI command '{cmd}' returned empty output")
-            print(f"  [LLM/CLI] ★响应 {len(output)} 字符:")
-            print(output[:800] + ("..." if len(output) > 800 else ""))
+            print(f"  [LLM/CLI] ★响应 {len(output)} 字符", flush=True)
             return output
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"CLI command '{cmd}' timed out ({timeout}s)")

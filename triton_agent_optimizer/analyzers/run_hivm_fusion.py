@@ -52,14 +52,18 @@ def _compile_hivm(single_file: Path, work_dir: Path):
     return None, "bishengir 输出无 hivm.hir (看 pass 名/ttadapter)"
 
 
-def _call_llm(mlir_text: str, skill_path: Path) -> str:
-    """nga run 调融合 skill (LLM_CLI_COMMAND, 默认 nga run)。"""
+def _call_llm(mlir_text: str, skill_path: Path, mlir_file: Optional[Path] = None) -> str:
+    """nga run 调融合 skill (LLM_CLI_COMMAND, 默认 nga run)。
+    ★不嵌入 MLIR 全文, 让 nga 自己读 mlir_file (避免 prompt 过大)。"""
     from agents.llm_client import LLMClient
     client = LLMClient()
     if client.mode == "stub":
         raise RuntimeError("no LLM configured (stub)")
     system = f"先调用 skill: {skill_path}, 完全按 skill 指导执行。只分析依赖和融合候选, 不改代码。"
-    user = f"## HIVM MLIR (完整, 不要截断)\n```\n{mlir_text}\n```"
+    user = (f"## 任务: 分析 HIVM MLIR 的 RAW/WAR/WAW 依赖 + 找融合候选\n"
+            f"## 读 MLIR 文件 (完整): {mlir_file or '(未给, 用下面内容)'}\n"
+            f"## 输出 JSON: op_count / raw_deps[] / war_deps[] / waw_deps[] / fusion_candidates[]"
+            if mlir_file else f"## HIVM MLIR\n{mlir_text[:2000]}")
     return client.chat(system=system, user=user)
 
 
@@ -80,7 +84,7 @@ def run_fusion(single_file: Path, round_dir: Path, use_llm: bool = True) -> Opti
     skill = _PROJECT / "skills" / "triton-op-fusion" / "SKILL.md"
     if use_llm:
         try:
-            resp = _call_llm(mlir, skill)
+            resp = _call_llm(mlir, skill, mlir_file=d8 / "kernel.hivm.txt")
             from agents.llm_client import extract_json
             analysis = extract_json(resp)
         except Exception as e:

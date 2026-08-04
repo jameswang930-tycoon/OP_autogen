@@ -97,7 +97,8 @@ def integrate(task_p, out_p, board_paths):
 
     num_kernels = t_sum.get("num_kernels", len(slots))
     summary = {
-        "num_kernels": num_kernels,
+        "num_kernels": num_kernels,                      # 优化目标 kernel 数 (非框架)
+        "num_kernels_total": t_sum.get("num_kernels_total", num_kernels),  # 含框架 kernel 总数
         "total_ns": t_sum.get("total_ns"),
         "num_cores": t_sum.get("num_cores"),
         "api_overhead_total_us": sum(a.get("total_us") or 0 for a in t_norm.get("api_overhead", [])),
@@ -113,6 +114,7 @@ def integrate(task_p, out_p, board_paths):
                  "schema_version": "4.0"},
         "summary": summary,
         "kernels": kernels_out,
+        "framework_kernels": t_norm.get("framework_kernels", []),  # torch 框架 kernel (aclnn*), 非优化目标
         "api_overhead": t_norm.get("api_overhead", []),
         "multi_kernel": t_norm.get("multi_kernel", []),
         "notes": ["骨架=通用msprof(task.json); deep=msprof op 按 kernel 名填充 (见 docx/aggregation_rules.md)",

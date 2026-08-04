@@ -58,6 +58,8 @@ class RoundPlan:
     expected_impact: str
     verification_method: str
     plan_text: str = ""
+    promote: bool = False          # planner 决策: 是否晋升下一 tier
+    promote_reason: str = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -169,6 +171,24 @@ GM→UB: 80.8 GB/s, UB→GM: 76.7 GB/s, VecUnit: 404 GB/s, CubeUnit: 150 GB/s
 ```"""
 
 
+def _extract_config_constants(kernel_code: str) -> str:
+    """从单文件 kernel_op.py 的 ① config 区提取常量 (M/N/K/DTYPE/BLOCK_*)。
+    只扫 @triton.jit 之前的 config 区, 避免抓到 launch 调用的关键字参数。"""
+    import re
+    head = kernel_code.split("@triton.jit")[0]   # ① config 区 (kernel 之前)
+    out = []
+    for m in re.finditer(r"^\s*([\w, ]+?)\s*=\s*([^#\n]+)", head, re.M):
+        vars_ = [v.strip() for v in m.group(1).split(",") if v.strip()]
+        if len(vars_) > 1:                        # BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+            vals = [v.strip() for v in m.group(2).split(",")]
+            if len(vars_) == len(vals):
+                for vv, vv_val in zip(vars_, vals):
+                    out.append(f"{vv} = {vv_val}")
+        else:                                      # M = int(os.environ.get(...)) / DTYPE = ...
+            out.append(f"{vars_[0]} = {m.group(2).strip()}")
+    return "\n".join(out)
+
+
 def _format_history(history: list) -> str:
     """将 history 列表格式化为文本。"""
     if not history:
@@ -259,6 +279,99 @@ class PlannerAgent:
             verification_method=str(plan_dict.get("verification_method", "")),
             plan_text=json.dumps(plan_dict, indent=2, ensure_ascii=False),
         )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  v4: 只喂当前 tier 提取的字段段 + 策略文档 + 单文件 + config → plan + 晋升决策
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def generate_v4(
+        self,
+        extracted: str,
+        tier: int,
+        history: list,
+        kernel_code: str,
+        round_num: int,
+        op_dir: Optional[Path] = None,
+    ) -> RoundPlan:
+        """v4 Planner: 输入 = 当前 tier 提取的字段段 (不是全部字段) + 单文件 + config。
+
+        额外输出 promote: bool + promote_reason (当前瓶颈是否属于本 tier, 决定晋升)。"""
+        playbook = _load_playbook(tier, self.playbook_dir)
+        history_text = _format_history(history)
+        config_text = _extract_config_constants(kernel_code)   # ★从单文件 config 区提取
+        if not config_text and op_dir:
+            cfg = Path(op_dir) / "config.json"                  # 旧式兜底
+            if cfg.exists():
+                config_text = cfg.read_text(encoding="utf-8")[:2000]
+
+        system_prompt = (
+            f"You are a Triton kernel optimizer for Ascend 910B3 (v4 flow).\n"
+            f"Current strategy: Tier {tier} — {TIER_NAMES.get(tier, '?')}.\n"
+            f"Only the current-tier data segments below are available. Do NOT reason about fields not given.\n"
+            f"## 当前 tier 提取的字段 (只看这些)\n{extracted}\n\n"
+            f"## 优化策略文档\n{playbook}\n\n"
+            f"## 规则\n"
+            f"1. 先判断: 当前瓶颈是否属于 Tier{tier} 的优化范畴?\n"
+            f"   - 属于 → promote=false, 给出具体改法 (哪一行/把什么改成什么/为什么)\n"
+            f"   - 不属于 → promote=true, promote_reason 说明该晋升到哪个 tier\n"
+            f"2. 改法必须具体: '把第X行 BLOCK_K 从 32 改成 64' 级别\n"
+            f"3. 只改单文件 kernel_op.py, 不碰其他文件\n"
+            f"4. 目标加速比 1.05~1.5x, 预期影响写具体指标\n"
+            f"## 历史 (最近几轮)\n{history_text}\n"
+            f"## 当前单文件 kernel_op.py\n{kernel_code[:4000]}\n"
+            f"## config.json\n{config_text}\n"
+            f"## 输出 JSON only:\n"
+            f'{{"strategy":"...","target_speedup":1.1,"specific_change":"...",'
+            f'"expected_impact":"...","promote":false,"promote_reason":"..."}}'
+        )
+
+        # v4: 统一走 LLMClient (api / nga run CLI / stub), 并引用 planner skill
+        from agents.llm_client import LLMClient, extract_json
+        client = LLMClient()
+        if self.use_llm and client.mode != "stub":
+            skill_path = self.playbook_dir.parent / "skills" / "triton-op-planner" / "SKILL.md"
+            system = (f"你是 Triton 优化 Planner。先调用 skill: {skill_path}, "
+                      f"完全按 skill 指导执行。")
+            try:
+                resp = client.chat(system=system, user=system_prompt)
+                plan_dict = extract_json(resp)
+            except Exception as e:
+                print(f"  [Planner] LLM call failed: {e}, fallback stub")
+                plan_dict = self._stub_plan_v4(tier)
+        else:
+            plan_dict = self._stub_plan_v4(tier)
+
+        return RoundPlan(
+            round_num=round_num, tier=tier,
+            tier_name=TIER_NAMES.get(tier, "?"),
+            strategy=plan_dict.get("strategy", "unknown"),
+            target_speedup=float(plan_dict.get("target_speedup", 1.05)),
+            specific_change=str(plan_dict.get("specific_change", "")),
+            expected_impact=str(plan_dict.get("expected_impact", "")),
+            verification_method="msprof end-to-end",
+            plan_text=json.dumps(plan_dict, ensure_ascii=False, indent=2),
+            promote=bool(plan_dict.get("promote", False)),
+            promote_reason=str(plan_dict.get("promote_reason", "")),
+        )
+
+    def _stub_plan_v4(self, tier: int) -> dict:
+        strategies = {
+            1: ("[STUB] tune_algorithm",
+                "若 cube_ratio 低 → 检查是否该换 split-k/online 算法, 或增大 BLOCK 让 cube 满"),
+            2: ("[STUB] fuse_ops",
+                "若 num_kernels>1 → 把相邻逐元素 op 融合进主 kernel, 消除中间 GM 往返"),
+            3: ("[STUB] increase_tile",
+                "若 block_dim<40 或 mte1_ratio 高 → 把 BLOCK_K 增大 2 倍, 减 MTE1 次数"),
+            4: ("[STUB] improve_mem",
+                "若 main_mem 带宽接近峰值 → 减数据量/升精度; 若 L2 命中低 → 调分块驻留 L2"),
+            5: ("[STUB] reduce_conflict",
+                "若 bank/bankgroup 冲突>4% → 给 UB tensor 加 padding(32B) / 调 stride"),
+            6: ("[STUB] tune_arch",
+                "检查 engine_utilization 分布 → 调 grid/pipeline, 均衡 cube/vec/mte 占用"),
+        }
+        s, c = strategies.get(tier, ("analyze", "进一步分析"))
+        return {"strategy": s, "target_speedup": 1.05, "specific_change": c,
+                "expected_impact": "~5%", "promote": False, "promote_reason": ""}
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  LLM 调用

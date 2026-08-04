@@ -11,24 +11,30 @@
 #        - diagnosis.json  (始终有, roofline 核心, 单算子优化用)
 #        - hivm_fusion_view.txt (多算子时有, 融合用)
 #
-#  用法: bash run_optimize.sh [M] [N] [K]
-#  产物: input/matmul/e2e_run/
+#  用法: bash run_optimize.sh <input_dir> [output_dir] [M] [N] [K]
+#    input_dir  算子目录 (含 kernel_op.py 单文件 或 test_matmul.py + triton_kernel.py)
+#    output_dir 输出目录 (调度器每轮指向不同 round_dir; 默认 input_dir/e2e_run)
+#  产物: <output_dir>/
 #    05_task/    通用 msprof op_summary (骨架: 每kernel耗时/核数/形状) → task.json
 #    04_board/   逐 kernel 的 msprof op 8 CSV (真实带宽/L2/cube) → board_<i>.json
 #    06_diagnosis/  task.json + board_*.json + diagnosis.json (骨架+deep 合并) (+ hivm, 多算子时)
 #    hivm_fusion_view.txt (多算子时, 融合专用)
 #  流程: 通用 msprof → 骨架 → 逐 distinct kernel 采 msprof op → 按名合并 (见 docx/aggregation_rules.md)
+#  单文件: 优先跑 input_dir/kernel_op.py (v4 单文件), 否则 test_matmul.py
 #  环境: ENABLE_HIVM=1 强制跑 hivm (多算子融合需要); 默认自动判断
 # ═══════════════════════════════════════════════════════════════════════════════
 set -u
 
-M=${1:-64}; N=${2:-64}; K=${3:-64}
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-MATMUL_DIR="$REPO_ROOT/input/matmul"
-OUT="$MATMUL_DIR/e2e_run"
-[ -f "$MATMUL_DIR/test_matmul.py" ] || { echo "❌ 找不到 test_matmul.py"; exit 1; }
+INPUT_DIR="${1:-$REPO_ROOT/input/matmul}"
+OUT="${2:-$INPUT_DIR/e2e_run}"
+M=${3:-512}; N=${4:-512}; K=${5:-512}
+
+# 要运行的文件: 优先单文件 kernel_op.py (v4), 否则 test_matmul.py
+RUN_PY="test_matmul.py"
+[ -f "$INPUT_DIR/kernel_op.py" ] && RUN_PY="kernel_op.py"
+[ -f "$INPUT_DIR/$RUN_PY" ] || { echo "❌ 找不到 $INPUT_DIR/{kernel_op.py,test_matmul.py}"; exit 1; }
 if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
 
 PASS=0; FAIL=0
@@ -37,7 +43,7 @@ fail(){ echo "  ❌ $1"; FAIL=$((FAIL+1)); }
 
 # ── 环境 + 清理旧产物 ──
 echo "══════ 环境 ══════"
-echo "M=$M N=$N K=$K  输出=$OUT  (ENABLE_HIVM=${ENABLE_HIVM:-auto})"
+echo "input=$INPUT_DIR  run=$RUN_PY  M=$M N=$N K=$K  输出=$OUT  (ENABLE_HIVM=${ENABLE_HIVM:-auto})"
 echo "  → 清理旧产物"
 rm -rf "$OUT"
 mkdir -p "$OUT"/04_board "$OUT"/05_task "$OUT"/06_diagnosis
@@ -46,7 +52,7 @@ if command -v conda >/dev/null 2>&1; then
   conda activate triton-npu 2>/dev/null && echo "  ✅ conda triton-npu" || echo "  ⚠ 手动 activate"
 fi
 source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null && echo "  ✅ set_env.sh" || echo "  ⚠ 手动 source"
-cd "$MATMUL_DIR"
+cd "$INPUT_DIR"
 
 # ═══════════ 阶段 1/3: 通用 msprof(骨架) → 逐 kernel 采 msprof op ═══════════
 echo ""; echo "══ 阶段 1/3: 通用 msprof(骨架) + 逐 kernel msprof op ══"
@@ -55,7 +61,7 @@ D="$OUT/06_diagnosis"
 # 1a. 通用 msprof 先跑 (任务级 op_summary → distinct kernel 名 → 骨架)
 TASK_OUT="$OUT/05_task/task_prof"; rm -rf "$TASK_OUT"; mkdir -p "$TASK_OUT"
 MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof --output="$TASK_OUT" \
-  --application="$PY test_matmul.py" --ai-core=on > "$OUT/05_task/task_run.txt" 2>&1
+  --application="$PY $RUN_PY" --ai-core=on > "$OUT/05_task/task_run.txt" 2>&1
 OPSUM=$(find "$OUT/05_task" -name 'op_summary*.csv' 2>/dev/null | wc -l)
 echo "  通用 msprof 退出码=$? op_summary x$OPSUM (8.5.1 用 --ai-core=on)"
 [ "$OPSUM" -gt 0 ] && pass "op_summary (骨架/kernel 数)" || fail "无 op_summary"
@@ -95,7 +101,7 @@ for KNAME in "${KERNELS[@]}"; do
   BOUT="$OUT/04_board/op_${IDX}"
   rm -rf "$BOUT"; mkdir -p "$BOUT"
   MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof op --kernel-name="$KNAME" \
-    --output="$BOUT" --warm-up=10 $PY test_matmul.py > "$OUT/04_board/board_${IDX}.txt" 2>&1
+    --output="$BOUT" --warm-up=10 $PY "$RUN_PY" > "$OUT/04_board/board_${IDX}.txt" 2>&1
   MC=$(find "$BOUT" -name 'Memory.csv' 2>/dev/null | head -1)
   if [ -n "$MC" ]; then
     pass "msprof op [$KNAME] 8 CSV"
@@ -140,21 +146,21 @@ if [ "$MULTI" = "1" ]; then
   echo ""; echo "══ 多算子路径: 编译 HIVM → 融合视图 ══"
   rm -rf ~/.triton
   export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
-  MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K $PY test_matmul.py > "$OUT/04_board/compile.txt" 2>&1
-  cp ~/.triton/dump/*/kernel.*.mlir "$MATMUL_DIR/" 2>/dev/null || true
+  MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K $PY "$RUN_PY" > "$OUT/04_board/compile.txt" 2>&1
+  cp ~/.triton/dump/*/kernel.*.mlir "$INPUT_DIR/" 2>/dev/null || true
   HIVM_OK=0
   for P in hivm-inject-sync hivm-graph-sync-solver; do
-    (cd "$MATMUL_DIR" && bishengir-compile --target=Ascend910B3 \
+    (cd "$INPUT_DIR" && bishengir-compile --target=Ascend910B3 \
       --enable-auto-multi-buffer=True --enable-auto-bind-sub-block=True \
       --enable-hfusion-compile=true --enable-hivm-compile=true \
       --enable-triton-kernel-compile=true \
       --bishengir-print-ir-after=$P kernel.ttadapter.mlir -o /tmp/k.o > hivm_try.txt 2>&1)
-    CNT=$(grep -c 'hivm.hir' "$MATMUL_DIR/hivm_try.txt" 2>/dev/null || echo 0)
+    CNT=$(grep -c 'hivm.hir' "$INPUT_DIR/hivm_try.txt" 2>/dev/null || echo 0)
     if [ "$CNT" -gt 0 ]; then echo "  pass=$P → hivm.hir x$CNT"; HIVM_OK=1; break; fi
   done
   if [ "$HIVM_OK" -eq 1 ]; then
     pass "hivm_try.txt 生成"
-    "$PY" "$SCRIPT_DIR/filter_hivm_for_fusion.py" "$MATMUL_DIR/hivm_try.txt" --out "$MATMUL_DIR/hivm_fusion_view.txt"
+    "$PY" "$SCRIPT_DIR/filter_hivm_for_fusion.py" "$INPUT_DIR/hivm_try.txt" --out "$INPUT_DIR/hivm_fusion_view.txt"
     pass "hivm_fusion_view.txt ✓ (融合专用: op+同步+依赖)"
     echo "  → LLM 读 hivm_fusion_view.txt: 找 RAW 链相邻逐元素 op → 融合; WAR → 换 buffer"
   else
@@ -184,5 +190,5 @@ fi
 
 echo ""; echo "══════════ 完成 (PASS=$PASS FAIL=$FAIL) ══════════"
 echo "  diagnosis.json     : $D/diagnosis.json  (单算子优化用)"
-echo "  hivm_fusion_view   : $MATMUL_DIR/hivm_fusion_view.txt  (多算子融合用, 若生成)"
+echo "  hivm_fusion_view   : $INPUT_DIR/hivm_fusion_view.txt  (多算子融合用, 若生成)"
 echo "  看诊断报告: python3 input/matmul/real_report.py"

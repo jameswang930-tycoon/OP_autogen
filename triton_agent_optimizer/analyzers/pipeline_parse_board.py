@@ -56,7 +56,7 @@ def _f(v):
     if v is None:
         return None
     s = str(v).strip()
-    if not s or s.lower() in ("n/a", "nan", "none", "-"):
+    if not s or s.lower() in ("n/a", "na", "nan", "none", "-", "null"):
         return None
     try:
         return float(s)

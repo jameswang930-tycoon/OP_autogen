@@ -139,7 +139,7 @@ def _f(v):
     if v is None:
         return None
     s = str(v).strip()
-    if not s or s.lower() in ("n/a", "nan", "none"):
+    if not s or s.lower() in ("n/a", "na", "nan", "none", "-", "null"):
         return None
     try:
         return float(s)
@@ -290,7 +290,9 @@ def parse(base):
                 "deep": None, "filled_by": None,
             }
         slots[name]["launch_count"] += 1
-    kernel_slots = list(slots.values())
+    # 优化目标 = 非框架 kernel; 框架 kernel (aclnn* torch 数据准备) 单列, 不参与逐 kernel 优化
+    kernel_slots = [s for s in slots.values() if not s["framework"]]
+    framework_kernels = [s for s in slots.values() if s["framework"]]
 
     # 多 kernel 分解 (op_statistic: 每类算子 次数/总耗时)
     multi_kernel = []
@@ -330,8 +332,11 @@ def parse(base):
     total_ns = total_ns * 1000 if total_ns else None
     kernel = next((k["op_name"] for k in kernels if k["op_name"]), None)
     # num_kernels = 去重后的 op 名数 (op_summary 每行是一次启动, 同名只算一个 kernel)
+    #   ★只算非框架 kernel (优化目标); 框架 kernel (aclnn* torch 数据准备) 单列 framework_kernels
     distinct = {k["op_name"] for k in kernels if k["op_name"]}
-    n_kernels = len(distinct) if distinct else len(kernels)
+    n_total = len(distinct) if distinct else len(kernels)
+    n_target = len(kernel_slots)
+    n_kernels = n_target if n_target else n_total
 
     report = {
         "meta": {"source": "task", "generated_at": datetime.now().isoformat(),
@@ -339,11 +344,13 @@ def parse(base):
         "execution_summary": {"total_ns": total_ns,
                               "num_cores": _max("block_dim"),
                               "kernel_name": kernel,
-                              "num_kernels": n_kernels},
+                              "num_kernels": n_kernels,
+                              "num_kernels_total": n_total},
         "raw": raw,                       # ★ 全文件全字段 (不遗漏)
         "normalized": {
             "kernels": kernels,
-            "kernel_slots": kernel_slots,   # ★骨架槽位 (distinct kernel, merge 目标, deep 待 msprof op 填)
+            "kernel_slots": kernel_slots,   # ★骨架槽位 (非框架 kernel, merge 目标, deep 待 msprof op 填)
+            "framework_kernels": framework_kernels,  # torch 框架 kernel (aclnn*), 非优化目标, 仅保留观察
             "ops": ops,                     # per-op 搬运分析 (shape+dtype→字节, pipe耗时→每通路带宽)
             "multi_kernel": multi_kernel,
             "api_overhead": api_overhead,

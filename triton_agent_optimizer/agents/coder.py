@@ -258,6 +258,19 @@ class CoderAgent:
                 error_message=err,
             )
 
+        # Step 3.5: 防截断 (dumb LLM 易输出不全) — 原代码所有函数必须仍在
+        import re as _re
+        orig_fns = _re.findall(r"def\s+(\w+)\s*\(", kernel_code)
+        opt_fns = _re.findall(r"def\s+(\w+)\s*\(", optimized)
+        missing = [f for f in orig_fns if f not in opt_fns]
+        if missing:
+            return CoderResult(
+                success=False,
+                optimized_code=kernel_code,
+                diff="",
+                error_message=f"输出截断, 缺少函数: {missing}",
+            )
+
         # Step 4: 检查是否实际有变更
         if self._is_noop_change(optimized, kernel_code):
             return CoderResult(
@@ -301,28 +314,16 @@ class CoderAgent:
             except Exception:
                 pass
 
-        import os
+        # v4: 统一走 LLMClient (api / nga run CLI / stub), 并引用 coder skill
+        from agents.llm_client import LLMClient
+        client = LLMClient()
+        if client.mode == "stub":
+            return self._stub_apply(kernel_code, plan_text)
         system = _build_system_prompt(plan_text, tier)
         user = _build_user_prompt(plan_text, kernel_code, previous_error)
-        deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
-        if deepseek_key:
-            from openai import OpenAI
-            client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com", timeout=60.0)
-            resp = client.chat.completions.create(
-                model="deepseek-v4-flash", max_tokens=4096,
-                extra_body={"thinking": {"type": "disabled"}},
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": user}])
-            return resp.choices[0].message.content or ""
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if anthropic_key:
-            import anthropic
-            client = anthropic.Anthropic(api_key=anthropic_key)
-            resp = client.messages.create(
-                model="claude-sonnet-4-20250514", max_tokens=4096,
-                system=system, messages=[{"role": "user", "content": user}])
-            return resp.content[0].text
-        raise RuntimeError("No API key")
+        skill_path = Path(__file__).resolve().parent.parent / "skills" / "triton-op-coder" / "SKILL.md"
+        system = f"先调用 skill: {skill_path}, 完全按 skill 指导执行。\n\n" + system
+        return client.chat(system=system, user=user)
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  Stub

@@ -84,14 +84,21 @@ def _match(name, keys, exclude=()):
     return all(k.lower() in cl for k in keys) and not any(x.lower() in cl for x in exclude)
 
 
+def _is_na(v):
+    """值是否为"无数据" (含裸 NA): 空串 / NA / N/A / nan / none / - / null"""
+    if v is None:
+        return True
+    s = str(v).strip().lower()
+    return s in ("", "n/a", "na", "nan", "none", "-", "null")
+
+
 def raw_cols_exist(raw, csv_name, keys, exclude=()):
-    """期望文件里是否有匹配列 **且 rows[0] 值非空**"""
+    """期望文件里是否有匹配列 **且 rows[0] 值非 NA** (列在但值 NA → 合法缺, 不误报 BUG)"""
     csvdata = raw.get(csv_name, {})
     row0 = (csvdata.get("rows") or [{}])[0]
     for col in csvdata.get("columns", []):
         if _match(col, keys, exclude):
-            v = row0.get(col)
-            if v is not None and str(v).strip().lower() not in ("", "n/a", "nan", "none", "-"):
+            if not _is_na(row0.get(col)):
                 return True
     return False
 

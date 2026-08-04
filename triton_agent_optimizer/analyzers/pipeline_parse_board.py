@@ -107,19 +107,19 @@ def parse(base):
     kernel_name = _first(obi, "Op", "Name")
     freq = _f(_first(obi, "Current", "Freq"))
 
-    # 引擎利用率 (PipeUtilization)
+    # 引擎利用率 (PipeUtilization) — 多键子串匹配, 与 check_fields 键一致; fixp 兼容 fixpipe
     engine_util = {}
     for eng, time_k, ratio_k in [
-        ("cube", "aic_cube_time", "aic_cube_ratio"),
-        ("vec", "aiv_vec_time", "aiv_vec_ratio"),
-        ("mte2", "mte2_time", "mte2_ratio"),
-        ("mte3", "mte3_time", "mte3_ratio"),
-        ("mte1", "mte1_time", "mte1_ratio"),
-        ("scalar", "scalar_time", "scalar_ratio"),
-        ("fixpipe", "fixpipe_time", "fixpipe_ratio"),
+        ("cube", ("aic", "cube", "time"), ("aic", "cube", "ratio")),
+        ("vec", ("aiv", "vec", "time"), ("aiv", "vec", "ratio")),
+        ("mte1", ("mte1", "time"), ("mte1", "ratio")),
+        ("mte2", ("mte2", "time"), ("mte2", "ratio")),
+        ("mte3", ("mte3", "time"), ("mte3", "ratio")),
+        ("scalar", ("scalar", "time"), ("scalar", "ratio")),
+        ("fixpipe", ("fixp", "time"), ("fixp", "ratio")),
     ]:
-        t = _f(_first(pu, time_k))
-        r = _f(_first(pu, ratio_k))
+        t = _f(_first(pu, *time_k))
+        r = _f(_first(pu, *ratio_k))
         if r is not None:
             engine_util[eng] = round(r, 4)
         elif t is not None and dur_us:

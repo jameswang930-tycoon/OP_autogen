@@ -27,6 +27,8 @@ LLM 调用（服务器无 Claude API, 用本地 codeagent）:
   2. 完整优化循环 (一键):
      LLM_CLI_COMMAND="nga run" python3 main.py input/matmul --max-rounds 2
      # 每轮: 采集→07字段→planner→coder→msprof端到端→加速比
+     # 从头开始(清 outputs/matmul + 重置): 加 --fresh
+     # 续跑(从上次 round 继续, 不清旧产物): 不加 --fresh
   3. 只采集+解析 (不跑优化):
      bash analyzers/run_optimize.sh input/matmul input/matmul/e2e_run
   4. 只看各 tier 筛字段:
@@ -51,6 +53,7 @@ if str(_PROJECT) not in sys.path:
     sys.path.insert(0, str(_PROJECT))
 
 from analyzers.merge_single_file import merge  # noqa: E402
+from config import config  # noqa: E402,F401 — 触发 _load_dotenv() 加载 .env (LLM_CLI_COMMAND 等)
 
 
 def main():
@@ -60,6 +63,8 @@ def main():
     p.add_argument("--target", type=float, default=1.5)
     p.add_argument("--stub", action="store_true", help="不调 LLM/真机, 用 stub (本地测试)")
     p.add_argument("--remerge", action="store_true", help="强制重新合并单文件 (会覆盖 coder 改动)")
+    p.add_argument("--fresh", action="store_true",
+                   help="清空 outputs/<op>/ 旧产物 + 重置 trajectory, 从头开始")
     args = p.parse_args()
 
     op_dir = Path(args.op_dir)
@@ -77,11 +82,31 @@ def main():
         return 1
     print(f"[main] 单文件: {kernel_op}")
 
+    # ①.5 --fresh: 清旧产物 + 重置 trajectory (从头开始)
+    if args.fresh:
+        import shutil
+        out_dir = _PROJECT / "outputs" / op_dir.name
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+            print(f"[main] --fresh: 已清空 {out_dir}")
+
+    # ① 单文件 kernel_op.py (★源文件, coder 直接改它, 不覆盖)
+    #    若缺 (旧式三文件 op) → 用 merge_single_file.py 生成一次
+    kernel_op = op_dir / "kernel_op.py"
+    if not kernel_op.exists():
+        merge(op_dir, kernel_op)
+    if not kernel_op.exists():
+        print(f"[ERROR] 单文件不存在: {kernel_op}")
+        return 1
+    print(f"[main] 单文件: {kernel_op}")
+
     # ② Scheduler 循环
     from agents.scheduler import Scheduler
     s = Scheduler(op_dir, max_rounds=args.max_rounds,
                   target_speedup=args.target, stub=args.stub)
     return s.run()
+
+
 
 
 if __name__ == "__main__":

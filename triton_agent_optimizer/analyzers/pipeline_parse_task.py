@@ -184,9 +184,9 @@ def parse(base):
     # 每 kernel 耗时 (op_summary 每行一个 kernel)
     kernels = []
     for r in op_sum:
-        # per-pipe 耗时列 (aic_=cube 核, aiv_=vector 核; 8.5.1 op_summary 有 mac/scalar/mte1/2/fixpipe)
+        # per-pipe 耗时列 (aic_=cube 核, aiv_=vector 核; 列名带 (us) 后缀; fixp/fixpipe 版本差异都兼容)
         pipes = {}
-        for p in ("cube", "mac", "scalar", "mte1", "mte2", "mte3", "fixpipe"):
+        for p in ("cube", "mac", "scalar", "mte1", "mte2", "mte3", "fixpipe", "fixp"):
             aic = _f(_first(r, "aic", p, "time"))
             if aic is not None:
                 pipes.setdefault(f"aic_{p}_time_us", aic)
@@ -260,7 +260,8 @@ def parse(base):
     #     task 字段取首个 launch, launch_count 累加, deep 留空待 msprof op 填充
     _PIPE_KEYS = ("aic_cube_time_us", "aic_mac_time_us", "aic_scalar_time_us",
                   "aic_mte1_time_us", "aic_mte2_time_us", "aic_mte3_time_us",
-                  "aic_fixpipe_time_us", "aiv_vec_time_us", "aiv_scalar_time_us",
+                  "aic_fixpipe_time_us", "aic_fixp_time_us",
+                  "aiv_vec_time_us", "aiv_scalar_time_us",
                   "aiv_mte2_time_us", "aiv_mte3_time_us")
     slots = {}
     for k, o in zip(kernels, ops):
@@ -268,6 +269,7 @@ def parse(base):
         if name not in slots:
             slots[name] = {
                 "kernel_name": name,
+                "framework": bool(name.lower().startswith("aclnn")),  # torch_npu 内部 kernel (数据准备/参考), 非我们优化目标
                 "launch_count": 0,
                 "task": {
                     "task_type": k.get("task_type"),

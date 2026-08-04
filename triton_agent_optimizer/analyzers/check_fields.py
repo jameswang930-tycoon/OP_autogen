@@ -109,13 +109,13 @@ def check_board(bd):
     issues = []
 
     def _check(section, norm_dict, prefix):
-        """统一检查: (field, src, keys[, exclude]) → 判定"""
+        """统一检查: (field, src, keys[, exclude]) → 判定, 带上期望列名"""
         for entry in BOARD_EXPECT[section]:
             field, src, keys = entry[0], entry[1], entry[2]
             exclude = entry[3] if len(entry) > 3 else ()
             if norm_dict.get(field) is None:
                 issues.append((f"{prefix}.{field}", src,
-                               raw_cols_exist(raw, src, keys, exclude)))
+                               raw_cols_exist(raw, src, keys, exclude), keys))
 
     _check("bandwidth", norm.get("bandwidth_gb_s", {}), "bandwidth")
     _check("engine_utilization", norm.get("engine_utilization", {}), "engine")
@@ -125,10 +125,11 @@ def check_board(bd):
         field, src, keys = entry[0], entry[1], entry[2]
         exclude = entry[3] if len(entry) > 3 else ()
         if not norm_key_exists(norm.get("conflict", {}), *keys, exclude=exclude):
-            issues.append((f"conflict.{field}", src, raw_cols_exist(raw, src, keys, exclude)))
+            issues.append((f"conflict.{field}", src, raw_cols_exist(raw, src, keys, exclude), keys))
 
     if norm.get("l2_hit_rate") is None:
-        issues.append(("l2_hit_rate", "L2Cache", raw_cols_exist(raw, "L2Cache", ("hit_rate",))))
+        issues.append(("l2_hit_rate", "L2Cache", raw_cols_exist(raw, "L2Cache", ("hit_rate",)),
+                       ("hit_rate",)))
     return issues
 
 
@@ -147,14 +148,14 @@ def check_task(tk):
                         ("aicore_time_us", ("aicore", "time")), ("aiv_time_us", ("aiv", "time")),
                         ("total_cycles", ("total", "cycle")), ("input_shapes", ("input", "shape"))):
             if k0.get(f) is None:
-                issues.append((f"kernel.{f}", "op_summary", col_hit(*keys)))
+                issues.append((f"kernel.{f}", "op_summary", col_hit(*keys), keys))
 
     if not norm.get("multi_kernel"):
-        issues.append(("multi_kernel", "op_statistic", False))
+        issues.append(("multi_kernel", "op_statistic", False, ("OP Type",)))
     if not norm.get("api_overhead"):
-        issues.append(("api_overhead", "api_statistic", False))
+        issues.append(("api_overhead", "api_statistic", False, ("API Name",)))
     if norm.get("l2_hit_rate") is None:
-        issues.append(("l2_hit_rate", "l2_cache", True))
+        issues.append(("l2_hit_rate", "l2_cache", True, ("Hit Rate",)))
     return issues
 
 
@@ -164,25 +165,27 @@ def check_diag(dg):
     if dg.get("summary") and dg.get("kernels"):
         s = dg["summary"]
         if s.get("num_kernels") is None:
-            issues.append(("summary.num_kernels", "整合", False))
+            issues.append(("summary.num_kernels", "整合", False, ("num_kernels",)))
         for i, k in enumerate(dg["kernels"]):
             if not k.get("kernel_name"):
-                issues.append((f"kernels[{i}].kernel_name", "整合", False))
+                issues.append((f"kernels[{i}].kernel_name", "整合", False, ("Op Name",)))
             deep = k.get("deep")
             if deep:
                 if not deep.get("roofline", {}).get("bottleneck_type"):
-                    issues.append((f"kernels[{i}].deep.roofline.bottleneck_type", "整合计算", False))
+                    issues.append((f"kernels[{i}].deep.roofline.bottleneck_type", "整合计算",
+                                   False, ("main_mem_*_bw + cube_fops",)))
                 if not deep.get("bandwidth_gb_s"):
-                    issues.append((f"kernels[{i}].deep.bandwidth_gb_s", "Memory.csv", False))
+                    issues.append((f"kernels[{i}].deep.bandwidth_gb_s", "Memory.csv",
+                                   False, ("aic_main_mem_read_bw",)))
         return issues
     # 旧 schema 兜底
     if not dg.get("roofline", {}).get("bottleneck_type"):
-        issues.append(("roofline.bottleneck_type", "整合计算", False))
+        issues.append(("roofline.bottleneck_type", "整合计算", False, ("main_mem_*_bw",)))
     if not dg.get("transfer_paths"):
-        issues.append(("transfer_paths", "Memory.csv", False))
+        issues.append(("transfer_paths", "Memory.csv", False, ("aic_*_bw",)))
     for k, v in dg.get("bottlenecks", {}).items():
         if not v.get("hint"):
-            issues.append((f"bottlenecks.{k}.hint", "规则", False))
+            issues.append((f"bottlenecks.{k}.hint", "规则", False, ("hint",)))
     return issues
 
 
@@ -196,12 +199,13 @@ def report(bd, tk, dg):
         print(f"\n── {label} ──")
         if not issues:
             print("  ✅ 所有期望字段都有数据")
-        for field, src, has_raw in issues:
+        for field, src, has_raw, keys in issues:
+            exp = " / ".join(f"含'{k}'" for k in keys) if keys else ""
             if has_raw:
-                print(f"  ⚠ {field:32s} → 原始 {src} 有该列但 normalized 没取到 → **字段名不匹配 (BUG/列名变)**")
+                print(f"  ⚠ {field:28s} 期望[{src} {exp}] → raw 有但没取到 → **字段名不匹配 (BUG/列名变)**")
                 total_bug += 1
             else:
-                print(f"  · {field:32s} → 原始 {src} 无此列/此数据 → **合法缺 (版本/产品无此数据)**")
+                print(f"  · {field:28s} 期望[{src} {exp}] → 该列不存在/为空 → **合法缺** (去真机核对)")
                 total_absent += 1
     print(f"\n{'=' * 60}")
     print(f"结论: 字段名不匹配 {total_bug} 个 (需修 parser 列名) | 合法缺 {total_absent} 个 (正常)")

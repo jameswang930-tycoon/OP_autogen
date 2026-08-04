@@ -63,9 +63,16 @@ echo "  通用 msprof 退出码=$? op_summary x$OPSUM (8.5.1 用 --ai-core=on)"
 [ -f "$D/task.json" ] || echo '{}' > "$D/task.json"
 
 # 1b. 从 task.json 取 distinct kernel 名 → 逐 kernel 跑 msprof op → board_<i>.json
-echo "  → 读取 kernel 名, 逐 kernel 采 msprof op (规则 O6)"
+#     默认跳过 torch 框架 kernel (aclnn* 数据准备), 除非 FORCE_ALL_KERNELS=1
+echo "  → 读取 kernel 名, 逐 kernel 采 msprof op (规则 O6, 默认跳过 aclnn* 框架 kernel)"
 KERNELS=()
-while IFS= read -r line; do [ -n "$line" ] && KERNELS+=("$line"); done < <(
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  case "$line" in
+    aclnn*) [ "${FORCE_ALL_KERNELS:-0}" = "1" ] && KERNELS+=("$line") || echo "  ⏭ 跳过框架 kernel: $line";;
+    *) KERNELS+=("$line");;
+  esac
+done < <(
   "$PY" - "$D/task.json" <<'PYEOF'
 import json, sys
 from pathlib import Path
@@ -80,7 +87,7 @@ except Exception:
 PYEOF
 )
 if [ "${#KERNELS[@]}" -eq 0 ]; then KERNELS=(matmul_kernel); echo "  ⚠ 无 kernel 名 → 回退 matmul_kernel"; fi
-echo "  kernels: ${KERNELS[*]}"
+echo "  待采 kernel: ${KERNELS[*]}"
 
 IDX=0; BOARD_OK=0
 for KNAME in "${KERNELS[@]}"; do

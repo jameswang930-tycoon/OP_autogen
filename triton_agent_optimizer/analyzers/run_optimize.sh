@@ -22,6 +22,29 @@
 #  流程: 通用 msprof → 骨架 → 逐 distinct kernel 采 msprof op → 按名合并 (见 docx/aggregation_rules.md)
 #  单文件: 优先跑 input_dir/kernel_op.py (v4 单文件), 否则 test_matmul.py
 #  环境: ENABLE_HIVM=1 强制跑 hivm (多算子融合需要); 默认自动判断
+#
+#  ═══════════════ 服务器运行步骤 (从 clone 到出诊断) ═══════════════
+#   1. 环境:
+#      conda activate triton-npu
+#      source /usr/local/Ascend/ascend-toolkit/set_env.sh
+#      cd triton_agent_optimizer
+#   2. 单文件能不能跑 (自包含, 无 import 依赖):
+#      cd input/matmul && python3 kernel_op.py && cd ../..
+#      # 预期: [info] launch grid=... ; [info] kernel launched & synced OK
+#   3. 采集+解析 (参数是 <input_dir> <output_dir>):
+#      bash analyzers/run_optimize.sh input/matmul input/matmul/e2e_run
+#      # 预期: run=kernel_op.py; ✅ op_summary; ✅ msprof op [matmul_kernel] 8 CSV;
+#      #        ✅ diagnosis.json ✓; 字段校验: 列名不匹配 0 个
+#   4. 看诊断:
+#      python3 input/matmul/real_report.py input/matmul/e2e_run/06_diagnosis/diagnosis.json
+#      # 预期: summary(num_kernels/filled) + kernel task/deep + roofline(一针见血)
+#   5. 完整优化循环 (一键, 每轮: 采集→提取当前tier字段→planner→coder→msprof端到端→加速比):
+#      LLM_CLI_COMMAND="nga run" python3 main.py input/matmul
+#      # 本地无 LLM 先试流程: python3 main.py input/matmul --max-rounds 3 --stub
+#
+#  ⚠ 参数变化: 原来 `bash run_optimize.sh 512 512 512` (M/N/K) 已改成
+#    `bash run_optimize.sh input/matmul <out_dir> 512 512 512` (input/output 在前)
+#  ⚠ 单文件 kernel_op.py 是源文件 (config+kernel+test 一体), coder 只改它; 已入库 (不在 .gitignore)
 # ═══════════════════════════════════════════════════════════════════════════════
 set -u
 

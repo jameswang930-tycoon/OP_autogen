@@ -41,6 +41,11 @@
 #   5. 完整优化循环 (一键, 每轮: 采集→提取当前tier字段→planner→coder→msprof端到端→加速比):
 #      LLM_CLI_COMMAND="nga run" python3 main.py input/matmul
 #      # 本地无 LLM 先试流程: python3 main.py input/matmul --max-rounds 3 --stub
+#   6. 核对当前策略筛字段 (解析完 07 已自动产出, 再手动核对一遍规则):
+#      python3 analyzers/test_tier_extract.py input/matmul/e2e_run/06_diagnosis/diagnosis.json
+#      # 预期: 每 tier 只显示自己策略的字段; X/Y 有数据 越大越好
+#   ★ 07 产物: 解析完自动产出 <out_dir>/07_tier<N>_fields/{tier<N>_fields.txt,.json}
+#      = 当前优化阶段筛选后的字段 (planner 只读这个; TIER 环境变量指定阶段, 默认 1)
 #
 #  ⚠ 参数变化: 原来 `bash run_optimize.sh 512 512 512` (M/N/K) 已改成
 #    `bash run_optimize.sh input/matmul <out_dir> 512 512 512` (input/output 在前)
@@ -53,6 +58,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INPUT_DIR="${1:-$REPO_ROOT/input/matmul}"
 OUT="${2:-$INPUT_DIR/e2e_run}"
 M=${3:-512}; N=${4:-512}; K=${5:-512}
+TIER=${TIER:-1}    # 当前优化阶段 1~6 (调度器传; 决定 07 筛哪层字段)
 
 # 要运行的文件: 优先单文件 kernel_op.py (v4), 否则 test_matmul.py
 RUN_PY="test_matmul.py"
@@ -70,12 +76,16 @@ echo "input=$INPUT_DIR  run=$RUN_PY  M=$M N=$N K=$K  输出=$OUT  (ENABLE_HIVM=$
 echo "  → 清理旧产物"
 rm -rf "$OUT"
 mkdir -p "$OUT"/04_board "$OUT"/05_task "$OUT"/06_diagnosis
+# 自包含: 本轮运行的源快照 → $OUT/input/, 从那里跑 (每轮独立可复现, 输入在 outputs 里)
+mkdir -p "$OUT/input"
+cp "$INPUT_DIR/$RUN_PY" "$OUT/input/$RUN_PY"
+RUN_DIR="$OUT/input"
 if command -v conda >/dev/null 2>&1; then
   CB=$(conda info --base 2>/dev/null || echo ""); [ -n "$CB" ] && source "$CB/etc/profile.d/conda.sh" 2>/dev/null
   conda activate triton-npu 2>/dev/null && echo "  ✅ conda triton-npu" || echo "  ⚠ 手动 activate"
 fi
 source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null && echo "  ✅ set_env.sh" || echo "  ⚠ 手动 source"
-cd "$INPUT_DIR"
+cd "$RUN_DIR"
 
 # ═══════════ 阶段 1/3: 通用 msprof(骨架) → 逐 kernel 采 msprof op ═══════════
 echo ""; echo "══ 阶段 1/3: 通用 msprof(骨架) + 逐 kernel msprof op ══"
@@ -146,6 +156,26 @@ else
 fi
 [ -f "$D/diagnosis.json" ] && pass "diagnosis.json ✓ (骨架+deep, 规则M11)" || fail "diagnosis.json 未生成"
 
+# 07: 解析完 → 按当前阶段筛字段, 产出到 07 (planner 读这个)
+if [ -f "$D/diagnosis.json" ]; then
+  "$PY" - "$REPO_ROOT" "$D/diagnosis.json" "$OUT" "$TIER" <<'PYEOF'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from agents.scheduler import extract_tier_fields, TIER_FIELDS, _get
+d = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+tier = int(sys.argv[4]); out = Path(sys.argv[3])
+txt = extract_tier_fields(d, tier)
+d7 = out / f"07_tier{tier}_fields"
+d7.mkdir(parents=True, exist_ok=True)
+(d7 / f"tier{tier}_fields.txt").write_text(txt, encoding="utf-8")
+vals = {desc: _get(d, path) for path, desc in TIER_FIELDS.get(tier, [])}
+(d7 / f"tier{tier}_fields.json").write_text(
+    json.dumps(vals, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+print(f"  ✅ 07_tier{tier}_fields: {sum(1 for l in txt.splitlines() if l.startswith('-'))} 字段 → {d7}")
+PYEOF
+fi
+
 # ═══════════ 阶段 3/3: 判断算子数 → 分流 ═══════════
 echo ""; echo "══ 阶段 3/3: 判断算子数 → 分流 ══"
 N_KERNELS=$("$PY" - "$D/task.json" <<'PYEOF'
@@ -167,6 +197,7 @@ else echo "  (单个 kernel → 单算子: roofline 诊断够用, 走 Tier3-6)";
 
 if [ "$MULTI" = "1" ]; then
   echo ""; echo "══ 多算子路径: 编译 HIVM → 融合视图 ══"
+  cd "$INPUT_DIR"     # hivm 编译/产物都在源目录 (自包含 input/ 只用于 msprof 采集)
   rm -rf ~/.triton
   export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
   MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K $PY "$RUN_PY" > "$OUT/04_board/compile.txt" 2>&1

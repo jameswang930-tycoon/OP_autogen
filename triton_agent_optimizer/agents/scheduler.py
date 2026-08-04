@@ -91,7 +91,8 @@ TIER_FIELDS = {
 
 
 def _get(d, path: str):
-    """按 'a.b.c' 或 'kernels[].x.y' 路径取值 (返回第一个匹配)。"""
+    """按 'a.b.c' 或 'kernels[].x.y' 路径取值 (返回第一个匹配)。
+    每级 dict 先精确键, 无则子串匹配兜底 (如 conflict.aiv_vec_bank_cflt_ratio ↔ bank_cflt_ratio)。"""
     parts = path.split(".")
     cur = d
     if parts and parts[0].endswith("[]"):
@@ -104,7 +105,13 @@ def _get(d, path: str):
         return None
     for p in parts:
         if isinstance(cur, dict):
-            cur = cur.get(p)
+            if p in cur:
+                cur = cur[p]
+            else:
+                nxt = next((vv for kk, vv in cur.items() if p.lower() in kk.lower()), None)
+                if nxt is None:
+                    return None
+                cur = nxt
         else:
             return None
     return cur
@@ -163,12 +170,15 @@ class Scheduler:
         return self.kernel_dir / TIER_NAMES.get(tier, "0x") / f"round{rn}"
 
     # ── ① 采集+解析 ──
-    def _run_optimize(self, round_dir: Path) -> Optional[dict]:
-        """调 run_optimize.sh <op_dir> <round_dir> → 读 diagnosis.json。"""
+    def _run_optimize(self, round_dir: Path, tier: int = 1) -> Optional[dict]:
+        """调 run_optimize.sh <op_dir> <round_dir> → 读 diagnosis.json。
+        TIER 环境变量传给 run_optimize, 让它解析完自动产出 07_tier<N>_fields。"""
         run_sh = (_PROJECT / "analyzers" / "run_optimize.sh").as_posix()
         cmd = ["bash", run_sh, str(self.op_dir), str(round_dir)]
-        print(f"  [Scheduler] {' '.join(cmd)}")
-        subprocess.run(cmd, check=False, timeout=1800)
+        print(f"  [Scheduler] {' '.join(cmd)} (TIER={tier})")
+        env = dict(os.environ)
+        env["TIER"] = str(tier)
+        subprocess.run(cmd, check=False, timeout=1800, env=env)
         dgn = round_dir / "06_diagnosis" / "diagnosis.json"
         if dgn.exists():
             return json.loads(dgn.read_text(encoding="utf-8"))
@@ -179,10 +189,24 @@ class Scheduler:
         print("  [Scheduler] ❌ diagnosis.json 未生成")
         return None
 
-    # ── ③ 提取字段 → ④ Planner ──
-    def _plan(self, diagnosis: dict, tier: int, rn: int, round_dir: Path):
-        from agents.planner import PlannerAgent
+    # ── ③ 诊断: 按当前阶段筛选字段 → 写 07 (planner 只读这个) ──
+    def _diagnose(self, diagnosis: dict, tier: int, round_dir: Path) -> str:
         extracted = extract_tier_fields(diagnosis, tier)
+        d7 = round_dir / f"07_tier{tier}_fields"
+        d7.mkdir(parents=True, exist_ok=True)
+        (d7 / f"tier{tier}_fields.txt").write_text(extracted, encoding="utf-8")
+        # 结构化 JSON: {字段说明: 值}
+        vals = {}
+        for path, desc in TIER_FIELDS.get(tier, []):
+            vals[desc] = _get(diagnosis, path)
+        (d7 / f"tier{tier}_fields.json").write_text(
+            json.dumps(vals, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+        print(f"  [诊断] Tier{tier} 筛出 {len(extracted.splitlines())} 行 → {d7}")
+        return extracted
+
+    # ── ④ Planner (只喂当前阶段筛好的字段) ──
+    def _plan(self, diagnosis: dict, extracted: str, tier: int, rn: int, round_dir: Path):
+        from agents.planner import PlannerAgent
         kernel_code = self.kernel_op.read_text(encoding="utf-8") if self.kernel_op.exists() else ""
         planner = PlannerAgent(use_llm=self.use_llm)
         plan = planner.generate_v4(
@@ -232,7 +256,7 @@ class Scheduler:
             base_dir = self.kernel_dir / "round0"
             base_dir.mkdir(parents=True, exist_ok=True)
             print("\n[Round 0] 基准采集...")
-            d0 = self._run_optimize(base_dir)
+            d0 = self._run_optimize(base_dir, tier)
             if d0:
                 ks = d0.get("summary", {})
                 st["baseline_ns"] = ks.get("total_ns")
@@ -248,18 +272,17 @@ class Scheduler:
             round_dir = self._round_dir(tier, rn)
             print(f"\n══ Tier{tier}({TIER_LABEL.get(tier)}) Round{rn} ══")
 
-            # ① 采集+解析
-            diagnosis = self._run_optimize(round_dir)
+            # ① 采集+解析 (run_optimize 自动产出 07_tier{N}_fields)
+            diagnosis = self._run_optimize(round_dir, tier)
             if not diagnosis:
                 print("  ⚠ 采集失败, 停止")
                 break
 
-            # ③ 提取字段 (每轮只看当前 tier)
-            extracted = extract_tier_fields(diagnosis, tier)
-            print(f"  [提取字段] Tier{tier} 共 {len(extracted.splitlines())} 行")
+            # ③ 诊断: 按当前阶段筛选字段 → 写 07
+            extracted = self._diagnose(diagnosis, tier, round_dir)
 
-            # ④ Planner → plan + 晋升决策
-            plan = self._plan(diagnosis, tier, rn, round_dir)
+            # ④ Planner → plan + 晋升决策 (只喂 07 筛好的字段)
+            plan = self._plan(diagnosis, extracted, tier, rn, round_dir)
 
             # ⑤ Coder → 改单文件 (报错同轮重改, ≤3次)
             prev_err, new_code = "", ""

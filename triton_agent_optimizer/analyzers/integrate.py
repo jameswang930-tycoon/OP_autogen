@@ -41,12 +41,12 @@ PATH_DESC = {
     'VecUnit': 'compute(UB)', 'CubeUnit': 'compute(L0C)', 'FixPipe': 'L0C→UB',
     'Sync': 'synchronize',
 }
-# 通路 → task.json 里的真实带宽字段
+# 通路 → board.json Memory.csv 里找带宽的列子串 (真实带宽来自 msprof op 的 Memory.csv)
 PATH_BW_KEY = {
-    'GM→UB': 'main_mem_read_bw', 'UB→GM': 'main_mem_write_bw',
-    'GM→L1': 'main_mem_read_bw', 'L1→L0': 'l1_read_bw',
-    'L0→GM': 'main_mem_write_bw',
-    'VecUnit': 'ub_read_bw', 'CubeUnit': 'l0c_read_bw', 'FixPipe': 'l0c_read_bw',
+    'GM→UB': ('main', 'mem', 'read'), 'UB→GM': ('main', 'mem', 'write'),
+    'GM→L1': ('main', 'mem', 'read'), 'L1→L0': ('l1', 'read'),
+    'L0→GM': ('main', 'mem', 'write'),
+    'VecUnit': ('ub', 'read'), 'CubeUnit': ('l0c', 'read'), 'FixPipe': ('l0c', 'read'),
 }
 # 真机峰值参考 (占位; 用 task 实测最大值校准后替换)
 PEAK_GB_S = {'GM→UB': None, 'UB→GM': None, 'GM→L1': None, 'L1→L0': None,
@@ -68,6 +68,28 @@ def integrate(hivm_p, sim_p, task_p, board_p, out_p):
     sm = read_json(sim_p)
     tk = read_json(task_p)
     bd = read_json(board_p)
+
+    # 真实带宽/L2 来自 board.json (msprof op 的 Memory.csv/L2Cache.csv), 不是 task.json
+    bd_bw = (bd.get("bandwidth_utilization") or {}).get("memory_bandwidth_gb_s") or {}
+    bd_l2 = (bd.get("bandwidth_utilization") or {}).get("l2_cache") or {}
+
+    def board_bw(*keys):
+        """从 board Memory.csv 找含所有子串的列, 返回带宽 (GB/s)。"""
+        for fname, cols in bd_bw.items():
+            for col, val in (cols or {}).items():
+                if all(k.lower() in str(col).lower() for k in keys):
+                    return _bw_gb_s(val)
+        return None
+
+    def board_l2():
+        """L2 命中率: 优先 Hit Rate 列 (避免误取 block_id 等)。"""
+        hit = None
+        for col, v in bd_l2.items():
+            cl = str(col).lower()
+            if 'hit' in cl and isinstance(v, (int, float)):
+                if 'rate' in cl or hit is None:
+                    hit = v
+        return round(hit, 4) if hit is not None else None
 
     # ── sim 索引 (指令时序 per pipe / sync 关键词) ──
     sim_by_pipe, sim_by_kw = {}, {}
@@ -123,14 +145,13 @@ def integrate(hivm_p, sim_p, task_p, board_p, out_p):
             o["pipe"] = s.get("pipeline_channel")
             o["call_count"] = s.get("call_count")
             o["sim_instr"] = s.get("op_name")
-        # 真机指标 (task 主 kernel)
+        # 真机指标: real_duration 从 task(op_summary Task Duration); 带宽/L2 从 board(Memory/L2Cache)
         if tk.get("per_op"):
-            top = tk["per_op"][0]
-            o["real_duration_ns"] = round((top.get("task_duration_us") or 0) * 1000, 2)
-            bw = _bw_gb_s(top.get(PATH_BW_KEY.get(ENGINE_FOR.get(t, ""), "")))
-            if bw:
-                o["real_bw_gb_s"] = bw
-            o["l2_hit"] = top.get("l2_hit_rate")
+            o["real_duration_ns"] = round((tk["per_op"][0].get("task_duration_us") or 0) * 1000, 2)
+        bw = board_bw(*PATH_BW_KEY.get(ENGINE_FOR.get(t, ""), ()))
+        if bw:
+            o["real_bw_gb_s"] = bw
+        o["l2_hit"] = board_l2()
         ops.append(o)
 
     # ── transfer_paths: 按引擎聚合真实带宽 ──
@@ -146,14 +167,11 @@ def integrate(hivm_p, sim_p, task_p, board_p, out_p):
         a["num_ops"] += 1
         a["total_size_kb"] += o.get("size_kb") or 0
         a["total_duration_ns"] += o.get("duration_ns") or 0
-    # 真机带宽注入 (task 主 kernel 的通路 bw)
-    if tk.get("per_op"):
-        top = tk["per_op"][0]
-        for p, key in PATH_BW_KEY.items():
-            if p in paths:
-                bw = _bw_gb_s(top.get(key))
-                if bw:
-                    paths[p]["real_bw_gb_s"] = bw
+    # 真机带宽注入 (board Memory.csv)
+    for p in paths:
+        bw = board_bw(*PATH_BW_KEY.get(p, ()))
+        if bw:
+            paths[p]["real_bw_gb_s"] = bw
     # 利用率/regime (peak 校准后才有意义; 无 peak 标 None)
     for a in paths.values():
         peak = PEAK_GB_S.get(a["path"])
@@ -181,14 +199,18 @@ def integrate(hivm_p, sim_p, task_p, board_p, out_p):
                 or hv_sum.get("total_ns"))
     num_cores = (tk_sum.get("num_cores") or sm_sum.get("num_cores")
                  or hv_sum.get("num_cores"))
-    l2_hit = None
-    if tk.get("per_op"):
-        l2_hit = tk["per_op"][0].get("l2_hit_rate")
-    # 引擎占比: task pipe ratios (真机) 优先
+    l2_hit = board_l2()
+    # 引擎占比: task pipe ratios (真机) 优先; 否则从 board 的 pipe 伪 op 算
     engine_util = {}
     if tk.get("per_op"):
         top = tk["per_op"][0]
         engine_util = {k: v for k, v in (top.get("pipe_ratios") or {}).items()}
+    if not engine_util and bd.get("per_op_statistics"):
+        bt = bd["execution_summary"].get("total_ns") or 0
+        for o in bd["per_op_statistics"]:
+            d = o.get("duration_ns")
+            if isinstance(d, (int, float)) and bt:
+                engine_util[str(o.get("op_type", "?"))] = round(d / bt, 4)
     summary = {
         "total_ns": total_ns, "num_cores": num_cores,
         "kernel_name": tk_sum.get("kernel_name") or hv_sum.get("kernel_name"),

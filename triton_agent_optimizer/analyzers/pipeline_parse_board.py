@@ -151,15 +151,28 @@ def parse(base):
     if not bandwidth:
         notes.append("无 Memory*.csv (需全指标 --aic-metrics 含 Memory)")
 
+    # ── L2Cache.csv → L2 命中率 ──
+    l2 = {}
+    l2f = opprof / "L2Cache.csv"
+    if l2f.exists():
+        rows = read_rows(l2f)
+        if rows:
+            r = rows[0]
+            l2 = {k.strip(): to_float(v) for k, v in r.items()
+                  if to_float(v) is not None}
+    else:
+        notes.append("无 L2Cache.csv (910B3 A2 应支持; 若缺看是否需显式指标)")
+
     summary = {"total_ns": total_ns, "num_ops": len(ops),
                "execution_mode": None, "num_cores": num_cores,
                "kernel_name": kernel_name}
     report = make_report("board", [str(opprof)], summary, ops,
                          engine_util=engine_util,
                          notes=notes + ["真机 op 级聚合: 整个 kernel 一行, per-op 只有引擎级伪 op (PipeUtilization)",
-                                        "total_ns 来自 Task Duration(us); 带宽/FLOPs 见 bandwidth_utilization"])
+                                        "total_ns 来自 Task Duration(us); 带宽/FLOPs/L2 见 bandwidth_utilization"])
     report["bandwidth_utilization"] = {"memory_bandwidth_gb_s": bandwidth,
-                                       "arithmetic": arith}
+                                       "arithmetic": arith,
+                                       "l2_cache": l2}
     return report
 
 

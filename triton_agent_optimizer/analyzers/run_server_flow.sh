@@ -1,6 +1,9 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════════════
-#  服务器端一键采集+解析+整合 (6 阶段 → diagnosis.json)  — 定稿版
+#  服务器端一键采集+解析+整合 → diagnosis.json  — 定稿版
+#  ★ 主流程 = msprof + msprof op + 通用 msprof (真机, 快/真/够用)
+#    hivm/sim 默认跳过 (复杂场景用不到/字段易出错); ENABLE_HIVM=1 / ENABLE_SIM=1 才跑
+#    diagnosis.json 无 hivm 时: transfer_paths 直接从 board Memory.csv 建真实带宽
 # ═══════════════════════════════════════════════════════════════════════════════
 #  用法: bash run_server_flow.sh [M] [N] [K]     (默认 64³, 避免 simulator 卡)
 #  产物: input/matmul/e2e_run/  (每阶段一个子目录, 运行前自动清理)
@@ -45,6 +48,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MATMUL_DIR="$REPO_ROOT/input/matmul"
 OUT="$MATMUL_DIR/e2e_run"
 SIM_TIMEOUT=${SIM_TIMEOUT:-1800}
+# ★ 主流程 = msprof + msprof op + 通用 msprof (真机, 快/真/够用)
+#   hivm / simulator 默认跳过 (复杂场景用不到, 字段解析易出错) — ENABLE_HIVM=1 / ENABLE_SIM=1 才跑
+ENABLE_HIVM=${ENABLE_HIVM:-0}
+ENABLE_SIM=${ENABLE_SIM:-0}
 [ -f "$MATMUL_DIR/test_matmul.py" ] || { echo "❌ 找不到 $MATMUL_DIR/test_matmul.py — 仓库结构不对"; exit 1; }
 if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
 
@@ -54,7 +61,7 @@ fail(){ echo "  ❌ $1"; FAIL=$((FAIL+1)); }
 
 # ── 环境 + 清理 ──
 echo "══════ 环境 ══════"
-echo "M=$M N=$N K=$K  输出=$OUT"
+echo "M=$M N=$N K=$K  输出=$OUT  (ENABLE_HIVM=$ENABLE_HIVM ENABLE_SIM=$ENABLE_SIM)"
 echo "  → 清理旧产物"
 rm -rf "$OUT"
 mkdir -p "$OUT"/01_compile "$OUT"/02_hivm "$OUT"/03_sim "$OUT"/04_board "$OUT"/05_task "$OUT"/06_diagnosis
@@ -66,7 +73,8 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null && echo "  ✅ se
 cd "$MATMUL_DIR"
 
 # ═══════════ 阶段 1/6: 编译 → ttir/ttadapter ═══════════
-echo ""; echo "══ 阶段 1/6: 编译 → ttir/ttadapter ══"
+if [ "$ENABLE_HIVM" = "1" ]; then
+echo ""; echo "══ 阶段 1/6 (可选, ENABLE_HIVM=1): 编译 → ttir/ttadapter ══"
 rm -rf ~/.triton
 export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
 MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K $PY test_matmul.py > "$OUT/01_compile/run_debug.txt" 2>&1
@@ -75,8 +83,8 @@ cp ~/.triton/dump/*/kernel.*.mlir "$OUT/01_compile/" 2>/dev/null || true
 [ -f "$OUT/01_compile/kernel.ttir.mlir" ] && pass "ttir.mlir" || fail "缺 ttir.mlir (看 run_debug.txt)"
 [ -f "$OUT/01_compile/kernel.ttadapter.mlir" ] && pass "ttadapter.mlir" || fail "缺 ttadapter.mlir"
 
-# ═══════════ 阶段 2/6: 真实 HIVM (流程 D) ═══════════
-echo ""; echo "══ 阶段 2/6: 真实 HIVM (bishengir 打印) ══"
+# ═══════════ 阶段 2/6 (可选): 真实 HIVM (流程 D) ═══════════
+echo ""; echo "══ 阶段 2/6 (可选): 真实 HIVM (bishengir 打印) ══"
 TTADAPTER="$OUT/01_compile/kernel.ttadapter.mlir"
 if [ -f "$TTADAPTER" ]; then
   HIVM_OK=0
@@ -93,11 +101,14 @@ if [ -f "$TTADAPTER" ]; then
 else
   fail "无 ttadapter.mlir"
 fi
+else
+  echo "  ⚠ ENABLE_HIVM=0, 跳过编译+HIVM (主流程只用 msprof+op)"
+fi
 
-# ═══════════ 阶段 3/6: simulator (指令级时序) ═══════════
-echo ""; echo "══ 阶段 3/6: msprof op simulator (64³ 应几十秒内) ══"
-if [ "${SKIP_SIM:-0}" = "1" ]; then
-  echo "  ⚠ SKIP_SIM=1, 跳过"
+# ═══════════ 阶段 3/6 (可选): simulator (指令级时序) ═══════════
+echo ""; echo "══ 阶段 3/6 (可选, ENABLE_SIM=1): msprof op simulator ══"
+if [ "$ENABLE_SIM" != "1" ]; then
+  echo "  ⚠ ENABLE_SIM=0, 跳过 simulator (真机 msprof+op 已够诊断)"
 else
   export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/tools/simulator/Ascend910B3/lib:$LD_LIBRARY_PATH
   SIMOUT="$OUT/03_sim/sim_prof"; rm -rf "$SIMOUT"; mkdir -p "$SIMOUT"
@@ -147,26 +158,26 @@ else
   else echo "  ❌ 诊断: $(tail -8 "$OUT/05_task/task_run.txt" 2>/dev/null | tr '\n' ' ')"; fail "无 op_summary"; fi
 fi
 
-# ═══════════ 阶段 6/6: 4 源解析 + 整合 → diagnosis.json ═══════════
-echo ""; echo "══ 阶段 6/6: 4 源解析 + 整合 ══"
+# ═══════════ 阶段 6/6: board+task 解析 + 整合 → diagnosis.json ═══════════
+echo ""; echo "══ 阶段 6/6: 解析 + 整合 (msprof+op → diagnosis.json) ══"
 D="$OUT/06_diagnosis"
 HAVE=""
-[ -f "$OUT/02_hivm/hivm_try.txt" ] && HAVE="$HAVE hivm"
-[ -n "$(find "$OUT/03_sim" -name '*_instr_exe.csv' 2>/dev/null | head -1)" ] && HAVE="$HAVE sim"
 [ -n "$(find "$OUT/04_board" -name 'OpBasicInfo.csv' 2>/dev/null | head -1)" ] && HAVE="$HAVE board"
 [ -n "$(find "$OUT/05_task" -name 'op_summary*.csv' 2>/dev/null | head -1)" ] && HAVE="$HAVE task"
+# 可选源 (若 ENABLE_HIVM/ENABLE_SIM 开了)
+[ -f "$OUT/02_hivm/hivm_try.txt" ] && HAVE="$HAVE hivm"
+[ -n "$(find "$OUT/03_sim" -name '*_instr_exe.csv' 2>/dev/null | head -1)" ] && HAVE="$HAVE sim"
 echo "  已有源:${HAVE:- 无}"
 if [ -n "$HAVE" ]; then
-  [ -f "$OUT/02_hivm/hivm_try.txt" ] && "$PY" "$SCRIPT_DIR/pipeline_parse_hivm.py" "$OUT/02_hivm/hivm_try.txt" "$D/hivm.json" || true
-  [ -n "$(find "$OUT/03_sim" -name '*_instr_exe.csv' 2>/dev/null | head -1)" ] && "$PY" "$SCRIPT_DIR/pipeline_parse_sim.py" "$OUT/03_sim" "$D/sim.json" || true
   [ -n "$(find "$OUT/04_board" -name 'OpBasicInfo.csv' 2>/dev/null | head -1)" ] && "$PY" "$SCRIPT_DIR/pipeline_parse_board.py" "$OUT/04_board" "$D/board.json" || true
   [ -n "$(find "$OUT/05_task" -name 'op_summary*.csv' 2>/dev/null | head -1)" ] && "$PY" "$SCRIPT_DIR/pipeline_parse_task.py" "$OUT/05_task" "$D/task.json" || true
   echo '{}' > "$D/empty.json"
-  for f in hivm sim task board; do [ -f "$D/$f.json" ] || cp "$D/empty.json" "$D/$f.json"; done
-  "$PY" "$SCRIPT_DIR/integrate.py" "$D/hivm.json" "$D/sim.json" "$D/task.json" "$D/board.json" "$D/diagnosis.json"
-  [ -f "$D/diagnosis.json" ] && pass "diagnosis.json ✓" || fail "diagnosis.json 未生成"
+  [ -f "$D/board.json" ] || cp "$D/empty.json" "$D/board.json"
+  [ -f "$D/task.json" ] || cp "$D/empty.json" "$D/task.json"
+  "$PY" "$SCRIPT_DIR/integrate.py" "$D/board.json" "$D/task.json" "$D/diagnosis.json"
+  [ -f "$D/diagnosis.json" ] && pass "diagnosis.json ✓ (roofline 核心)" || fail "diagnosis.json 未生成"
 else
-  fail "无任何源产物 (阶段2-5 至少一个 ✅ 才整合)"
+  fail "无 board/task 源 (阶段4/5 至少一个 ✅ 才整合)"
 fi
 
 # ═══════════ 字段预期校验 ═══════════
@@ -179,43 +190,31 @@ def load(n):
     p = D / n
     return json.loads(p.read_text(encoding='utf-8')) if p.exists() else {}
 
-hv, sm, bd, tk = load('hivm.json'), load('sim.json'), load('board.json'), load('task.json')
+bd, tk = load('board.json'), load('task.json')
 
-print("hivm.json 结构字段: ", end='')
-if hv.get('per_op_statistics'):
-    o = hv['per_op_statistics'][0]
-    have = {k for k in ('op_type','engine','dst','src','size_kb','memory_region','dependencies') if k in o}
-    print(f"{len(have)}/7 该有 (op_type/dst/size/region/deps), 缺失={sorted({'op_type','engine','dst','src','size_kb','memory_region','dependencies'}-have)}")
-else:
-    print("无 ops")
+print("board.json (msprof op) 真机: ", end='')
+b_sum = bd.get('execution_summary', {})
+b_norm = bd.get('normalized', {})
+print(f"total_ns={b_sum.get('total_ns')} cores={b_sum.get('num_cores')} freq={b_sum.get('freq_mhz')} "
+      f"engine_util={len(b_norm.get('engine_utilization', {}))}种 "
+      f"bandwidth={sum(1 for v in b_norm.get('bandwidth_gb_s', {}).values() if v)}条 "
+      f"L2={b_norm.get('l2_hit_rate')} 冲突={len(b_norm.get('conflict', {}))}")
 
-print("sim.json 时序: ", end='')
-sm_ops = sm.get('per_op_statistics', [])
-n_dur = sum(1 for o in sm_ops if (o.get('duration_ns') or 0) > 0)
-print(f"{n_dur}/{len(sm_ops)} 指令有 duration (running_time=0 已用 cycles 兜底)")
-
-print("board.json 真机: ", end='')
-bw = bd.get('bandwidth_utilization', {})
-print(f"total_ns={bd.get('execution_summary',{}).get('total_ns')} cores={bd.get('execution_summary',{}).get('num_cores')} "
-      f"Memory={bool(bw.get('memory_bandwidth_gb_s'))} L2={bool(bw.get('l2_cache'))} Arithmetic={bool(bw.get('arithmetic'))}")
-
-print("task.json: ", end='')
-tk_ops = tk.get('per_op', [])
-if tk_ops:
-    t = tk_ops[0]
-    print(f"Task Duration={t.get('task_duration_us')} Block Dim={t.get('block_num')} "
-          f"aicore_time={t.get('aicore_time_us')}(合法缺=8.5.1 task-time限制)")
-else:
-    print("无 op")
+print("task.json (通用 msprof): ", end='')
+t_sum = tk.get('execution_summary', {})
+t_norm = tk.get('normalized', {})
+print(f"kernels={t_sum.get('num_kernels')} 多kernel统计={len(t_norm.get('multi_kernel', []))} "
+      f"api_overhead={len(t_norm.get('api_overhead', []))} L2={t_norm.get('l2_hit_rate')}")
 
 if Path(D / 'diagnosis.json').exists():
     dg = json.load(open(D / 'diagnosis.json', encoding='utf-8'))
     print("diagnosis.json: ", end='')
-    np = len(dg.get('ops', [])); nt = len(dg.get('transfer_paths', []))
-    nbw = sum(1 for p in dg.get('transfer_paths', []) if p.get('real_bw_gb_s'))
-    nh = sum(1 for k, v in dg.get('bottlenecks', {}).items() if v.get('hint'))
-    print(f"ops={np} 通路={nt} (有真实带宽 {nbw}/{nt}) 瓶颈hint {nh}/6")
-    print("  合法缺失: bw_utilization/regime (需 peak 校准); 无 Memory 的通路 real_bw=None")
+    ro = dg.get('roofline', {})
+    nt = len(dg.get('transfer_paths', []))
+    nh = sum(1 for v in dg.get('bottlenecks', {}).values() if v.get('hint'))
+    print(f"roofline={ro.get('bottleneck_type')} 通路={nt} 瓶颈hint {nh}/5")
+    print(f"  访存利用率={ro.get('memory_utilization')} 算力利用率={ro.get('compute_utilization')}")
+    print("  合法缺失: 无 hivm → 无 per-op/依赖 (Tier2 融合需临时 ENABLE_HIVM=1)")
 PYEOF
 
 echo ""; echo "══════════ 检查清单 (PASS=$PASS FAIL=$FAIL) ══════════"

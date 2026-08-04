@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""4 源整合 → diagnosis.json (按优化策略组织, 精准找瓶颈)。
+"""整合 board + task → diagnosis.json (roofline 核心, 只用 msprof + msprof op)。
 
-输入: hivm.json (结构) + sim.json (指令时序) + task.json (真机每op指标) + board.json (聚合)
-输出: diagnosis.json:
-  - summary         端到端/核数/L2/执行模式/引擎占比
-  - ops[]           每 op: 结构(hivm) + 指令时序(sim) + 真机带宽/L2(task) + 依赖
-  - transfer_paths[] 每通路(引擎): 真实带宽 vs 峰值 → 哪条饱和=瓶颈
-  - dependencies[]  RAW/WAR/WAW
-  - bottlenecks{}   每 Tier 瓶颈信号 + 优化提示
+主流程已弃 hivm/sim → 诊断 = kernel + 引擎 + 通路 三级, roofline 判类型。
 
-用法: python integrate.py <hivm.json> <sim.json> <task.json> <board.json> <out.json>
+结构:
+  kernel_summary   每 kernel 耗时/核数/多kernel/launch/L2
+  roofline         访存 vs 计算 → memory/compute/latency bound (★一针见血)
+  engine_util      各引擎利用率 (cube/vec/mte/scalar/fixpipe)
+  transfer_paths   每通路真实带宽
+  memory_issues    L2 + UB 冲突
+  compute          cube/vec fops
+  bottlenecks      每 Tier 处方化 hint
+
+用法: python integrate.py <board.json> <task.json> <out.json>
 """
 import os
 import sys
@@ -19,294 +22,183 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pipeline_schema import read_json, write_json  # noqa: E402
 
-# hivm op_type → 通路/引擎
-ENGINE_FOR = {
-    'gm_to_ub': 'GM→UB', 'ub_to_gm': 'UB→GM',
-    'vadd': 'VecUnit', 'vmul': 'VecUnit', 'vsub': 'VecUnit', 'vdiv': 'VecUnit',
-    'vmax': 'VecUnit', 'vmin': 'VecUnit', 'vexp': 'VecUnit', 'vlog': 'VecUnit',
-    'vabs': 'VecUnit', 'vrelu': 'VecUnit', 'vsqrt': 'VecUnit', 'vtanh': 'VecUnit',
-    'vbrc': 'VecUnit', 'vcvt': 'VecUnit', 'vmov': 'VecUnit', 'vsel': 'VecUnit',
-    'vcmp': 'VecUnit', 'vdul': 'VecUnit', 'vdup': 'VecUnit', 'vneg': 'VecUnit',
-    'gm_to_l1': 'GM→L1', 'l1_to_l0': 'L1→L0',
-    'matmul': 'CubeUnit', 'matrixmul': 'CubeUnit', 'mix_matmul': 'CubeUnit',
-    'mmadL1': 'CubeUnit', 'batchMmadL1': 'CubeUnit',
-    'l0_to_gm': 'L0→GM',
-    'set_flag': 'Sync', 'wait_flag': 'Sync', 'pipe_barrier': 'Sync', 'sync_block': 'Sync',
-    'fixpipe': 'FixPipe',
-}
-# 通路 → 从哪搬到哪 (诊断用)
-PATH_DESC = {
-    'GM→UB': 'GM→UB', 'UB→GM': 'UB→GM', 'GM→L1': 'GM→L1',
-    'L1→L0': 'L1→L0', 'L0→GM': 'L0→GM',
-    'VecUnit': 'compute(UB)', 'CubeUnit': 'compute(L0C)', 'FixPipe': 'L0C→UB',
-    'Sync': 'synchronize',
-}
-# 通路 → board.json Memory.csv 里找带宽的列子串 (真实带宽来自 msprof op 的 Memory.csv)
+# ── 910B3 理论峰值 (官网/实测) ──
+PEAK_MEM_BW_GB_S = 1800.0     # GM 理论 ~1.8 TB/s
+PEAK_COMPUTE_TFLOPS = 294.9   # cube fp16: 20核 × 16³ FMA × 1.8GHz
+
+# 通路 → 带宽字段 (board normalized.bandwidth_gb_s)
 PATH_BW_KEY = {
-    'GM→UB': ('main', 'mem', 'read'), 'UB→GM': ('main', 'mem', 'write'),
-    'GM→L1': ('main', 'mem', 'read'), 'L1→L0': ('l1', 'read'),
-    'L0→GM': ('main', 'mem', 'write'),
-    'VecUnit': ('ub', 'read'), 'CubeUnit': ('l0c', 'read'), 'FixPipe': ('l0c', 'read'),
+    "GM读": "main_mem_read_gb_s", "GM写": "main_mem_write_gb_s",
+    "L1": "l1_read_gb_s", "L2": "l2_read_gb_s",
+    "UB": "ub_read_gb_s",
+    "L0A": "l0a_read_gb_s", "L0B": "l0b_read_gb_s", "L0C": "l0c_read_gb_s",
 }
-# 真机峰值参考 (占位; 用 task 实测最大值校准后替换)
-PEAK_GB_S = {'GM→UB': None, 'UB→GM': None, 'GM→L1': None, 'L1→L0': None,
-             'L0→GM': None, 'VecUnit': None, 'CubeUnit': None, 'FixPipe': None,
-             'Sync': 0.0}
 
 
-def _bw_gb_s(v):
-    """op_summary 带宽值 (可能是 MB/s 或 GB/s) → GB/s (按量级推断)"""
-    if v is None:
-        return None
-    if v >= 1e4:      # 大数值假设是 MB/s
-        return round(v / 1000.0, 3)
-    return round(v, 3)
-
-
-def integrate(hivm_p, sim_p, task_p, board_p, out_p):
-    hv = read_json(hivm_p)
-    sm = read_json(sim_p)
-    tk = read_json(task_p)
+def integrate(board_p, task_p, out_p):
     bd = read_json(board_p)
+    tk = read_json(task_p)
+    b_norm = bd.get("normalized", {})
+    t_norm = tk.get("normalized", {})
 
-    # 真实带宽/L2 来自 board.json (msprof op 的 Memory.csv/L2Cache.csv), 不是 task.json
-    bd_bw = (bd.get("bandwidth_utilization") or {}).get("memory_bandwidth_gb_s") or {}
-    bd_l2 = (bd.get("bandwidth_utilization") or {}).get("l2_cache") or {}
-
-    def board_bw(*keys):
-        """从 board Memory.csv 找含所有子串的列, 返回带宽 (GB/s)。"""
-        for fname, cols in bd_bw.items():
-            for col, val in (cols or {}).items():
-                if all(k.lower() in str(col).lower() for k in keys):
-                    return _bw_gb_s(val)
-        return None
-
-    def board_l2():
-        """L2 命中率: 优先 Hit Rate 列 (避免误取 block_id 等)。"""
-        hit = None
-        for col, v in bd_l2.items():
-            cl = str(col).lower()
-            if 'hit' in cl and isinstance(v, (int, float)):
-                if 'rate' in cl or hit is None:
-                    hit = v
-        return round(hit, 4) if hit is not None else None
-
-    # ── sim 索引 (指令时序 per pipe / sync 关键词) ──
-    sim_by_pipe, sim_by_kw = {}, {}
-    for o in sm.get("per_op_statistics", []):
-        o_dur = o.get("total_duration_ns") or 0
-        pipe = o.get("pipeline_channel")
-        if pipe:
-            prev = sim_by_pipe.get(pipe)
-            if prev is None or o_dur > (prev.get("total_duration_ns") or 0):
-                sim_by_pipe[pipe] = o
-        inst = (o.get("op_name") or "").upper()
-        for kw in ("SET_FLAG", "WAIT_FLAG", "BAR", "SYNC_BLOCK"):
-            if kw in inst:
-                prev = sim_by_kw.get(kw)
-                if prev is None or o_dur > (prev.get("total_duration_ns") or 0):
-                    sim_by_kw[kw] = o
-                break
-    HIVM_PIPE = {'gm_to_ub': 'MTE2', 'ub_to_gm': 'MTE3',
-                 'vadd': 'VECTOR', 'vmul': 'VECTOR', 'vbrc': 'VECTOR', 'vcvt': 'VECTOR',
-                 'vmov': 'VECTOR', 'vsel': 'VECTOR', 'vcmp': 'VECTOR',
-                 'matmul': 'CUBE', 'matrixmul': 'CUBE', 'mix_matmul': 'CUBE',
-                 'mmadL1': 'CUBE', 'batchMmadL1': 'CUBE'}
-    SYNC_KW = {'set_flag': 'SET_FLAG', 'wait_flag': 'WAIT_FLAG',
-               'pipe_barrier': 'BAR', 'sync_block': 'SYNC_BLOCK'}
-
-    # ── per-op: hivm 结构 + sim 时序 + 真机指标 ──
-    ops = []
-    for m in hv.get("per_op_statistics", []):
-        t = m.get("op_type") or ""
-        o = {
-            "op_id": m.get("op_id"),
-            "op_type": t,
-            "transfer_path": ENGINE_FOR.get(t, t),
-            "path_desc": PATH_DESC.get(ENGINE_FOR.get(t, t), t),
-            "dst": m.get("dst"), "src": m.get("src"), "src2": m.get("src2"),
-            "dst_region": m.get("memory_region"),
-            "size_kb": m.get("size_kb"), "dtype": m.get("dtype"),
-            "attrs": m.get("attrs"),
-            "duration_ns": m.get("duration_ns"),      # 待 sim 填
-            "cycles": m.get("cycles"),
-            "pipe": m.get("pipeline_channel"),
-            "call_count": m.get("call_count"),
-            "real_duration_ns": None,                  # 真机 (task 每 op)
-            "real_bw_gb_s": None, "l2_hit": None,
-            "dependencies": m.get("dependencies") or [],
-        }
-        # sim 时序对齐 (引擎/pipe + sync 关键词)
-        kw = SYNC_KW.get(t)
-        s = sim_by_kw.get(kw) if kw else sim_by_pipe.get(HIVM_PIPE.get(t, ""))
-        if s:
-            o["duration_ns"] = s.get("duration_ns")
-            o["cycles"] = s.get("cycles")
-            o["pipe"] = s.get("pipeline_channel")
-            o["call_count"] = s.get("call_count")
-            o["sim_instr"] = s.get("op_name")
-        # 真机指标: real_duration 从 task(op_summary Task Duration); 带宽/L2 从 board(Memory/L2Cache)
-        if tk.get("per_op"):
-            o["real_duration_ns"] = round((tk["per_op"][0].get("task_duration_us") or 0) * 1000, 2)
-        bw = board_bw(*PATH_BW_KEY.get(ENGINE_FOR.get(t, ""), ()))
-        if bw:
-            o["real_bw_gb_s"] = bw
-        o["l2_hit"] = board_l2()
-        ops.append(o)
-
-    # ── transfer_paths: 按引擎聚合真实带宽 ──
-    paths = {}
-    for o in ops:
-        p = o["transfer_path"]
-        a = paths.setdefault(p, {
-            "path": p, "desc": o["path_desc"], "num_ops": 0,
-            "total_size_kb": 0.0, "total_duration_ns": 0.0,
-            "real_bw_gb_s": None, "peak_bw_gb_s": None, "bw_utilization": None,
-            "regime": None,
-        })
-        a["num_ops"] += 1
-        a["total_size_kb"] += o.get("size_kb") or 0
-        a["total_duration_ns"] += o.get("duration_ns") or 0
-    # 真机带宽注入 (board Memory.csv)
-    for p in paths:
-        bw = board_bw(*PATH_BW_KEY.get(p, ()))
-        if bw:
-            paths[p]["real_bw_gb_s"] = bw
-    # 利用率/regime (peak 校准后才有意义; 无 peak 标 None)
-    for a in paths.values():
-        peak = PEAK_GB_S.get(a["path"])
-        rbw = a["real_bw_gb_s"]
-        if peak and rbw:
-            a["bw_utilization"] = round(rbw / peak, 3)
-            a["regime"] = ('saturated' if a["bw_utilization"] >= 0.95
-                           else ('floor' if a["bw_utilization"] <= 0.5 else 'ramp'))
-            a["peak_bw_gb_s"] = peak
-        if a["total_size_kb"] and a["total_duration_ns"]:
-            a["effective_bw_gb_s"] = round(a["total_size_kb"] * 1024 / a["total_duration_ns"], 3)
-
-    # ── dependencies ──
-    deps = []
-    for o in ops:
-        for d in o["dependencies"]:
-            deps.append({"from_op": d.get("from_op_id"), "to_op": o["op_id"],
-                         "type": d.get("type"), "buffer": d.get("buffer")})
-
-    # ── summary ──
-    tk_sum = tk.get("execution_summary", {})
-    sm_sum = sm.get("execution_summary", {})
-    hv_sum = hv.get("execution_summary", {})
-    total_ns = (tk_sum.get("total_ns") or sm_sum.get("total_ns")
-                or hv_sum.get("total_ns"))
-    num_cores = (tk_sum.get("num_cores") or sm_sum.get("num_cores")
-                 or hv_sum.get("num_cores"))
-    l2_hit = board_l2()
-    # 引擎占比: task pipe ratios (真机) 优先; 否则从 board 的 pipe 伪 op 算
-    engine_util = {}
-    if tk.get("per_op"):
-        top = tk["per_op"][0]
-        engine_util = {k: v for k, v in (top.get("pipe_ratios") or {}).items()}
-    if not engine_util and bd.get("per_op_statistics"):
-        bt = bd["execution_summary"].get("total_ns") or 0
-        for o in bd["per_op_statistics"]:
-            d = o.get("duration_ns")
-            if isinstance(d, (int, float)) and bt:
-                engine_util[str(o.get("op_type", "?"))] = round(d / bt, 4)
-    summary = {
-        "total_ns": total_ns, "num_cores": num_cores,
-        "kernel_name": tk_sum.get("kernel_name") or hv_sum.get("kernel_name"),
-        "execution_mode": sm_sum.get("execution_mode"),
-        "l2_hit_rate": l2_hit,
-        "engine_utilization": engine_util or bd.get("engine_utilization", {}),
+    # ── kernel_summary ──
+    b_sum = bd.get("execution_summary", {})
+    t_sum = tk.get("execution_summary", {})
+    total_ns = b_sum.get("total_ns") or t_sum.get("total_ns")
+    num_cores = b_sum.get("num_cores") or t_sum.get("num_cores")
+    kernels = t_norm.get("kernels", [])
+    main_kernel = next((k for k in kernels if k.get("task_duration_us")), None)
+    kernel_summary = {
+        "kernel_name": b_sum.get("kernel_name") or t_sum.get("kernel_name"),
+        "total_ns": total_ns,
+        "num_cores": num_cores,
+        "freq_mhz": b_sum.get("freq_mhz"),
+        "num_kernels": t_sum.get("num_kernels", len(kernels)),
+        "input_shapes": main_kernel.get("input_shapes") if main_kernel else None,
+        "output_shapes": main_kernel.get("output_shapes") if main_kernel else None,
+        "api_overhead_total_us": sum(a.get("total_us") or 0 for a in t_norm.get("api_overhead", [])),
+        "l2_hit_rate": b_norm.get("l2_hit_rate") or t_norm.get("l2_hit_rate"),
     }
 
-    # ── bottlenecks: 每 Tier 信号 + 提示 ──
-    def _path_bottleneck():
-        if not paths:
-            return None
-        # 有真实带宽的路径里, 利用率最高/耗时最大的
-        cand = [p for p in paths.values() if p["real_bw_gb_s"]]
-        if cand:
-            return max(cand, key=lambda p: p.get("bw_utilization") or 0
-                       or (p.get("total_duration_ns") or 0))
-        return max(paths.values(), key=lambda p: p.get("total_duration_ns") or 0)
+    # ── roofline ──
+    bw = b_norm.get("bandwidth_gb_s", {})
+    comp = b_norm.get("compute", {})
+    achieved_mem = max([bw.get("main_mem_read_gb_s"), bw.get("main_mem_write_gb_s")],
+                       key=lambda x: x or 0) or 0
+    cube_fops = comp.get("cube_fops") or 0
+    vec_fops = comp.get("vector_fops") or 0
+    achieved_compute_tflops = (cube_fops + vec_fops) / 1e12 if (cube_fops or vec_fops) else 0
+    mem_util = achieved_mem / PEAK_MEM_BW_GB_S if PEAK_MEM_BW_GB_S else 0
+    comp_util = achieved_compute_tflops / PEAK_COMPUTE_TFLOPS if PEAK_COMPUTE_TFLOPS else 0
+    if mem_util >= 0.8 and comp_util < 0.5:
+        btype = "memory_bound"
+    elif comp_util >= 0.8 and mem_util < 0.5:
+        btype = "compute_bound"
+    elif mem_util < 0.3 and comp_util < 0.3:
+        btype = "latency_bound"
+    else:
+        btype = "balanced"
+    roofline = {
+        "achieved_memory_bw_gb_s": round(achieved_mem, 1),
+        "peak_memory_bw_gb_s": PEAK_MEM_BW_GB_S,
+        "memory_utilization": round(mem_util, 3),
+        "achieved_compute_tflops": round(achieved_compute_tflops, 2),
+        "peak_compute_tflops": PEAK_COMPUTE_TFLOPS,
+        "compute_utilization": round(comp_util, 3),
+        "arithmetic_intensity": round(achieved_compute_tflops * 1e12 / achieved_mem / 1e9, 2)
+                                if achieved_mem else None,
+        "bottleneck_type": btype,
+    }
 
-    def _top_ops(n=5):
-        return sorted(ops, key=lambda o: -(o.get("duration_ns") or 0))[:n]
+    # ── engine_utilization ──
+    engine_util = b_norm.get("engine_utilization", {})
 
-    pb = _path_bottleneck()
-    top = _top_ops()
-    war = [d for d in deps if d["type"] == "WAR"]
-    raw_vec_chain = sum(1 for o in ops if o["transfer_path"] == "VecUnit" and o.get("duration_ns"))
+    # ── transfer_paths (每通路真实带宽) ──
+    transfer_paths = []
+    for path, key in PATH_BW_KEY.items():
+        v = bw.get(key)
+        if v is not None:
+            transfer_paths.append({"path": path, "real_bw_gb_s": v,
+                                   "source": "Memory/MemoryL0.csv (真机)"})
+
+    # ── memory_issues ──
+    conflict = b_norm.get("conflict", {})
+    memory_issues = {
+        "l2_hit_rate": b_norm.get("l2_hit_rate"),
+        "ub_bank_conflict_ratio": conflict.get("aiv_vec_bank_cflt_ratio"),
+        "ub_bankgroup_conflict_ratio": conflict.get("aiv_vec_bankgroup_cflt_ratio"),
+        "vec_resc_conflict_ratio": conflict.get("aiv_vec_resc_cflt_ratio"),
+    }
+
+    # ── compute ──
+    compute = {
+        "cube_fops": cube_fops, "vector_fops": vec_fops,
+        "cube_ratio": comp.get("cube_ratio"), "vec_ratio": comp.get("vec_ratio"),
+        "aic_total_cycles": comp.get("aic_total_cycles"),
+        "aiv_total_cycles": comp.get("aiv_total_cycles"),
+    }
+
+    # ── bottlenecks (每 Tier 处方化 hint) ──
+    multi = t_norm.get("multi_kernel", [])
+    n_kernels = t_sum.get("num_kernels", len(kernels))
+    api_over = kernel_summary["api_overhead_total_us"]
+    l2 = b_norm.get("l2_hit_rate")
+    bank = memory_issues["ub_bank_conflict_ratio"]
+    scalar_r = engine_util.get("scalar")
+    mte2_r = engine_util.get("mte2")
+    cube_r = engine_util.get("cube")
+    vec_r = engine_util.get("vec")
 
     bottlenecks = {
-        "tier1_algorithm": {
-            "execution_mode": summary["execution_mode"],
-            "num_ops": len(ops),
-            "top_ops": [{"op_id": o["op_id"], "op_type": o["op_type"],
-                         "duration_ns": o.get("duration_ns")} for o in top],
-            "hint": ("串行执行 + 多 op → 考虑 Persistent Kernel / 减少 launch"
-                     if summary["execution_mode"] == "sequential" and len(ops) > 10
-                     else "结构检查: 看 top_ops 哪个 op 最耗时"),
-        },
-        "tier2_fusion": {
-            "war_deps": len(war),
-            "war_buffers": sorted({d["buffer"] for d in war}),
-            "vec_ops": raw_vec_chain,
-            "fusion_candidates": [o["op_type"] for o in ops
-                                  if o["transfer_path"] == "VecUnit" and o["op_id"] > 0],
-            "hint": (f"存在 {len(war)} 条 WAR 依赖 → 分配独立 buffer 可解锁并行"
-                     if war else "看 RAW 链上逐元素 op 是否可融合"),
+        "tier1_kernel": {
+            "num_kernels": n_kernels, "api_overhead_us": api_over,
+            "multi_kernel_top": multi[:5],
+            "hint": ("launch/API 开销占比高 → 考虑 Persistent Kernel 减少 launch"
+                     if api_over and total_ns and api_over * 1000 / total_ns > 0.2
+                     else ("多 kernel → 考虑 kernel 融合"
+                           if n_kernels and n_kernels > 1 else "单 kernel, 无 kernel 级优化空间")),
         },
         "tier3_tiling": {
-            "path_regimes": {p["path"]: p["regime"] for p in paths.values()},
-            "path_effective_bw": {p["path"]: p.get("effective_bw_gb_s")
-                                  for p in paths.values()},
-            "hint": (f"瓶颈通路 {pb['path']} regime={pb.get('regime')} — "
-                     f"{'tile 过小(ramp/floor), 增大 tile 到饱和' if pb.get('regime') in ('ramp','floor') else '已达峰值, 换思路'}"
-                     if pb else "需真机带宽校准后判断"),
+            "bottleneck_type": btype,
+            "memory_utilization": roofline["memory_utilization"],
+            "compute_utilization": roofline["compute_utilization"],
+            "hint": ("访存 bound (带宽利用率高, 算力低) → 增大 tile / 双缓冲 / 减少 GM 流量"
+                     if btype == "memory_bound"
+                     else ("计算 bound → 优化计算指令 / 提高占用率 / 精度取舍"
+                           if btype == "compute_bound"
+                           else ("latency bound (两者都低) → 增并行 / 减同步"
+                                 if btype == "latency_bound" else "计算访存平衡, 可微调"))),
         },
         "tier4_memory": {
-            "l2_hit_rate": l2_hit,
-            "small_transfer_ops": [o["op_type"] for o in ops
-                                   if (o.get("size_kb") or 0) and (o.get("size_kb") or 0) < 8],
-            "hint": (f"L2 命中 {l2_hit} — {'低, 考虑 L2 驻留/改善访问模式' if l2_hit is not None and l2_hit < 0.5 else '正常'}"
-                     if l2_hit is not None else "L2 数据需 op_summary 提供"),
+            "l2_hit_rate": l2,
+            "bank_conflict_ratio": bank,
+            "mte2_ratio": mte2_r,
+            "hint": ("L2 命中低 ({}<0.8) → L2 驻留: 切工作集 ≤ 192MB, 改善访问模式".format(l2)
+                     if l2 is not None and l2 < 0.8
+                     else ("UB bank 冲突高 → 数据对齐 / padding".format(bank)
+                           if bank and bank > 0.05
+                           else "L2/冲突正常")),
         },
         "tier5_compute": {
-            "cube_fops": (tk["per_op"][0].get("cube_fops") if tk.get("per_op") else None),
-            "vector_fops": (tk["per_op"][0].get("vector_fops") if tk.get("per_op") else None),
-            "vec_ops": raw_vec_chain,
-            "hint": "看 cube/vec fops 谁大 → 判断算力瓶颈在哪; 结合 sim 看 Vec 是否等 MTE(气泡)",
+            "cube_ratio": cube_r, "vec_ratio": vec_r, "scalar_ratio": scalar_r,
+            "hint": ("scalar 占用高 ({:.0%}) → 简化索引/避免 i64 比较退化 scalar".format(scalar_r)
+                     if scalar_r and scalar_r > 0.3
+                     else ("cube 忙 vec 闲 → 计算-搬运重叠 (双缓冲/pipeline)".format(cube_r, vec_r)
+                           if cube_r and vec_r and cube_r > vec_r * 2
+                           else "cube/vec 相对均衡")),
         },
         "tier6_arch": {
-            "block_num": summary["num_cores"],
-            "engine_utilization": summary["engine_utilization"],
-            "hint": "看哪条 pipe 利用率高/低 → grid 或 pipeline 调整; 20/40 核约束",
+            "engine_utilization": engine_util,
+            "l2_hit_rate": l2,
+            "num_cores": num_cores,
+            "hint": ("核数使用 ({} 核) vs 理论 (20 AIC) → 检查 grid 是否充分利用".format(num_cores)
+                     if num_cores and num_cores < 20
+                     else "核数正常; 看 engine_utilization 哪条 pipe 饱和 → 对应优化"),
         },
     }
 
     report = {
-        "meta": {
-            "source": "integrate", "generated_at": datetime.now().isoformat(),
-            "inputs": {"hivm": hivm_p, "sim": sim_p, "task": task_p, "board": board_p},
-            "schema_version": "2.0",
-        },
-        "summary": summary,
-        "ops": ops,
-        "transfer_paths": list(paths.values()),
-        "dependencies": deps,
+        "meta": {"source": "integrate (msprof+op only)", "generated_at": datetime.now().isoformat(),
+                 "inputs": {"board": board_p, "task": task_p}, "schema_version": "3.0"},
+        "kernel_summary": kernel_summary,
+        "roofline": roofline,
+        "engine_utilization": engine_util,
+        "transfer_paths": transfer_paths,
+        "memory_issues": memory_issues,
+        "compute": compute,
         "bottlenecks": bottlenecks,
-        "notes": ["按优化策略组织: 每 Tier 直接看 bottlenecks.<tier> 的 hint",
-                  "real_bw 来自真机 op_summary; 峰值校准后 bw_utilization 才有意义",
-                  "duration 来自 simulator (per-call); real_duration 来自真机 Task Duration"],
+        "notes": ["只用 msprof + msprof op (hivm/sim 已弃用主流程)",
+                  "roofline 是核心: 先判 memory/compute/latency bound, 再细化到通路/引擎",
+                  "peak_memory=1.8TB/s, peak_compute=294.9TFLOPS (910B3 理论, 可校准)",
+                  "缺: Tier2 内部融合 (需 hivm 依赖); 每 op 精准归因"],
     }
     write_json(report, out_p)
-    print(f"[integrate] {out_p}: {len(ops)} ops, {len(paths)} paths, "
-          f"{len(deps)} deps, total_ns={summary['total_ns']}")
+    print(f"[integrate] {out_p}: total_ns={total_ns} bottleneck={btype} "
+          f"paths={len(transfer_paths)}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 6:
-        print("用法: python integrate.py <hivm.json> <sim.json> <task.json> <board.json> <out.json>")
+    if len(sys.argv) < 4:
+        print("用法: python integrate.py <board.json> <task.json> <out.json>")
         sys.exit(1)
-    integrate(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+    integrate(sys.argv[1], sys.argv[2], sys.argv[3])

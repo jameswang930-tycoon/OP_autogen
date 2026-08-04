@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
-"""源3: 解析真机 msprof op 输出目录 (board_prof) → 统一格式 JSON。
+"""源3: 解析 msprof op (真机单算子) → board.json — 完整提取全部 8 个 CSV 的所有字段。
 
-op 级聚合 (整个 kernel 一行):
-  - OpBasicInfo.csv            → total_ns (Task Duration us→ns), num_cores (Block Dim), kernel_name
-  - PipeUtilization.csv        → 各引擎耗时 (aic_cube_time/aiv_vec_time/mte1/2/3/scalar) → per-engine pseudo-ops
-  - ArithmeticUtilization.csv  → cube/vec 周期占比 + FLOPs + 指令数
-  - Memory*.csv                → 各级带宽 (峰值校准用)
+msprof op 默认产出 8 个 CSV (官网核实):
+  OpBasicInfo / PipeUtilization / ArithmeticUtilization / Memory / MemoryL0 /
+  MemoryUB / L2Cache / ResourceConflictRatio
 
-列名随 CANN 版本变 (ai*_ 前缀 = aic_ 或 aiv_), 用子串匹配, 未识别列进 notes。
+输出结构:
+  - raw[]        每 CSV 的 所有列 + 所有行 (不遗漏任何字段)
+  - normalized    关键字段标准化: engine_util(各pipe占比) / bandwidth(每通路) /
+                   compute(cube/vec fops) / l2 / conflict
+用法: python pipeline_parse_board.py <board_prof目录> <out.json>
 """
 import csv
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pipeline_schema import write_json  # noqa: E402
 
-from pipeline_schema import empty_op, make_report, write_json  # noqa: E402
+# msprof op 的 8 个 CSV 文件名 (官网核实)
+CSV_FILES = ["OpBasicInfo", "PipeUtilization", "ArithmeticUtilization",
+             "Memory", "MemoryL0", "MemoryUB", "L2Cache", "ResourceConflictRatio"]
 
 
 def find_opprof(base):
@@ -26,31 +32,44 @@ def find_opprof(base):
     return None
 
 
-def read_rows(path):
+def read_csv_all(path):
+    """读 CSV: 返回 (columns, rows), 所有列都保留。"""
     with open(path, encoding="utf-8", newline="") as f:
-        return list(csv.DictReader(f))
+        reader = csv.reader(f)
+        rows = list(reader)
+    if not rows:
+        return [], []
+    columns = [c.strip() for c in rows[0]]
+    data = []
+    for r in rows[1:]:
+        if len(r) == len(columns):
+            data.append({columns[i]: r[i].strip() for i in range(len(columns))})
+        elif r:
+            data.append({f"col{i}": v.strip() for i, v in enumerate(r)})
+    return columns, data
 
 
-def find_col(row, *substrings):
-    """在行里找包含任一子串的列, 返回首个匹配 (值/None)。"""
-    for k, v in row.items():
-        kl = (k or "").lower()
-        for s in substrings:
-            if s.lower() in kl:
-                return v
-    return None
-
-
-def to_float(v):
+def _f(v):
     if v is None:
         return None
     s = str(v).strip()
-    if not s or s.lower() == "n/a":
+    if not s or s.lower() in ("n/a", "nan", "none", "-"):
         return None
     try:
         return float(s)
     except ValueError:
         return None
+
+
+def _first(rows, *keys):
+    """在 rows[0] 找含所有子串的列值"""
+    if not rows:
+        return None
+    for k, v in rows[0].items():
+        kl = k.lower()
+        if all(x.lower() in kl for x in keys):
+            return v
+    return None
 
 
 def parse(base):
@@ -59,120 +78,126 @@ def parse(base):
         raise SystemExit(f"[board] 找不到 {base}/OPPROF_*/")
     notes = []
 
-    # ── OpBasicInfo.csv ──
-    total_ns = num_cores = kernel_name = None
-    obi = opprof / "OpBasicInfo.csv"
-    if obi.exists():
-        rows = read_rows(obi)
-        if rows:
-            r = rows[0]
-            dur = to_float(find_col(r, "Task Duration"))
-            total_ns = round(dur * 1000.0, 2) if dur else None
-            num_cores = to_float(find_col(r, "Block Dim"))
-            kernel_name = find_col(r, "Op Name")
+    # ── raw: 全部 CSV 全字段 ──
+    raw = {}
+    for name in CSV_FILES:
+        p = opprof / f"{name}.csv"
+        if p.exists():
+            cols, rows = read_csv_all(p)
+            raw[name] = {"columns": cols, "rows": rows}
         else:
-            notes.append("OpBasicInfo.csv 空")
-    else:
-        notes.append("无 OpBasicInfo.csv (需 --aic-metrics=... 全指标)")
+            notes.append(f"缺 {name}.csv")
 
-    # ── PipeUtilization.csv → per-engine pseudo-ops ──
-    ops = []
+    # ── normalized ──
+    obi = raw.get("OpBasicInfo", {}).get("rows", [])
+    pu = raw.get("PipeUtilization", {}).get("rows", [])
+    au = raw.get("ArithmeticUtilization", {}).get("rows", [])
+    mem = raw.get("Memory", {}).get("rows", [])
+    meml0 = raw.get("MemoryL0", {}).get("rows", [])
+    memub = raw.get("MemoryUB", {}).get("rows", [])
+    l2 = raw.get("L2Cache", {}).get("rows", [])
+    rcr = raw.get("ResourceConflictRatio", {}).get("rows", [])
+
+    # kernel 级
+    dur_us = _f(_first(obi, "Task", "Duration"))
+    num_cores = _f(_first(obi, "Block", "Dim"))
+    kernel_name = _first(obi, "Op", "Name")
+    freq = _f(_first(obi, "Current", "Freq"))
+
+    # 引擎利用率 (PipeUtilization)
     engine_util = {}
-    pu = opprof / "PipeUtilization.csv"
-    if pu.exists():
-        rows = read_rows(pu)
-        if rows:
-            r = rows[0]
-            eng_cols = [
-                ("CubeUnit", "aic_cube_time", "aic_cube_ratio"),
-                ("VecUnit", "aiv_vec_time", "aiv_vec_ratio"),
-                ("GM→UB", "mte2_time", "mte2_ratio"),
-                ("UB→GM", "mte3_time", "mte3_ratio"),
-                ("L1→L0", "mte1_time", "mte1_ratio"),
-                ("Scalar", "scalar_time", "scalar_ratio"),
-                ("FixPipe", "fixpipe_time", "fixpipe_ratio"),
-            ]
-            for eng, time_sub, ratio_sub in eng_cols:
-                t = to_float(find_col(r, time_sub))
-                if t is None:
-                    continue
-                o = empty_op()
-                o.update({
-                    "op_id": len(ops),
-                    "op_name": eng,
-                    "op_type": eng,
-                    "engine": eng,
-                    "instruction": f"PipeUtilization {eng}",
-                    "duration_ns": round(t * 1000.0, 2),
-                    "memory_region": "chip",
-                    "core_id": str(find_col(r, "block_id") or num_cores),
-                })
-                ops.append(o)
-                rat = to_float(find_col(r, ratio_sub))
-                if rat is not None:
-                    engine_util[eng] = round(rat, 4)
-    else:
-        notes.append("无 PipeUtilization.csv")
+    for eng, time_k, ratio_k in [
+        ("cube", "aic_cube_time", "aic_cube_ratio"),
+        ("vec", "aiv_vec_time", "aiv_vec_ratio"),
+        ("mte2", "mte2_time", "mte2_ratio"),
+        ("mte3", "mte3_time", "mte3_ratio"),
+        ("mte1", "mte1_time", "mte1_ratio"),
+        ("scalar", "scalar_time", "scalar_ratio"),
+        ("fixpipe", "fixpipe_time", "fixpipe_ratio"),
+    ]:
+        t = _f(_first(pu, time_k))
+        r = _f(_first(pu, ratio_k))
+        if r is not None:
+            engine_util[eng] = round(r, 4)
+        elif t is not None and dur_us:
+            engine_util[eng] = round(t / dur_us, 4)
 
-    # ── ArithmeticUtilization.csv → cube/vec 计算特征 ──
-    arith = {}
-    au = opprof / "ArithmeticUtilization.csv"
-    if au.exists():
-        rows = read_rows(au)
-        if rows:
-            r = rows[0]
-            arith = {
-                "aic_cube_ratio": to_float(find_col(r, "aic_cube_ratio")),
-                "aic_cube_fops": to_float(find_col(r, "aic_cube_fops")),
-                "aic_cube_instr": to_float(find_col(r, "total_instr_number")),
-                "aiv_vec_ratio": to_float(find_col(r, "aiv_vec_ratio")),
-                "aiv_vec_fops": to_float(find_col(r, "aiv_vec_fops")),
-            }
-            if arith.get("aic_cube_ratio") is not None and "CubeUnit" not in engine_util:
-                engine_util["CubeUnit"] = arith["aic_cube_ratio"]
-            if arith.get("aiv_vec_ratio") is not None and "VecUnit" not in engine_util:
-                engine_util["VecUnit"] = arith["aiv_vec_ratio"]
-    else:
-        notes.append("无 ArithmeticUtilization.csv")
+    # 每通路带宽 (Memory/MemoryL0/MemoryUB) — 全列
+    def _bw(rows, *keys):
+        return _f(_first(rows, *keys))
 
-    # ── Memory*.csv → 带宽 (峰值校准源) ──
-    bandwidth = {}
-    for mf in sorted(opprof.glob("Memory*.csv")):
-        rows = read_rows(mf)
-        if not rows:
-            continue
-        r = rows[0]
-        bw = {}
-        for k, v in r.items():
-            if v is not None and to_float(v) is not None:
-                bw[k.strip()] = to_float(v)
-        if bw:
-            bandwidth[mf.name] = bw
-    if not bandwidth:
-        notes.append("无 Memory*.csv (需全指标 --aic-metrics 含 Memory)")
+    bandwidth = {
+        "main_mem_read_gb_s": _bw(mem, "main", "mem", "read", "bw"),
+        "main_mem_write_gb_s": _bw(mem, "main", "mem", "write", "bw"),
+        "l1_read_gb_s": _bw(mem, "l1", "read", "bw"),
+        "l1_write_gb_s": _bw(mem, "l1", "write", "bw"),
+        "l2_read_gb_s": _bw(mem, "l2", "read", "bw"),
+        "l2_write_gb_s": _bw(mem, "l2", "write", "bw"),
+        "ub_read_gb_s": _bw(mem, "ub", "read", "bw"),
+        "ub_write_gb_s": _bw(mem, "ub", "write", "bw"),
+        "l0a_read_gb_s": _bw(meml0, "l0a", "read", "bw"),
+        "l0a_write_gb_s": _bw(meml0, "l0a", "write", "bw"),
+        "l0b_read_gb_s": _bw(meml0, "l0b", "read", "bw"),
+        "l0b_write_gb_s": _bw(meml0, "l0b", "write", "bw"),
+        "l0c_read_gb_s": _bw(meml0, "l0c", "read", "bw"),
+        "l0c_write_gb_s": _bw(meml0, "l0c", "write", "bw"),
+        "ub_mte_read_gb_s": _bw(memub, "mte", "read", "bw"),
+        "ub_vector_read_gb_s": _bw(memub, "vector", "read", "bw"),
+        "ub_scalar_read_gb_s": _bw(memub, "scalar", "read", "bw"),
+    }
+    # 带宽单位换算: 官网值常为 MB/s, 统一转 GB/s (按量级推断)
+    for k in list(bandwidth):
+        v = bandwidth[k]
+        if v is not None and v >= 1e4:
+            bandwidth[k] = round(v / 1000.0, 3)  # MB/s → GB/s
 
-    # ── L2Cache.csv → L2 命中率 ──
-    l2 = {}
-    l2f = opprof / "L2Cache.csv"
-    if l2f.exists():
-        rows = read_rows(l2f)
-        if rows:
-            r = rows[0]
-            l2 = {k.strip(): to_float(v) for k, v in r.items()
-                  if to_float(v) is not None}
-    else:
-        notes.append("无 L2Cache.csv (910B3 A2 应支持; 若缺看是否需显式指标)")
+    # 计算 (ArithmeticUtilization)
+    compute = {
+        "cube_fops": _f(_first(au, "cube", "fops")),
+        "cube_ratio": _f(_first(au, "cube", "ratio")),
+        "cube_fp16_ratio": _f(_first(au, "cube", "fp16", "ratio")),
+        "cube_int8_ratio": _f(_first(au, "cube", "int8", "ratio")),
+        "cube_instr_number": _f(_first(au, "cube", "total", "instr")),
+        "vector_fops": _f(_first(au, "vector", "fops")),
+        "vec_ratio": _f(_first(au, "aiv", "vec", "ratio")),
+        "vec_fp32_ratio": _f(_first(au, "vec", "fp32", "ratio")),
+        "vec_instr_number": _f(_first(au, "vec", "total", "instr")),
+        "aic_total_cycles": _f(_first(au, "aic", "total", "cycle")),
+        "aiv_total_cycles": _f(_first(au, "aiv", "total", "cycle")),
+    }
 
-    summary = {"total_ns": total_ns, "num_ops": len(ops),
-               "execution_mode": None, "num_cores": num_cores,
-               "kernel_name": kernel_name}
-    report = make_report("board", [str(opprof)], summary, ops,
-                         engine_util=engine_util,
-                         notes=notes + ["真机 op 级聚合: 整个 kernel 一行, per-op 只有引擎级伪 op (PipeUtilization)",
-                                        "total_ns 来自 Task Duration(us); 带宽/FLOPs/L2 见 bandwidth_utilization"])
-    report["bandwidth_utilization"] = {"memory_bandwidth_gb_s": bandwidth,
-                                       "arithmetic": arith,
-                                       "l2_cache": l2}
+    # L2
+    l2_hit = None
+    for k, v in (l2[0].items() if l2 else []):
+        kl = k.lower()
+        if "hit" in kl and _f(v) is not None:
+            l2_hit = round(_f(v), 4)
+            break
+
+    # 冲突
+    conflict = {}
+    for k, v in (rcr[0].items() if rcr else []):
+        if _f(v) is not None:
+            conflict[k.strip()] = round(_f(v), 4)
+
+    summary = {"total_ns": round(dur_us * 1000, 2) if dur_us else None,
+               "num_cores": num_cores, "kernel_name": kernel_name,
+               "freq_mhz": freq}
+    report = {
+        "meta": {"source": "board", "generated_at": datetime.now().isoformat(),
+                 "input_files": [str(opprof)], "schema_version": "2.0"},
+        "execution_summary": summary,
+        "raw": raw,                       # ★ 8 CSV 全字段 (不遗漏)
+        "normalized": {
+            "engine_utilization": engine_util,
+            "bandwidth_gb_s": bandwidth,
+            "compute": compute,
+            "l2_hit_rate": l2_hit,
+            "conflict": conflict,
+        },
+        "notes": notes + ["board.json = msprof op 全字段; normalized 是 LLM 用关键字段",
+                          "带宽单位已统一转 GB/s (原可能 MB/s); 8 CSV 缺哪个在 raw 里可见"],
+    }
     return report
 
 

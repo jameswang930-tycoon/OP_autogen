@@ -1,250 +1,68 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-910B3 真机 MatMul 驱动脚本 (triton-ascend + msprof)
+910B3 真机 MatMul 驱动 + 优化数据采集流程
 ================================================================
-依赖: torch_npu + triton-ascend + CANN(Toolkit/Kernels 910b), 必须在 910B3 服务器运行
-kernel: 同目录 triton_kernel.py 的 matmul_kernel (C = A @ B, 512x512x512)
+依赖: torch_npu + triton-ascend + CANN, 必须在 910B3 服务器运行
+kernel: 同目录 triton_kernel.py 的 matmul_kernel
 
-每次终端先准备环境:
-    conda activate triton-npu
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh
+★ 主流程 (一键, 推荐): bash analyzers/run_server_flow.sh
+   = msprof op + 通用 msprof → diagnosis.json (roofline 核心诊断)
+   自动: 采集 → 解析 → 整合 → 字段校验
+   产物: input/matmul/e2e_run/06_diagnosis/diagnosis.json
 
-【真机命令 1/3 — msprof op 单算子调优】 (真实硬件时序, 单算子粒度):
-    全指标版 (产出所有 csv):
-    msprof op --kernel-name=matmul_kernel \
-        --aic-metrics=PipeUtilization,ResourceConflictRatio,ArithmeticUtilization,Memory,MemoryL0,MemoryUB,L2Cache \
-        --output=./board_prof python3 test_matmul.py
-    精简版 (只产 PipeUtilization + ResourceConflictRatio):
-    msprof op --kernel-name=matmul_kernel \
-        --aic-metrics=PipeUtilization,ResourceConflictRatio \
-        --output=./board_prof python3 test_matmul.py
-    产物: ./board_prof/OPPROF_xxx/
-        OpBasicInfo.csv              算子基础信息 (端到端耗时, 真实延迟)
-        PipeUtilization.csv          计算/搬运单元耗时占比
-        ArithmeticUtilization.csv    Cube/Vector 指令周期占比
-        ResourceConflictRatio.csv    UB bank 冲突率
-        Memory.csv / MemoryL0.csv / MemoryUB.csv   各级读写带宽率
-        L2Cache.csv                  L2 命中率
-        visualize_data.bin           MindStudio Insight 可视化
-        dump/                        原始数据 + aicore_binary.o
-    注意: 单算子模式不产出 op_summary_*.csv, 那是通用 msprof 的产物
+─────────────────────────────────────────────
+0. 每次运行前清理旧产物 (主流程脚本已自动做):
+   rm -rf e2e_run ~/.triton
+─────────────────────────────────────────────
 
-【真机命令 2/3 — msprof 通用任务级】 (真实硬件, 算子汇总, 产出 op_summary):
-    msprof --output=./task_prof --application="python3 test_matmul.py"
-    产物: ./task_prof/PROF_xxx/
-        host/data/                          Host 侧原始数据 (无需关注)
-        device_{id}/data/                   Device 侧原始数据 (无需关注)
-        mindstudio_profiler_output/         ★ 性能数据分析推荐目录
-            op_summary_*.csv     AI Core/AI CPU 算子数据, 关键列:
-                                 Task Duration(us) / Task Type(AI_CORE|AI_VECTOR_CORE|AI_CPU)
-                                 / aicore_time(us) / aiv_time(us) / total_cycles
-                                 / Block Dim / Task Start Time(us) / Stream ID / Device ID
-            op_statistic_*.csv   算子调用次数/总耗时统计
-            msprof_*.json        timeline 主表 (Chrome tracing 打开)
-            task_time_*.csv      Task Scheduler 调度信息
-            api_statistic_*.csv  CANN 层 API 耗时
-            fusion_op_*.csv      算子融合信息
-    注意: 通用 msprof 不采集 Python 调用栈 / PyTorch 框架层数据; 具体列名以
-          服务器上 head -1 mindstudio_profiler_output/op_summary_*.csv 为准
+【真机命令 1 — msprof op (★主源, 默认全量 8 CSV)】
+   msprof op --kernel-name=matmul_kernel --warm-up=10 --output=./board_prof python3 test_matmul.py
+   注意: 不要指定 --aic-metrics (默认全量; 指定会限制/报错)
+   产物: OpBasicInfo/PipeUtilization/ArithmeticUtilization/Memory/MemoryL0/MemoryUB/L2Cache/ResourceConflictRatio
+   → board.json (真实带宽/L2/cube/引擎利用率)
 
-【仿真命令 3/3 — msprof op simulator】 (CPU 指令级仿真, 不占 NPU):
-    export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/tools/simulator/Ascend910B3/lib:$LD_LIBRARY_PATH
-    msprof op simulator --kernel-name=matmul_kernel --soc-version=Ascend910B3 \
-        --output=./sim_prof python3 test_matmul.py
-    产物: ./sim_prof/OPPROF_xxx/
-        simulator/trace.json              全核汇总指令流水 (Chrome tracing)
-        simulator/core*.veccore*/         每核一目录 (含 cubecore)
-            *_instr_exe.csv   ★ 指令级时序 (pipe/cycles/running_time)
-            *_code_exe.csv    代码行耗时
-        dump/aicore_binary.o  算子二进制
-    注: 只有本命令产出 instr_exe.csv, 是真机 msprof/msprof op 没有的
+【真机命令 2 — msprof 通用 (任务级, op_summary)】
+   msprof --output=./task_prof --application="python3 test_matmul.py" --ai-core=on
+   注意: 8.5.1 不认 --aic-metrics (退出255), 用 --ai-core=on 拿基础 op_summary
+   产物: op_summary/op_statistic/task_time/api_statistic/l2_cache
+   → task.json (每kernel耗时/核数/多kernel/launch/L2)
 
-【方式 4/4 — HIVM IR dump】 (编译中间产物, 静态结构字段来源, 不占 NPU)
-    机制: TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1 → ~/.triton/dump/<hash>/
-         产 kernel.ttir.mlir + kernel.ttadapter.mlir + host 代码(.h/.cxx)。
-    ★ 关键事实 (本机 3.2.0 已确认):
-        - kernel.npuir.mlir 不生成: 同步 pass 改名 (hivm-inject-sync →
-          hivm-graph-sync-solver) 跟着 CANN 的 bishengir 走, 与 triton-ascend
-          版本无关 (3.2.0 也中招)。
-        - TRITON_DEBUG 有时命中缓存 → 只产 .h/.cxx (host 启动代码, 分析用不到),
-          连 ttir/ttadapter 都不产。
-        → 不再依赖 TRITON_DEBUG dump, 直接手动对 ttadapter.mlir 跑 bishengir
-          打印 HIVM (下方标准流程)。
+【仿真命令 3 — msprof op simulator (可选, 复杂场景弃用)】
+   export LD_LIBRARY_PATH=.../tools/simulator/Ascend910B3/lib:$LD_LIBRARY_PATH
+   msprof op simulator --kernel-name=matmul_kernel --soc-version=Ascend910B3 --output=./sim_prof python3 test_matmul.py
+   注意: 大负载会卡死 (指令级仿真慢); 只适合小尺寸看指令结构 (建议 MATMUL_M/N/K=64)
 
-    拿真实 HIVM 的标准流程 (按序执行; A/B/C 都是给 D 准备输入):
-        # A. 找已有 ttadapter.mlir (之前拷回 ir_dump/ 过可直接复用, 跳过 B)
-        find . -name 'kernel.ttadapter.mlir' -o -name 'kernel.ttir.mlir' 2>/dev/null
+【可选 — HIVM (多算子融合时用)】
+   多算子 (op_summary 里多个不同 kernel) → 需看内部结构/依赖做融合:
+   1. 编译 + 打印 HIVM:
+      rm -rf ~/.triton
+      export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
+      python3 test_matmul.py
+      cp ~/.triton/dump/*/kernel.*.mlir ./
+      bishengir-compile --target=Ascend910B3 --enable-auto-multi-buffer=True --enable-auto-bind-sub-block=True --enable-hfusion-compile=true --enable-hivm-compile=true --enable-triton-kernel-compile=true --bishengir-print-ir-after=hivm-inject-sync kernel.ttadapter.mlir -o /tmp/k.o 2>&1 | tee hivm_try.txt
+      (pass 名 hivm-inject-sync 或 hivm-graph-sync-solver 都试)
+   2. 过滤成融合专用视图 (删无关, 保留 op+同步+依赖):
+      python3 analyzers/filter_hivm_for_fusion.py hivm_try.txt --out hivm_fusion_view.txt
+   3. LLM 读 hivm_fusion_view.txt: 找 RAW 链相邻逐元素 op → 融合候选; WAR → 换 buffer
+   注意: npuir.mlir 不生成 (pass 改名跟 CANN bishengir 走) → 手动 D 打印是正路
 
-        # B. 没有就强制重编译 (nuke 整个 ~/.triton 才保险; 单清 dump 会命中缓存只产 .h/.cxx)
-        rm -rf ~/.triton
-        export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
-        python3 test_matmul.py 2>&1 | tee run_debug.txt
-        find ~/.triton -type f | head -30     # 预期: kernel.ttir.mlir + kernel.ttadapter.mlir
-        cp ~/.triton/dump/*/kernel.*.mlir ./  # ★ 拷回当前目录, D 才有输入文件
+【诊断输出 diagnosis.json (roofline 核心)】
+   kernel_summary  每kernel耗时/核数/多kernel/launch/L2
+   roofline        memory/compute/latency/balanced 判类型
+   engine_util     cube/vec/mte1/2/3/scalar/fixpipe 占比
+   transfer_paths  每通路真实带宽 (GM/L1/L2/UB/L0)
+   memory_issues   L2命中 + UB冲突
+   compute         cube/vec fops
+   bottlenecks     每 Tier 处方化 hint
+   注意: 只有 kernel 级, 无 per-op (内部 load/matmul/store 拆不开)
+     Tier2 内部融合需临时跑 hivm 看依赖
 
-        # C. 确认 bishengir-compile 在 PATH (不在就 find 定位)
-        which bishengir-compile || find /usr/local/Ascend -name 'bishengir-compile' 2>/dev/null
+【尺寸可调】 MATMUL_M/N/K env 覆盖 (默认 512^3; simulator 建议 64^3)
 
-        # D. ★核心: 对 ttadapter.mlir 直接跑官方命令打印 HIVM (不依赖 TRITON_DEBUG)
-        #    (ttadapter.mlir 必须在当前目录 — B 末尾已拷回; 不在就 ls /root/.triton/dump/*/ 找)
-        bishengir-compile --target=Ascend910B3 --enable-auto-multi-buffer=True \
-          --enable-auto-bind-sub-block=True --enable-hfusion-compile=true \
-          --enable-hivm-compile=true --enable-triton-kernel-compile=true \
-          --bishengir-print-ir-after=hivm-inject-sync kernel.ttadapter.mlir \
-          -o /tmp/k.o 2>&1 | tee hivm_try.txt
-        grep -c 'hivm.hir' hivm_try.txt      # 预期 >0 即成功; 0 → 换 pass hivm-graph-sync-solver 重跑
-        # 仍 0: 加 --enable-hivm-graph-sync-solver=true (新版同步求解器默认 false, 不开不产 HIVM)
-        # 打印 flag 必须是 --bishengir-print-ir-after=<pass名> (不是 --mlir-print-ir-after-all)
-        # hivm_try.txt 即含 hivm.hir 的完整 IR, 拷回本目录直接喂 hivmir_analyzer
-
-    方案 A (兜底, D 拿不到 HIVM 时): 真机 ttir.mlir 喂现有 ttir_to_hivm() → 直接出结构 JSON
-        python3 -c "
-        from analyzers.ttir_to_hivm import ttir_to_hivm
-        hivm_text, ops = ttir_to_hivm(open('kernel.ttir.mlir').read(), 'matmul_kernel')
-        open('kernel_hivm_fallback.mlir','w').write(hivm_text)
-        print('ops:', len(ops))
-        "
-        ⚠️ 局限: matmul 的 cube 通路 (L0A/L0B/L0C) 是近似的; 但依赖边/buffer大小/dtype/op类型
-           (融合/分块/访存判定核心) 是对的
-
-    怎么看 D 的产物 hivm_try.txt (纯查看, 不需要编译):
-        grep -c 'hivm.hir' hivm_try.txt                      # 指令总数, 应 > 0
-        grep -n 'memref.alloc'  hivm_try.txt | head          # buffer: size+region+dtype
-        grep -E 'hivm.hir.matmul|hivm.hir.load' hivm_try.txt | head   # 指令样例
-
-    # 产物自动核验 (标准字段匹配 → PASS/ERROR; 保密服务器专用, 只输出判定+短字段名):
-        # 依据 = 网上核实的 Ascend910B3 标准 (triton-ascend 3.2.0 / msopprof / msprof op):
-        #   - instr_exe.csv 表头: instr,addr,pipe,call_count,cycles,running_time(us),detail
-        #   - OpBasicInfo 关键列: Op Name / Op Type / Task Duration(us) / Block Dim
-        #   - PipeUtilization 关键列: aic_cube_time / aiv_vec_time / aic_mte1~3_time
-        #                             / aic_total_cycles / aiv_total_cycles
-        #   - address_space 映射: cbuf=L1, ca=L0A, cb=L0B, cc=L0C, ub=UB, gm=GM
-        #   - cube op 家族: mix_matmul / mmadL1 / batchMmadL1
-        #   - sync op: set_flag / wait_flag / pipe_barrier / sync_block (hivm. 或 hivm.hir. 前缀都兼容)
-        # 规则: 匹配 → 只打 PASS + 短名; 不匹配 → ERROR + 实际字段名。
-        #       所有非命令行都以 # 开头 (整体粘贴到 bash 不会 syntax error), 无反斜杠。
-
-        # ── 第 1 组: HIVM 结构 (hivm_try.txt) ─────────────────────────────
-        # [1] hivm.hir op 分布 + cube op 判定 (PASS 时把 cube= 后的名字读回):
-        grep -oE 'hivm.hir.[a-z_]+' hivm_try.txt | sort | uniq -c   # 先看分布
-        cube=$(grep -oE 'hivm.hir.(mix_matmul|mmadL1|batchMmadL1|matmul)' hivm_try.txt | sort | uniq -c)
-        [ -n "$cube" ] && echo "[1] PASS cube=$cube" || echo "[1] ERROR 无已知cube op, 看上面分布"
-
-        # [2] sync op 分布 (hivm. 和 hivm.hir. 两种前缀都匹配):
-        sync=$(grep -oE 'hivm.hir.(set_flag|wait_flag|pipe_barrier|sync_block)|hivm.(set_flag|wait_flag|pipe_barrier|sync_block)' hivm_try.txt | sort | uniq -c)
-        [ -n "$sync" ] && echo "[2] PASS $sync" || echo "[2] ERROR 无 sync op"
-
-        # [3] matmul/mmad 家族关键词 (cube op 在不在, 叫什么):
-        m=$(grep -oE '(mix_matmul|mmadL1|batchMmadL1|matmul|mmad|tl.dot)' hivm_try.txt | sort | uniq -c)
-        [ -n "$m" ] && echo "[3] PASS $m" || echo "[3] ERROR 无任何 cube/矩阵关键词"
-
-        # [4] 2D alloc 数 (matmul 必有 2D memref, size_kb 靠它算):
-        n2d=$(grep -oE 'memref<[0-9]+x[0-9]+x[a-z0-9]+' hivm_try.txt | wc -l)
-        [ "$n2d" -gt 0 ] && echo "[4] PASS 2D_alloc=$n2d" || echo "[4] ERROR 无 2D alloc"
-
-        # [5] address_space 白名单 (匹配整个 #hivm.address_space<值> 外壳):
-        bad=$(grep -oE '#hivm.address_space<[a-z0-9_]+>' hivm_try.txt | sort -u | grep -vE '^#hivm.address_space<(ub|cbuf|ca|cb|cc|gm)>$')
-        [ -z "$bad" ] && echo "[5] PASS" || echo "[5] ERROR 未知值=$bad"
-
-        # [6] sync op 语法 (前缀 + 分隔符是 [ 还是 { 还是 ():
-        syn=$(grep -oE '(hivm.hir.)?(set_flag|wait_flag|pipe_barrier|sync_block)[^a-z_]*' hivm_try.txt | sort | uniq -c)
-        [ -n "$syn" ] && echo "[6] PASS $syn" || echo "[6] ERROR 无 sync"
-
-        # ── 第 2 组: simulator 指令级 (sim_prof) ───────────────────────────
-        # [7] cubecore 核目录数:
-        n=$(ls sim_prof/OPPROF_*/simulator/core*.cubecore* 2>/dev/null | wc -l)
-        [ "$n" -gt 0 ] && echo "[7] PASS cubecore_dir=$n" || echo "[7] ERROR 无 cubecore 目录"
-
-        # [8] cubecore/veccore instr_exe 数量:
-        nc=$(ls sim_prof/OPPROF_*/simulator/core*.cubecore*/*instr_exe.csv 2>/dev/null | wc -l)
-        nv=$(ls sim_prof/OPPROF_*/simulator/core*.veccore*/*instr_exe.csv 2>/dev/null | wc -l)
-        [ "$nc" -gt 0 ] && echo "[8] PASS cubecore=$nc veccore=$nv" || echo "[8] ERROR cubecore=$nc veccore=$nv"
-
-        # [9] instr_exe 表头 (预期含 instr,addr,pipe,call_count,cycles,running_time,detail):
-        f=$(ls sim_prof/OPPROF_*/simulator/core*.cubecore*/*instr_exe.csv 2>/dev/null | head -1)
-        hdr=$(head -1 "$f" 2>/dev/null)
-        ok=1
-        for k in instr addr pipe call_count cycles running_time detail; do
-          echo "$hdr" | grep -q "$k" || { ok=0; echo "[9] 缺字段=$k"; }
-        done
-        [ "$ok" -eq 1 ] && echo "[9] PASS" || echo "[9] ERROR 实际表头=$hdr"
-
-        # [10] instr_exe 总行数:
-        n=$(cat sim_prof/OPPROF_*/simulator/core*.cubecore*/*instr_exe.csv 2>/dev/null | wc -l)
-        [ "$n" -gt 0 ] && echo "[10] PASS 指令行=$n" || echo "[10] ERROR 0 行"
-
-        # [11] trace.json:
-        t=$(ls sim_prof/OPPROF_*/simulator/trace.json 2>/dev/null | wc -l)
-        [ "$t" -gt 0 ] && echo "[11] PASS" || echo "[11] ERROR 无 trace.json"
-
-        # [12] instr_exe pipe 分布 (第3列, 预期含 CUBE/VECTOR/MTE1/MTE2/MTE3):
-        p=$(cut -d',' -f3 sim_prof/OPPROF_*/simulator/core*.cubecore*/*instr_exe.csv 2>/dev/null | sort | uniq -c)
-        echo "$p"
-        echo "$p" | grep -qiE 'cube|vector|mte' && echo "[12] PASS" || echo "[12] ERROR 无计算/搬运 pipe"
-
-        # ── 第 3 组: 真机 msprof op 校准 (board_prof, 补 peak_bw/L2) ──────
-        # [13] OpBasicInfo.csv 表头 (预期含 Op Name/Op Type/Task Duration/Block Dim):
-        hdr=$(head -1 board_prof/OPPROF_*/OpBasicInfo.csv 2>/dev/null)
-        ok=1
-        for k in 'Op Name' 'Op Type' 'Task Duration' 'Block Dim'; do
-          echo "$hdr" | grep -q "$k" || { ok=0; echo "[13] 缺字段=$k"; }
-        done
-        [ "$ok" -eq 1 ] && echo "[13] PASS" || echo "[13] ERROR 实际表头=$hdr"
-
-        # [14] PipeUtilization.csv 表头 (预期含 aic_cube_time/aiv_vec_time/mte1~3/aic_total_cycles):
-        hdr=$(head -1 board_prof/OPPROF_*/PipeUtilization.csv 2>/dev/null)
-        ok=1
-        for k in aic_time aiv_time aic_cube_time aiv_vec_time aic_mte1_time aic_mte2_time aic_mte3_time aic_total_cycles aiv_total_cycles; do
-          echo "$hdr" | grep -q "$k" || { ok=0; echo "[14] 缺字段=$k"; }
-        done
-        [ "$ok" -eq 1 ] && echo "[14] PASS" || echo "[14] ERROR 实际表头=$hdr"
-
-        # [15] Memory 系列 csv (peak_bw 校准):
-        m=$(ls board_prof/OPPROF_*/Memory*.csv 2>/dev/null | wc -l)
-        [ "$m" -gt 0 ] && echo "[15] PASS Memory_csv=$m" || echo "[15] ERROR 无 Memory csv"
-
-        # [16] 文件里大量 ? 的判据 (MLIR 合法 ? vs 编码问题):
-        file hivm_try.txt
-        echo -n "字面?总数: "; grep -oF '?' hivm_try.txt | wc -l
-        echo -n "?紧贴数字: "; grep -oE '[0-9][?]|[?][0-9]' hivm_try.txt | wc -l
-        echo -n "动态维<?x: "; grep -oF '<?x' hivm_try.txt | wc -l
-        echo -n "memref形状分布: "; grep -oE 'memref<[0-9?x]+[a-z0-9]+' hivm_try.txt | sort | uniq -c
-        # 判定: file=ASCII 且 ?紧贴数字=0 → 问号是 MLIR 合法占位(动态维), 数字完好
-        #       file=ASCII 且 动态维<?x>0 → memref 动态维, analyzer 需加 ? 分支
-        #       file 非 ASCII → 查看器/编码问题, 数字实际在文件里
-
-        # 汇总: 全 PASS → 数据齐, 按标准字段直接修 analyzer; 有 ERROR → 把该编号的
-        # ERROR 行 (只含字段名) 贴回, 按实际字段调命令/解析器。
-
-    真实格式 = hivmir_analyzer 的 Format A, 样例:
-        %alloc = memref.alloc() : memref<256x256xf32, #hivm.address_space<ub>>
-        hivm.hir.load ins(%arg0 : memref<...>) outs(%alloc : memref<...>)
-        hivm.hir.matmul ins(%A, %B : ...) outs(%C : ...) {a_transpose, block_sizes=[16,16,16]}
-
-    怎么解析并映射到 29 字段 (纯 Python, 可在 WSL2/任意机器跑):
-        python3 -c "
-        from pathlib import Path
-        from analyzers.hivmir_analyzer import HIVMIRAnalyzer
-        a = HIVMIRAnalyzer()
-        rep = a.analyze_file(Path('hivm_try.txt'))
-        import json; print(json.dumps(a.to_dict(rep), ensure_ascii=False, indent=2))
-        "
-        得到: op_id/op_type/instruction/dst/src/src2/size_kb/memory_region/
-              dependencies(RAW/WAR/WAW)/buffers(producers/consumers)/dtype/attrs(block_sizes)
-        ⚠️ timing 字段 (duration_ns/start/end/带宽) 仍是 "待补充" — 由 方式1/2/3 的
-           msprof 数据填, dsl_merger 按 op_id 对齐。
-
-    ⚠️ hivmir_analyzer 对真实 dump 有 3 个待补点 (见 analyzers/hivmir_analyzer.py):
-        1) 2D memref alloc (memref<256x256xf32,...>) 不解析 → size_kb 变 0, 需加 2D 分支
-        2) address_space 值 cbuf/ca/cb/cc (=L1/L0A/L0B/L0C) 未映射 → L0 通路 region 判错
-        3) sync/barrier op (hivm.barrier, 非 hivm.hir.*) 被跳过 → 丢失依赖/串行证据
-
-常见提示说明:
-    - "not selected via --kernel-name" 是 reference 的 torch.matmul 被过滤, 正常;
-      若担心 matmul_kernel 没采到, 检查 OPPROF_xxx/simulator/ 是否有 instr_exe.csv
-    - "terminate called after throwing 'std::bad_weak_ptr'" 是仿真器退出时 teardown
-      崩溃, 通常 OPPROF 数据已写盘; 已默认关闭正确性校验降低触发概率
+常见提示:
+   - "not selected via --kernel-name" 是 reference 的 torch.matmul 被过滤, 正常
+   - "std::bad_weak_ptr" 是仿真器退出时 teardown 崩溃, 通常数据已写盘
 ================================================================
 """
 import os

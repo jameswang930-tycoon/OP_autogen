@@ -194,6 +194,12 @@ def parse(base):
             aiv = _f(_first(r, "aiv", p, "time"))
             if aiv is not None:
                 pipes.setdefault(f"aiv_{p}_time_us", aiv)
+        # 归一化: cube 耗时缺用 mac (真实列常是 aic_mac_time(us));
+        #         cube 的 mte3 缺用 aiv_mte3 (结果 L0C→fixpipe→UB→GM, UB→GM 是 aiv_mte3)
+        if "aic_cube_time_us" not in pipes and "aic_mac_time_us" in pipes:
+            pipes["aic_cube_time_us"] = pipes["aic_mac_time_us"]
+        if "aic_mte3_time_us" not in pipes and "aiv_mte3_time_us" in pipes:
+            pipes["aic_mte3_time_us"] = pipes["aiv_mte3_time_us"]
         kernels.append({
             "op_name": _first(r, "Op", "Name") or _first(r, "op", "name"),
             "op_type": _first(r, "Op", "Type") or _first(r, "op", "type"),

@@ -20,15 +20,23 @@ argument-hint: >
 </role>
 
 ## 输入
-- **plan**: planner 的计划。重点看 `specific_change`（哪一行/改成什么）和 `expected_impact`。
+- **plan**: planner 的计划。**重点看 `changes[]`**（每项含 `old_code`/`new_code`/`reason`）。
 - **kernel_code**: 当前 `kernel_op.py` 完整源码。
 - **previous_error**（可选）: 上轮 msprof 端到端运行报错。有则**先解决报错**，再落实 plan。
 - **coding_guide**: 改码规范 + 本 tier 策略文档。
 
+## ★优先确定性应用 changes[]（不要重写整文件）
+
+1. plan 的 `changes[]` 每项是 `{old_code, new_code}`。
+2. 对每项做**精确字符串替换**：在 kernel_op.py 里找到 `old_code`，原样替换成 `new_code`。
+3. **找不到 `old_code` 就报告**（输出 `# CODER: old_code 未匹配: <内容>`），**绝不猜测乱改**。
+4. 改完跑语法检查，确保仍是合法 Python。
+5. 只有当 `changes[]` 为空、或 previous_error 需要 LLM 修报错时，才自己改码。
+
 ## 修改原则
 
 ### 最小改动
-- 只改 plan 要求改的地方，别顺手重构无关代码。
+- 只改 plan 要求改的地方（changes[] 指定的），别顺手重构无关代码。
 - 保持函数名、参数名、参数数量不变。
 - 保持缩进和风格一致。
 

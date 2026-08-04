@@ -191,6 +191,40 @@ def _count_lines_changed(diff_text: str) -> int:
     return additions + deletions
 
 
+def _extract_changes(plan_text: str) -> list:
+    """从 plan JSON 提取 changes[] (planner 输出, 见 skills/triton-op-planner)。"""
+    if not plan_text or not plan_text.strip():
+        return []
+    import json
+    text = plan_text.strip()
+    if text.startswith("```"):
+        text = "\n".join(l for l in text.splitlines() if not l.startswith("```"))
+    start = text.find("{"); end = text.rfind("}")
+    if start < 0 or end <= start:
+        return []
+    try:
+        d = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return []
+    return d.get("changes", []) if isinstance(d, dict) else []
+
+
+def _apply_plan_changes(code: str, changes: list):
+    """确定性应用 changes[]: old_code → new_code 精确替换。返回 (新代码, applied, missing)。"""
+    applied, missing = [], []
+    for ch in changes:
+        old = (ch or {}).get("old_code", "")
+        new = (ch or {}).get("new_code", "")
+        if not old:
+            continue
+        if old in code:
+            code = code.replace(old, new, 1)
+            applied.append(ch)
+        else:
+            missing.append(old[:60])
+    return code, applied, missing
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Coder Agent
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -228,6 +262,25 @@ class CoderAgent:
         Returns:
             CoderResult (optimized_code + diff)
         """
+
+        # ★Step 0: 确定性应用 plan 的 changes[] (old_code→new_code 精确替换, 不靠 LLM, 最稳)
+        #    仅当无 previous_error (有报错时才走 LLM 修复)
+        if not previous_error:
+            changes = _extract_changes(plan_text)
+            if changes:
+                new_code, applied, missing = _apply_plan_changes(kernel_code, changes)
+                if missing:
+                    return CoderResult(
+                        success=False, optimized_code=kernel_code, diff="",
+                        error_message=f"plan old_code 未在代码中找到: {missing} (请让 planner 输出精确 old_code)")
+                if applied:
+                    ok, err = _validate_python(new_code)
+                    if not ok:
+                        return CoderResult(success=False, optimized_code=kernel_code,
+                                           diff="", error_message=f"替换后语法错: {err}")
+                    diff = _generate_diff(kernel_code, new_code)
+                    return CoderResult(success=True, optimized_code=new_code, diff=diff,
+                                       lines_changed=_count_lines_changed(diff))
 
         # Step 1: 调用 LLM (或 stub)
         if self.use_llm:

@@ -292,8 +292,9 @@ class PlannerAgent:
         kernel_code: str,
         round_num: int,
         op_dir: Optional[Path] = None,
+        fusion_analysis: Optional[dict] = None,
     ) -> RoundPlan:
-        """v4 Planner: 输入 = 当前 tier 提取的字段段 (不是全部字段) + 单文件 + config。
+        """v4 Planner: 输入 = 当前 tier 提取的字段段 (不是全部字段) + 单文件 + config + 融合分析。
 
         额外输出 promote: bool + promote_reason (当前瓶颈是否属于本 tier, 决定晋升)。"""
         playbook = _load_playbook(tier, self.playbook_dir)
@@ -303,6 +304,8 @@ class PlannerAgent:
             cfg = Path(op_dir) / "config.json"                  # 旧式兜底
             if cfg.exists():
                 config_text = cfg.read_text(encoding="utf-8")[:2000]
+        fusion_text = (json.dumps(fusion_analysis, ensure_ascii=False)[:2000]
+                       if fusion_analysis else "(无融合分析)")
 
         system_prompt = (
             f"You are a Triton kernel optimizer for Ascend 910B3 (v4 flow).\n"
@@ -320,9 +323,12 @@ class PlannerAgent:
             f"## 历史 (最近几轮)\n{history_text}\n"
             f"## 当前单文件 kernel_op.py\n{kernel_code[:4000]}\n"
             f"## config.json\n{config_text}\n"
-            f"## 输出 JSON only:\n"
-            f'{{"strategy":"...","target_speedup":1.1,"specific_change":"...",'
-            f'"expected_impact":"...","promote":false,"promote_reason":"..."}}'
+            f"## 融合分析 (Tier2 时才有, RAW/WAR/WAW + 融合候选)\n{fusion_text}\n"
+            f"## 输出 JSON only (★changes[] 必须机器可执行):\n"
+            f'{{"strategy":"...","target_speedup":1.1,\n'
+            f'  "changes":[{{"old_code":"kernel_op.py 里被替换的整行(必须逐字符匹配)","new_code":"替换后的整行","reason":"为什么","section":"① config/② kernel/③ main"}}],\n'
+            f'  "expected_impact":"...","promote":false,"promote_reason":"..."}}\n'
+            f'注意: old_code 必须与 kernel_op.py 某段逐字符相同, 否则 coder 无法替换, 宁缺勿错。'
         )
 
         # v4: 统一走 LLMClient (api / nga run CLI / stub), 并引用 planner skill
@@ -355,22 +361,35 @@ class PlannerAgent:
         )
 
     def _stub_plan_v4(self, tier: int) -> dict:
+        """stub 也输出 changes[] 格式 (old_code 用默认 matmul 配置, 便于本地测确定性替换)。"""
         strategies = {
             1: ("[STUB] tune_algorithm",
-                "若 cube_ratio 低 → 检查是否该换 split-k/online 算法, 或增大 BLOCK 让 cube 满"),
+                [{"old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+                  "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
+                  "reason": "增大 BLOCK_K 减 MTE1 次数", "section": "① config"}]),
             2: ("[STUB] fuse_ops",
-                "若 num_kernels>1 → 把相邻逐元素 op 融合进主 kernel, 消除中间 GM 往返"),
+                [{"old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+                  "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
+                  "reason": "融合需要更大 block 减少 kernel 数", "section": "① config"}]),
             3: ("[STUB] increase_tile",
-                "若 block_dim<40 或 mte1_ratio 高 → 把 BLOCK_K 增大 2 倍, 减 MTE1 次数"),
+                [{"old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+                  "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
+                  "reason": "Tier3: mte1_ratio 高 → 增大 BLOCK_K", "section": "① config"}]),
             4: ("[STUB] improve_mem",
-                "若 main_mem 带宽接近峰值 → 减数据量/升精度; 若 L2 命中低 → 调分块驻留 L2"),
+                [{"old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+                  "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
+                  "reason": "Tier4: 增大 tile 提高 L2 复用", "section": "① config"}]),
             5: ("[STUB] reduce_conflict",
-                "若 bank/bankgroup 冲突>4% → 给 UB tensor 加 padding(32B) / 调 stride"),
+                [{"old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+                  "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
+                  "reason": "Tier5: 调整 block 减冲突", "section": "① config"}]),
             6: ("[STUB] tune_arch",
-                "检查 engine_utilization 分布 → 调 grid/pipeline, 均衡 cube/vec/mte 占用"),
+                [{"old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+                  "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
+                  "reason": "Tier6: 调 block 均衡引擎占用", "section": "① config"}]),
         }
-        s, c = strategies.get(tier, ("analyze", "进一步分析"))
-        return {"strategy": s, "target_speedup": 1.05, "specific_change": c,
+        s, changes = strategies.get(tier, ("analyze", []))
+        return {"strategy": s, "target_speedup": 1.05, "changes": changes,
                 "expected_impact": "~5%", "promote": False, "promote_reason": ""}
 
     # ═══════════════════════════════════════════════════════════════════════════

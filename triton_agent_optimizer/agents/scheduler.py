@@ -40,16 +40,22 @@ TIER_LABEL = {
 
 # ── 每 tier 要提取的字段段 (JSON path → 中文说明) ──
 #   deep 在 kernels[i].deep 下 → 前缀 kernels[].deep
+#   每 tier 的字段要足以: ①判断瓶颈是否属本层(promote) ②给出具体改法
 TIER_FIELDS = {
-    1: [  # 算法: 算力利用
+    1: [  # 算法结构: 算力利用 + 精度 + 强度 (11 字段)
+        ("summary.num_kernels", "优化目标kernel数"),
+        ("summary.total_ns", "端到端耗时ns"),
         ("kernels[].deep.compute.cube_fops", "cube浮点运算数"),
         ("kernels[].deep.compute.vector_fops", "向量运算数"),
-        ("kernels[].deep.engine_utilization.cube", "cube指令占比"),
+        ("kernels[].deep.compute.cube_ratio", "cube指令占比"),
+        ("kernels[].deep.compute.cube_fp16_ratio", "cube fp16占比"),
+        ("kernels[].deep.compute.cube_int8_ratio", "cube int8占比"),
         ("kernels[].deep.engine_utilization.vec", "向量指令占比"),
         ("kernels[].deep.roofline.compute_utilization", "算力利用率"),
+        ("kernels[].deep.roofline.arithmetic_intensity", "算术强度(计算/访存)"),
         ("kernels[].deep.roofline.bottleneck_type", "瓶颈类型"),
     ],
-    2: [  # 融合: 多算子/launch/类型
+    2: [  # 算子融合: 多算子/launch/类型 (8 字段)
         ("summary.num_kernels", "优化目标kernel数"),
         ("summary.num_kernels_total", "总kernel数(含框架)"),
         ("summary.api_overhead_total_us", "launch开销us"),
@@ -59,32 +65,43 @@ TIER_FIELDS = {
         ("multi_kernel", "算子类型分解"),
         ("framework_kernels", "框架kernel(非目标)"),
     ],
-    3: [  # 分块: 核数/L0A/B
+    3: [  # 分块配置: 核数 + L0A/B 搬运 (8 字段)
         ("kernels[].task.block_dim", "核数"),
         ("kernels[].deep.engine_utilization.mte1", "MTE1(L1→L0A/B)占比"),
+        ("kernels[].deep.engine_utilization.mte2", "MTE2(GM→L1)占比"),
+        ("kernels[].deep.engine_utilization.cube", "cube占比"),
         ("kernels[].deep.bandwidth_gb_s.l0a_read_gb_s", "L0A读带宽"),
+        ("kernels[].deep.bandwidth_gb_s.l0a_write_gb_s", "L0A写带宽"),
         ("kernels[].deep.bandwidth_gb_s.l0b_read_gb_s", "L0B读带宽"),
+        ("kernels[].deep.bandwidth_gb_s.l0b_write_gb_s", "L0B写带宽"),
     ],
-    4: [  # 访存: GM带宽/L2/搬运时间
+    4: [  # 访存: GM带宽/L2/搬运 (9 字段)
         ("kernels[].deep.bandwidth_gb_s.main_mem_read_gb_s", "GM读带宽"),
         ("kernels[].deep.bandwidth_gb_s.main_mem_write_gb_s", "GM写带宽"),
+        ("kernels[].deep.bandwidth_gb_s.gm_to_ub_gb_s", "GM→UB带宽"),
+        ("kernels[].deep.bandwidth_gb_s.ub_to_gm_gb_s", "UB→GM带宽"),
         ("kernels[].deep.l2_hit_rate", "L2命中率"),
         ("kernels[].task.pipes_us.aic_mte2_time_us", "MTE2(GM读)耗时"),
         ("kernels[].task.pipes_us.aic_mte3_time_us", "MTE3(GM写)耗时"),
         ("kernels[].deep.roofline.memory_utilization", "访存利用率"),
+        ("kernels[].deep.roofline.arithmetic_intensity", "算术强度(计算/访存)"),
     ],
-    5: [  # 计算: cube时间/冲突
+    5: [  # 计算占用: cube/标量时间 + 冲突 (8 字段)
         ("kernels[].task.pipes_us.aic_cube_time_us", "cube耗时"),
         ("kernels[].task.pipes_us.aic_scalar_time_us", "标量耗时"),
+        ("kernels[].deep.engine_utilization.scalar", "scalar占比"),
+        ("kernels[].deep.engine_utilization.fixpipe", "fixpipe占比"),
+        ("kernels[].deep.compute.cube_ratio", "cube指令占比"),
         ("kernels[].deep.conflict.bank_cflt_ratio", "bank冲突"),
         ("kernels[].deep.conflict.bankgroup_cflt_ratio", "bankgroup冲突"),
         ("kernels[].deep.conflict.total_cflt_ratio", "vec总冲突"),
-        ("kernels[].deep.compute.cube_ratio", "cube指令占比"),
     ],
-    6: [  # 架构: 引擎分布/阻塞
+    6: [  # 910B3 架构: 引擎分布/阻塞 (6 字段)
         ("kernels[].deep.engine_utilization", "各引擎利用率"),
         ("kernels[].deep.conflict.mte_cflt_ratio", "mte冲突"),
+        ("kernels[].deep.conflict.wait_ratio", "vec被阻塞占比"),
         ("kernels[].task.task_type", "每kernel引擎"),
+        ("kernels[].task.block_dim", "核数"),
         ("kernels[].deep.roofline.bottleneck_type", "瓶颈类型"),
     ],
 }
@@ -156,7 +173,7 @@ class Scheduler:
                 return traj
             # 旧版本 (v3) trajectory → 重置, 避免 tier/round 错位
             print("  [Scheduler] 检测到旧版本 trajectory, 重置为 v4")
-        return {"v": 4, "state": {"tier": 1, "round": 0, "best_speedup": 1.0,
+        return {"v": 4, "state": {"tier": 1, "round": 1, "best_speedup": 1.0,
                                   "baseline_ns": None, "num_kernels": None},
                 "history": []}
 
@@ -204,8 +221,16 @@ class Scheduler:
         print(f"  [诊断] Tier{tier} 筛出 {len(extracted.splitlines())} 行 → {d7}")
         return extracted
 
-    # ── ④ Planner (只喂当前阶段筛好的字段) ──
-    def _plan(self, diagnosis: dict, extracted: str, tier: int, rn: int, round_dir: Path):
+    # ── 融合专用: 编译 HIVM MLIR → nga run 依赖分析 → 08_fusion/ ──
+    def _run_fusion(self, round_dir: Path):
+        """Tier2 独有: 生成 hivm MLIR + nga run 融合分析, 写 round_dir/08_fusion/。"""
+        from analyzers.run_hivm_fusion import run_fusion
+        print("  [Scheduler] Tier2 融合: 编译 HIVM MLIR → nga run 分析依赖 → 08_fusion/")
+        return run_fusion(self.kernel_op, round_dir, use_llm=self.use_llm)
+
+    # ── ④ Planner (只喂当前阶段筛好的字段 + 融合分析) ──
+    def _plan(self, diagnosis: dict, extracted: str, tier: int, rn: int, round_dir: Path,
+              fusion_analysis: Optional[dict] = None):
         from agents.planner import PlannerAgent
         kernel_code = self.kernel_op.read_text(encoding="utf-8") if self.kernel_op.exists() else ""
         planner = PlannerAgent(use_llm=self.use_llm)
@@ -215,11 +240,15 @@ class Scheduler:
             kernel_code=kernel_code,
             round_num=rn,
             op_dir=self.op_dir,
+            fusion_analysis=fusion_analysis,
         )
         round_dir.mkdir(parents=True, exist_ok=True)
         (round_dir / "plan.md").write_text(
             f"# Tier{tier} Round{rn} Plan\n\n{plan.plan_text}\n\n"
-            f"## 提取字段\n{extracted}", encoding="utf-8")
+            f"## 提取字段\n{extracted}"
+            + (f"\n\n## 融合分析\n{json.dumps(fusion_analysis, ensure_ascii=False, indent=1)}"
+               if fusion_analysis else ""),
+            encoding="utf-8")
         return plan
 
     # ── ⑤ Coder ──
@@ -245,28 +274,11 @@ class Scheduler:
             print(f"  [Scheduler] verify stub: {e}")
             return {"ok": True, "ns": None, "speedup": 1.0, "note": "stub(无真机)"}
 
-    # ── 主循环 ──
+    # ── 主循环 (无 round0: 首轮采集即基准, 全部轮次直接进 outputs/<op>/<tier>/roundN) ──
     def run(self):
         st = self.traj["state"]
-        tier, rn = st.get("tier", 1), st.get("round", 0)
+        tier, rn = st.get("tier", 1), st.get("round", 1)
         print(f"══ Scheduler: {self.kernel_name} 目标 {self.target_speedup}x ══")
-
-        # Round 0: 基准
-        if rn == 0:
-            base_dir = self.kernel_dir / "round0"
-            base_dir.mkdir(parents=True, exist_ok=True)
-            print("\n[Round 0] 基准采集...")
-            d0 = self._run_optimize(base_dir, tier)
-            if d0:
-                ks = d0.get("summary", {})
-                st["baseline_ns"] = ks.get("total_ns")
-                st["num_kernels"] = ks.get("num_kernels")
-                st["round"] = 1
-                self._save_traj()
-                print(f"  基准: total_ns={ks.get('total_ns')} kernels={ks.get('num_kernels')}")
-            else:
-                print("  ❌ 基准采集失败")
-                return 1
 
         while rn <= self.max_rounds:
             round_dir = self._round_dir(tier, rn)
@@ -277,12 +289,24 @@ class Scheduler:
             if not diagnosis:
                 print("  ⚠ 采集失败, 停止")
                 break
+            # 首轮 (原始 kernel_op.py 未改) 采集 = 基准
+            if st.get("baseline_ns") is None:
+                ks = diagnosis.get("summary", {})
+                st["baseline_ns"] = ks.get("total_ns")
+                st["num_kernels"] = ks.get("num_kernels")
+                self._save_traj()
+                print(f"  [基准] 首轮采集 total_ns={ks.get('total_ns')} kernels={ks.get('num_kernels')} (速度比基准)")
 
             # ③ 诊断: 按当前阶段筛选字段 → 写 07
             extracted = self._diagnose(diagnosis, tier, round_dir)
 
-            # ④ Planner → plan + 晋升决策 (只喂 07 筛好的字段)
-            plan = self._plan(diagnosis, extracted, tier, rn, round_dir)
+            # ③.5 Tier2 融合: 多走一步 — 编译 HIVM MLIR → nga run 分析依赖 → 08_fusion/
+            fusion_analysis = None
+            if tier == 2:
+                fusion_analysis = self._run_fusion(round_dir)
+
+            # ④ Planner → plan + 晋升决策 (只喂 07 筛好的字段 + 融合分析)
+            plan = self._plan(diagnosis, extracted, tier, rn, round_dir, fusion_analysis)
 
             # ⑤ Coder → 改单文件 (报错同轮重改, ≤3次)
             prev_err, new_code = "", ""

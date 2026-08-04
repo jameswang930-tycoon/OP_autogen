@@ -212,63 +212,105 @@
 
 ---
 
-## 四、字段 → 优化策略映射（按优化大顺序 Tier 1→6）
+## 四、字段 → 优化策略映射（按优化大顺序 Tier 1→6，审计定版 2026-08-04）
 
-> 每个字段标「来源」；「用途/判据」是看它干嘛、怎么判断该不该动。判据里的峰值见第六节。
+> 每 tier 提取的字段量（已审计验证：跑真实流水线 → diagnosis.json → 全部字段路径可解析）：
+> **Tier1=11 / Tier2=8 / Tier3=8 / Tier4=9 / Tier5=8 / Tier6=6，共 50 字段**。
+> 每个 tier 的字段要足以：① 判断瓶颈是否属本层（promote）② 给出具体改法。
+> normalized 路径前缀：`kernels[].deep.*`（msprof op 深层）、`kernels[].task.*`（通用 msprof 骨架）。
 
-### Tier 1 算法结构 — 先定"用对算法、算力用对没"
+### Tier 1 算法结构 — 先定"用对算法、算力用对没"（11 字段）
 
-| 字段（中文） | 来源 | 用途/判据 |
+| normalized 字段（中文） | 来源 | 用途/判据 |
 |---|---|---|
-| `aic_cube_fops`（cube浮点运算数） | msprof op / ArithmeticUtilization.csv | 算力分子：cube 实际 FLOPs，对 294.9TFLOPS 看利用 |
-| `aiv_vec_fops`（向量浮点运算数） | msprof op / ArithmeticUtilization.csv | vector FLOPs |
-| `aic_cube_ratio`（cube指令周期占比） | msprof op / PipeUtilization.csv | cube 利用率低 → 算法不行 |
-| `aiv_vec_ratio`（向量指令周期占比） | msprof op / PipeUtilization.csv | 高 + cube 低 → 该用 matmul 却走了逐元素 → 换算法 |
+| `summary.num_kernels` | 通用 msprof / op_summary | 单算子还是多算子 |
+| `summary.total_ns` | 通用 msprof / op_summary `Task Duration(us)` | 端到端多慢 |
+| `deep.compute.cube_fops` | msprof op / ArithmeticUtilization `aic_cube_fops` | 算力分子，对 294.9TFLOPS 看利用 |
+| `deep.compute.vector_fops` | msprof op / ArithmeticUtilization `aiv_vec_fops` | vector FLOPs（纯cube kernel 为 NA，正常） |
+| `deep.compute.cube_ratio` | msprof op / ArithmeticUtilization `aic_cube_ratio` | cube 利用率低 → 算法不行 |
+| `deep.compute.cube_fp16_ratio` / `cube_int8_ratio` | msprof op / ArithmeticUtilization | 精度判断（该用 fp16 没换 → 精度层） |
+| `deep.engine_utilization.vec` | msprof op / PipeUtilization `aiv_vec_ratio` | vec 高 cube 低 → 该用 matmul 却走逐元素 |
+| `deep.roofline.compute_utilization` | 计算 | 对 294.9TFLOPS 利用率 |
+| `deep.roofline.arithmetic_intensity` | 计算 | 计算/访存比，roofline 关键 |
+| `deep.roofline.bottleneck_type` | 计算 | memory/compute/latency/balanced |
 
-### Tier 2 算子融合 — 再看"中间存储要不要消"
+### Tier 2 算子融合 — 再看"中间存储要不要消"（8 字段 + ★额外 hivm 依赖分析）
 
-| 字段（中文） | 来源 | 用途/判据 |
+| normalized 字段（中文） | 来源 | 用途/判据 |
 |---|---|---|
-| `num_kernels`（去重算子数） | 通用 msprof / op_summary.csv | >1 → 有融合机会 |
-| `Task Type`（引擎归属） | 通用 msprof / op_summary.csv | AI_CORE/AIV/MIX → 串行判断 |
-| `Time(us)`+`Count`（API总耗时/次数） | 通用 msprof / api_statistic.csv | API 耗时≈kernel 耗时 → launch 开销大 → 融合 |
-| `Ratio(%)`（算子类型耗时占比） | 通用 msprof / op_statistic.csv | 占比大的类型优先优化 |
+| `summary.num_kernels` | 通用 msprof / op_summary | >1 → 有融合机会 |
+| `summary.num_kernels_total` | 通用 msprof / op_summary | 含框架 kernel 总数 |
+| `summary.api_overhead_total_us` | 通用 msprof / api_statistic | API 耗时≈kernel 耗时 → launch 开销大 → 融合 |
+| `kernels[].task.task_type` | 通用 msprof / op_summary | 引擎归属 |
+| `kernels[].launch_count` | 通用 msprof / op_summary | 重复 launch |
+| `api_overhead[]` | 通用 msprof / api_statistic | 明细 |
+| `multi_kernel[]` | 通用 msprof / op_statistic | 类型分解 |
+| `framework_kernels[]` | 通用 msprof / op_summary | 非目标 kernel |
 
-### Tier 3 分块 & 启动配置 — 然后调"核吃满没、L0A/B 够不够"
+**★ 融合额外步骤（Tier2 独有）**：编译单文件 → HIVM MLIR → txt → `nga run` 调 `skills/triton-op-fusion/SKILL.md` 分析 **RAW/WAR/WAW 依赖** → 找融合候选 → 产物写 `round_dir/08_fusion/`。依赖链不在 diagnosis.json（那是 msprof 侧），需要 HIVM 结构信息。
 
-| 字段（中文） | 来源 | 用途/判据 |
+### Tier 3 分块 & 启动配置 — 然后调"核吃满没、L0A/B 够不够"（8 字段）
+
+| normalized 字段（中文） | 来源 | 用途/判据 |
 |---|---|---|
-| `Block Dim`（核数） | msprof op / OpBasicInfo.csv 或 通用 msprof / op_summary.csv | < 40（vector核）→ tile 太小/并行不足 |
-| `aic_mte1_time(us)`/`aic_mte1_ratio`（L1→L0A/B 搬运） | msprof op / PipeUtilization.csv | 占比高 → L0A/B 搬运瓶颈 → 调 BLOCK_K |
-| `aic_l0a_read_bw`/`aic_l0b_read_bw`（L0A/L0B读带宽） | msprof op / MemoryL0.csv | 接近饱和 → 减搬运量/换通路 |
+| `kernels[].task.block_dim` | 通用 msprof / op_summary `Block Dim` | < 40 → tile 太小/并行不足 |
+| `deep.engine_utilization.mte1` | msprof op / PipeUtilization `aic_mte1_ratio` | L1→L0A/B 搬运瓶颈 → 调 BLOCK_K |
+| `deep.engine_utilization.mte2` | msprof op / PipeUtilization | GM→L1 读占比 |
+| `deep.engine_utilization.cube` | msprof op / PipeUtilization | cube 忙不忙 |
+| `deep.bandwidth_gb_s.l0a_read/write` | msprof op / MemoryL0 `aic_l0a_read/write_bw` | L0A 带宽饱和 |
+| `deep.bandwidth_gb_s.l0b_read/write` | msprof op / MemoryL0 `aic_l0b_read/write_bw` | L0B 带宽饱和 |
 
-### Tier 4 内存访问 — 再调"带宽用满没、L2 命中"
+### Tier 4 内存访问 — 再调"带宽用满没、L2 命中"（9 字段）
 
-| 字段（中文） | 来源 | 用途/判据 |
+| normalized 字段（中文） | 来源 | 用途/判据 |
 |---|---|---|
-| `aic_main_mem_read_bw`/`aic_main_mem_write_bw`（GM读/写带宽） | msprof op / Memory.csv | 接近 1.8TB/s → memory_bound → 减数据量/升精度 |
-| `aic_total_hit_rate(%)`（L2总命中率） | msprof op / L2Cache.csv | 低 → 数据复用差 → 调分块驻留 L2 |
-| `aic_mte2_time(us)`（GM→核 读）、`aic_mte3_time(us)`（核→GM 写） | msprof op / PipeUtilization.csv | ≈总耗时 → 读/写是瓶颈 |
-| `aiv_gm_to_ub_bw`/`aiv_ub_to_gm_bw`（GM→UB/UB→GM 带宽） | msprof op / Memory.csv | 搬运通路饱和 → 合并小传输/double buffer |
+| `deep.bandwidth_gb_s.main_mem_read/write` | msprof op / Memory `aic_main_mem_read/write_bw` | 接近 1.8TB/s → memory_bound → 减数据量/升精度 |
+| `deep.bandwidth_gb_s.gm_to_ub/ub_to_gm` | msprof op / Memory `aiv_gm_to_ub_bw`/`aiv_ub_to_gm_bw` | 搬运通路（纯cube kernel 为 NA，正常） |
+| `deep.l2_hit_rate` | msprof op / L2Cache | 低 → 数据复用差 → 调分块驻留 L2 |
+| `kernels[].task.pipes_us.aic_mte2_time` | 通用 msprof / op_summary（归一化自 mac/mte3） | GM 读耗时 |
+| `kernels[].task.pipes_us.aic_mte3_time` | 通用 msprof / op_summary | GM 写耗时（cube缺用 aiv_mte3） |
+| `deep.roofline.memory_utilization` | 计算 | 对 1.8TB/s 利用率 |
+| `deep.roofline.arithmetic_intensity` | 计算 | 访存 vs 计算 |
 
-### Tier 5 计算 & 占用 — 再调"指令冲突、标量拖累"
+### Tier 5 计算 & 占用 — 再调"指令冲突、标量拖累"（8 字段）
 
-| 字段（中文） | 来源 | 用途/判据 |
+| normalized 字段（中文） | 来源 | 用途/判据 |
 |---|---|---|
-| `aic_cube_time(us)`（cube耗时） | msprof op / PipeUtilization.csv | 满 → compute_bound |
-| `aic_scalar_time(us)`（标量指令耗时） | msprof op / PipeUtilization.csv | 高 → 减地址计算/循环展开 |
-| `aiv_vec_bank_cflt_ratio`（bank冲突） | msprof op / ResourceConflictRatio.csv | >4% → padding(32B) |
-| `aiv_vec_bankgroup_cflt_ratio`（bankgroup冲突） | msprof op / ResourceConflictRatio.csv | >4% → 调 repeatStride/blockStride |
-| `aiv_vec_total_cflt_ratio`（vec总冲突） | msprof op / ResourceConflictRatio.csv | >5% → 触发冲突优化流程 |
+| `kernels[].task.pipes_us.aic_cube_time` | 通用 msprof / op_summary `aic_mac_time(us)` | cube 耗时（归一化自 mac） |
+| `kernels[].task.pipes_us.aic_scalar_time` | 通用 msprof / op_summary | 标量耗时 |
+| `deep.engine_utilization.scalar` | msprof op / PipeUtilization | scalar 占比高 → 简化索引 |
+| `deep.engine_utilization.fixpipe` | msprof op / PipeUtilization | L0C→L1 占比 |
+| `deep.compute.cube_ratio` | msprof op / ArithmeticUtilization | cube 忙 |
+| `deep.conflict.bank_cflt_ratio` | msprof op / ResourceConflictRatio | >4% → padding(32B)（vector 空闲时 NA，正常） |
+| `deep.conflict.bankgroup_cflt_ratio` | msprof op / ResourceConflictRatio | >4% → 调 repeatStride/blockStride |
+| `deep.conflict.total_cflt_ratio` | msprof op / ResourceConflictRatio | >5% → 触发冲突优化流程 |
 
-### Tier 6 910B3 架构 — 最后调"取指、阻塞、引擎分配"
+### Tier 6 910B3 架构 — 最后调"取指、阻塞、引擎分配"（6 字段）
 
-| 字段（中文） | 来源 | 用途/判据 |
+| normalized 字段（中文） | 来源 | 用途/判据 |
 |---|---|---|
-| `aic_icache_miss_rate`（指令cache缺失率） | msprof op / PipeUtilization.csv | 高 → 指令体量大 → 代码紧凑化 |
-| `aiv_vec_wait_ratio`（vector被阻塞占比） | msprof op / ResourceConflictRatio.csv | 高 → double buffer / 加深流水重叠 |
-| `aic_cube_wait_ratio`（cube被阻塞占比） | msprof op / ResourceConflictRatio.csv | 高 → 流水重叠不足 |
-| `Task Type`（kernel归属引擎） | 通用 msprof / op_summary.csv | 引擎分配不均 → 切 pipeline / 调 grid |
+| `deep.engine_utilization`（全引擎） | msprof op / PipeUtilization | 引擎分布 |
+| `deep.conflict.mte_cflt_ratio` | msprof op / ResourceConflictRatio | mte 冲突 |
+| `deep.conflict.wait_ratio` | msprof op / ResourceConflictRatio `aiv_vec_wait_ratio` | 阻塞高 → double buffer |
+| `kernels[].task.task_type` | 通用 msprof / op_summary | 引擎分配 |
+| `kernels[].task.block_dim` | 通用 msprof / op_summary | 核数 |
+| `deep.roofline.bottleneck_type` | 计算 | 瓶颈类型 |
+
+---
+
+## 四B、910B3 纯 cube matmul 实测 NA 判定（2026-08-04 真机确认）
+
+> 纯 cube 执行、vector 引擎整条空闲的 matmul 上，以下字段**源里就是 NA，属正常**（不是 parser 问题）：
+
+| 字段 | NA 原因 |
+|---|---|
+| `vector_fops` / `vec_ratio` | vector 引擎空闲 → `aiv_vec_fops`/`aiv_vec_ratio` NA |
+| `gm_to_ub` / `ub_to_gm` | AIV 的 GM↔UB 路径，纯 cube kernel 不用 |
+| `ub_vector/scalar_*`（MemoryUB） | 无 vector/scalar 运算 |
+| `conflict.bank/bankgroup/total/mte/wait` | 无 vector 指令 → 无 bank 冲突 |
+| `task.pipes_us` 部分（mte3/cube） | op_summary per-pipe 列稀疏；但**归一化后** cube←mac、mte3←aiv_mte3 有值 |
+
+**必须有数据**（若没有 = 采集问题）：`main_mem_read/write`、`l1_*`、`l0a/l0b/l0c_*`、`cube_fops`、`cube_ratio`、`mte1/mte2_ratio`、`l2_hit_rate`、`roofline.*`。
 
 ---
 

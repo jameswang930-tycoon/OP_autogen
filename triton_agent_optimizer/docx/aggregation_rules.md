@@ -164,3 +164,28 @@
 | `integrate.py` | 新签名 `integrate <task.json> <out.json> [board_*.json...]`，按 kernel 名合并 deep + per-kernel roofline |
 | `run_optimize.sh` | msprof op 改为逐 kernel 循环 → 每 kernel 一个 board → integrate 传全部 board |
 | `check_fields.py` | 最终校验对每个 board 跑一遍 |
+
+---
+
+## 6. 每轮 Planner/Coder 读来源（核对用）
+
+> 调度器每轮从**相应位置读最新产物**注入 agent；agent 不自己到处找文件。
+
+| 谁 | 读什么 | 从哪读 | 最新性 |
+|---|---|---|---|
+| Planner | 当前 tier 字段段 | `roundN/07_tier{N}_fields/` | run_optimize 每轮重新解析 |
+| Planner | 融合分析（Tier2） | `roundN/08_fusion/fusion_analysis.json` | Tier2 每轮重新 nga run |
+| Planner | 单文件代码 | `input/<op>/kernel_op.py`（scheduler 读全文） | **coder 上轮改的最新版** |
+| Planner | 策略文档 | `docx/playbook_tier{N}.md` + `CODING_GUIDE.md` | 静态 |
+| Planner | config 常量 | kernel_op.py 的 ① config 区 | 最新 |
+| Planner | 历史 | `outputs/<op>/optimization_trajectory.json` | 每轮更新 |
+| Coder | plan 的 changes[] | `roundN/plan.md`（old_code→new_code） | 本轮 planner 产出 |
+| Coder | 单文件 | `input/<op>/kernel_op.py` | 最新 |
+| Coder | 教程/纠错 | `docx/CODING_GUIDE.md` + playbook_tier | 静态 |
+
+## 7. 改码确定性规则（dumb agent 保障）
+
+1. **planner 必须输出 `changes[]`**：每项 `{old_code, new_code, reason, section}`，old_code 必须与 kernel_op.py 某段**逐字符匹配**。
+2. **coder 优先精确替换**：找到 old_code → 原样替换 new_code；**找不到就报告，绝不猜测乱改**。
+3. coder 只走 LLM 的情形：有 `previous_error`（验证报错）需修报错时。
+4. 替换后校验：python 语法 + 防截断（所有 def 仍在）+ no-op 检查。

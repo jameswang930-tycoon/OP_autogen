@@ -50,21 +50,35 @@ GM≈1.8TB/s, cube≈294.9TFLOPS(fp16)。
 
 参考 `playbook` 的具体优化手段和 910B3 约束（UB 192KB 上限等）。
 
-## 输出格式（严格 JSON，不要其他文字）
+## 输出格式（严格 JSON，不要其他文字）★changes 必须机器可执行
 
 ```json
 {
-  "strategy": "优化策略名",
-  "target_speedup": 1.1,
-  "specific_change": "第X行: 把 BLOCK_K 从 32 改成 64",
-  "expected_impact": "预期 mte1_ratio 下降, MTE1 搬运次数减半",
+  "strategy": "增大 BLOCK_K 减 MTE1 次数",
+  "changes": [
+    {
+      "old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+      "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
+      "reason": "Tier3: mte1_ratio 高, 增大 BLOCK_K 减少 MTE1 搬运次数",
+      "section": "① 场景 config"
+    }
+  ],
+  "expected_impact": "MTE1 搬运次数减半, 端到端降 ~10%",
   "promote": false,
   "promote_reason": ""
 }
 ```
+
+### changes[].old_code 的铁律（★最关键）
+1. `old_code` **必须逐字符** 等于 kernel_op.py 里某一段（coder 会做精确字符串替换）。
+2. 取整行，别只取半个表达式。例：`BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32`。
+3. 改 kernel 内部就用 `@triton.jit` 函数里的整行代码。
+4. **拿不准 old_code 是不是精确匹配 → 不改这一处**，在 reason 里说明，别让 coder 猜。
+5. `new_code` 只改该改的，其余保持原样。
 
 ## 铁律
 1. 只改单文件 `kernel_op.py`，绝不建议改其他文件。
 2. 不引入 num_warps/num_stages 到 @triton.jit() 内。
 3. target_speedup 现实一点（1.05~1.5x）。
 4. 如果 `extracted_fields` 显示该字段全是"无数据"，说明采集/解析有问题，先报告，不硬编优化。
+5. `changes` 数组至少 1 项；确实无法给出精确 old_code → 输出 `changes: []` + promote=true 说明该晋升。

@@ -39,10 +39,11 @@ class LLMClient:
         self.mode = self._detect_mode()
 
     def _detect_mode(self) -> str:
-        if os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"):
-            return "api"
+        # CLI (nga run) 优先 — 服务器只能用本地 codeagent, 不调 Claude API
         if os.environ.get("LLM_CLI_COMMAND"):
             return "cli"
+        if os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"):
+            return "api"
         return "stub"
 
     def chat(self, system: str, user: str, max_tokens: int = 2048) -> str:

@@ -136,9 +136,12 @@ def bandwidth_at_size(engine: int, size_kb: float) -> tuple[float, str]:
 #
 # A buffer's region is identified by its name prefix (gm_/ub_/l1_/l0_).
 MEMORY_CAPACITY_KB = {
-    'UB': 512.0,    # Unified Buffer   — vector pipeline working set
-    'L1': 2048.0,   # L1 SRAM          — matrix pipeline staging (2 MB)
-    'L0': 1024.0,   # L0 register file — feeds the MAC array (1 MB)
+    'UB': 192.0,    # Unified Buffer (AIV)   — vector pipeline working set (910B3)
+    'L1': 512.0,    # L1 Buffer (AIC)        — matrix pipeline staging (910B3)
+    'L0A': 64.0,    # L0A (AIC)              — feeds Cube left operand
+    'L0B': 64.0,    # L0B (AIC)              — feeds Cube right operand
+    'L0C': 128.0,   # L0C (AIC)              — Cube accumulator output
+    'L2': 4096.0,   # L2 cache (chip-level)  — 4-8 MB (910B3)
     'GM': None,     # Global Memory    — unbounded (reported, not enforced)
 }
 

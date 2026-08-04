@@ -80,6 +80,32 @@ def parse_instr_csv(path):
     return rows
 
 
+def parse_trace_events(trace_path):
+    """解析 trace.json (Chrome trace) 的 ph=X 事件 → 按 (名称,通道) 聚合 start/end。
+
+    官方: trace.json 是指令流水图, 每条指令有 ts/dur → 补 instr_exe 缺失的 start/end。
+    返回 { (name, cat): {name, cat, start_ns, end_ns, count} }
+    """
+    import json as _json
+    data = _json.loads(Path(trace_path).read_text(encoding="utf-8"))
+    events = data if isinstance(data, list) else data.get("traceEvents", [])
+    agg = {}
+    for e in events:
+        if e.get("ph") != "X":
+            continue
+        name = e.get("name", "")
+        cat = e.get("cat", "")
+        ts = float(e.get("ts", 0))
+        dur = float(e.get("dur", 0))
+        key = (name, cat)
+        a = agg.setdefault(key, {"name": name, "cat": cat,
+                                 "start_ns": ts, "end_ns": ts + dur, "count": 0})
+        a["start_ns"] = min(a["start_ns"], ts)
+        a["end_ns"] = max(a["end_ns"], ts + dur)
+        a["count"] += 1
+    return agg
+
+
 def parse_detail(detail_str):
     """从 detail 提取搬运数据块大小 (字节) 与 dtype。detail 逗号分隔的 K:V。"""
     size, dtype = 0, ""
@@ -151,9 +177,9 @@ def parse(base):
         })
         ops.append(o)
 
-    # trace.json → summary
+    # trace.json → summary + 逐指令 start/end (关键路径/并行/时序)
     total_ns = exec_mode = n_trace_cores = None
-    parallelism, critical_path = {}, {}
+    parallelism, critical_path, trace_events = {}, {}, {}
     trace = sim / "trace.json"
     if trace.exists():
         ti = MsprofParser.parse_trace_json(trace)
@@ -163,14 +189,18 @@ def parse(base):
                        "total_pairs": len(ti.get("parallel_pairs") or [])}
         critical_path = {"path": ti.get("critical_path"),
                          "length_ns": ti.get("critical_path_length_ns")}
+        trace_events = parse_trace_events(trace)
 
     summary = {"total_ns": total_ns, "num_ops": len(ops),
                "execution_mode": exec_mode, "num_cores": n_cores or n_trace_cores,
                "kernel_name": None}
-    return make_report("sim", [str(sim)], summary, ops,
-                       parallelism=parallelism, critical_path=critical_path,
-                       notes=[f"{n_cores} 核 instr_exe 按指令名聚合; 未匹配 HIVM op 的指令在 merge 时做引擎/pipe 对齐",
-                              "SCALAR 指令已保留 (engine=SCALAR), 如需排除在 merge 里过滤"])
+    report = make_report("sim", [str(sim)], summary, ops,
+                         parallelism=parallelism, critical_path=critical_path,
+                         notes=[f"{n_cores} 核 instr_exe 按指令名聚合; 未匹配 HIVM op 的指令在 merge 时做引擎/pipe 对齐",
+                                "SCALAR 指令已保留 (engine=SCALAR), 如需排除在 merge 里过滤",
+                                "trace_events = trace.json 逐指令 start/end (Chrome trace, ph=X)"])
+    report["trace_events"] = trace_events
+    return report
 
 
 if __name__ == "__main__":

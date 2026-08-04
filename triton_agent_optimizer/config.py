@@ -889,8 +889,11 @@ class Config:
             0: "GM→UB", 1: "UB→GM", 2: "VecUnit",
             3: "GM→L1", 4: "L1→L0", 5: "CubeUnit", 6: "L0→GM",
         }
+        # 910B3 (Atlas A2) 实测容量: UB=192KB(AIV), L1=512KB(AIC),
+        # L0A/L0B=64KB, L0C=128KB (AIC), L2≈4-8MB(芯片级缓存)
         self.hardware.memory_capacity_kb = {
-            "UB": 192.0, "L1": 2048.0, "L0": 1024.0, "GM": None,
+            "UB": 192.0, "L1": 512.0, "L0A": 64.0, "L0B": 64.0, "L0C": 128.0,
+            "L2": 4096.0, "GM": None,
         }
 
     def _build_env_info(self) -> Dict[str, Any]:

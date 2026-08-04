@@ -20,7 +20,7 @@ M  = int(os.environ.get("MATMUL_M", 512))
 N  = int(os.environ.get("MATMUL_N", 512))
 K  = int(os.environ.get("MATMUL_K", 512))
 DTYPE = torch.float32                    # 精度 (tier5 优化点: fp16 计算 + fp32 累加)
-BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32   # 分块大小 (tier3 优化点)
+BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64   # 分块大小 (tier3 优化点)
 # 注意: 不传 num_warps/num_stages — triton-ascend 禁止 tune 这两个参数, 自动管理 tiling/流水
 
 

@@ -107,6 +107,19 @@ TIER_FIELDS = {
 }
 
 
+def _extract_changes_from_plan(plan_text: str) -> list:
+    """从 plan JSON 提取 changes[] 数量 (打印用)。"""
+    try:
+        t = plan_text.strip()
+        s, e = t.find("{"), t.rfind("}")
+        if s >= 0 and e > s:
+            d = json.loads(t[s:e + 1])
+            return d.get("changes", []) if isinstance(d, dict) else []
+    except Exception:
+        pass
+    return []
+
+
 def _get(d, path: str):
     """按 'a.b.c' 或 'kernels[].x.y' 路径取值 (返回第一个匹配)。
     每级 dict 先精确键, 无则子串匹配兜底 (如 conflict.aiv_vec_bank_cflt_ratio ↔ bank_cflt_ratio)。"""
@@ -231,8 +244,14 @@ class Scheduler:
     # ── ④ Planner (只喂当前阶段筛好的字段 + 融合分析) ──
     def _plan(self, diagnosis: dict, extracted: str, tier: int, rn: int, round_dir: Path,
               fusion_analysis: Optional[dict] = None):
-        from agents.planner import PlannerAgent
+        from agents.planner import PlannerAgent, _extract_config_constants
         kernel_code = self.kernel_op.read_text(encoding="utf-8") if self.kernel_op.exists() else ""
+        skill = (_PROJECT / "skills" / "triton-op-planner" / "SKILL.md")
+        cfg = _extract_config_constants(kernel_code)
+        print(f"  [Planner] 输入: 07字段({len(extracted.splitlines())}行) + playbook_tier{tier} "
+              f"+ kernel_op.py({len(kernel_code)}字符) + config[{cfg.splitlines()[0] if cfg else '?'}] "
+              f"+ 历史{len(self.traj.get('history', []))}轮")
+        print(f"  [Planner] 调 skill: {skill}")
         planner = PlannerAgent(use_llm=self.use_llm)
         plan = planner.generate_v4(
             extracted=extracted, tier=tier,
@@ -243,24 +262,32 @@ class Scheduler:
             fusion_analysis=fusion_analysis,
         )
         round_dir.mkdir(parents=True, exist_ok=True)
-        (round_dir / "plan.md").write_text(
-            f"# Tier{tier} Round{rn} Plan\n\n{plan.plan_text}\n\n"
-            f"## 提取字段\n{extracted}"
-            + (f"\n\n## 融合分析\n{json.dumps(fusion_analysis, ensure_ascii=False, indent=1)}"
-               if fusion_analysis else ""),
-            encoding="utf-8")
+        plan_md = (f"# Tier{tier} Round{rn} Plan\n\n{plan.plan_text}\n\n"
+                   f"## 提取字段\n{extracted}"
+                   + (f"\n\n## 融合分析\n{json.dumps(fusion_analysis, ensure_ascii=False, indent=1)}"
+                      if fusion_analysis else ""))
+        (round_dir / "plan.md").write_text(plan_md, encoding="utf-8")
+        n_changes = len(_extract_changes_from_plan(plan.plan_text))
+        print(f"  [Planner] → {round_dir}/plan.md ({len(plan_md)}字符, changes[]={n_changes}项) "
+              f"promote={plan.promote}")
         return plan
 
-    # ── ⑤ Coder ──
+    # ── ⑤ Coder (读 round_dir/plan.md, 精确应用 changes[]) ──
     def _code(self, plan, rn: int, round_dir: Path, prev_err: str = "") -> str:
         from agents.coder import CoderAgent
         original = self.kernel_op.read_text(encoding="utf-8") if self.kernel_op.exists() else ""
+        skill = _PROJECT / "skills" / "triton-op-coder" / "SKILL.md"
+        print(f"  [Coder] 读 {round_dir}/plan.md 的 changes[] (精确替换) + skill {skill}")
         coder = CoderAgent(use_llm=self.use_llm)
         result = coder.apply(original, plan.plan_text, prev_err, plan.tier)
         round_dir.mkdir(parents=True, exist_ok=True)
         (round_dir / "diff.patch").write_text(result.diff or "(no change)", encoding="utf-8")
-        if not result.success:
-            print(f"  [Coder] 未成功: {result.error_message[:200]}")
+        n_changes = len(_extract_changes_from_plan(plan.plan_text))
+        if result.success:
+            lines = result.lines_changed or 0
+            print(f"  [Coder] ✅ 应用 {n_changes} 处 changes → {lines} 行改动 → diff.patch")
+        else:
+            print(f"  [Coder] ⚠ 未成功: {result.error_message[:200]}")
         return result.optimized_code
 
     # ── ⑥ 验证: 只跑 msprof 端到端 ──
@@ -280,6 +307,20 @@ class Scheduler:
         tier, rn = st.get("tier", 1), st.get("round", 1)
         print(f"══ Scheduler: {self.kernel_name} 目标 {self.target_speedup}x ══")
 
+        # Warm-up: 首次 nga run 冷启动(模型加载)可能很久, 提前预热
+        if self.use_llm:
+            print("  [Warm-up] 预热 nga run (首次冷启动)...")
+            try:
+                from agents.llm_client import LLMClient
+                c = LLMClient()
+                if c.mode == "cli":
+                    c.chat("你是测试", "只回复 OK")
+                    print("  [Warm-up] ✅ nga run 预热完成")
+                else:
+                    print(f"  [Warm-up] 模式={c.mode} (非 cli, 跳过)")
+            except Exception as e:
+                print(f"  [Warm-up] ⚠ 预热失败: {str(e)[:120]} (继续, 后续调用再试)")
+
         while rn <= self.max_rounds:
             round_dir = self._round_dir(tier, rn)
             print(f"\n══ Tier{tier}({TIER_LABEL.get(tier)}) Round{rn} ══")
@@ -289,13 +330,18 @@ class Scheduler:
             if not diagnosis:
                 print("  ⚠ 采集失败, 停止")
                 break
+            # 诊断摘要
+            ks0 = diagnosis.get("summary", {})
+            k0 = (diagnosis.get("kernels") or [{}])[0]
+            ro = (k0.get("deep") or {}).get("roofline", {})
+            print(f"  [诊断] kernels={ks0.get('num_kernels')} total_ns={ks0.get('total_ns')} "
+                  f"bottleneck={ro.get('bottleneck_type')} 产物→{round_dir}")
             # 首轮 (原始 kernel_op.py 未改) 采集 = 基准
             if st.get("baseline_ns") is None:
-                ks = diagnosis.get("summary", {})
-                st["baseline_ns"] = ks.get("total_ns")
-                st["num_kernels"] = ks.get("num_kernels")
+                st["baseline_ns"] = ks0.get("total_ns")
+                st["num_kernels"] = ks0.get("num_kernels")
                 self._save_traj()
-                print(f"  [基准] 首轮采集 total_ns={ks.get('total_ns')} kernels={ks.get('num_kernels')} (速度比基准)")
+                print(f"  [基准] 首轮采集 total_ns={ks0.get('total_ns')} kernels={ks0.get('num_kernels')} (加速比基准)")
 
             # ③ 诊断: 按当前阶段筛选字段 → 写 07
             extracted = self._diagnose(diagnosis, tier, round_dir)

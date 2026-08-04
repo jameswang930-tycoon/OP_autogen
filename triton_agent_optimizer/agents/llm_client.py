@@ -92,19 +92,24 @@ class LLMClient:
 
     def _call_cli(self, system: str, user: str) -> str:
         cmd = os.environ.get("LLM_CLI_COMMAND", "nga run")
+        timeout = int(os.environ.get("LLM_CLI_TIMEOUT", "900"))   # 冷启动/大prompt, 默认900s
         # 合并 system prompt 和 user prompt 为一个输入
         full_prompt = f"{system}\n\n---\n\n{user}"
 
-        print(f"  [LLM/CLI] piping {len(full_prompt)} chars to: {cmd}")
+        # ★严格按 echo "<内容>" | nga run 格式 (shlex.quote 正确转义单引号/换行/特殊字符)
+        import shlex
+        shell_cmd = f"echo {shlex.quote(full_prompt)} | {cmd}"
+
+        print(f"\n──────────────── [LLM/CLI] 调用 nga run ────────────────")
+        print(f"  命令: {cmd}  (timeout={timeout}s)")
+        print(f"  发送内容 {len(full_prompt)} 字符:")
+        print(full_prompt if len(full_prompt) <= 1500 else full_prompt[:1500] + "\n  ...(截断, 共" + str(len(full_prompt)) + "字符)")
+        print(f"──────────────────────────────────────────────────────")
 
         try:
-            result = subprocess.run(
-                cmd, shell=True,
-                input=full_prompt,
-                capture_output=True,
-                text=True,
-                timeout=int(os.environ.get("LLM_CLI_TIMEOUT", "300")),
-            )
+            # 显式 bash -c (服务器也是 bash; echo 引号语义一致); 显式 utf-8 避免系统编码差异
+            result = subprocess.run(["bash", "-c", shell_cmd], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=timeout)
             if result.returncode != 0:
                 stderr = result.stderr[:500] if result.stderr else ""
                 raise RuntimeError(
@@ -113,10 +118,11 @@ class LLMClient:
             output = result.stdout.strip()
             if not output:
                 raise RuntimeError(f"CLI command '{cmd}' returned empty output")
-            print(f"  [LLM/CLI] response: {len(output)} chars")
+            print(f"  [LLM/CLI] ★响应 {len(output)} 字符:")
+            print(output[:800] + ("..." if len(output) > 800 else ""))
             return output
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"CLI command '{cmd}' timed out")
+            raise RuntimeError(f"CLI command '{cmd}' timed out ({timeout}s)")
 
     # ── Stub 模式 ─────────────────────────────────────────────────────────────
 

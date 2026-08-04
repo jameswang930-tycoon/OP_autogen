@@ -13,10 +13,11 @@
 #
 #  用法: bash run_optimize.sh [M] [N] [K]
 #  产物: input/matmul/e2e_run/
-#    04_board/   msprof op 8 CSV (真实带宽/L2/cube)
-#    05_task/    通用 msprof op_summary (每kernel耗时/核数)
-#    06_diagnosis/  board.json + task.json + diagnosis.json (+ hivm.json, 多算子时)
+#    05_task/    通用 msprof op_summary (骨架: 每kernel耗时/核数/形状) → task.json
+#    04_board/   逐 kernel 的 msprof op 8 CSV (真实带宽/L2/cube) → board_<i>.json
+#    06_diagnosis/  task.json + board_*.json + diagnosis.json (骨架+deep 合并) (+ hivm, 多算子时)
 #    hivm_fusion_view.txt (多算子时, 融合专用)
+#  流程: 通用 msprof → 骨架 → 逐 distinct kernel 采 msprof op → 按名合并 (见 docx/aggregation_rules.md)
 #  环境: ENABLE_HIVM=1 强制跑 hivm (多算子融合需要); 默认自动判断
 # ═══════════════════════════════════════════════════════════════════════════════
 set -u
@@ -47,34 +48,67 @@ fi
 source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null && echo "  ✅ set_env.sh" || echo "  ⚠ 手动 source"
 cd "$MATMUL_DIR"
 
-# ═══════════ 阶段 1/3: 采集 msprof + msprof op (真机主源) ═══════════
-echo ""; echo "══ 阶段 1/3: 采集 msprof op + 通用 msprof ══"
+# ═══════════ 阶段 1/3: 通用 msprof(骨架) → 逐 kernel 采 msprof op ═══════════
+echo ""; echo "══ 阶段 1/3: 通用 msprof(骨架) + 逐 kernel msprof op ══"
+D="$OUT/06_diagnosis"
 
-# 1a. msprof op (★主源, 默认全量 8 CSV)
-BOARD_OUT="$OUT/04_board/board_prof"; rm -rf "$BOARD_OUT"; mkdir -p "$BOARD_OUT"
-MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof op --kernel-name=matmul_kernel \
-  --output="$BOARD_OUT" --warm-up=10 $PY test_matmul.py > "$OUT/04_board/board_run.txt" 2>&1
-echo "  msprof op 退出码=$? (8 CSV)"
-[ -n "$(find "$BOARD_OUT" -name 'Memory.csv' 2>/dev/null | head -1)" ] && pass "msprof op 8 CSV (真实带宽)" || fail "缺 Memory.csv"
-
-# 1b. 通用 msprof (任务级 op_summary → 判断 kernel 数)
+# 1a. 通用 msprof 先跑 (任务级 op_summary → distinct kernel 名 → 骨架)
 TASK_OUT="$OUT/05_task/task_prof"; rm -rf "$TASK_OUT"; mkdir -p "$TASK_OUT"
 MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof --output="$TASK_OUT" \
   --application="$PY test_matmul.py" --ai-core=on > "$OUT/05_task/task_run.txt" 2>&1
 OPSUM=$(find "$OUT/05_task" -name 'op_summary*.csv' 2>/dev/null | wc -l)
 echo "  通用 msprof 退出码=$? op_summary x$OPSUM (8.5.1 用 --ai-core=on)"
-[ "$OPSUM" -gt 0 ] && pass "op_summary (判断 kernel 数)" || fail "无 op_summary"
-
-# ═══════════ 阶段 2/3: 解析 + 整合 → diagnosis.json (roofline) ═══════════
-echo ""; echo "══ 阶段 2/3: 解析 + 整合 → diagnosis.json ══"
-D="$OUT/06_diagnosis"
-"$PY" "$SCRIPT_DIR/pipeline_parse_board.py" "$BOARD_OUT" "$D/board.json" || true
+[ "$OPSUM" -gt 0 ] && pass "op_summary (骨架/kernel 数)" || fail "无 op_summary"
 "$PY" "$SCRIPT_DIR/pipeline_parse_task.py" "$TASK_OUT" "$D/task.json" || true
-echo '{}' > "$D/empty.json"
-[ -f "$D/board.json" ] || cp "$D/empty.json" "$D/board.json"
-[ -f "$D/task.json" ] || cp "$D/empty.json" "$D/task.json"
-"$PY" "$SCRIPT_DIR/integrate.py" "$D/board.json" "$D/task.json" "$D/diagnosis.json"
-[ -f "$D/diagnosis.json" ] && pass "diagnosis.json ✓ (roofline)" || fail "diagnosis.json 未生成"
+[ -f "$D/task.json" ] || echo '{}' > "$D/task.json"
+
+# 1b. 从 task.json 取 distinct kernel 名 → 逐 kernel 跑 msprof op → board_<i>.json
+echo "  → 读取 kernel 名, 逐 kernel 采 msprof op (规则 O6)"
+KERNELS=()
+while IFS= read -r line; do [ -n "$line" ] && KERNELS+=("$line"); done < <(
+  "$PY" - "$D/task.json" <<'PYEOF'
+import json, sys
+from pathlib import Path
+try:
+    tk = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+    for s in tk.get('normalized', {}).get('kernel_slots', []):
+        n = s.get('kernel_name')
+        if n:
+            print(n)
+except Exception:
+    pass
+PYEOF
+)
+if [ "${#KERNELS[@]}" -eq 0 ]; then KERNELS=(matmul_kernel); echo "  ⚠ 无 kernel 名 → 回退 matmul_kernel"; fi
+echo "  kernels: ${KERNELS[*]}"
+
+IDX=0; BOARD_OK=0
+for KNAME in "${KERNELS[@]}"; do
+  IDX=$((IDX+1))
+  BOUT="$OUT/04_board/op_${IDX}"
+  rm -rf "$BOUT"; mkdir -p "$BOUT"
+  MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof op --kernel-name="$KNAME" \
+    --output="$BOUT" --warm-up=10 $PY test_matmul.py > "$OUT/04_board/board_${IDX}.txt" 2>&1
+  MC=$(find "$BOUT" -name 'Memory.csv' 2>/dev/null | head -1)
+  if [ -n "$MC" ]; then
+    pass "msprof op [$KNAME] 8 CSV"
+    "$PY" "$SCRIPT_DIR/pipeline_parse_board.py" "$BOUT" "$D/board_${IDX}.json" || true
+    [ -f "$D/board_${IDX}.json" ] && BOARD_OK=$((BOARD_OK+1))
+  else
+    fail "msprof op [$KNAME] 缺 Memory.csv (kernel 名不匹配? 看 board_${IDX}.txt)"
+  fi
+done
+
+# ═══════════ 阶段 2/3: 整合 → diagnosis.json (骨架 + deep 按 kernel 名合并) ═══════════
+echo ""; echo "══ 阶段 2/3: 整合骨架 + deep → diagnosis.json ══"
+BOARDS=( "$D"/board_*.json )
+if [ "${#BOARDS[@]}" -ge 1 ] && [ -f "${BOARDS[0]}" ]; then
+  "$PY" "$SCRIPT_DIR/integrate.py" "$D/task.json" "$D/diagnosis.json" "${BOARDS[@]}"
+else
+  echo "  ⚠ 无 board.json → 骨架保留 (filled=0)"
+  "$PY" "$SCRIPT_DIR/integrate.py" "$D/task.json" "$D/diagnosis.json"
+fi
+[ -f "$D/diagnosis.json" ] && pass "diagnosis.json ✓ (骨架+deep, 规则M11)" || fail "diagnosis.json 未生成"
 
 # ═══════════ 阶段 3/3: 判断算子数 → 分流 ═══════════
 echo ""; echo "══ 阶段 3/3: 判断算子数 → 分流 ══"
@@ -121,29 +155,25 @@ if [ "$MULTI" = "1" ]; then
   fi
 fi
 
-# ═══════════ 字段校验 ═══════════
+# ═══════════ 字段校验 (check_fields.py: OK / 列名不匹配 / 源无) ═══════════
 echo ""; echo "══════════ 字段校验 ══════════"
-"$PY" - "$D" <<'PYEOF'
-import json, sys
-from pathlib import Path
-D = Path(sys.argv[1])
-def load(n):
-    p = D / n
-    return json.loads(p.read_text(encoding='utf-8')) if p.exists() else {}
-bd, tk = load('board.json'), load('task.json')
-b_norm, t_norm = bd.get('normalized', {}), tk.get('normalized', {})
-print("board: ", end='')
-print(f"total_ns={bd.get('execution_summary',{}).get('total_ns')} cores={bd.get('execution_summary',{}).get('num_cores')} "
-      f"bandwidth={sum(1 for v in b_norm.get('bandwidth_gb_s',{}).values() if v)}条 L2={b_norm.get('l2_hit_rate')} "
-      f"engine={len(b_norm.get('engine_utilization',{}))}种")
-print("task: ", end='')
-print(f"kernels={tk.get('execution_summary',{}).get('num_kernels')} api={len(t_norm.get('api_overhead',[]))}")
-if Path(D/'diagnosis.json').exists():
-    dg = json.load(open(D/'diagnosis.json',encoding='utf-8'))
-    print("diagnosis: roofline=", dg['roofline']['bottleneck_type'],
-          " 通路=", len(dg['transfer_paths']),
-          " hints=", sum(1 for v in dg['bottlenecks'].values() if v.get('hint')), "/5")
-PYEOF
+CF_RC=0
+if [ -f "$D/task.json" ]; then
+  DGN=""
+  [ -f "$D/diagnosis.json" ] && DGN="$D/diagnosis.json"
+  if ls "$D"/board_*.json >/dev/null 2>&1; then
+    for b in "$D"/board_*.json; do
+      echo "── 校验 $(basename "$b") ──"
+      "$PY" "$SCRIPT_DIR/check_fields.py" "$b" "$D/task.json" $DGN || CF_RC=1
+    done
+  else
+    echo "── 校验 task.json (无 board) ──"
+    "$PY" "$SCRIPT_DIR/check_fields.py" "$D/task.json" "$D/task.json" $DGN || CF_RC=1
+  fi
+  [ "$CF_RC" -eq 0 ] && pass "字段校验: 无列名不匹配 (合法缺属正常)" || fail "字段校验: 有列名不匹配 (看 raw 修 parser)"
+else
+  fail "字段校验: task.json 缺失"
+fi
 
 echo ""; echo "══════════ 完成 (PASS=$PASS FAIL=$FAIL) ══════════"
 echo "  diagnosis.json     : $D/diagnosis.json  (单算子优化用)"

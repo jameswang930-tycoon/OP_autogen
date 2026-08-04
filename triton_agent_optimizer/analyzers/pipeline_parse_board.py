@@ -26,6 +26,9 @@ CSV_FILES = ["OpBasicInfo", "PipeUtilization", "ArithmeticUtilization",
 
 
 def find_opprof(base):
+    """base 可直接是 OPPROF 目录 (含 OpBasicInfo.csv) 或它的父目录。"""
+    if (Path(base) / "OpBasicInfo.csv").exists():
+        return Path(base)
     for opprof in sorted(Path(base).glob("OPPROF_*")):
         if opprof.is_dir():
             return opprof
@@ -133,17 +136,25 @@ def parse(base):
         "l1_write_gb_s": _bw(mem, "l1", "write", "bw"),
         "l2_read_gb_s": _bw(mem, "l2", "read", "bw"),
         "l2_write_gb_s": _bw(mem, "l2", "write", "bw"),
-        "ub_read_gb_s": _bw(mem, "ub", "read", "bw"),
-        "ub_write_gb_s": _bw(mem, "ub", "write", "bw"),
+        # UB↔GM 真实搬运带宽 (MTE2 load / MTE3 store) — Memory.csv 真实列名:
+        #   aiv_gm_to_ub_bw (GM→UB 读) / aiv_ub_to_gm_bw (UB→GM 写)
+        "gm_to_ub_gb_s": _bw(mem, "gm", "to_ub", "bw"),
+        "ub_to_gm_gb_s": _bw(mem, "ub", "to_gm", "bw"),
+        # MemoryUB.csv 真实列名: aiv_ub_read/write_bw_vector / aiv_ub_read/write_bw_scalar
+        #   (ub_read_bw_mte 仅推理产品有, 910B3 合法缺)
+        "ub_vector_read_gb_s": _bw(memub, "vector", "read", "bw"),
+        "ub_vector_write_gb_s": _bw(memub, "vector", "write", "bw"),
+        "ub_scalar_read_gb_s": _bw(memub, "scalar", "read", "bw"),
+        "ub_scalar_write_gb_s": _bw(memub, "scalar", "write", "bw"),
+        "ub_mte_read_gb_s": _bw(memub, "mte", "read", "bw"),
+        "ub_mte_write_gb_s": _bw(memub, "mte", "write", "bw"),
+        # MemoryL0.csv 真实列名 (A2 系用 aic_ 前缀): aic_l0a_read_bw / l0c_read_bw_cube ...
         "l0a_read_gb_s": _bw(meml0, "l0a", "read", "bw"),
         "l0a_write_gb_s": _bw(meml0, "l0a", "write", "bw"),
         "l0b_read_gb_s": _bw(meml0, "l0b", "read", "bw"),
         "l0b_write_gb_s": _bw(meml0, "l0b", "write", "bw"),
         "l0c_read_gb_s": _bw(meml0, "l0c", "read", "bw"),
         "l0c_write_gb_s": _bw(meml0, "l0c", "write", "bw"),
-        "ub_mte_read_gb_s": _bw(memub, "mte", "read", "bw"),
-        "ub_vector_read_gb_s": _bw(memub, "vector", "read", "bw"),
-        "ub_scalar_read_gb_s": _bw(memub, "scalar", "read", "bw"),
     }
     # 带宽单位换算: 官网值常为 MB/s, 统一转 GB/s (按量级推断)
     for k in list(bandwidth):
@@ -158,7 +169,7 @@ def parse(base):
         "cube_fp16_ratio": _f(_first(au, "cube", "fp16", "ratio")),
         "cube_int8_ratio": _f(_first(au, "cube", "int8", "ratio")),
         "cube_instr_number": _f(_first(au, "cube", "total", "instr")),
-        "vector_fops": _f(_first(au, "vector", "fops")),
+        "vector_fops": _f(_first(au, "vec", "fops")),  # 真实列名 aiv_vec_fops
         "vec_ratio": _f(_first(au, "aiv", "vec", "ratio")),
         "vec_fp32_ratio": _f(_first(au, "vec", "fp32", "ratio")),
         "vec_instr_number": _f(_first(au, "vec", "total", "instr")),
@@ -166,12 +177,13 @@ def parse(base):
         "aiv_total_cycles": _f(_first(au, "aiv", "total", "cycle")),
     }
 
-    # L2
+    # L2 (列名 aic_total_hit_rate(%) 是百分数, 归一化为 0~1)
     l2_hit = None
     for k, v in (l2[0].items() if l2 else []):
         kl = k.lower()
         if "hit" in kl and _f(v) is not None:
-            l2_hit = round(_f(v), 4)
+            val = _f(v)
+            l2_hit = round(val / 100.0, 4) if val > 1 else round(val, 4)
             break
 
     # 冲突

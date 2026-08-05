@@ -27,13 +27,16 @@ argument-hint: >
 
 ## ★读来源 + 写目标（必须分清）
 
-**输入代码**（`kernel_code` / prompt 里的当前单文件）= **当前正在优化的版本**：
+**输入代码**（`kernel_code` / prompt 里的当前单文件）= **当前正在优化的版本 = 最新被采纳的 kernel**：
 
 | 轮次 | 读哪个文件 | 含义 |
 |---|---|---|
 | round1 | `input/<op>/kernel_op.py` | 原始源文件 |
-| roundN (N>1) | `outputs/<op>/<tier>/round(N-1)/kernel_op.py` | 上一轮成功输出 |
-| 失败回退 | 沿用上一个**成功**的 kernel | 验证失败不提交 |
+| roundN (N>1) | 调度器 `current_kernel` = 上一个**被采纳**的 kernel | 采纳 = 本轮加速比 ≥ 上一被采纳版 |
+| 变慢回退(REVERT) | 沿用上一个被采纳的 kernel（上上个） | 本轮能跑但变慢 → 不采纳，链不前进 |
+| 失败(FAIL) | 沿用上一个被采纳的 kernel | 验证报错/跑不起来不提交 |
+
+> **判定口径**：`speedup` 输出始终 = 初始基线耗时/本轮耗时（累计）；「是否采纳」对比上一被采纳版（≥ 采纳，< 回退）。REVERT 轮你的改动不会被采纳，下一轮从上一被采纳版继续。
 
 **输出**：写 `roundN/kernel_op.py`（本轮目录），**绝不写回 `input/<op>/kernel_op.py` 源文件**。
 只改 prompt 给的那个当前文件，不碰源文件、不碰其他轮的文件。

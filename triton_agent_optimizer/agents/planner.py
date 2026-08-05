@@ -201,7 +201,8 @@ def _extract_config_constants(kernel_code: str) -> str:
 
 def _format_history(history: list) -> str:
     """将 history 格式化为紧凑梗概 (每轮一行: 改了啥 → 加速比 [结果])。
-    ★读 speedup (不是 actual_speedup — 旧 bug 恒显示 1.00x)。"""
+    ★读 speedup (不是 actual_speedup — 旧 bug 恒显示 1.00x)。
+    ★REVERT(变慢回退) 轮标「↩回退」— planner 知道别重复这个坏改动。"""
     if not history:
         return "(no history)"
     recent = history[-5:]   # 只看最近5轮, 紧凑
@@ -212,6 +213,8 @@ def _format_history(history: list) -> str:
         sp_s = f"{sp:.2f}x" if isinstance(sp, (int, float)) else "?"
         res = r.get("result", "")
         line = f"- R{r.get('round','?')} t{r.get('tier','?')}: {change} → {sp_s}"
+        if r.get("decision") == "REVERT":
+            line += " ↩回退"          # 变慢/未采纳 → 明确标记, 防重复优化
         if res:
             line += f" [{res}]"
         if r.get("error"):

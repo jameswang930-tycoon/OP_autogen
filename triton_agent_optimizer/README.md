@@ -1,11 +1,12 @@
-# Triton Agent Optimizer — 完整架构设计 (v4.0)
+# Triton Agent Optimizer — 完整架构设计 (v4.1)
 
-> **核心差异化优势**: 不靠盲试，用 **真机 msprof + msprof op** 精确诊断瓶颈（真实带宽/L2/算力/冲突），6 层策略按「结构影响从大到小」逐轮优化，每轮只看**当前策略需要的字段**，Planner 定方向、Coder 精准改码、**只用 msprof 端到端验证加速比**。
+> **核心差异化优势**：不靠盲试（AutoKernel 300~400 轮），用 **真机 msprof + msprof op** 精确诊断瓶颈（真实带宽/L2/算力/冲突），6 层策略按「结构影响从大到小」逐轮优化，每轮只看**当前策略需要的字段**，Planner（笨 LLM）定方向、Coder **确定性改码**、**只用 msprof 端到端验证加速比**。
 >
-> **数据源 = 真机双源**: ① 通用 `msprof`（骨架：kernel 数/耗时/形状/launch/L2）+ ② 逐 kernel `msprof op`（深层：真实带宽/引擎利用率/算力/冲突）→ `integrate.py` 按 kernel 名合并 → `diagnosis.json`（roofline 核心）。
+> **数据源 = 真机双源**：① 通用 `msprof`（骨架：kernel 数/耗时/形状/launch/L2）+ ② 逐 kernel `msprof op`（深层：真实带宽/引擎利用率/算力/冲突）→ `integrate.py` 按 kernel 名合并 → `diagnosis.json`（roofline 核心）。
 >
-> **环境**: 910B3 真机（保密服务器，只能 paste-in）+ CANN 8.5.1 / triton-ascend 3.2.0 / torch_npu 2.9.0。
-> **更新**: 2026-08-04 — v4 架构（单文件驱动 + 真机双源 + 6 层轮次化）。
+> **环境**：Ascend 910B3（保密服务器，只能 paste-in）+ CANN 8.5.1 / triton-ascend 3.2.0 / torch_npu 2.9.0。
+> **LLM 调用**：服务器无 Claude API，用本地 codeagent：`echo "<prompt>" | nga run`（`LLM_CLI_COMMAND="nga run"`）。
+> **更新**：2026-08-05 — v4 完整落地（单文件 + kernel 链 + 确定性改码 + 硬件基准套件 + 轨迹图）。
 
 ---
 
@@ -13,309 +14,268 @@
 
 | 原则 | 说明 |
 |---|---|
-| **真机数据优先** | 只用 msprof + msprof op（已弃 hivm/simulator 主流程，按需保留 fusion） |
-| **单文件驱动** | 算子 + 场景 + 测试**合并成一个文件**，只运行/只读写这一个文件，杜绝多文件错位 |
-| **每轮只看该策略的字段** | 6 层策略各有自己的数据段，Planner 只喂当前层要的字段 |
-| **验证只跑 msprof** | 每轮改完只跑一次 msprof 端到端算加速比；不提取字段、不跑 msprof op |
-| **失败就地修** | Coder 改完跑不了 → 报错直接回传 Coder 改，不新开一轮 |
-| **Planner 定晋升** | 读完当前瓶颈判断是否属于本策略 → 决定停留/晋升下一策略 |
+| **真机数据优先** | 只用 msprof + msprof op（弃 hivm/simulator 主流程，按需保留 fusion） |
+| **单文件驱动** | 算子 + config + 测试合成 `kernel_op.py`（①config ②kernel ③main），coder 只改它 |
+| **kernel 链** | round1 读源文件，roundN 读上一轮成功输出；**源文件永不修改**；失败不提交 |
+| **每轮只看该策略字段** | 6 层策略各有自己的数据段（50 字段），Planner 只喂当前层要的 |
+| **确定性改码** | Planner 输出 `changes[]`（old_code→new_code 逐字符匹配），Coder 精确替换，找不到就报告不猜 |
+| **验证只跑 msprof** | warmup + 3 轮 msprof 取平均 → 加速比（时间比）；报错就地回传 Coder |
+| **Planner 定晋升** | 读当前瓶颈判断是否属本 tier → 停留/晋升/降级/停止 |
+| **历史梗概** | 每轮记「改了啥 → 加速比 [KEEP/REVERT/FAIL]」，REVERT(变慢回退) 明确标记，Planner 知道试过什么不重复踩坑 |
 
 ---
 
-## 1. 整体架构图
+## 1. 整体架构
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                               INPUT LAYER                                     │
-│   input/<op>/  ──合并──►  单文件 kernel_op.py (算子 + 场景 config + 测试)      │
-│   (算子/场景/测试)            ★ 后续输入输出只读写这一个文件                     │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │   main.py 启动
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          EXECUTION + ANALYSIS LAYER                           │
-│   run_optimize.sh <input_dir> <output_dir>   ★支持输入/输出参数(调度器重定向) │
-│      │  ① 通用 msprof ──► 骨架 task.json (kernel 数/耗时/形状/launch/L2)     │
-│      │  ② 逐 kernel msprof op ──► board_<i>.json (带宽/引擎/算力/冲突)      │
-│      │  ③ integrate 按 kernel 名合并 ──► diagnosis.json (roofline 核心)     │
-│      ▼                                                                         │
-│   outputs/<op>/<tier>/round<N>/  ← 每轮产物 (diagnosis/task/board json)      │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            SCHEDULER (状态机)                                 │
-│   ① 读 diagnosis.json → summary.num_kernels (几个算子)                        │
-│   ② 当前策略 tier (算法→融合→分块→访存→计算→架构)                             │
-│   ③ 提取本 tier 要看的字段段 → 传给 Planner                                    │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                               AGENT LAYER                                     │
-│   Planner (LLM): 提取字段 + 优化策略文档 + 当前单文件 + config                  │
-│       → 详细计划 plan.md (哪一行/改什么/改成什么) + 晋升决策                    │
-│            │                                                                   │
-│            ▼                                                                   │
-│   Coder (LLM): plan + 代码教程 + 纠错/改码原则文档 + 单文件                     │
-│       → 修改单文件 kernel_op.py (+ diff.patch)                                 │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                             VERIFY (脚本)                                     │
-│   只跑一次 msprof 端到端 (整文件) → 端到端耗时 → 加速比                        │
-│       ├─ 跑不了 → 报错回传 Coder 就地改 (不新开一轮)                          │
-│       └─ 跑通   → 记录 + Planner 判定晋升 → 下一轮/下一 tier                  │
-└─────────────────────────────────────────────────────────────────────────────┘
+main.py input/matmul [--fresh] [--resume] [--max-rounds N] [--target X]
+  └─ Scheduler 循环 (默认每次初始化; --resume 续跑)
+      每轮:
+        ① run_optimize.sh <input_dir> <round_dir>   ← input_dir = current_kernel.parent
+             ├─ 通用 msprof → task.json (骨架)
+             ├─ 逐 kernel msprof op → board_<i>.json (深层)
+             └─ integrate → diagnosis.json (roofline)
+        ② _diagnose → 写 roundN/07_tier{N}_fields/ (当前 tier 筛字段)
+        ③ (Tier2) _run_fusion → roundN/08_fusion/ (HIVM MLIR + nga 融合分析)
+        ④ _plan (planner via nga run) → roundN/plan.md (含 changes[])
+        ⑤ _code (coder 确定性替换 changes[]) → roundN/kernel_op.py + diff.patch
+        ⑥ verify (msprof warmup + 3轮平均) → 加速比 vs 初始基准
+        ⑦ 记录 hist (change/speedup/result/error) → 晋升/降级/停止
 ```
 
 ---
 
-## 2. 输入（input/<op>/ → 单文件合并）
+## 2. 完整数据流（每轮）
+
+```
+┌─ kernel 链 (采纳/回退) ──────────────────────────────────────────────┐
+│ round1: current_kernel = input/<op>/kernel_op.py (源, 永不改)       │
+│ roundN: current_kernel = 上一个**被采纳**的 kernel                    │
+│  采纳 = 本轮 speedup ≥ 上一被采纳版 (speedup 输出=初始基线/本轮,累计) │
+│  REVERT(变慢) / FAIL(≤3次重试) : 不提交, 沿用上一个被采纳版(上上个)  │
+└──────────────────────────────────────────────────────────────────────┘
+           │
+           ▼
+run_optimize.sh input_dir round_dir
+  ├─ 拷贝 current_kernel → roundN/input/kernel_op.py (快照)
+  ├─ 通用 msprof → 骨架 → task.json
+  ├─ 逐 kernel msprof op → board_<i>.json
+  └─ integrate → diagnosis.json (summary + kernels[].task/deep + roofline)
+           │
+           ▼
+_diagnose: TIER_FIELDS[tier] → roundN/07_tier{N}_fields/{txt,json}
+           │
+           ▼
+_plan (planner via nga run):
+  读: 07字段 + playbook_tier{N}.md + current_kernel + config + 历史梗概
+  出: plan.md 含 changes[] (old_code→new_code) + promote
+           │
+           ▼
+_code (coder 确定性):
+  读: current_kernel + plan.changes[]
+  做: 精确替换 old_code→new_code → roundN/kernel_op.py + diff.patch
+  (old_code 找不到 → 报告, 不猜; NOOP 标记)
+           │
+           ▼
+verify: msprof 跑 roundN/kernel_op.py (warmup + 3轮平均)
+  speedup = baseline_ns / ns   (baseline = round1 采集的原始 kernel)
+           │
+           ▼
+记录 hist + 晋升 (planner.promote / 3轮无改进 / 达标 / tier6停)
+```
+
+---
+
+## 3. 输入（input/<op>/）
 
 ```
 input/<op>/
-├── triton_kernel.py      # 算子 (triton kernel)
-├── config.json           # 场景信息 (M/N/K/dtype/block/优化目标)
-└── test_*.py             # 测试驱动 (真机命令注释)
-
-── 启动时合并成一个文件 ──►  kernel_op.py
-   (算子 + config 常量 + 测试 main 合在一起)
-   ★ 后续所有输入/输出只读写 kernel_op.py 这一个文件
+  kernel_op.py    ← ★单文件: ① 场景 config(M/N/K/DTYPE/BLOCK_*) ② kernel ③ 测试 main
+  config.json     ← 旧式场景配置 (已不用, 并入 kernel_op.py)
+  triton_kernel.py/test_matmul.py  ← 旧式三文件 (已不用, 内容并入 kernel_op.py)
 ```
 
-- 合并的好处：调度器每轮只需替换/读取**一个文件**，避免多文件版本错位、import 路径错、参数不一致。
-- 合并由 `main.py` 启动时做（复制算子 + 注入 config + 追加测试 main）。
+- **kernel_op.py 是纯 triton 语法**（`@triton.jit`/`tl.dot`/BLOCK_M/N/K constexprs），跑在 **triton-ascend 后端**（910B3 NPU）。
+- 约束：`num_warps`/`num_stages` 由 triton-ascend 自动管理，**不能传**（传了报 `please do not tune args`）。
 
 ---
 
-## 3. 主循环（每轮做什么）
+## 4. 输出结构（每轮自包含）
 
 ```
-Round N (tier T):
-  ├─ ① 采集+解析: run_optimize.sh <input_dir> <round_dir>
-  │     通用 msprof + 逐 kernel msprof op → diagnosis.json (+task/board)
-  │
-  ├─ ② 调度器: 读 diagnosis.json
-  │     看 summary.num_kernels → 看当前 tier → 提取该 tier 字段段
-  │
-  ├─ ③ Planner (LLM): 提取字段 + 策略文档 + 单文件 + config → plan.md
-  │     含: 当前瓶颈是否属于本 tier? 属于→给改法; 不属于→决定晋升
-  │
-  ├─ ④ Coder (LLM): plan + 教程 + 纠错文档 → 修改 kernel_op.py
-  │
-  ├─ ⑤ 验证: 只跑一次 msprof 端到端 → 端到端耗时 → 加速比
-  │     ├─ FAIL → 报错回传 Coder (同轮重改, ≤3次)
-  │     └─ PASS → 记录加速比
-  │
-  └─ ⑥ 判定: 加速比达标? → 停; 本 tier 连续N轮无改进? → 晋升下一 tier; 否则下一轮
-
-Round 0 (Baseline): 只采集+解析, 记基准加速比=1.0
+outputs/<op>/<tier>/roundN/
+  input/kernel_op.py      ← 本轮采集快照 (上一轮输出/源)
+  kernel_op.py            ← ★本轮 coder 输出的优化 kernel
+  diff.patch              ← 本轮改动
+  plan.md                 ← planner 计划 (含 changes[])
+  optimization_record     ← (hist 记入 trajectory)
+  04_board/               ← msprof op 8 CSV 原始
+  05_task/                ← 通用 msprof 原始
+  06_diagnosis/           ← diagnosis.json (+task/board json)
+  07_tier{N}_fields/      ← ★当前 tier 筛字段 (planner 读)
+  08_fusion/              ← (仅 Tier2) HIVM MLIR + 融合分析
+outputs/<op>/optimization_trajectory.json   ← ★全局状态 (tier/round/best/current_kernel/history)
+outputs/<op>/final_output/trajectory_chart.png  ← 轨迹图
 ```
 
 ---
 
-## 4. run_optimize.sh — 采集 + 解析（支持输入输出参数）
+## 5. 6 层策略 × 每轮字段（审计定版 50 字段）
 
-```bash
-# 用法 (支持输入/输出重定向, 调度器每轮指向不同 round_dir)
-bash run_optimize.sh <input_dir> <output_dir>
-
-# 示例:
-bash analyzers/run_optimize.sh input/matmul outputs/matmul/01_algorithmic_structure/round1
-```
-
-**做什么（按顺序）：**
-1. 通用 msprof 跑一遍 → 骨架 `task.json`（kernel 数/耗时/形状/引擎/launch/L2）
-2. 从 task.json 取 distinct kernel 名（跳过 aclnn* 框架 kernel）→ 逐 kernel 跑 msprof op → `board_<i>.json`
-3. `integrate.py` 按 **Op Name** 合并骨架+深层 → `diagnosis.json`
-
-**产物 → 输出到 `<output_dir>/`：**
-| 文件 | 内容 |
-|---|---|
-| `diagnosis.json` | ★最终产物（summary + kernels[].task/deep + roofline） |
-| `task.json` | 骨架（通用 msprof 全字段） |
-| `board_<i>.json` | 每 kernel 深层（msprof op 全字段） |
-
-> 调度器只需换 `<input_dir>`（下一轮用哪个单文件）和 `<output_dir>`（写到哪个 round），即可驱动整个优化循环。
-
----
-
-## 5. 输出结构
-
-```
-outputs/<op>/
-├── 01_algorithmic_structure/round1..N/   # Tier 1 每轮产物
-│   ├── diagnosis.json      ← ★每轮诊断 (roofline + kernels)
-│   ├── task.json           ← 骨架
-│   ├── board_<i>.json      ← 每 kernel 深层
-│   ├── kernel_op.py        ← 当前单文件 (Coder 改的)
-│   ├── plan.md             ← Planner 计划
-│   ├── diff.patch          ← Coder 改动
-│   └── optimization_record.json  ← 本轮记录 (加速比/决策)
-├── 02_operator_fusion/round1..N/
-├── 03_tiling_block_config/round1..N/
-├── 04_memory_access/round1..N/
-├── 05_compute_occupancy/round1..N/
-├── 06_910b3_architecture/round1..N/
-├── optimization_trajectory.json         # ★全局中枢状态 (tier/round/speedup)
-└── final_output/                        # 最终: optimized kernel_op.py + summary
-```
-
-**每轮输入/执行/输出清单：**
-
-| 环节 | 输入 | 执行文件 | 输出 | 输出到 |
+| Tier | 策略 | 字段数 | 主要字段 | 晋升条件 |
 |---|---|---|---|---|
-| 采集解析 | `<input_dir>/kernel_op.py` | `run_optimize.sh` | diagnosis/task/board json | `<output_dir>/` |
-| 提取字段 | `diagnosis.json` | scheduler | 该 tier 字段段文本 | 内存→Planner |
-| Planner | 字段段 + 策略文档 + 单文件 + config | planner (LLM) | `plan.md` | `<output_dir>/` |
-| Coder | `plan.md` + 教程 + 纠错文档 + 单文件 | coder (LLM) | 新 `kernel_op.py` + `diff.patch` | `<output_dir>/` |
-| 验证 | 新 `kernel_op.py` | `msprof` (端到端) | 端到端耗时 → 加速比 | `optimization_record.json` |
-| 判定 | 加速比 + 瓶颈 | planner/scheduler | 下一轮 or 晋升 | `optimization_trajectory.json` |
+| 1 | 算法结构 | 11 | cube_fops/vec_fops/cube_ratio/fp16/int8占比/算力利用率/算术强度/瓶颈类型/total_ns/num_kernels | 算法已最优 |
+| 2 | 算子融合 | 8(+08_fusion) | num_kernels/api_overhead/task_type/launch_count/multi_kernel/framework + HIVM 依赖分析 | 无可融合 |
+| 3 | 分块配置 | 8 | block_dim/mte1/mte2/cube_ratio/l0a读写/l0b读写 | 3轮无改进 |
+| 4 | 访存 | 9 | main_mem读写/gm_to_ub/ub_to_gm/l2/mte2/3耗时/访存利用率/算术强度 | 3轮无改进 |
+| 5 | 计算占用 | 8 | cube耗时/标量耗时/scalar/fixpipe占比/cube_ratio/冲突 | 3轮无改进 |
+| 6 | 架构专属 | 6 | engine_util/mte冲突/wait_ratio/task_type/block_dim/瓶颈类型 | 3轮无改进→停 |
 
-**下一个环节的输入 = 上一个环节的输出**（闭环：诊断→计划→改码→验证→下一轮诊断）。
-
----
-
-## 6. 六层策略 × 每轮看哪些字段
-
-> 字段来源详见 `docx/msprof_fields_reference.md` 第四节；完整列名见第五节。
-
-| Tier | 策略 | 每轮提取的字段（只看这些） | 晋升条件 |
-|---|---|---|---|
-| **1** | 算法结构 | `deep.compute.cube_fops/vec_fops`、`deep.engine.cube_ratio/vec_ratio`、`deep.roofline.compute_utilization` | 算法已最优 |
-| **2** | 算子融合 | `summary.num_kernels`、`kernels[].task.task_type`、`api_overhead`、`multi_kernel`、`framework_kernels` | 无可融合 kernel |
-| **3** | 分块配置 | `task.block_dim`、`deep.engine.mte1_ratio`、`deep.bandwidth.l0a/l0b` | 连续3轮无改进 |
-| **4** | 访存 | `deep.bandwidth.main_mem_read/write`、`deep.l2_hit_rate`、`task.pipes.mte2/mte3` | 连续3轮无改进 |
-| **5** | 计算占用 | `deep.compute.cube_ratio`、`task.pipes.cube_time/scalar_time`、`deep.conflict.*` | 连续3轮无改进 |
-| **6** | 架构专属 | `deep.engine.*`、`deep.conflict.wait_ratio`、`task.task_type` | 连续3轮无改进→停 |
-
-**提取原则**：每轮只把**当前 tier 的字段**喂给 Planner，其他字段不注入（省 token + 聚焦 + 防弱 LLM 被无关字段误导）。
+**分块调参逻辑**（用户关注点）：
+- **传输瓶颈**(memory_bound, mem_util≥0.8 且 comp<0.5) → **增大 tile**（复用↑, GM流量↓）
+- **计算瓶颈**(comp≥0.8 且 mem<0.5) → **不调小**（cube 已满, 看算法/精度如 fp16）
+- **延迟瓶颈**(两者都<0.3) → 调小/增并行
+- UB 约束：每 K 迭代 `(BLOCK_M+BLOCK_N)×BLOCK_K×dtype` ≤ 192KB
 
 ---
 
-## 7. Planner 职责
+## 6. 关键技术细节
 
-**输入**：① 当前 tier 提取的字段段（上节）② 优化策略文档（`docx/OPTIMIZATION_METHODOLOGY.md` + `playbook_tierN_*.md`）③ 当前 `kernel_op.py` ④ `config.json`
+### 6.1 确定性改码（changes[]）
+```json
+{"strategy":"增大BLOCK_K","changes":[
+  {"old_code":"BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+   "new_code":"BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
+   "reason":"Tier3: mte1_ratio高","section":"① config"}]}
+```
+- Planner 必须输出 old_code 逐字符匹配当前 kernel
+- Coder 精确替换**全部出现处**（old_code 须为整行）；找不到 → 报告（NOOP 标记）；绝不猜测
+- 只走 LLM 的情形：有 previous_error（验证报错）需修报错
 
-**输出**：`plan.md`，必须**详细完整**到 Coder 能直接改：
-- 改哪个函数、哪一行
-- 把什么改成什么（具体参数/表达式）
-- 为什么（依据哪个字段/哪个策略）
-- 改完预期效果（哪个指标该变多少）
+### 6.2 nga run 调用（3 个 skill）
+```bash
+echo "你是 Triton 优化 Planner。先调用 skill: skills/triton-op-planner/SKILL.md, 完全按 skill 指导执行。
++ 07字段 + 读 playbook_tier{N}.md + 读 current_kernel + 输出 changes[]" | nga run
+```
+- `skills/triton-op-planner`：判瓶颈属不属本层 + 输出 changes[]
+- `skills/triton-op-coder`：确定性替换 changes[] + 报错修
+- `skills/triton-op-fusion`：Tier2 读 HIVM MLIR 分析 RAW/WAR/WAW
+- 调用实现：`shlex.quote(full_prompt)` 构造 `echo '<prompt>' | nga run`，`["bash","-c",...]` 执行，**实时流式打印**输出
 
-**晋升决策**：读完当前瓶颈 → 判断**是否属于本 tier 的优化范畴**：
-- 属于 → 给出具体改法
-- 不属于（瓶颈在别层）→ 决定晋升到下一 tier，说明理由
+### 6.3 历史梗概（防重复优化）
+每轮 hist 记：`change`(改了啥) + `speedup`(vs初始, 累计) + `prev_speedup`(上一被采纳版) + `decision`(KEEP/REVERT/FAIL) + `result`(OK/FAIL/NOOP) + `error`(短)。Planner 读最近 5 轮 1 行梗概（REVERT 轮标「↩回退」）。
+
+### 6.4 超时设置
+| env | 默认 | 作用 |
+|---|---|---|
+| `LLM_CLI_TIMEOUT` | 900 | nga run 调用 |
+| `OPTIMIZE_TIMEOUT` | 3600 | run_optimize 采集 |
+| `VERIFY_WARMUP` | 1 | 验证热身裸跑 |
+| `VERIFY_RUNS` | 3 | 验证 msprof 轮数 |
+
+### 6.5 加速比
+- **加速比 = 时间比**：`baseline_time / current_time`（msprof Task Duration），baseline = round1 采集的原始 kernel
+- 图上 TFLOPS = 同一比值的换算（M/N/K 固定时 2MNK/time）
+- vs PyTorch = 我们算力 / torch.matmul 算力
 
 ---
 
-## 8. Coder 职责
+## 7. 文件介绍
 
-**输入**：① `plan.md` ② 代码教程（改码规范）③ 纠错/改码原则文档（应对各种报错）④ 当前 `kernel_op.py`
+### 入口
+| 文件 | 作用 |
+|---|---|
+| `main.py` | v4 入口。`--fresh`(清旧产物重置) / `--resume`(续跑) / `--stub`(本地) / `--max-rounds` / `--target` |
 
-**只做一件事**：按 plan 修改 `kernel_op.py`，不碰任何其他文件。
+### agents（智能体层）
+| 文件 | 作用 |
+|---|---|
+| `scheduler.py` | 状态机：kernel 链、tier 字段提取、hist 记录、NOOP 检测、晋升决策 |
+| `planner.py` | `generate_v4`：读文件路径(不嵌入内容)，输出 changes[] + promote |
+| `coder.py` | 确定性 changes[] 替换 + BOM/垃圾清理 + 防截断校验 |
+| `verifier.py` | `verify_end_to_end`：warmup + 3 轮 msprof 平均 |
+| `llm_client.py` | `echo '<prompt>' | nga run` + 实时流式输出（API/CLI/stub 三模式，CLI 优先） |
 
-**出错处理**：改完跑 msprof 若报错 → 报错信息直接回传 Coder → **同轮**根据报错就地改（最多 3 次），不新开一轮。
+### analyzers（采集解析层）
+| 文件 | 作用 |
+|---|---|
+| `run_optimize.sh` | `<input_dir> <output_dir>` 采集+解析+07 产出；自包含拷贝；绝对路径 msprof |
+| `pipeline_parse_task.py` | 通用 msprof → task.json（kernel_slots 去重 + 框架过滤 + pipe 归一化） |
+| `pipeline_parse_board.py` | msprof op → board_<i>.json（8 CSV 全字段） |
+| `integrate.py` | 按 kernel 名合并骨架+deep → diagnosis.json |
+| `check_fields.py` | 缺字段精准指路（工具/文件/列名），区分「列名不匹配/合法缺」 |
+| `test_tier_extract.py` | 逐 tier 筛字段核对 |
+| `run_hivm_fusion.py` | Tier2：HIVM MLIR + nga 融合分析 |
+| `merge_single_file.py` | 旧式三文件→单文件兜底 |
+
+### skills（agent 教学）
+`skills/triton-op-{planner,coder,fusion}/SKILL.md` — 每个 agent 的完整指令（读来源、输出格式、铁律）。
+
+### docx（知识库）
+`OPTIMIZATION_METHODOLOGY.md`（6层方法论）/ `msprof_fields_reference.md`（字段来源）/ `aggregation_rules.md`（聚合规则）/ `final_product_spec.md`（产物规格）/ `field_extraction_checklist.md`（缺字段核对）/ `playbook_tier1~6.md`（改码教程）。
+
+### bench_910b3（硬件基准套件）
+`bench_kernels.py`（6个测速 kernel）/ `bench_common.py`（msprof 测量工具）/ `run_bench.py`（自动跑+算+输出）/ `bench_pytorch.py`（PyTorch 基准线）。
+
+### 其他
+`feedback/trajectory_chart.py`（v4 轨迹图）/ `input/matmul/kernel_op.py`（单文件源）。
 
 ---
 
-## 9. 验证（只跑 msprof 端到端）
+## 8. 运行命令（服务器）
 
 ```bash
-# 每轮改完后, 只跑这一下 (整文件, 端到端耗时)
-msprof --output=<round_dir>/msprof --application="python3 kernel_op.py" --ai-core=on
-# 从 op_summary 读 Task Duration(us) → 端到端耗时 → 加速比 = baseline / 本轮
-```
+# 环境 (一次性)
+conda activate triton-npu
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
-- **不提取字段、不跑 msprof op**（那些只在每轮开始跑一次用于诊断）
-- 加速比 = baseline 端到端耗时 / 本轮端到端耗时
-- 跑不了 → 报错回传 Coder 就地改
+# ① 完整优化循环 (推荐)
+LLM_CLI_COMMAND='nga run' python3 main.py input/matmul --fresh --max-rounds 15 --target 2.0
 
----
+# ② 只采集+解析
+bash analyzers/run_optimize.sh input/matmul input/matmul/e2e_run
 
-## 10. 晋升 / 降级 / 停止
+# ③ 逐 tier 筛字段核对
+python3 analyzers/test_tier_extract.py input/matmul/e2e_run/06_diagnosis/diagnosis.json
 
-- **晋升**：本 tier 连续 N 轮（默认 3）无改进（加速比变化 <5%）→ 下一 tier
-- **降级**：结构性变更后回退——改了算法→回 Tier2；融合了新算子→回 Tier3；改了 pipeline→回 Tier3
-- **停止**：加速比达标 / 到 Tier6 且连续 3 轮无改进 / 超出最大轮数
+# ④ 硬件基准 (填占位参数 + PyTorch 基准线)
+cd bench_910b3 && python3 run_bench.py && python3 bench_pytorch.py
 
----
+# ⑤ 轨迹图 (含 PyTorch 虚线)
+cd .. && python3 feedback/trajectory_chart.py outputs/matmul
 
-## 11. 文件架构总览（v4 目标）
-
-```
-triton_agent_optimizer/
-├── README.md                    # 本文档
-├── main.py                      # ★入口: python main.py input/matmul [--round-dir ...]
-├── config.py                    # 全局配置 (路径/硬件/阈值)
-│
-├── input/<op>/                  # 每算子输入: triton_kernel.py + config.json + test_*.py
-├── outputs/<op>/<tier>/roundN/  # 每轮产物 (diagnosis/task/board + kernel_op.py + plan/diff/record)
-│
-├── analyzers/                   # 采集+解析层
-│   ├── run_optimize.sh          # ★采集+解析主脚本 (支持输入/输出参数)
-│   ├── pipeline_parse_task.py   #   通用 msprof → 骨架 task.json (kernel_slots + framework 过滤)
-│   ├── pipeline_parse_board.py  #   msprof op → 每 kernel board_<i>.json (8 CSV 全字段)
-│   ├── integrate.py             #   按 kernel 名合并 → diagnosis.json (roofline)
-│   ├── check_fields.py          #   缺字段核对 (去哪个工具/文件/列名)
-│   └── real_report.py           #   诊断报告渲染
-│
-├── agents/                      # 智能体层
-│   ├── scheduler.py             #   状态机: 读 diagnosis → 提取字段 → 驱动循环
-│   ├── planner.py               #   LLM: 字段+策略+单文件 → plan.md + 晋升决策
-│   ├── coder.py                 #   LLM: plan → 改 kernel_op.py (+纠错循环)
-│   └── llm_client.py            #   LLM API
-│
-├── docx/                        # 知识库
-│   ├── OPTIMIZATION_METHODOLOGY.md   # 6 层策略方法论
-│   ├── msprof_fields_reference.md    # 所有字段含义/列名
-│   ├── field_extraction_checklist.md # 缺字段去哪核对
-│   ├── aggregation_rules.md          # JSON 聚合规则
-│   ├── final_product_spec.md         # 最终产物规格
-│   └── playbook_tier1~6_*.md         # 每层改码教程
-│
-└── feedback/record_manager.py   # 加速比记录 + 晋升/停止
+# ⑥ 看诊断报告
+python3 input/matmul/real_report.py <round_dir>/06_diagnosis/diagnosis.json
 ```
 
 ---
 
-## 12. 关键文件读写映射
+## 9. 910B3 硬件参数
 
-| 文件 | 写入者 | 读取者 |
-|---|---|---|
-| `kernel_op.py`（单文件） | Coder | run_optimize.sh / msprof / Planner / Coder |
-| `diagnosis.json` | integrate.py | Scheduler → Planner |
-| `task.json` / `board_<i>.json` | parse 脚本 | check_fields / 人工 |
-| `plan.md` | Planner | Coder |
-| `diff.patch` | Coder | 人工 review |
-| `optimization_record.json` | RecordManager | 判定 |
-| `optimization_trajectory.json` | RecordManager | Scheduler |
+**✅ 准确**：20 AI + 40 Vec cores @1.8GHz；UB=192KB、L1=512KB、L0A/L0B=64KB、L0C=128KB、L2=192MB、HBM=64GB；GM 峰值 1.8TB/s；cube 峰值 294.9 TFLOPS(fp16)。
+
+**⚠️ 占位未实测**（`timing_estimator.py` SATURATION_PARAMS）：GM→L1 37.5 / L1→L0 100 / CubeUnit 150 / L0→GM 37.5（PLACEHOLDER）。用 `bench_910b3/run_bench.py` 实测填。
 
 ---
 
-## 13. 与 v3 的差异（v3 → v4）
+## 10. 开发记录
 
-| 项 | v3（旧） | v4（本版） |
-|---|---|---|
-| 数据源 | 真实 HIVM + simulator + 真机 msprof op 三源 | **只 msprof + msprof op 双源**（hivm/sim 弃用主流程） |
-| 文件 | kernel.py / test.py / config.json 分开 | **合并成单文件 kernel_op.py** |
-| 每轮分析 | hivmir→msprof(sim)→dsl_merger→29字段 | run_optimize.sh → diagnosis.json（roofline） |
-| 每轮验证 | CPU Emulator + 910B3 实测 | **只跑 msprof 端到端算加速比** |
-| Planner 输入 | 全部 29 字段 | **只喂当前 tier 的字段段** |
-| 失败处理 | 重开验证循环 | **报错就地回传 Coder 改** |
-| 输出 | roundN 混放 | **outputs/<op>/<tier>/roundN/ 每轮含 diagnosis json** |
-
-> **实现状态**：`run_optimize.sh` + 三个 parser + integrate + check_fields 已按 v4 落地（合成数据验证通过）；`main.py`/agents 仍为 v3 结构，需按本文档改造（单文件合并、scheduler 字段提取、验证改 msprof 端到端）。
+- **07-23~07-31 (v3)**：Triton→HIVM→simulator 三源 + 29 字段 dsl_merger + agents 循环。
+- **08-03**：HIVM 获取打通 + msprof op 字段核实（OpBasicInfo/PipeUtilization/Memory）。
+- **08-04**：v4 起步——单文件合并、run_optimize.sh 输入输出参数、scheduler 状态机、integrate v4、tier 字段提取、nga run 接入、确定性改码。
+- **08-05 (本次)**：
+  - kernel 链（round1 源 / roundN 上轮输出 / 源不改）
+  - 修复：NA 误报、conflict 子串、pipe 归一化、coder BOM、历史 speedup bug、nga echo 转义、CLI 优先级、planner 读路径、coder 传路径、默认初始化
+  - 6 层字段审计定版（50 字段）
+  - 硬件基准套件 bench_910b3 + PyTorch 基准线
+  - 轨迹图 v4 兼容
+  - 全部提交 commit `2c53616`
 
 ---
 
-## 14. 参考资料
+## 11. 参考资料
 
-| 内容 | 链接 |
-|---|---|
-| msprof op 8 CSV 字段 | https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha002/devaids/optool/atlasopdev_16_00851.html |
-| op_summary 字段 | https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/opdevg/Ascendcopdevg/atlas_ascendc_best_practices_10_0008.html |
-| triton-ascend profiling | https://github.com/triton-lang/triton-ascend/blob/main/docs/en/debug_guide/profiling.md |
-| msopprof 模式性能数据 | https://www.hiascend.com/document/detail/zh/mindstudio/latest/msOT/Operatordevelopmenttools/docs/zh/user_guide/msopprof_simulator_user_guide.md |
+- Triton 03 教程（matmul/swizzle）：https://triton-lang.org/main/_downloads/b51b68bc1c6b1a5e509f67800b6235af/03-matrix-multiplication.ipynb
+- msprof op 8 CSV 字段：https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha002/devaids/optool/atlasopdev_16_00851.html
+- triton-ascend 指南：https://gitcode.com/Ascend/triton-ascend/blob/main/docs/zh/programming_guide/cube_operator.md
+- ascend-dmi 硬件诊断（测带宽）：https://xiexianbin.cn/hardware/huawei-ascend/commands/index.html

@@ -9,7 +9,7 @@
 #        └─ 否 → msprof+op → diagnosis.json (roofline) → Tier3-6 逐级优化
 #    ③ 输出:
 #        - diagnosis.json  (始终有, roofline 核心, 单算子优化用)
-#        - hivm_fusion_view.txt (多算子时有, 融合用)
+#        - 08_fusion/hivm_fusion_view.txt (多算子时有, 融合用)
 #
 #  用法: bash run_optimize.sh <input_dir> [output_dir] [M] [N] [K]
 #    input_dir  算子目录 (含 kernel_op.py 单文件 或 test_matmul.py + triton_kernel.py)
@@ -18,7 +18,7 @@
 #    05_task/    通用 msprof op_summary (骨架: 每kernel耗时/核数/形状) → task.json
 #    04_board/   逐 kernel 的 msprof op 8 CSV (真实带宽/L2/cube) → board_<i>.json
 #    06_diagnosis/  task.json + board_*.json + diagnosis.json (骨架+deep 合并) (+ hivm, 多算子时)
-#    hivm_fusion_view.txt (多算子时, 融合专用)
+#    08_fusion/     (多算子时) hivm_try.txt + hivm_fusion_view.txt (融合专用)
 #  流程: 通用 msprof → 骨架 → 逐 distinct kernel 采 msprof op → 按名合并 (见 docx/aggregation_rules.md)
 #  单文件: 优先跑 input_dir/kernel_op.py (v4 单文件), 否则 test_matmul.py
 #  环境: ENABLE_HIVM=1 强制跑 hivm (多算子融合需要); 默认自动判断
@@ -55,10 +55,14 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+START_DIR="$(pwd)"    # 调用时 cwd — 相对路径参数归一化为绝对 (msprof/拷贝依赖绝对路径)
 INPUT_DIR="${1:-$REPO_ROOT/input/matmul}"
 OUT="${2:-$INPUT_DIR/e2e_run}"
 M=${3:-512}; N=${4:-512}; K=${5:-512}
 TIER=${TIER:-1}    # 当前优化阶段 1~6 (调度器传; 决定 07 筛哪层字段)
+# ★相对路径→绝对路径 (脚本内部 cd 换目录后, 相对路径会解析错位)
+case "$INPUT_DIR" in /*) ;; *) INPUT_DIR="$START_DIR/$INPUT_DIR";; esac
+case "$OUT" in /*) ;; *) OUT="$START_DIR/$OUT";; esac
 
 # 要运行的文件: 优先单文件 kernel_op.py (v4), 否则 test_matmul.py
 RUN_PY="test_matmul.py"
@@ -198,28 +202,30 @@ else echo "  (单个 kernel → 单算子: roofline 诊断够用, 走 Tier3-6)";
 
 if [ "$MULTI" = "1" ]; then
   echo ""; echo "══ 多算子路径: 编译 HIVM → 融合视图 ══"
-  cd "$INPUT_DIR"     # hivm 编译/产物都在源目录 (自包含 input/ 只用于 msprof 采集)
+  FUSION_DIR="$OUT/08_fusion"     # ★融合产物集中到本轮目录, 不污染源/上轮目录 (自包含原则)
+  mkdir -p "$FUSION_DIR"
   rm -rf ~/.triton
   export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
-  MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K $PY "$RUN_PY" > "$OUT/04_board/compile.txt" 2>&1
-  cp ~/.triton/dump/*/kernel.*.mlir "$INPUT_DIR/" 2>/dev/null || true
+  (cd "$RUN_DIR" && MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K $PY "$APP_ABS" > "$OUT/04_board/compile.txt" 2>&1)
+  cp ~/.triton/dump/*/kernel.ttadapter.mlir "$FUSION_DIR/" 2>/dev/null || \
+    cp ~/.triton/dump/*/kernel.*.mlir "$FUSION_DIR/" 2>/dev/null || true
   HIVM_OK=0
   for P in hivm-inject-sync hivm-graph-sync-solver; do
-    (cd "$INPUT_DIR" && bishengir-compile --target=Ascend910B3 \
+    (cd "$FUSION_DIR" && bishengir-compile --target=Ascend910B3 \
       --enable-auto-multi-buffer=True --enable-auto-bind-sub-block=True \
       --enable-hfusion-compile=true --enable-hivm-compile=true \
       --enable-triton-kernel-compile=true \
       --bishengir-print-ir-after=$P kernel.ttadapter.mlir -o /tmp/k.o > hivm_try.txt 2>&1)
-    CNT=$(grep -c 'hivm.hir' "$INPUT_DIR/hivm_try.txt" 2>/dev/null || echo 0)
+    CNT=$(grep -c 'hivm.hir' "$FUSION_DIR/hivm_try.txt" 2>/dev/null || echo 0)
     if [ "$CNT" -gt 0 ]; then echo "  pass=$P → hivm.hir x$CNT"; HIVM_OK=1; break; fi
   done
   if [ "$HIVM_OK" -eq 1 ]; then
     pass "hivm_try.txt 生成"
-    "$PY" "$SCRIPT_DIR/filter_hivm_for_fusion.py" "$INPUT_DIR/hivm_try.txt" --out "$INPUT_DIR/hivm_fusion_view.txt"
-    pass "hivm_fusion_view.txt ✓ (融合专用: op+同步+依赖)"
-    echo "  → LLM 读 hivm_fusion_view.txt: 找 RAW 链相邻逐元素 op → 融合; WAR → 换 buffer"
+    "$PY" "$SCRIPT_DIR/filter_hivm_for_fusion.py" "$FUSION_DIR/hivm_try.txt" --out "$FUSION_DIR/hivm_fusion_view.txt"
+    pass "hivm_fusion_view.txt ✓ → $FUSION_DIR (融合专用: op+同步+依赖)"
+    echo "  → LLM 读 $FUSION_DIR/hivm_fusion_view.txt: 找 RAW 链相邻逐元素 op → 融合; WAR → 换 buffer"
   else
-    fail "hivm 生成失败 (看 hivm_try.txt)"
+    fail "hivm 生成失败 (看 $FUSION_DIR/hivm_try.txt)"
   fi
 fi
 
@@ -245,5 +251,5 @@ fi
 
 echo ""; echo "══════════ 完成 (PASS=$PASS FAIL=$FAIL) ══════════"
 echo "  diagnosis.json     : $D/diagnosis.json  (单算子优化用)"
-echo "  hivm_fusion_view   : $INPUT_DIR/hivm_fusion_view.txt  (多算子融合用, 若生成)"
+echo "  hivm_fusion_view   : $OUT/08_fusion/hivm_fusion_view.txt  (多算子融合用, 若生成)"
 echo "  看诊断报告: python3 input/matmul/real_report.py"

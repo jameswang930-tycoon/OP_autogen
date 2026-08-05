@@ -163,8 +163,8 @@ def _generate_diff(original: str, optimized: str) -> str:
     opt_lines = optimized.splitlines(keepends=True)
     diff = difflib.unified_diff(
         orig_lines, opt_lines,
-        fromfile="kernel.py (original)",
-        tofile="kernel.py (optimized)",
+        fromfile="kernel_op.py (original)",
+        tofile="kernel_op.py (optimized)",
     )
     return "".join(diff)
 
@@ -195,7 +195,8 @@ def _extract_changes(plan_text: str) -> list:
 
 
 def _apply_plan_changes(code: str, changes: list):
-    """确定性应用 changes[]: old_code → new_code 精确替换。返回 (新代码, applied, missing)。"""
+    """确定性应用 changes[]: old_code → new_code 精确替换（★全部出现处, 不只第一处）。
+    old_code 必须是完整行 (planner skill 铁律), 若同段在文件出现多次, 视为同一定义全改。"""
     applied, missing = [], []
     for ch in changes:
         old = (ch or {}).get("old_code", "")
@@ -203,7 +204,7 @@ def _apply_plan_changes(code: str, changes: list):
         if not old:
             continue
         if old in code:
-            code = code.replace(old, new, 1)
+            code = code.replace(old, new)   # replace all (old_code 为整行, 所有出现都该改)
             applied.append(ch)
         else:
             missing.append(old[:60])

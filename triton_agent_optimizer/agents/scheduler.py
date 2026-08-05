@@ -148,16 +148,9 @@ def _summarize_changes(plan) -> str:
 
 
 def _extract_changes_from_plan(plan_text: str) -> list:
-    """从 plan JSON 提取 changes[] 数量 (打印用)。"""
-    try:
-        t = plan_text.strip()
-        s, e = t.find("{"), t.rfind("}")
-        if s >= 0 and e > s:
-            d = json.loads(t[s:e + 1])
-            return d.get("changes", []) if isinstance(d, dict) else []
-    except Exception:
-        pass
-    return []
+    """从 plan JSON 提取 changes[] (与 coder._extract_changes 同一实现, 不重复维护)。"""
+    from agents.coder import _extract_changes
+    return _extract_changes(plan_text)
 
 
 def _get(d, path: str):
@@ -230,6 +223,7 @@ class Scheduler:
         """初始化: 从头开始 (round1/tier1 读源文件)。"""
         self.traj = {"v": 4, "state": {"tier": 1, "round": 1, "best_speedup": 1.0,
                                        "baseline_ns": None, "num_kernels": None,
+                                       "current_speedup": 1.0,   # 当前已接受 kernel 的加速比 (基线=1.0)
                                        "current_kernel": str(self.op_dir / "kernel_op.py")},
                      "history": []}
         self.current_kernel = self.op_dir / "kernel_op.py"
@@ -243,7 +237,8 @@ class Scheduler:
             # 旧版本 (v3) trajectory → 重置, 避免 tier/round 错位
             print("  [Scheduler] 检测到旧版本 trajectory, 重置为 v4")
         return {"v": 4, "state": {"tier": 1, "round": 1, "best_speedup": 1.0,
-                                  "baseline_ns": None, "num_kernels": None},
+                                  "baseline_ns": None, "num_kernels": None,
+                                  "current_speedup": 1.0},
                 "history": []}
 
     def _save_traj(self):
@@ -447,6 +442,8 @@ class Scheduler:
             # ⑤ Coder → 改代码, 输出到 round_dir/kernel_op.py (不碰源文件) (报错同轮重改, ≤3次)
             prev_err, new_code = "", ""
             round_kernel = round_dir / "kernel_op.py"
+            prev_speedup = st.get("current_speedup", 1.0)   # 上一轮已接受 kernel 的加速比 (基线=1.0)
+            kept = False                                      # 本轮是否被采纳进 kernel 链
             pre_code = self.current_kernel.read_text(encoding="utf-8") \
                 if self.current_kernel.exists() else ""    # NOOP 对比用 (改之前的版本)
             for attempt in range(3):
@@ -455,9 +452,16 @@ class Scheduler:
                 # ⑥ 验证 (只 msprof 端到端, 验证本轮新 kernel)
                 v = self._verify(round_dir, st.get("baseline_ns"))
                 if v.get("ok"):
-                    # ★成功 → 提交为下一轮的当前 kernel (失败则保留上一个成功的), 并持久化
-                    self.current_kernel = round_kernel
-                    st["current_kernel"] = str(round_kernel)
+                    # ★保留判定: speedup 始终 = 初始基线/本轮 (累计, 输出的就是这个);
+                    #   但"是否采纳进 kernel 链"对比上一轮已接受的加速比 (prev_speedup)
+                    speedup = v.get("speedup", 1.0)
+                    if speedup >= prev_speedup:
+                        self.current_kernel = round_kernel
+                        st["current_kernel"] = str(round_kernel)
+                        st["current_speedup"] = round(speedup, 4)
+                        kept = True
+                    else:
+                        print(f"  ↩ 回退: 本轮 {speedup:.3f}x < 上一轮 {prev_speedup:.3f}x, 沿用上一轮 kernel")
                     self._save_traj()
                     break
                 prev_err = v.get("error", "unknown error")
@@ -465,7 +469,8 @@ class Scheduler:
 
             speedup = v.get("speedup", 1.0)
             ns = v.get("ns")
-            print(f"  加速比: {speedup:.3f}x (ns={ns})")
+            print(f"  加速比: {speedup:.3f}x (vs 初始基线 {st.get('baseline_ns')}ns; 上一轮 {prev_speedup:.3f}x)"
+                  + ("  ✅采纳" if kept else "  ↩未采纳"))
             print(f"  ⏱ ⑤Coder+验证: {time.time()-_t0:.1f}s")
             print(f"  ⏱ 本轮总时: {time.time()-round_start:.1f}s  (总用时 {time.time()-total_start:.1f}s)")
 
@@ -479,21 +484,28 @@ class Scheduler:
                 except Exception:
                     pass
             result = "NOOP" if noop else ("OK" if ok else "FAIL")
+            decision = "KEEP" if kept else ("FAIL" if not ok else "REVERT")
             hist = {"round": rn, "tier": tier, "strategy": plan.strategy,
                     "change": _summarize_changes(plan),       # 例: "BLOCK_M,BLOCK_N,BLOCK_K=64,64,64"
-                    "speedup": round(speedup, 4), "ns": ns,
-                    "decision": "KEEP", "result": result,
+                    "speedup": round(speedup, 4),             # 加速比 = 初始基线/本轮 (累计)
+                    "prev_speedup": round(prev_speedup, 4),   # 上一轮已接受 kernel 的加速比 (保留判定用)
+                    "ns": ns, "decision": decision, "result": result,
                     "error": (prev_err[:120] if prev_err else "")}
-            if st.get("best_speedup") is None or speedup > st["best_speedup"]:
-                st["best_speedup"] = speedup
             if st.get("best_speedup") is None or speedup > st["best_speedup"]:
                 st["best_speedup"] = speedup
             self.traj["history"].append(hist)
 
             # 晋升决策: planner.promote (读瓶颈判断) + 连续3轮无改进兜底 + 达标/到Tier6停止
             planner_promote = getattr(plan, "promote", False)
-            no_improve = sum(1 for h in self.traj["history"][-3:]
-                             if h.get("tier") == tier and h.get("speedup", 0) < 1.05)
+            # ★无改进 = 本轮加速比没超过上一轮已接受的 (speedup <= prev_speedup);
+            #   数"本 tier 连续无改进"轮数 (跨 tier 边界即断)
+            no_improve = 0
+            for h in reversed(self.traj["history"]):
+                if h.get("tier") != tier:
+                    break
+                if h.get("speedup", 0) > h.get("prev_speedup", 0):
+                    break
+                no_improve += 1
             if speedup >= self.target_speedup:
                 print("  🎯 加速比达标, 停止")
                 st["round"] = rn + 1

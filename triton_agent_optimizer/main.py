@@ -24,10 +24,11 @@ LLM 调用（服务器无 Claude API, 用本地 codeagent）:
   1. 单文件能跑:
      python3 input/matmul/kernel_op.py
      # 预期: [info] kernel launched & synced OK
-  2. 完整优化循环 (一键):
+  2. 完整优化循环 (一键; input/ 下算子目录, 例 matmul / attention_mlp):
      LLM_CLI_COMMAND="nga run" python3 main.py input/matmul --max-rounds 2
+     LLM_CLI_COMMAND="nga run" python3 main.py input/attention_mlp --fresh --max-rounds 15   # 复杂算子
      # 每轮: 采集→07字段→planner→coder→msprof端到端→加速比
-     # 从头开始(清 outputs/matmul + 重置): 加 --fresh
+     # 从头开始(清 outputs/<op> + 重置): 加 --fresh
      # 续跑(从上次 round 继续, 不清旧产物): 不加 --fresh
   3. 只采集+解析 (不跑优化):
      bash analyzers/run_optimize.sh input/matmul input/matmul/e2e_run

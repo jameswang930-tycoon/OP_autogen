@@ -234,6 +234,11 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 # ① 完整优化循环 (推荐; --target 省略/0 = 不设目标跑满 --max-rounds, 看最优)
 LLM_CLI_COMMAND='nga run' python3 main.py input/matmul --fresh --max-rounds 15 --target 2.0
 LLM_CLI_COMMAND='nga run' python3 main.py input/matmul --fresh --max-rounds 15   # 无目标, 跑满15轮
+LLM_CLI_COMMAND='nga run' python3 main.py input/attention_mlp --fresh --max-rounds 15   # 复杂算子: 自注意力+MLP (5 kernel)
+
+# ①.5 单文件能跑 + 数值校验 (跑优化前先确认 kernel_op.py 能跑)
+python3 input/matmul/kernel_op.py && MATMUL_VERIFY=1 python3 input/matmul/kernel_op.py
+python3 input/attention_mlp/kernel_op.py && MATMUL_VERIFY=1 python3 input/attention_mlp/kernel_op.py
 
 # ② 只采集+解析
 bash analyzers/run_optimize.sh input/matmul input/matmul/e2e_run

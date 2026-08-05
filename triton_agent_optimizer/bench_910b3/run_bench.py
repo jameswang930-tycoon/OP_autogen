@@ -49,10 +49,10 @@ def _merge_max(peak: dict, m: dict):
 
 def main():
     p = argparse.ArgumentParser(description="910B3 硬件基准实测")
-    p.add_argument("--rounds", type=int, default=int(os.environ.get("BENCH_MEASURE_ITERS", "100")),
-                   help="测量 launch 次数 (默认 100, 一次 msprof 内循环)")
-    p.add_argument("--warmup", type=int, default=int(os.environ.get("BENCH_WARMUP_ITERS", "30")),
-                   help="热身 launch 次数 (默认 30, 跳过热身前奏)")
+    p.add_argument("--rounds", type=int, default=int(os.environ.get("BENCH_MEASURE_ITERS", "30")),
+                   help="测量 launch 次数 (默认 30, 设备时间确定性高, 够稳)")
+    p.add_argument("--warmup", type=int, default=int(os.environ.get("BENCH_WARMUP_ITERS", "10")),
+                   help="热身 launch 次数 (默认 10, 过 JIT/冷cache)")
     p.add_argument("--bench", type=str, default=None, help="只测单个 bench")
     p.add_argument("--skip-op", action="store_true",
                    help="跳过 msprof op per-path (只测聚合峰值, 快)")

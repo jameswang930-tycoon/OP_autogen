@@ -6,9 +6,10 @@
 **科学原则**:
 1. **多变体扫描**: 每类 bench 跑多个变体 (尺寸×分块×精度) — 任何单次测量是真值的下界
 2. **取最大**: 每个度量取全变体 max = 该路径峰值的最佳估计
-3. **30 热身 + 100 测量平均 (一次 msprof 内循环)**: app 内部 launch warmup+measure 次,
-   读 op_summary **跳过前 30 次 (冷cache/编译), 平均后 100 次 (稳态)** — 与主优化循环同源
-   (不拆 100 次独立 msprof — 每次有 ~30s 工具开销, 100 次不可行)
+3. **10 热身 + 30 测量平均 (一次 msprof 内循环)**: app 内部 launch warmup+measure 次,
+   读 op_summary **跳过前 10 次 (JIT/冷cache), 平均后 30 次 (稳态)** — 与主优化循环同源
+   (msprof 测设备侧时间确定性高, 10/30 统计上够稳, 无需 100;
+    也不拆 N 次独立 msprof — 每次有 ~30s 工具开销)
 4. **双数据源**: 聚合峰值 (GB/s/TFLOPS) 用通用 msprof (与主优化循环同源);
    per-path 带宽 (l0a/l0b feed, gm_to_ub, mte1/mte2) 用 msprof op + board.json (`--single` 单次)
 
@@ -45,16 +46,16 @@ conda activate triton-npu
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 cd bench_910b3
 
-# ① 全套实测 (推荐; 每个变体一次 msprof, 内循环 30 热身 + 100 测量取稳态平均)
+# ① 全套实测 (推荐; 每个变体一次 msprof, 内循环 10 热身 + 30 测量取稳态平均)
 python3 run_bench.py
 
 # ② 快速模式 (只聚合峰值, 跳过 per-path msprof op)
 python3 run_bench.py --skip-op
 
-# ③ 只测某类 / 调热身/测量次数
+# ③ 只测某类 / 调热身/测量次数 (一般不用调, 10/30 已够稳)
 python3 run_bench.py --bench cube
-python3 run_bench.py --warmup 50 --rounds 200     # 更多热身/更多测量
-# env 覆盖: BENCH_WARMUP_ITERS=30 BENCH_MEASURE_ITERS=100
+python3 run_bench.py --warmup 20 --rounds 50     # 想更稳可加大
+# env 覆盖: BENCH_WARMUP_ITERS=10 BENCH_MEASURE_ITERS=30
 ```
 
 ## 输出与校准
@@ -104,7 +105,7 @@ python3 feedback/trajectory_chart.py outputs/matmul
 ```
 
 ## 注意
-- 尺寸 env 覆盖: `BENCH_MM` / `BENCH_BW_N` / `BENCH_VEC_N`; 热身/测量: `BENCH_WARMUP_ITERS`(30) / `BENCH_MEASURE_ITERS`(100)
+- 尺寸 env 覆盖: `BENCH_MM` / `BENCH_BW_N` / `BENCH_VEC_N`; 热身/测量: `BENCH_WARMUP_ITERS`(10) / `BENCH_MEASURE_ITERS`(30)
 - 大尺寸 (8192³ fp32) 编译/运行较慢, 首次 JIT 编译 (warmup 已覆盖)
 - 保密服务器: 结果只含数字, 可直接贴出
 - `run_bench.py --skip-op` 跳过 per-path (只校准 GM/cube/vec 峰值, 不填微路径)

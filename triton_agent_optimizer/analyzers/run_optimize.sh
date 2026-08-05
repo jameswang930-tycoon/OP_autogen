@@ -95,9 +95,15 @@ cd "$RUN_DIR"
 echo ""; echo "══ 阶段 1/3: 通用 msprof(骨架) + 逐 kernel msprof op ══"
 D="$OUT/06_diagnosis"
 
+# 0. 预热: 先裸跑一次 (Triton JIT 编译 + 设备初始化), 避免冷启动污染基准
+#    msprof 首次 attach 可能漏掉前几个 kernel; 且首 launch 含 JIT 编译(秒级)。
+#    verify (verify_end_to_end) 已热身 → baseline 必须同口径, 否则 speedup 失真
+APP_ABS="$RUN_DIR/$RUN_PY"    # 绝对路径, 避免 msprof 从别的 cwd 解析不到
+MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K $PY "$APP_ABS" > "$OUT/05_task/warmup.txt" 2>&1 || true
+echo "  ⚡ warmup 裸跑 (JIT 编译/设备初始化) done"
+
 # 1a. 通用 msprof 先跑 (任务级 op_summary → distinct kernel 名 → 骨架)
 TASK_OUT="$OUT/05_task/task_prof"; rm -rf "$TASK_OUT"; mkdir -p "$TASK_OUT"
-APP_ABS="$RUN_DIR/$RUN_PY"    # 绝对路径, 避免 msprof 从别的 cwd 解析不到
 MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof --output="$TASK_OUT" \
   --application="$PY $APP_ABS" --ai-core=on > "$OUT/05_task/task_run.txt" 2>&1
 OPSUM=$(find "$OUT/05_task" -name 'op_summary*.csv' 2>/dev/null | wc -l)

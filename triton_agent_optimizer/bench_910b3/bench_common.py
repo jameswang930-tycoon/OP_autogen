@@ -58,11 +58,12 @@ def _read_kernel_durations(prof_out: Path, kernel_name: str) -> list:
 # ═══════════════════════════════════════════════════════════════════════
 
 def measure_msprof(app_cmd: str, kernel_name: str,
-                   warmup: int = 30, measure: int = 100,
+                   warmup: int = 10, measure: int = 30,
                    work_dir: Path = None) -> tuple:
     """模式 A: 一次 msprof 跑整个 app (app 内部 launch warmup+measure 次),
     读 op_summary 目标 kernel 逐次耗时, 跳过前 warmup 个, 平均后 measure 个.
-    返回 (avg_us, measured_durations)."""
+    ★msprof 测的是设备侧 kernel 时间(确定性高): 热身10(过JIT/冷cache) + 测量30(够稳) 即可,
+      100 轮无统计增益, 且要求 msprof 记录 131 行(易触发合并问题). 返回 (avg_us, measured_durations)."""
     if work_dir is None:
         work_dir = Path(os.environ.get("BENCH_OUT", "bench_out"))
     work_dir.mkdir(parents=True, exist_ok=True)

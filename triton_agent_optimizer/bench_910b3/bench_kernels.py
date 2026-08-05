@@ -4,8 +4,9 @@
 科学原则:
   1. 多变体扫描 (尺寸×分块×精度) — 单次测量是真值的下界, 取最大
   2. **一次 msprof 内循环跑 warmup+measure 次** — 跳过热身前奏, 平均稳态:
-     - 默认 BENCH_WARMUP_ITERS=30 热身 + BENCH_MEASURE_ITERS=100 测量
-     - run_bench.py 读 op_summary 跳过前 30 次, 平均后 100 次 (与主循环同源 msprof)
+     - 默认 BENCH_WARMUP_ITERS=10 热身 + BENCH_MEASURE_ITERS=30 测量
+       (msprof 测设备侧时间确定性高, 10 过 JIT/冷cache + 30 平均够稳, 无需 100)
+     - run_bench.py 读 op_summary 跳过前 warmup 次, 平均后 measure 次 (与主循环同源 msprof)
   3. `--single` 单次 launch — 供 msprof op per-path (每路径带宽) 用
 
 测什么 (6 类, 覆盖全链路带宽/算力):
@@ -19,10 +20,10 @@
 用法 (910B3 服务器):
   conda activate triton-npu && source /usr/local/Ascend/ascend-toolkit/set_env.sh
   python3 bench_kernels.py --list                          # 列出所有
-  python3 bench_kernels.py --bench cube --variant 0        # 单变体 (30+100 循环, 打印 avg)
+  python3 bench_kernels.py --bench cube --variant 0        # 单变体 (10+30 循环, 打印 avg)
   python3 bench_kernels.py --bench cube --variant 0 --single  # 单次 (msprof op 用)
   python3 run_bench.py                                     # ★全套实测 (推荐)
-  循环次数: BENCH_WARMUP_ITERS=30 BENCH_MEASURE_ITERS=100  (env 覆盖)
+  循环次数: BENCH_WARMUP_ITERS=10 BENCH_MEASURE_ITERS=30  (env 覆盖)
 """
 import os
 import sys
@@ -216,8 +217,8 @@ def main():
         return
 
     # 循环模式: warmup + measure 次, 分配一次复用 (供 run_bench 的 msprof 一次采集)
-    warmup = int(os.environ.get("BENCH_WARMUP_ITERS", "30"))
-    measure = int(os.environ.get("BENCH_MEASURE_ITERS", "100"))
+    warmup = int(os.environ.get("BENCH_WARMUP_ITERS", "10"))
+    measure = int(os.environ.get("BENCH_MEASURE_ITERS", "30"))
     t = _alloc(b["type"], v)
     for _ in range(warmup):
         _launch(b["type"], v, t)

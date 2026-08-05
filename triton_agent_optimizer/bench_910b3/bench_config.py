@@ -17,20 +17,21 @@ BENCHES = {
     #   大 BLOCK: 数据搬运主导, 带宽收敛于峰值 (取这个为 GM 峰值)
     #   UB 上限 192KB: read/write 单块 ≤49152 元素; copy 双缓冲 ≤24576; 保守取 16384 全兼容
     "gm_read": {
-        "desc": "GM 读带宽 (128MB 固定, BLOCK 512→16384 扫描)",
+        "desc": "GM 读带宽 (128MB 固定, BLOCK 512→32768 扫描)",
         "type": "read", "kernel_name": "read_kernel",
         "variants": [
             {"N": 1 << 25, "BLOCK": 512},      # 128MB, 小分块 (未饱和)
             {"N": 1 << 25, "BLOCK": 1024},
             {"N": 1 << 25, "BLOCK": 2048},
             {"N": 1 << 25, "BLOCK": 4096},
-            {"N": 1 << 25, "BLOCK": 8192},     # 大分块
-            {"N": 1 << 25, "BLOCK": 16384},    # 64KB/块, 接近 UB 上限
+            {"N": 1 << 25, "BLOCK": 8192},
+            {"N": 1 << 25, "BLOCK": 16384},    # 64KB/块
+            {"N": 1 << 25, "BLOCK": 32768},    # 128KB/块 (UB 192KB 内; 若报错说明到编译器/UB 极限)
             {"N": 1 << 26, "BLOCK": 8192},     # 256MB 确认饱和
         ],
     },
     "gm_write": {
-        "desc": "GM 写带宽 (128MB 固定, BLOCK 512→16384)",
+        "desc": "GM 写带宽 (128MB 固定, BLOCK 512→32768)",
         "type": "write", "kernel_name": "write_kernel",
         "variants": [
             {"N": 1 << 25, "BLOCK": 512},
@@ -39,6 +40,7 @@ BENCHES = {
             {"N": 1 << 25, "BLOCK": 4096},
             {"N": 1 << 25, "BLOCK": 8192},
             {"N": 1 << 25, "BLOCK": 16384},
+            {"N": 1 << 25, "BLOCK": 32768},
         ],
     },
     "gm_copy": {
@@ -54,12 +56,13 @@ BENCHES = {
         ],
     },
     "l2_read": {
-        "desc": "L2 读带宽 (L2 内数组反复读)",
+        "desc": "L2 读带宽 (8MB 固定, BLOCK 1024→8192 扫描 — 补上之前遗漏的 BLOCK 维度)",
         "type": "l2", "kernel_name": "l2_read_kernel",
         "variants": [
-            {"N": 1 << 20, "ITERS": 128, "BLOCK": 1024},   # 4MB
-            {"N": 1 << 21, "ITERS": 64,  "BLOCK": 1024},   # 8MB
-            {"N": 1 << 22, "ITERS": 32,  "BLOCK": 1024},   # 16MB
+            {"N": 1 << 21, "ITERS": 64, "BLOCK": 1024},
+            {"N": 1 << 21, "ITERS": 64, "BLOCK": 2048},
+            {"N": 1 << 21, "ITERS": 64, "BLOCK": 4096},
+            {"N": 1 << 21, "ITERS": 64, "BLOCK": 8192},
         ],
     },
     "cube": {
@@ -84,17 +87,22 @@ BENCHES = {
              "BM": 128, "BN": 128, "BK": 64},
             {"dtype": "float16", "M": 4096, "N": 4096, "K": 4096,
              "BM": 128, "BN": 256, "BK": 64},
+            {"dtype": "float16", "M": 4096, "N": 4096, "K": 4096,
+             "BM": 128, "BN": 256, "BK": 128},       # L0B=256×128×2=64KB 上限
+            {"dtype": "float32", "M": 4096, "N": 4096, "K": 4096,
+             "BM": 128, "BN": 128, "BK": 128},       # fp32 L0A=128×128×4=64KB 上限
         ],
     },
     "vec": {
-        "desc": "Vec 吞吐 (add/fma, BLOCK 1024→8192) + per-path",
+        "desc": "Vec 吞吐 (add/fma, BLOCK 1024→16384) + per-path",
         "type": "vec", "kernel_name": "vec_kernel",
         "variants": [
             {"OP": 0, "N": 1 << 23, "BLOCK": 1024},   # add 8M
             {"OP": 0, "N": 1 << 23, "BLOCK": 4096},
             {"OP": 2, "N": 1 << 23, "BLOCK": 1024},   # fma 8M
             {"OP": 2, "N": 1 << 23, "BLOCK": 4096},
-            {"OP": 2, "N": 1 << 24, "BLOCK": 8192},   # fma 16M, 大块 (3×8K×4=96KB<192KB)
+            {"OP": 2, "N": 1 << 24, "BLOCK": 8192},   # fma 16M, 96KB
+            {"OP": 2, "N": 1 << 24, "BLOCK": 16384},  # 192KB 满 (UB 极限, 可能报错=fail-fast)
         ],
     },
 }

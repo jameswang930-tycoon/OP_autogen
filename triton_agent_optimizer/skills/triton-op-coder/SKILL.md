@@ -25,10 +25,23 @@ argument-hint: >
 - **previous_error**（可选）: 上轮 msprof 端到端运行报错。有则**先解决报错**，再落实 plan。
 - **coding_guide**: 改码规范 + 本 tier 策略文档。
 
+## ★读来源 + 写目标（必须分清）
+
+**输入代码**（`kernel_code` / prompt 里的当前单文件）= **当前正在优化的版本**：
+
+| 轮次 | 读哪个文件 | 含义 |
+|---|---|---|
+| round1 | `input/<op>/kernel_op.py` | 原始源文件 |
+| roundN (N>1) | `outputs/<op>/<tier>/round(N-1)/kernel_op.py` | 上一轮成功输出 |
+| 失败回退 | 沿用上一个**成功**的 kernel | 验证失败不提交 |
+
+**输出**：写 `roundN/kernel_op.py`（本轮目录），**绝不写回 `input/<op>/kernel_op.py` 源文件**。
+只改 prompt 给的那个当前文件，不碰源文件、不碰其他轮的文件。
+
 ## ★优先确定性应用 changes[]（不要重写整文件）
 
 1. plan 的 `changes[]` 每项是 `{old_code, new_code}`。
-2. 对每项做**精确字符串替换**：在 kernel_op.py 里找到 `old_code`，原样替换成 `new_code`。
+2. 对每项做**精确字符串替换**：在**当前文件**里找到 `old_code`，原样替换成 `new_code`。
 3. **找不到 `old_code` 就报告**（输出 `# CODER: old_code 未匹配: <内容>`），**绝不猜测乱改**。
 4. 改完跑语法检查，确保仍是合法 Python。
 5. 只有当 `changes[]` 为空、或 previous_error 需要 LLM 修报错时，才自己改码。

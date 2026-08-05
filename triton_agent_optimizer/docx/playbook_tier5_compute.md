@@ -237,3 +237,29 @@ def var_elim_after(x_ptr, out_ptr, scale, bias, alpha, n_elements, BLOCK_SIZE: t
 - **修复方案**：严格遵循优化层级顺序，Tier 5 仅做 Tier 2 未覆盖的指令级精细优化；Tier 2 已融合的算子不再重复处理，仅针对未融合的残余计算链优化。
 
 需要我补充某个算子的完整 Tier 5 优化示例，或者计算单元占用率的评估公式吗？
+---
+
+## ★matmul 专属改码示例（纯 triton, 910B3 验证可行）
+
+### 精度: fp16 计算 + fp32 累加 (cube 更快)
+
+**before（当前 fp32 计算, cube fp32 慢）:**
+```python
+DTYPE = torch.float32
+# kernel 里: acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+#            a = tl.load(...); b = tl.load(...); acc = tl.dot(a, b, acc)
+```
+
+**after（输入转 fp16, 累加保持 fp32）:**
+```python
+DTYPE = torch.float16          # ① config: 输入精度改 fp16
+# kernel 里: acc 保持 fp32, tl.dot 会自动 fp16×fp16→fp32 累加 (无需改)
+```
+
+**改哪**: ① config 区 `DTYPE = torch.float32` → `torch.float16`。
+**判定**: Tier5 `cube_ratio` 低 / `compute_utilization` 低 → fp16 提升 cube 吞吐（910B3 fp16 是 fp32 的 ~2 倍）。
+**注意**: 
+- 累加器 `acc = tl.zeros(..., dtype=tl.float32)` **保持 fp32**（精度）
+- 正确性: fp16 值域 ±65504, matmul 中间累加在 fp32 内, 一般够; 若精度不达标回退 fp32
+- 这同时减半 GM 读带宽（A/B 各减半）→ Tier4 也受益
+

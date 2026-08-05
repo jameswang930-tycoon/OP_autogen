@@ -200,15 +200,23 @@ def _extract_config_constants(kernel_code: str) -> str:
 
 
 def _format_history(history: list) -> str:
-    """将 history 列表格式化为文本。"""
+    """将 history 格式化为紧凑梗概 (每轮一行: 改了啥 → 加速比 [结果])。
+    ★读 speedup (不是 actual_speedup — 旧 bug 恒显示 1.00x)。"""
     if not history:
         return "(no history)"
-    recent = history[-5:]
-    lines = ["## Recent History (last 5 rounds)"]
+    recent = history[-5:]   # 只看最近5轮, 紧凑
+    lines = ["## 历史梗概 (最近5轮: 改了啥 → 加速比 [结果])"]
     for r in recent:
-        lines.append(
-            f"- Round {r.get('round','?')}: {r.get('strategy','?')} → "
-            f"{r.get('decision','?')} ({r.get('actual_speedup',1.0):.2f}x)")
+        change = r.get("change") or r.get("strategy", "?")
+        sp = r.get("speedup")
+        sp_s = f"{sp:.2f}x" if isinstance(sp, (int, float)) else "?"
+        res = r.get("result", "")
+        line = f"- R{r.get('round','?')} t{r.get('tier','?')}: {change} → {sp_s}"
+        if res:
+            line += f" [{res}]"
+        if r.get("error"):
+            line += f" (err: {r['error'][:50]})"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -304,6 +312,7 @@ class PlannerAgent:
         op_dir: Optional[Path] = None,
         fusion_analysis: Optional[dict] = None,
         round_dir: Optional[Path] = None,
+        current_kernel: Optional[Path] = None,
     ) -> RoundPlan:
         """v4 Planner: 输入 = 小指令 + 读文件路径 + 内联小字段 → plan + 晋升决策。
 
@@ -327,7 +336,7 @@ class PlannerAgent:
             f"执行步骤 (调用 skill / 读文件, 不要复述大段内容):\n"
             f"1. 调用 skill: {skill_path}\n"
             f"2. 读优化策略文档: {playbook_path}  (只看『优化内容』表 + 『决策依据』段)\n"
-            f"3. 读当前单文件: {op_dir / 'kernel_op.py' if op_dir else '(未给)'}  (重点 ② kernel 区)\n"
+            f"3. 读当前单文件 (★当前正在优化的版本, 不是源文件): {current_kernel or (op_dir / 'kernel_op.py' if op_dir else '(未给)')}  (重点 ② kernel 区)\n"
             f"4. 读诊断字段文件: {d7_path or '(未给, 用下面内联字段)'}\n\n"
             f"## 内联诊断字段 (当前 tier 筛好的, 若第4步文件读不到就用这些):\n{extracted}\n\n"
             f"## config 常量:\n{config_text or '(无)'}\n"
@@ -340,7 +349,12 @@ class PlannerAgent:
             f"2. changes[] 的 old_code 必须与 kernel_op.py 某段【逐字符】相同 (coder 精确替换用); 拿不准就不改, 宁缺勿错\n"
             f"3. 只改单文件 kernel_op.py ①config/②kernel, 不碰其他文件; 不引入 num_warps/num_stages 到 @triton.jit()\n"
             f"4. 目标加速比 1.05~1.5x\n\n"
-            f"## 输出 JSON only:\n"
+            f"## 输出 JSON only (★先看真实示例再写):\n"
+            f"例: 想把 BLOCK_K 增大 → \n"
+            f'{{"strategy":"增大BLOCK_K减MTE1次数","target_speedup":1.1,\n'
+            f'  "changes":[{{"old_code":"BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32","new_code":"BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64","reason":"Tier3: mte1_ratio高, 增大BLOCK_K减少MTE1搬运","section":"① config"}}],\n'
+            f'  "expected_impact":"MTE1搬运次数减半","promote":false,"promote_reason":""}}\n'
+            f"格式 (old_code 必须逐字符匹配当前 kernel):\n"
             f'{{"strategy":"...","target_speedup":1.1,\n'
             f'  "changes":[{{"old_code":"被替换的整行","new_code":"替换后的整行","reason":"为什么","section":"① config/② kernel"}}],\n'
             f'  "expected_impact":"...","promote":false,"promote_reason":"..."}}'

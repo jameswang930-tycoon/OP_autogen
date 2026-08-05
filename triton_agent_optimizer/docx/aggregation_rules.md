@@ -170,18 +170,24 @@
 ## 6. 每轮 Planner/Coder 读来源（核对用）
 
 > 调度器每轮从**相应位置读最新产物**注入 agent；agent 不自己到处找文件。
+> **★核心: current_kernel 链** — round1 读源文件, 后续轮读上一轮成功输出, 永不改源文件。
 
 | 谁 | 读什么 | 从哪读 | 最新性 |
 |---|---|---|---|
 | Planner | 当前 tier 字段段 | `roundN/07_tier{N}_fields/` | run_optimize 每轮重新解析 |
 | Planner | 融合分析（Tier2） | `roundN/08_fusion/fusion_analysis.json` | Tier2 每轮重新 nga run |
-| Planner | 单文件代码 | `input/<op>/kernel_op.py`（scheduler 读全文） | **coder 上轮改的最新版** |
+| Planner | **当前 kernel 代码** | `round1: input/<op>/kernel_op.py`；`roundN: round(N-1)/kernel_op.py`（prompt 给绝对路径） | **上一轮成功输出** |
 | Planner | 策略文档 | `docx/playbook_tier{N}.md` + `CODING_GUIDE.md` | 静态 |
-| Planner | config 常量 | kernel_op.py 的 ① config 区 | 最新 |
+| Planner | config 常量 | 当前 kernel 的 ① config 区 | 最新 |
 | Planner | 历史 | `outputs/<op>/optimization_trajectory.json` | 每轮更新 |
 | Coder | plan 的 changes[] | `roundN/plan.md`（old_code→new_code） | 本轮 planner 产出 |
-| Coder | 单文件 | `input/<op>/kernel_op.py` | 最新 |
+| Coder | **当前 kernel** | `round1: input/<op>/kernel_op.py`；`roundN: round(N-1)/kernel_op.py` | 上一轮成功输出 |
 | Coder | 教程/纠错 | `docx/CODING_GUIDE.md` + playbook_tier | 静态 |
+
+**写目标**: Coder 输出 → `roundN/kernel_op.py`（每轮目录），**永不写回 `input/<op>/kernel_op.py`**。
+
+**保留/回退**: 验证成功 → `current_kernel = roundN/kernel_op.py`（提交, 记入 trajectory）；
+验证失败(重试≤3次后) → **不提交**, current_kernel 沿用上一个成功的, 本轮 kernel 不进入下一轮链。
 
 ## 7. 改码确定性规则（dumb agent 保障）
 

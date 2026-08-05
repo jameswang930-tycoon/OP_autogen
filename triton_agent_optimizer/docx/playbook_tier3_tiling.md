@@ -25,9 +25,9 @@ Tier 3 是全链路优化的最底层参数级优化，**必须在 Tier 1（算�
 | 分块尺寸调优 | 带宽利用率 `bw_utilization` | < 70% 且访存 op 占比 > 60% | 增大分块尺寸，提升访存连续性 |
 | 分块尺寸调优 | 单块数据量 `size_kb` | > 128KB 且存在缓存换出标记 | 减小分块尺寸，避免片上缓存溢出 |
 | 分块尺寸调优 | 边界掩码开销占比 | > 10% | 增大分块，降低边界处理占比 |
-| 软件流水线调优 | RAW 依赖等待占比 | > 15% | 增加 `num_stages`，加深软件流水线 |
-| 软件流水线调优 | 计算单元利用率 | < 60% | 调整 `num_warps`，提升并行度 |
-| 软件流水线调优 | 寄存器溢出标记 | 存在 | 减少 `num_warps` 或 `num_stages` |
+| 软件流水线调优 | RAW 依赖等待占比 | > 15% | ⚠️triton-ascend 自动管理 num_stages, 不可 tune; 用增大 BLOCK_K 加深内循环粒度代替 |
+| 软件流水线调优 | 计算单元利用率 | < 60% | ⚠️triton-ascend 自动管理 num_warps, 不可 tune; 用增大 BLOCK_M/N 提升每核工作量代替 |
+| 软件流水线调优 | 寄存器溢出标记 | 存在 | ⚠️同上, 改用减小 BLOCK 尺寸代替 |
 | 访存对齐优化 | 访存 op 对齐标记 | 存在未对齐访问 | 注入对齐提示，调整分块对齐 |
 | 数据精度调优 | 带宽利用率 `bw_utilization` | > 90% 且计算 op 占比 < 20% | 存储精度降级为 FP16，减少访存带宽 |
 
@@ -55,8 +55,8 @@ Tier 3 是全链路优化的最底层参数级优化，**必须在 Tier 1（算�
 | 逐元素算子（GELU、Add等） | BLOCK_SIZE | 128 ~ 1024 | 256 | 带宽不足时增大，溢出时减小 |
 | 归约类算子（Softmax、RMSNorm） | BLOCK_SIZE | 128 ~ 512 | 256 | 归约维度优先 256，行优先匹配缓存 |
 | LayerNorm | BLOCK_SIZE | 128 ~ 512 | 256 | 与特征维度对齐，避免跨行分块 |
-| 矩阵乘 MatMul | BLOCK_M / BLOCK_N | 64 ~ 256 | 128 | 计算瓶颈时增大，访存瓶颈时减小 |
-| 矩阵乘 MatMul | BLOCK_K | 32 ~ 64 | 32 | 访存瓶颈时增大，精度敏感时减小 |
+| 矩阵乘 MatMul | BLOCK_M / BLOCK_N | 64 ~ 256 | 128 | **传输瓶颈时增大**（复用↑, GM流量↓）；计算瓶颈时保持够大让cube满, 不调小；延迟瓶颈(两者都低)才调小/增并行 |
+| 矩阵乘 MatMul | BLOCK_K | 32 ~ 64 | 32 | **传输瓶颈时增大**（每K迭代搬运↓, 复用↑）；精度敏感时减小 |
 
 ### 2.3 诊断驱动调优流程
 1. **带宽不足场景**（bw_util < 70%）：分块尺寸 ×2，重新编译测试，直到带宽利用率进入 90% 区间或触发缓存溢出。
@@ -121,11 +121,9 @@ rmsnorm_tune_after[grid](x_ptr, w_ptr, out_ptr, n_cols, eps, BLOCK_SIZE=256)
 
 根据 Triton 3.4.0 官方规范，`num_warps`、`num_stages` **不属于 `@triton.jit` 装饰器入参**，它们在我们的 pipeline 中通过编译配置传递。
 
-### 3.2 num_warps 调优规则
-`num_warps` 控制单块内的并行计算单元数量，NPU 场景下映射为向量计算单元的并行度，默认值为 4。
-- **匹配规则**：通常每 warp 对应处理 32 个元素，`BLOCK_SIZE / 32 = num_warps` 为最优匹配；例如 BLOCK_SIZE=128 匹配 num_warps=4，BLOCK_SIZE=256 匹配 num_warps=8。
-- **触发调优**：计算单元利用率 < 60% 且无访存瓶颈 → 增加 num_warps；出现寄存器溢出 → 减少 num_warps。
-- **取值范围**：NPU 场景推荐 2/4/8 三档，禁止使用 1 或 >8 的值，避免调度异常。
+### 3.2 num_warps 调优规则（⚠️ triton-ascend 自动管理，只作知识）
+`num_warps` 在 triton-ascend 上**由后端自动管理**，传给 kernel 会报 `please do not tune args ['num_warps','num_stages']`。
+**不要改它**。想让每核工作量更大 → 增大 `BLOCK_M`/`BLOCK_N`（每个 program 处理更大 tile）。
 
 ### 3.3 num_stages 调优规则
 `num_stages` 控制软件流水线深度，通过预取后续迭代数据掩盖访存延迟，默认值为 3。
@@ -335,3 +333,27 @@ def precision_after(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 - **修复方案**：遵循最小分块阈值，逐元素算子不小于 128，矩阵乘不小于 64×64。
 
 需要我补充某类算子（如 MatMul）的完整 Tier 3 调优决策树，或者对应的性能对比测试模板吗？
+---
+
+## ★matmul 专属改码示例（纯 triton, 910B3 验证可行）
+
+### 分块尺寸 (BLOCK_M/N/K) — Ascend 偏好 512B 对齐
+
+**before（当前 64×64×32, fp32）:**
+```python
+BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+```
+
+**after（增大到 128×128×64, fp32 128 元素=512B 对齐）:**
+```python
+BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+```
+
+**改哪**: ① config 区的 `BLOCK_M, BLOCK_N, BLOCK_K = ...` 整行。
+**判定**: Tier3 `block_dim < 40`（核没吃满）或 `mte1_ratio` 高 → 增大 BLOCK_K；`cube_ratio` 低 → 增大 BLOCK_M/N。
+**约束**: 
+- fp32 行宽 = BLOCK_N×4B 要 ≥512B（即 BLOCK_N≥128）；fp16 行宽 = BLOCK_N×2B 要 ≥512B（即 BLOCK_N≥256）
+- 单块 tile 数据量 = (BLOCK_M×BLOCK_K + BLOCK_K×BLOCK_N)×dtype 要 ≤ UB 192KB（fp32 时 128×128×64 ≈ 4MB? 不, 是 tile 加载尺寸, 编译器自动分块, 但别一次塞太大）
+- BLOCK_M/N 取 2 的幂（64/128/256）
+**grid 会变**: BLOCK 变大 → grid 变小 → 每核工作量增大。
+

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-优化轨迹图 — 6 阶段加速比曲线。
+优化轨迹图 — 6 阶段加速比曲线 (v4 兼容)。
 
 ═══ 图表设计 ═══
   单 Y 轴: Speedup / TFLOPS (同一条线)
@@ -11,6 +11,17 @@
   标注:    超过 8% 的跳跃自动标注策略名
   虚线:    PyTorch baseline (灰色水平)
   标题:    总轮次 | TFLOPS 变化 | 加速比 | vs PyTorch
+
+═══ 怎么运行 ═══
+  前置: 先跑 main.py 生成 outputs/<op>/optimization_trajectory.json
+        (可选) 先跑 bench_910b3/bench_pytorch.py 生成 pytorch_tflops.json → 图上出 PyTorch 虚线
+  运行:
+    python3 feedback/trajectory_chart.py outputs/matmul
+    # 输出: outputs/matmul/final_output/trajectory_chart.png
+  依赖: matplotlib (pip install matplotlib)
+
+  v4 说明: 读 state.initial_tflops / state.pytorch_tflops (scheduler 设基准时算好);
+            hist 存 speedup (每轮 vs 初始), cumulative = running best。
 """
 
 from __future__ import annotations
@@ -35,21 +46,28 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
         raise FileNotFoundError(f"Not found: {traj_file}")
     traj = json.loads(traj_file.read_text(encoding="utf-8"))
     history = traj.get("history", [])
-    baseline = traj.get("baseline", {})
+    state = traj.get("state", {})
 
-    if len(history) < 2:
-        raise ValueError("Need at least baseline + 1 round")
+    if len(history) < 1:
+        raise ValueError("Need at least 1 round")
 
-    # ── 数据 ──
-    rounds = [r["round"] for r in history]
-    decisions = [r.get("decision","?") for r in history]
-    strategies = [r.get("strategy","") for r in history]
-    reasons = [r.get("decision_reason","") for r in history]
-    cum_speeds = [r.get("cumulative_speedup",1.0) for r in history]
-    speeds = [r.get("actual_speedup",1.0) for r in history]
+    # ── 数据 (v4: hist 存 speedup = 每轮 vs 初始基准; cumulative = 历史最优) ──
+    rounds = [r.get("round", i + 1) for i, r in enumerate(history)]
+    decisions = [r.get("decision", "?") for r in history]
+    strategies = [r.get("change") or r.get("strategy", "") for r in history]
+    reasons = [r.get("error", "") for r in history]
+    speeds = [r.get("speedup", 1.0) for r in history]           # 每轮 vs baseline
+    cum_speeds = list(np.maximum.accumulate(np.array(speeds)))  # running best
+    # 基准点: 第 0 轮前 speedup=1.0 (初始)
+    rounds = [0] + rounds
+    cum_speeds = [1.0] + cum_speeds
+    speeds = [1.0] + speeds
+    decisions = ["BASELINE"] + decisions
+    strategies = ["Baseline"] + strategies
 
-    initial_tflops = baseline.get("throughput_tflops", 6.4)
-    pytorch_tflops = baseline.get("pytorch_baseline_tflops", 9.2)
+    # TFLOPS: 从 state.baseline_ns 算 (需 M/N/K, 存在 state 里) 或默认
+    initial_tflops = state.get("initial_tflops") or 6.4
+    pytorch_tflops = state.get("pytorch_tflops") or 9.2
     tflops_arr = np.array([initial_tflops * cs for cs in cum_speeds])
 
     # ── Tier ranges ──

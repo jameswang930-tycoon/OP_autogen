@@ -242,3 +242,37 @@ def stride_access_after(mat_ptr, out_ptr, M, N, BLOCK_M: tl.constexpr, BLOCK_N: 
 - **修复方案**：单次合并总数据量不超过 64KB，超过时拆分为 2~3 次传输；优先合并地址最连续、调度开销最高的一组。
 
 需要我补充针对特定算子（如矩阵乘、LayerNorm）的 Tier 4 专项优化模板，或者访存优化的收益量化计算公式吗？
+---
+
+## ★matmul 专属改码示例（纯 triton, 910B3 验证可行）
+
+### Swizzle（grouped ordering）— 提升 L2 复用, 经典 >10% 优化
+
+当前我们的 kernel 用简单 row-major（`pid_m = pid // grid_n`）。改成 **grouped swizzle**（官方 03 教程方法，纯 triton，triton-ascend 可用）：
+
+**before（当前, 低 L2 复用）:**
+```python
+    pid = tl.program_id(axis=0)
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+```
+
+**after（swizzle, L2 复用更高）:**
+```python
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    GROUP_SIZE_M = 8                       # 每个 group 多少行 M-tile (超参, 可 4/8/16)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+```
+
+**改哪**: kernel 函数开头的 pid 计算部分（② kernel 区）。`GROUP_SIZE_M` 可放 ① config 区。
+**判定**: Tier4 `l2_hit_rate` 低 或 `main_mem_read_bw` 高 → 优先加 swizzle。
+**注意**: 只改 pid 计算, 不改 offs_m/offs_n 的用法, 不改数学。
+

@@ -6,9 +6,13 @@ description: >
   并给出是否晋升下一 tier 的决策。
   触发：调度器每轮开始，把 diagnosis.json 提取出的当前 tier 字段段 + 单文件代码喂给本 skill。
 argument-hint: >
-  输入：tier、extracted_fields（当前 tier 字段段文本）、playbook（策略文档内容）、
-  kernel_code（当前单文件 kernel_op.py 源码）、config（config.json）、history（最近几轮记录）。
-  输出：JSON {strategy, target_speedup, specific_change, expected_impact, promote, promote_reason}
+  输入（由调度器在 prompt 里给出路径/内容）：
+    - 步骤1: skill 路径（本文件, 必须读）
+    - 步骤2: 优化策略文档路径 = docx/playbook_tier{N}_*.md （★按当前 tier 读, 用『cat 路径』读取内容）
+    - 步骤3: 当前单文件路径（★当前正在优化的版本: round1=input/<op>/kernel_op.py, roundN=round(N-1)/kernel_op.py）
+    - 步骤4: 诊断字段文件路径（roundN/07_tier{N}_fields/tier{N}_fields.txt）+ 内联字段
+    - config 常量、history、fusion_analysis（Tier2）
+  输出：JSON {strategy, target_speedup, changes[], expected_impact, promote, promote_reason}
 ---
 
 # Triton Ascend 优化 Planner Skill
@@ -24,6 +28,25 @@ GM≈1.8TB/s, cube≈294.9TFLOPS(fp16)。
 
 调度器只喂**当前 tier 的字段段**（`extracted_fields`）。你只能基于这些字段推理，
 **不要**假设有带宽/算力/冲突等字段，除非它出现在 `extracted_fields` 里。
+
+## ★读来源（必须分清，别读错文件）—— 全从 prompt 给的路径读，别自己找
+
+| 步骤 | 读什么 | 怎么读 |
+|---|---|---|
+| 1 | skill（本文件） | `cat <prompt步骤1给的skill路径>` |
+| 2 | 优化策略文档 | `cat <prompt步骤2给的playbook路径>` = `docx/playbook_tier{N}_*.md`（★按当前 tier） |
+| 3 | 当前单文件 | `cat <prompt步骤3给的kernel路径>`（★当前正在优化的版本） |
+| 4 | 诊断字段 | `cat <prompt步骤4给的07字段文件>` 或 用内联字段 |
+
+「当前单文件」含义（调度器已给绝对路径，直接用）：
+| 轮次 | 路径 | 含义 |
+|---|---|---|
+| round1 | `input/<op>/kernel_op.py` | 原始源文件（未被改过） |
+| roundN (N>1) | `outputs/<op>/<tier>/round(N-1)/kernel_op.py` | **上一轮成功输出**（验证通过才提交） |
+| 失败回退 | 沿用上一个**成功**的 kernel | 验证失败的轮次不提交 |
+
+**只读 prompt 步骤 3 给的那个路径**，绝不去猜/读别的文件。
+`changes[]` 的 old_code 必须**逐字符匹配那个文件**里的代码。
 
 ## 第一步：判断瓶颈是否属于本 tier（promote 决策）
 

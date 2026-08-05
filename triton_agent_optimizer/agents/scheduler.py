@@ -113,6 +113,40 @@ TIER_FIELDS = {
 }
 
 
+def _extract_mnk(code: str):
+    """从 kernel_op.py ①config 区提取 M/N/K (默认值) → (M,N,K) 或 None。"""
+    import re
+    vals = {}
+    for var, env in (("M", "MATMUL_M"), ("N", "MATMUL_N"), ("K", "MATMUL_K")):
+        m = re.search(rf'os\.environ\.get\("{env}",\s*"?(\d+)"?\)', code)
+        if not m:
+            m = re.search(rf"^\s*{var}\s*=\s*(\d+)", code, re.M)
+        if m:
+            vals[var] = int(m.group(1))
+    if len(vals) == 3 and all(vals.values()):
+        return vals["M"], vals["N"], vals["K"]
+    return None
+
+
+def _summarize_changes(plan) -> str:
+    """把 plan 的 changes[] 压成一句梗概 (hist 记录用, 让 planner 知道试过什么)。
+    例: "BLOCK_M,BLOCK_N,BLOCK_K=64,64,64" 或 kernel 行 old→new 截断。"""
+    changes = _extract_changes_from_plan(getattr(plan, "plan_text", ""))
+    if not changes:
+        return getattr(plan, "strategy", "?")[:60]
+    parts = []
+    for ch in changes[:2]:
+        old = (ch.get("old_code") or "").strip()
+        new = (ch.get("new_code") or "").strip()
+        lhs = old.split("=")[0].strip()[:40]
+        rhs = new.split("=")[1].strip()[:40] if "=" in new else ""
+        if rhs:
+            parts.append(f"{lhs}={rhs}")
+        else:
+            parts.append(f"{old[:60]}→{new[:60]}")
+    return "; ".join(parts)[:150]
+
+
 def _extract_changes_from_plan(plan_text: str) -> list:
     """从 plan JSON 提取 changes[] 数量 (打印用)。"""
     try:
@@ -177,6 +211,7 @@ class Scheduler:
         self.max_rounds = max_rounds
         self.target_speedup = target_speedup
         self.use_llm = use_llm and not stub
+        self.optimize_timeout = int(os.environ.get("OPTIMIZE_TIMEOUT", "3600"))
         self.outputs = _PROJECT / "outputs"
         self.kernel_name = op_dir.name
         self.kernel_dir = self.outputs / self.kernel_name
@@ -228,9 +263,14 @@ class Scheduler:
         input_dir = self.current_kernel.parent    # round1=源目录; 后续=上一轮输出目录
         cmd = ["bash", run_sh, str(input_dir), str(round_dir)]
         print(f"  [Scheduler] {' '.join(cmd)} (TIER={tier}, kernel={self.current_kernel})")
+        print(f"  ⏳ 采集进行中 (msprof 需几分钟, 期间无输出是正常的; 超时 {self.optimize_timeout}s)...")
         env = dict(os.environ)
         env["TIER"] = str(tier)
-        subprocess.run(cmd, check=False, timeout=1800, env=env)
+        try:
+            subprocess.run(cmd, check=False, timeout=self.optimize_timeout, env=env)
+        except subprocess.TimeoutExpired:
+            print(f"  ❌ run_optimize 超时 ({self.optimize_timeout}s), 看 {round_dir}/05_task/task_run.txt")
+            return None
         dgn = round_dir / "06_diagnosis" / "diagnosis.json"
         if dgn.exists():
             return json.loads(dgn.read_text(encoding="utf-8"))
@@ -283,6 +323,7 @@ class Scheduler:
             op_dir=self.op_dir,
             fusion_analysis=fusion_analysis,
             round_dir=round_dir,
+            current_kernel=self.current_kernel,
         )
         round_dir.mkdir(parents=True, exist_ok=True)
         plan_md = (f"# Tier{tier} Round{rn} Plan\n\n{plan.plan_text}\n\n"
@@ -302,7 +343,8 @@ class Scheduler:
         skill = _PROJECT / "skills" / "triton-op-coder" / "SKILL.md"
         print(f"  [Coder] 读 {self.current_kernel} 的 changes[] (精确替换) + skill {skill}")
         coder = CoderAgent(use_llm=self.use_llm)
-        result = coder.apply(original, plan.plan_text, prev_err, plan.tier)
+        result = coder.apply(original, plan.plan_text, prev_err, plan.tier,
+                             kernel_path=str(round_dir / "kernel_op.py"))
         round_dir.mkdir(parents=True, exist_ok=True)
         (round_dir / "diff.patch").write_text(result.diff or "(no change)", encoding="utf-8")
         n_changes = len(_extract_changes_from_plan(plan.plan_text))
@@ -368,8 +410,22 @@ class Scheduler:
             if st.get("baseline_ns") is None:
                 st["baseline_ns"] = ks0.get("total_ns")
                 st["num_kernels"] = ks0.get("num_kernels")
+                # 从 kernel config 算 initial_tflops (matmul: 2MNK / baseline_time), 供轨迹图
+                mnk = _extract_mnk(self.current_kernel.read_text(encoding="utf-8")
+                                   if self.current_kernel.exists() else "")
+                if mnk and st["baseline_ns"]:
+                    st["initial_tflops"] = round(
+                        2 * mnk[0] * mnk[1] * mnk[2] / (st["baseline_ns"] / 1e9) / 1e12, 2)
+                # 读 PyTorch 基准 (bench_910b3/pytorch_tflops.json, 由 bench_pytorch.py 生成)
+                pt = _PROJECT / "bench_910b3" / "pytorch_tflops.json"
+                if pt.exists():
+                    try:
+                        st["pytorch_tflops"] = json.loads(pt.read_text(encoding="utf-8"))["tflops"]
+                    except Exception:
+                        pass
                 self._save_traj()
-                print(f"  [基准] 首轮采集 total_ns={ks0.get('total_ns')} kernels={ks0.get('num_kernels')} (加速比基准)")
+                print(f"  [基准] total_ns={ks0.get('total_ns')} kernels={ks0.get('num_kernels')} "
+                      f"initial_tflops={st.get('initial_tflops')} (加速比基准)")
 
             # ③ 诊断: 按当前阶段筛选字段 → 写 07
             _t0 = time.time()
@@ -391,6 +447,8 @@ class Scheduler:
             # ⑤ Coder → 改代码, 输出到 round_dir/kernel_op.py (不碰源文件) (报错同轮重改, ≤3次)
             prev_err, new_code = "", ""
             round_kernel = round_dir / "kernel_op.py"
+            pre_code = self.current_kernel.read_text(encoding="utf-8") \
+                if self.current_kernel.exists() else ""    # NOOP 对比用 (改之前的版本)
             for attempt in range(3):
                 new_code = self._code(plan, rn, round_dir, prev_err)
                 round_kernel.write_text(new_code, encoding="utf-8")
@@ -411,9 +469,23 @@ class Scheduler:
             print(f"  ⏱ ⑤Coder+验证: {time.time()-_t0:.1f}s")
             print(f"  ⏱ 本轮总时: {time.time()-round_start:.1f}s  (总用时 {time.time()-total_start:.1f}s)")
 
-            # ⑦ 记录 + 晋升决策
+            # ⑦ 记录 + 晋升决策 (hist 记"改了啥+结果"梗概, 让 planner 知道试过什么)
+            ok = v.get("ok", False)
+            # NOOP 检测: 本轮写出的 kernel 和改之前的 pre_code 一模一样 (coder 没成功应用)
+            noop = False
+            if round_kernel.exists() and pre_code:
+                try:
+                    noop = (round_kernel.read_text(encoding="utf-8") == pre_code)
+                except Exception:
+                    pass
+            result = "NOOP" if noop else ("OK" if ok else "FAIL")
             hist = {"round": rn, "tier": tier, "strategy": plan.strategy,
-                    "speedup": speedup, "ns": ns, "decision": "KEEP"}
+                    "change": _summarize_changes(plan),       # 例: "BLOCK_M,BLOCK_N,BLOCK_K=64,64,64"
+                    "speedup": round(speedup, 4), "ns": ns,
+                    "decision": "KEEP", "result": result,
+                    "error": (prev_err[:120] if prev_err else "")}
+            if st.get("best_speedup") is None or speedup > st["best_speedup"]:
+                st["best_speedup"] = speedup
             if st.get("best_speedup") is None or speedup > st["best_speedup"]:
                 st["best_speedup"] = speedup
             self.traj["history"].append(hist)

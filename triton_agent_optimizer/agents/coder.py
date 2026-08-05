@@ -87,45 +87,23 @@ def _load_coding_guide() -> str:
     return ""
 
 def _build_system_prompt(plan_text: str = "", tier: int = 1) -> str:
-    guide = _load_coding_guide()
-
-    # 加载当前 Tier 的 Playbook
-    playbook = ""
+    """构造 coder LLM prompt — ★只给文件路径, 让 nga 自己读, 不内嵌大段内容。"""
+    docx = Path(__file__).resolve().parent.parent / "docx"
     tier_files = {
         1: "playbook_tier1_algorithm.md", 2: "playbook_tier2_fusion.md",
         3: "playbook_tier3_tiling.md", 4: "playbook_tier4_memory.md",
         5: "playbook_tier5_compute.md", 6: "playbook_tier6_architecture.md",
     }
-    pb_path = Path(__file__).resolve().parent.parent / "docx" / tier_files.get(tier, "")
-    if pb_path.exists():
-        playbook = pb_path.read_text(encoding="utf-8")[:2000]
-
     parts = []
-    parts.append("You are a Triton kernel code modifier. Output the COMPLETE modified Python file.")
-
-    # ★ 注入 CODING_GUIDE + Tier Playbook (裁剪, 只留关键段; 主要走确定性 changes[] 替换)
-    if guide:
-        parts.append(f"## Coding Guide (MUST READ)\n{guide[:1200]}")
-    if playbook:
-        parts.append(f"## Tier {tier} Optimization Strategy (MUST READ)\n{playbook[:1500]}")
-
-    parts.append(f"""## CRITICAL: Your output MUST be DIFFERENT from the input code.
-Make at least ONE concrete change from this list:
-- Increase BLOCK_SIZE to next power-of-2 (256→512→1024→2048)
-- Fuse two adjacent simple ops into one expression
-- Eliminate a redundant tl.load (same pointer loaded twice)
-- Reorder operations to reduce intermediate variables
-
-## IRON RULES (violating any = FAILURE)
-1. NEVER put num_warps or num_stages inside @triton.jit() — these do NOT go there
-2. NEVER use @triton.autotune — ONLY plain @triton.jit
-3. NEVER change function name, parameter names, or parameter count
-4. NEVER modify the mathematical formula
-5. NEVER add new imports (no torch, numpy, etc.)
-6. Keep exact indentation and code style
-
-## Output: COMPLETE modified Python code. No markdown, no explanation.""")
-
+    parts.append("你是 Triton kernel 代码修改者。优先按 changes[] 精确替换; 需要修报错时才自行改码。")
+    parts.append(f"## 读改码教程: {docx / 'CODING_GUIDE.md'} (前1200字符)")
+    parts.append(f"## 读当前 tier({tier}) 策略: {docx / tier_files.get(tier, '')} (前1500字符)")
+    parts.append("""## IRON RULES (违反 = 失败)
+1. 只改 prompt 给的当前 kernel 文件, 不碰其他文件 (尤其不碰 input/<op>/kernel_op.py 源文件)
+2. 不把 num_warps/num_stages 写进 @triton.jit() (triton-ascend 自动管理)
+3. 不新增 import, 不改函数名/参数名/参数个数
+4. 输出完整修改后的代码, 不要 markdown 代码块包裹
+5. 若 changes[] 的 old_code 找不到 → 报告, 绝不猜测乱改""")
     return "\n\n".join(parts)
 
 
@@ -133,10 +111,11 @@ def _build_user_prompt(
     plan_text: str,
     kernel_code: str,
     previous_error: str = "",
+    kernel_path: Optional[str] = None,
 ) -> str:
     parts = []
 
-    parts.append("## Optimization Plan")
+    parts.append("## Optimization Plan (含 changes[])")
     parts.append(plan_text)
     parts.append("")
 
@@ -149,10 +128,15 @@ def _build_user_prompt(
         parts.append("Please fix this error while still implementing the plan.")
         parts.append("")
 
-    parts.append("## Current Kernel Code")
-    parts.append("```python")
-    parts.append(kernel_code)
-    parts.append("```")
+    if kernel_path:
+        # ★只给路径, 让 nga 读文件 (不内嵌几千字符)
+        parts.append(f"## 当前要改的文件 (读它): {kernel_path}")
+        parts.append("按 plan 的 changes[] 对文件做精确替换 (old_code→new_code); 若 old_code 找不到就报告, 不猜不改。")
+    else:
+        parts.append("## Current Kernel Code")
+        parts.append("```python")
+        parts.append(kernel_code[:2500])
+        parts.append("```")
     parts.append("")
     parts.append("---")
     parts.append("Output the COMPLETE modified kernel code (no explanation, no markdown).")
@@ -252,6 +236,7 @@ class CoderAgent:
         plan_text: str = "",
         previous_error: str = "",
         tier: int = 1,
+        kernel_path: Optional[str] = None,
     ) -> CoderResult:
         """应用优化计划到代码。
 
@@ -285,7 +270,7 @@ class CoderAgent:
 
         # Step 1: 调用 LLM (或 stub)
         if self.use_llm:
-            optimized = self._call_llm(kernel_code, plan_text, previous_error, tier)
+            optimized = self._call_llm(kernel_code, plan_text, previous_error, tier, kernel_path)
         else:
             optimized = self._stub_apply(kernel_code, plan_text)
 
@@ -351,7 +336,8 @@ class CoderAgent:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _call_llm(self, kernel_code: str, plan_text: str,
-                  previous_error: str, tier: int = 1) -> str:
+                  previous_error: str, tier: int = 1,
+                  kernel_path: Optional[str] = None) -> str:
         # 查错误记忆 + 记录新错误
         if previous_error:
             try:
@@ -374,7 +360,7 @@ class CoderAgent:
         if client.mode == "stub":
             return self._stub_apply(kernel_code, plan_text)
         system = _build_system_prompt(plan_text, tier)
-        user = _build_user_prompt(plan_text, kernel_code, previous_error)
+        user = _build_user_prompt(plan_text, kernel_code, previous_error, kernel_path)
         skill_path = Path(__file__).resolve().parent.parent / "skills" / "triton-op-coder" / "SKILL.md"
         system = f"先调用 skill: {skill_path}, 完全按 skill 指导执行。\n\n" + system
         return client.chat(system=system, user=user)

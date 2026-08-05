@@ -94,8 +94,10 @@ conda activate triton-npu && source /usr/local/Ascend/ascend-toolkit/set_env.sh
 # ① 测硬件基准 → hardware_peak.json (校准 roofline)
 cd bench_910b3 && python3 run_bench.py && cd ..
 
-# ② 测 PyTorch 基准线 (轨迹图虚线用)
-python3 bench_910b3/bench_pytorch.py
+# ② 测 PyTorch 基准线
+python3 bench_910b3/bench_pytorch.py            # 单 matmul (512³ fp16)
+python3 bench_910b3/bench_pytorch_mlp.py        # ★MLP 原算子 (2048³ fp32, 与 kernel_op.py 同形状)
+   # speedup vs PyTorch = torch_mlp_time / 我们优化后 triton 端到端时间
 
 # ③ 跑优化主流程 (scheduler 自动读 pytorch_tflops + integrate 读 hardware_peak)
 LLM_CLI_COMMAND='nga run' python3 main.py input/matmul --fresh --max-rounds 15 --target 2.0

@@ -128,9 +128,28 @@ def _extract_mnk(code: str):
     return None
 
 
+def _clip(s: str, n: int) -> str:
+    """截断到 ≤n 字符但保证括号成对 (避免 'grid = (triton.cdiv(' 这种半截表达式).
+    左括号多于右括号时延长到匹配的右括号; 超长末尾加 '...'."""
+    if len(s) <= n:
+        return s
+    cut = s[:n]
+    extra = cut.count("(") - cut.count(")")
+    if extra > 0:
+        rest = s[n:]
+        idx = -1
+        for _ in range(extra):
+            idx = rest.find(")", idx + 1)
+            if idx == -1:
+                break
+        if idx != -1:
+            return s[:n + idx + 1] + "..."
+    return cut + "..."
+
+
 def _summarize_changes(plan) -> str:
     """把 plan 的 changes[] 压成一句梗概 (hist 记录用, 让 planner 知道试过什么)。
-    例: "BLOCK_M,BLOCK_N,BLOCK_K=64,64,64" 或 kernel 行 old→new 截断。"""
+    用 '=' 提取 LHS(变量名)=RHS(新值), 截断时括号保持成对 (不再出现半截表达式)."""
     changes = _extract_changes_from_plan(getattr(plan, "plan_text", ""))
     if not changes:
         return getattr(plan, "strategy", "?")[:60]
@@ -138,13 +157,15 @@ def _summarize_changes(plan) -> str:
     for ch in changes[:2]:
         old = (ch.get("old_code") or "").strip()
         new = (ch.get("new_code") or "").strip()
-        lhs = old.split("=")[0].strip()[:40]
-        rhs = new.split("=")[1].strip()[:40] if "=" in new else ""
+        # ★split("=", 1): 只按第一个 "=" 切 — 否则 new 里第二个 "=" (如 input_precision="tf32")
+        #   会把 RHS 取错段/截断, 产生"只有左括号"的半截表达式
+        lhs = _clip(old.split("=", 1)[0].strip(), 40)
+        rhs = _clip(new.split("=", 1)[1].strip(), 40) if "=" in new else ""
         if rhs:
             parts.append(f"{lhs}={rhs}")
         else:
-            parts.append(f"{old[:60]}→{new[:60]}")
-    return "; ".join(parts)[:150]
+            parts.append(f"{_clip(old, 60)}→{_clip(new, 60)}")
+    return _clip("; ".join(parts), 150)
 
 
 def _extract_changes_from_plan(plan_text: str) -> list:
@@ -379,7 +400,8 @@ class Scheduler:
     def run(self):
         st = self.traj["state"]
         tier, rn = st.get("tier", 1), st.get("round", 1)
-        print(f"══ Scheduler: {self.kernel_name} 目标 {self.target_speedup}x ══")
+        tgt = f"目标 {self.target_speedup}x" if self.target_speedup > 0 else "无目标(跑满 max_rounds 看最优)"
+        print(f"══ Scheduler: {self.kernel_name} {tgt} ══")
 
         # Warm-up: 首次 nga run 冷启动(模型加载)可能很久, 提前预热
         if self.use_llm:
@@ -418,6 +440,10 @@ class Scheduler:
             if st.get("baseline_ns") is None:
                 st["baseline_ns"] = ks0.get("total_ns")
                 st["num_kernels"] = ks0.get("num_kernels")
+                mnk = _extract_mnk(self.current_kernel.read_text(encoding="utf-8")
+                                   if self.current_kernel.exists() else "")
+                if mnk:
+                    st["baseline_mnk"] = list(mnk)   # 记 baseline 尺寸, 防后续轮跨尺寸失真
                 # initial_tflops (供轨迹图):
                 #   ★优先用诊断的真实 cube_fops 之和 (多 matmul/多 kernel 正确, MLP=2×2MNK)
                 #   兜底用 config 的 2MNK (单 matmul)
@@ -426,12 +452,9 @@ class Scheduler:
                 if cube_fops and st["baseline_ns"]:
                     st["initial_tflops"] = round(
                         cube_fops / (st["baseline_ns"] / 1e9) / 1e12, 2)
-                else:
-                    mnk = _extract_mnk(self.current_kernel.read_text(encoding="utf-8")
-                                       if self.current_kernel.exists() else "")
-                    if mnk and st["baseline_ns"]:
-                        st["initial_tflops"] = round(
-                            2 * mnk[0] * mnk[1] * mnk[2] / (st["baseline_ns"] / 1e9) / 1e12, 2)
+                elif mnk and st["baseline_ns"]:
+                    st["initial_tflops"] = round(
+                        2 * mnk[0] * mnk[1] * mnk[2] / (st["baseline_ns"] / 1e9) / 1e12, 2)
                 # 读 PyTorch 基准 (bench_910b3/pytorch_tflops.json, 由 bench_pytorch.py 生成)
                 pt = _PROJECT / "bench_910b3" / "pytorch_tflops.json"
                 if pt.exists():
@@ -439,9 +462,36 @@ class Scheduler:
                         st["pytorch_tflops"] = json.loads(pt.read_text(encoding="utf-8"))["tflops"]
                     except Exception:
                         pass
+                # ★基准复测: 诊断 total_ns 是单次 msprof 采样(噪声大),
+                #   用 verify 机制 (warmup + VERIFY_RUNS 轮 msprof 平均) 重测源 kernel,
+                #   与后续轮完全同口径, 加速比才可信. 默认开, VERIFY_BASELINE=0 跳过.
+                if os.environ.get("VERIFY_BASELINE", "1") == "1":
+                    try:
+                        from agents.verifier import verify_end_to_end
+                        base_rd = self.kernel_dir / "baseline_verify"
+                        base_rd.mkdir(parents=True, exist_ok=True)
+                        vb = verify_end_to_end(self.current_kernel, base_rd, None)
+                        if vb.get("ok") and vb.get("ns"):
+                            st["baseline_ns"] = vb["ns"]
+                            if cube_fops:
+                                st["initial_tflops"] = round(
+                                    cube_fops / (vb["ns"] / 1e9) / 1e12, 2)
+                            print(f"  [基准] 复测平均 baseline_ns={vb['ns']}ns "
+                                  f"(warmup+msprof 平均, 与后续轮同口径)")
+                    except Exception as e:
+                        print(f"  [基准] 复测失败({str(e)[:100]}), 用诊断 total_ns")
                 self._save_traj()
                 print(f"  [基准] total_ns={ks0.get('total_ns')} kernels={ks0.get('num_kernels')} "
                       f"initial_tflops={st.get('initial_tflops')} (加速比基准)")
+
+            # 尺寸一致性 guard: 若本轮 kernel 的 M/N/K 与 baseline 不同 → 加速比跨尺寸失真
+            bmnk = st.get("baseline_mnk")
+            if bmnk:
+                cmnk = _extract_mnk(self.current_kernel.read_text(encoding="utf-8")
+                                    if self.current_kernel.exists() else "")
+                if cmnk and tuple(cmnk) != tuple(bmnk):
+                    print(f"  ⚠ 尺寸变化! baseline M/N/K={bmnk}, 当前={list(cmnk)} "
+                          f"→ 加速比跨尺寸失真, 检查优化是否误改 M/N/K")
 
             # ③ 诊断: 按当前阶段筛选字段 → 写 07
             _t0 = time.time()
@@ -527,7 +577,7 @@ class Scheduler:
                 if h.get("speedup", 0) > h.get("prev_speedup", 0):
                     break
                 no_improve += 1
-            if speedup >= self.target_speedup:
+            if self.target_speedup > 0 and speedup >= self.target_speedup:
                 print("  🎯 加速比达标, 停止")
                 st["round"] = rn + 1
                 self._save_traj()

@@ -231,8 +231,9 @@ echo "你是 Triton 优化 Planner。先调用 skill: skills/triton-op-planner/S
 conda activate triton-npu
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
-# ① 完整优化循环 (推荐)
+# ① 完整优化循环 (推荐; --target 省略/0 = 不设目标跑满 --max-rounds, 看最优)
 LLM_CLI_COMMAND='nga run' python3 main.py input/matmul --fresh --max-rounds 15 --target 2.0
+LLM_CLI_COMMAND='nga run' python3 main.py input/matmul --fresh --max-rounds 15   # 无目标, 跑满15轮
 
 # ② 只采集+解析
 bash analyzers/run_optimize.sh input/matmul input/matmul/e2e_run

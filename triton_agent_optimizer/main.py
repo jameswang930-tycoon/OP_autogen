@@ -60,7 +60,8 @@ def main():
     p = argparse.ArgumentParser(description="Triton Agent Optimizer v4")
     p.add_argument("op_dir", type=str, help="input/<op> 目录 (含 triton_kernel.py + config.json + test)")
     p.add_argument("--max-rounds", type=int, default=200)
-    p.add_argument("--target", type=float, default=1.5)
+    p.add_argument("--target", type=float, default=0.0,
+                   help="目标加速比, 达标即停; 0 或省略 = 不设目标, 跑满 --max-rounds 看最优")
     p.add_argument("--stub", action="store_true", help="不调 LLM/真机, 用 stub (本地测试)")
     p.add_argument("--remerge", action="store_true", help="强制重新合并单文件 (会覆盖 coder 改动)")
     p.add_argument("--fresh", action="store_true",

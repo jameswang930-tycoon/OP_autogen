@@ -168,7 +168,7 @@ echo "你是 Triton 优化 Planner。先调用 skill: skills/triton-op-planner/S
 ### 6.4 超时设置
 | env | 默认 | 作用 |
 |---|---|---|
-| `LLM_CLI_TIMEOUT` | 900 | nga run 调用 |
+| `LLM_CLI_TIMEOUT` | 1200 | nga run 调用 (超时自动兜底不崩循环) |
 | `OPTIMIZE_TIMEOUT` | 3600 | run_optimize 采集 |
 | `VERIFY_WARMUP` | 1 | 验证热身裸跑 |
 | `VERIFY_RUNS` | 3 | 验证 msprof 轮数 |

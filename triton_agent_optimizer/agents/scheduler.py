@@ -333,13 +333,19 @@ class Scheduler:
 
     # ── ⑤ Coder (读 current_kernel, 精确应用 changes[], 输出 round_dir/kernel_op.py) ──
     def _code(self, plan, rn: int, round_dir: Path, prev_err: str = "") -> str:
-        from agents.coder import CoderAgent
+        from agents.coder import CoderAgent, CoderResult
         original = self.current_kernel.read_text(encoding="utf-8") if self.current_kernel.exists() else ""
         skill = _PROJECT / "skills" / "triton-op-coder" / "SKILL.md"
         print(f"  [Coder] 读 {self.current_kernel} 的 changes[] (精确替换) + skill {skill}")
         coder = CoderAgent(use_llm=self.use_llm)
-        result = coder.apply(original, plan.plan_text, prev_err, plan.tier,
-                             kernel_path=str(round_dir / "kernel_op.py"))
+        try:
+            result = coder.apply(original, plan.plan_text, prev_err, plan.tier,
+                                 kernel_path=str(round_dir / "kernel_op.py"))
+        except Exception as e:
+            # ★任何编码异常(含 LLM 超时) → 不崩整个循环: 沿用原代码, 本轮失败
+            print(f"  [Coder] ❌ 编码异常: {str(e)[:200]} → 沿用原代码, 本轮失败")
+            result = CoderResult(success=False, optimized_code=original, diff="",
+                                 error_message=f"编码异常: {str(e)[:200]}")
         round_dir.mkdir(parents=True, exist_ok=True)
         (round_dir / "diff.patch").write_text(result.diff or "(no change)", encoding="utf-8")
         n_changes = len(_extract_changes_from_plan(plan.plan_text))

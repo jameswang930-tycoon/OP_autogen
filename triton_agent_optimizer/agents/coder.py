@@ -271,7 +271,13 @@ class CoderAgent:
 
         # Step 1: 调用 LLM (或 stub)
         if self.use_llm:
-            optimized = self._call_llm(kernel_code, plan_text, previous_error, tier, kernel_path)
+            try:
+                optimized = self._call_llm(kernel_code, plan_text, previous_error, tier, kernel_path)
+            except Exception as e:
+                # ★超时/调用失败 → 不崩整个循环: 返回原代码 + 报错信息 (调度器标 NOOP/FAIL 继续)
+                print(f"  [Coder] ⚠ LLM 调用失败: {str(e)[:200]}")
+                return CoderResult(success=False, optimized_code=kernel_code, diff="",
+                                   error_message=f"LLM 调用失败: {str(e)[:200]}")
         else:
             optimized = self._stub_apply(kernel_code, plan_text)
 

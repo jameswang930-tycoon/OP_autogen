@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
-"""910B3 硬件基准 kernels — 纯 triton (与 kernel_op.py 同风格), 自包含可跑。
+"""910B3 硬件基准 kernels — 纯 triton, 自包含可跑. 每类 bench 多个变体 (尺寸×分块×精度扫描).
 
-每个 bench: 分配 NPU 张量 → 启动 kernel → 同步。返回 (bytes, flops) 供算带宽/算力。
+科学原则:
+  1. 多变体扫描 (尺寸×分块×精度) — 单次测量是真值的下界, 取最大
+  2. **一次 msprof 内循环跑 warmup+measure 次** — 跳过热身前奏, 平均稳态:
+     - 默认 BENCH_WARMUP_ITERS=30 热身 + BENCH_MEASURE_ITERS=100 测量
+     - run_bench.py 读 op_summary 跳过前 30 次, 平均后 100 次 (与主循环同源 msprof)
+  3. `--single` 单次 launch — 供 msprof op per-path (每路径带宽) 用
 
-═══ 怎么运行 (910B3 服务器) ═══
-  单测某个 kernel 能跑 (不带 msprof):
-    python3 bench_kernels.py --bench read_bw
-  列出所有:
-    python3 bench_kernels.py --list
-  完整测量 (warmup+msprof 多轮): 用 run_bench.py (见其顶部教程)
-  环境: conda activate triton-npu && source set_env.sh
+测什么 (6 类, 覆盖全链路带宽/算力):
+  gm_read     GM 读带宽 (多尺寸×分块扫描)
+  gm_write    GM 写带宽
+  gm_copy     GM 拷贝 (读A写B)
+  l2_read     L2 读带宽 (L2 内数组反复读)
+  cube        cube 算力 (fp16/fp32 × 尺寸×分块扫描)
+  vec         Vec 吞吐 (add/mul/fma)
 
-  测什么 (6 个):
-    read_bw  GM 读带宽 | write_bw  GM 写带宽 | copy_bw  GM 拷贝
-    l2_bw    L2 读带宽 | mm       cube 算力  | vec      Vec 吞吐
-  尺寸 env: BENCH_BW_N / BENCH_L2_N / BENCH_MM / BENCH_VEC_N
+用法 (910B3 服务器):
+  conda activate triton-npu && source /usr/local/Ascend/ascend-toolkit/set_env.sh
+  python3 bench_kernels.py --list                          # 列出所有
+  python3 bench_kernels.py --bench cube --variant 0        # 单变体 (30+100 循环, 打印 avg)
+  python3 bench_kernels.py --bench cube --variant 0 --single  # 单次 (msprof op 用)
+  python3 run_bench.py                                     # ★全套实测 (推荐)
+  循环次数: BENCH_WARMUP_ITERS=30 BENCH_MEASURE_ITERS=100  (env 覆盖)
 """
 import os
 import sys
+import time
 import torch
 try:
     import torch_npu          # 仅服务器有; --list/--help 不需要
@@ -26,20 +35,13 @@ except ImportError:
 import triton
 import triton.language as tl
 
+# 配置注册表 + 静态字节/算力 (无 triton 依赖, 见 bench_config.py)
+from bench_config import BENCHES, variant_bytes_flops  # noqa: E402
+
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
-
-# ═══ 配置 (env 可覆盖) ═══
-BW_N      = int(os.environ.get("BENCH_BW_N", 1 << 22))       # 4M 元素 = 16MB fp32
-L2_N      = int(os.environ.get("BENCH_L2_N", 1 << 20))       # 1M 元素 = 4MB (L2 内)
-L2_ITERS  = int(os.environ.get("BENCH_L2_ITERS", 64))        # L2 内反复读次数
-MM        = int(os.environ.get("BENCH_MM", 4096))            # 4096³ matmul (compute-bound)
-VEC_N     = int(os.environ.get("BENCH_VEC_N", 1 << 23))      # 8M 元素
-BLOCK     = 1024
-DTYPE     = torch.float32
-MM_BLOCK_M, MM_BLOCK_N, MM_BLOCK_K = 128, 128, 64
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -47,24 +49,26 @@ MM_BLOCK_M, MM_BLOCK_N, MM_BLOCK_K = 128, 128, 64
 # ═══════════════════════════════════════════════════════════════════════
 
 @triton.jit
-def read_bw_kernel(x_ptr, out_ptr, N, BLOCK: tl.constexpr):
+def read_kernel(x_ptr, out_ptr, N, BLOCK: tl.constexpr):
+    """纯读大数组 (归约防 load 被优化掉)."""
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < N
     x = tl.load(x_ptr + offs, mask=mask, other=0.0)
-    tl.store(out_ptr + pid, tl.sum(x))   # 归约防 load 被优化掉
+    tl.store(out_ptr + pid, tl.sum(x))
 
 
 @triton.jit
-def write_bw_kernel(x_ptr, N, BLOCK: tl.constexpr):
+def write_kernel(x_ptr, N, BLOCK: tl.constexpr):
+    """纯写大数组."""
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N
-    tl.store(x_ptr + offs, 1.0, mask=mask)
+    tl.store(x_ptr + offs, 1.0, mask=offs < N)
 
 
 @triton.jit
-def copy_bw_kernel(a_ptr, b_ptr, N, BLOCK: tl.constexpr):
+def copy_kernel(a_ptr, b_ptr, N, BLOCK: tl.constexpr):
+    """读A写B (拷贝)."""
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < N
@@ -72,7 +76,8 @@ def copy_bw_kernel(a_ptr, b_ptr, N, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def l2_bw_kernel(x_ptr, out_ptr, N, ITERS, BLOCK: tl.constexpr):
+def l2_read_kernel(x_ptr, out_ptr, N, ITERS, BLOCK: tl.constexpr):
+    """L2 内小数组反复读 (测 L2 带宽, 数据不落 GM)."""
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < N
@@ -85,6 +90,7 @@ def l2_bw_kernel(x_ptr, out_ptr, N, ITERS, BLOCK: tl.constexpr):
 @triton.jit
 def mm_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    """matmul (fp16/fp32, 视输入 dtype), fp32 累加."""
     pid = tl.program_id(0)
     grid_n = (N + BLOCK_N - 1) // BLOCK_N
     pid_m = pid // grid_n
@@ -106,113 +112,124 @@ def mm_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
 
 
 @triton.jit
-def vec_bw_kernel(a_ptr, b_ptr, c_ptr, N, BLOCK: tl.constexpr):
+def vec_kernel(a_ptr, b_ptr, c_ptr, N, OP: tl.constexpr, BLOCK: tl.constexpr):
+    """向量运算: OP=0 add, 1 mul, 2 fma (a*b+a). 读2写1."""
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < N
     a = tl.load(a_ptr + offs, mask=mask, other=0.0)
     b = tl.load(b_ptr + offs, mask=mask, other=0.0)
-    tl.store(c_ptr + offs, a + b, mask=mask)
+    if OP == 0:
+        r = a + b
+    elif OP == 1:
+        r = a * b
+    else:
+        r = a * b + a
+    tl.store(c_ptr + offs, r, mask=mask)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  bench 运行函数 → (bytes, flops)
+#  分配 + launch 分离 (循环复用同一批张量, 避免分配开销污染计时)
 # ═══════════════════════════════════════════════════════════════════════
 
-def run_read_bw():
-    """GM 读带宽: 读 BW_N*4B, 写几乎为 0。"""
-    x = torch.empty(BW_N, dtype=DTYPE, device="npu")
-    out = torch.empty(BW_N // BLOCK, dtype=DTYPE, device="npu")
-    grid = (BW_N // BLOCK,)
-    read_bw_kernel[grid](x, out, BW_N, BLOCK=BLOCK)
-    torch.npu.synchronize()
-    return BW_N * 4, 0
+def _alloc(btype: str, v: dict) -> dict:
+    npu = torch.device("npu")
+    if btype == "read":
+        return {"x": torch.empty(v["N"], dtype=torch.float32, device=npu),
+                "out": torch.empty(v["N"] // v["BLOCK"], dtype=torch.float32, device=npu)}
+    if btype == "write":
+        return {"x": torch.empty(v["N"], dtype=torch.float32, device=npu)}
+    if btype == "copy":
+        return {"a": torch.empty(v["N"], dtype=torch.float32, device=npu),
+                "b": torch.empty(v["N"], dtype=torch.float32, device=npu)}
+    if btype == "l2":
+        return {"x": torch.empty(v["N"], dtype=torch.float32, device=npu),
+                "out": torch.empty(v["N"] // v["BLOCK"], dtype=torch.float32, device=npu)}
+    if btype == "mm":
+        dt = torch.float16 if v["dtype"] == "float16" else torch.float32
+        return {"a": torch.rand(v["M"], v["K"], dtype=dt, device=npu),
+                "b": torch.rand(v["K"], v["N"], dtype=dt, device=npu),
+                "c": torch.empty(v["M"], v["N"], dtype=torch.float32, device=npu)}
+    if btype == "vec":
+        return {"a": torch.empty(v["N"], dtype=torch.float32, device=npu),
+                "b": torch.empty(v["N"], dtype=torch.float32, device=npu),
+                "c": torch.empty(v["N"], dtype=torch.float32, device=npu)}
+    raise ValueError(f"未知 bench 类型: {btype}")
 
 
-def run_write_bw():
-    """GM 写带宽: 写 BW_N*4B。"""
-    x = torch.empty(BW_N, dtype=DTYPE, device="npu")
-    grid = (BW_N // BLOCK,)
-    write_bw_kernel[grid](x, BW_N, BLOCK=BLOCK)
-    torch.npu.synchronize()
-    return 0, BW_N * 4
+def _launch(btype: str, v: dict, t: dict):
+    if btype == "read":
+        read_kernel[(v["N"] // v["BLOCK"],)](t["x"], t["out"], v["N"], BLOCK=v["BLOCK"])
+    elif btype == "write":
+        write_kernel[(v["N"] // v["BLOCK"],)](t["x"], v["N"], BLOCK=v["BLOCK"])
+    elif btype == "copy":
+        copy_kernel[(v["N"] // v["BLOCK"],)](t["a"], t["b"], v["N"], BLOCK=v["BLOCK"])
+    elif btype == "l2":
+        l2_read_kernel[(v["N"] // v["BLOCK"],)](t["x"], t["out"], v["N"], v["ITERS"], BLOCK=v["BLOCK"])
+    elif btype == "mm":
+        grid = (triton.cdiv(v["M"], v["BM"]) * triton.cdiv(v["N"], v["BN"]),)
+        mm_kernel[grid](t["a"], t["b"], t["c"], v["M"], v["N"], v["K"],
+                        BLOCK_M=v["BM"], BLOCK_N=v["BN"], BLOCK_K=v["BK"])
+    elif btype == "vec":
+        vec_kernel[(v["N"] // v["BLOCK"],)](t["a"], t["b"], t["c"], v["N"], OP=v["OP"], BLOCK=v["BLOCK"])
+    else:
+        raise ValueError(f"未知 bench 类型: {btype}")
 
 
-def run_copy_bw():
-    """GM 拷贝带宽: 读 A + 写 B, 共 2*BW_N*4B。"""
-    a = torch.empty(BW_N, dtype=DTYPE, device="npu")
-    b = torch.empty(BW_N, dtype=DTYPE, device="npu")
-    grid = (BW_N // BLOCK,)
-    copy_bw_kernel[grid](a, b, BW_N, BLOCK=BLOCK)
-    torch.npu.synchronize()
-    return BW_N * 4, BW_N * 4
-
-
-def run_l2_bw():
-    """L2 读带宽: 小数组 (L2 内) 反复读 L2_ITERS 次。"""
-    x = torch.empty(L2_N, dtype=DTYPE, device="npu")
-    out = torch.empty(L2_N // BLOCK, dtype=DTYPE, device="npu")
-    grid = (L2_N // BLOCK,)
-    l2_bw_kernel[grid](x, out, L2_N, L2_ITERS, BLOCK=BLOCK)
-    torch.npu.synchronize()
-    return L2_N * 4 * L2_ITERS, 0
-
-
-def run_mm():
-    """cube 算力: 4096³ fp16 matmul (compute-bound), flops=2*M*N*K。"""
-    dtype = torch.float16
-    a = torch.rand(MM, MM, dtype=dtype, device="npu")
-    b = torch.rand(MM, MM, dtype=dtype, device="npu")
-    c = torch.empty(MM, MM, dtype=torch.float32, device="npu")
-    grid = ((MM // MM_BLOCK_M) * (MM // MM_BLOCK_N),)
-    mm_kernel[grid](a, b, c, MM, MM, MM,
-                    BLOCK_M=MM_BLOCK_M, BLOCK_N=MM_BLOCK_N, BLOCK_K=MM_BLOCK_K)
-    torch.npu.synchronize()
-    bytes_ = (MM * MM * 3) * 2   # 读A+读B+写C, fp16
-    return bytes_, 0
-
-
-def run_vec():
-    """Vec 吞吐: 读 A+B + 写 C, 共 3*VEC_N*4B。"""
-    a = torch.empty(VEC_N, dtype=DTYPE, device="npu")
-    b = torch.empty(VEC_N, dtype=DTYPE, device="npu")
-    c = torch.empty(VEC_N, dtype=DTYPE, device="npu")
-    grid = (VEC_N // BLOCK,)
-    vec_bw_kernel[grid](a, b, c, VEC_N, BLOCK=BLOCK)
-    torch.npu.synchronize()
-    return VEC_N * 4 * 2, VEC_N * 4
-
-
-# ═══ bench 注册 (flops: 计算量, 算 TFLOPS 用; 其余为字节数) ═══
-BENCHES = {
-    "read_bw":   {"run": run_read_bw,  "desc": "GM 读带宽 (只读大数组)", "flops": 0},
-    "write_bw":  {"run": run_write_bw, "desc": "GM 写带宽 (只写大数组)", "flops": 0},
-    "copy_bw":   {"run": run_copy_bw,  "desc": "GM 拷贝带宽 (读A写B)", "flops": 0},
-    "l2_bw":     {"run": run_l2_bw,    "desc": "L2 读带宽 (L2内小数组反复读)", "flops": 0},
-    "mm":        {"run": run_mm,       "desc": "cube 算力 (4096³ fp16 matmul)", "flops": 2 * MM * MM * MM},
-    "vec":       {"run": run_vec,      "desc": "Vec 吞吐 (大向量 add)", "flops": 0},
-}
+def run_variant(btype: str, v: dict, sync: bool = True) -> tuple:
+    """分配一次 + launch (可选 sync). 返回 (bytes, flops)."""
+    t = _alloc(btype, v)
+    _launch(btype, v, t)
+    if sync:
+        torch.npu.synchronize()
+    return variant_bytes_flops(btype, v)
 
 
 def main():
     import argparse
     p = argparse.ArgumentParser(description="910B3 bench kernels")
     p.add_argument("--bench", type=str, help=f"bench 名: {list(BENCHES)}")
-    p.add_argument("--list", action="store_true", help="列出所有 bench")
+    p.add_argument("--variant", type=int, default=0, help="变体索引")
+    p.add_argument("--single", action="store_true", help="单次 launch (msprof op per-path 用)")
+    p.add_argument("--list", action="store_true", help="列出所有 bench + 变体")
     args = p.parse_args()
     if args.list:
         for n, b in BENCHES.items():
-            print(f"  {n:10s} {b['desc']}")
+            print(f"  {n:10s} {b['desc']}  ({len(b['variants'])} 变体)")
         return
     if args.bench not in BENCHES:
         print(f"❌ 未知 bench: {args.bench}. 可选: {list(BENCHES)}")
+        sys.exit(1)
+    b = BENCHES[args.bench]
+    if not (0 <= args.variant < len(b["variants"])):
+        print(f"❌ variant 越界: 0~{len(b['variants'])-1}")
         sys.exit(1)
     if not torch.npu.is_available():
         print("[FATAL] torch.npu 不可用")
         sys.exit(1)
     torch.npu.set_device(0)
-    rb, wb = BENCHES[args.bench]["run"]()
-    print(f"[ok] {args.bench}: read={rb}B write={wb}B")
+    v = b["variants"][args.variant]
+
+    if args.single:
+        bytes_total, flops = run_variant(b["type"], v, sync=True)
+        print(f"[ok] {args.bench} v{args.variant}: single launch bytes={bytes_total}B flops={flops}")
+        return
+
+    # 循环模式: warmup + measure 次, 分配一次复用 (供 run_bench 的 msprof 一次采集)
+    warmup = int(os.environ.get("BENCH_WARMUP_ITERS", "30"))
+    measure = int(os.environ.get("BENCH_MEASURE_ITERS", "100"))
+    t = _alloc(b["type"], v)
+    for _ in range(warmup):
+        _launch(b["type"], v, t)
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(measure):
+        _launch(b["type"], v, t)
+    torch.npu.synchronize()
+    t1 = time.perf_counter()
+    avg_us = (t1 - t0) / measure * 1e6
+    print(f"[bench] {args.bench} v{args.variant}: warmup {warmup} + measure {measure} "
+          f"→ avg {avg_us:.1f} us/run (host 计时, 仅供参考; run_bench 以 msprof 为准)")
 
 
 if __name__ == "__main__":

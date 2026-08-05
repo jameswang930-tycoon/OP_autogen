@@ -420,8 +420,8 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
     """
     import os as _os
     import subprocess
-    warmup = int(_os.environ.get("VERIFY_WARMUP", "1"))
-    runs = int(_os.environ.get("VERIFY_RUNS", "3"))
+    warmup = int(_os.environ.get("VERIFY_WARMUP", "3"))   # 裸跑热身 (JIT/冷cache), 便宜
+    runs = int(_os.environ.get("VERIFY_RUNS", "3"))       # msprof 轮数 (每次~1-2min, 别调太大)
     py = "python3"
 
     # warmup: 裸跑预热 (不 profile)

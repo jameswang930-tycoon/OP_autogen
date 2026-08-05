@@ -17,9 +17,23 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pipeline_schema import read_json, write_json  # noqa: E402
 
-# ── 910B3 理论峰值 (官网/实测) ──
-PEAK_MEM_BW_GB_S = 1800.0     # GM 理论 ~1.8 TB/s
-PEAK_COMPUTE_TFLOPS = 294.9   # cube fp16: 20核 × 16³ FMA × 1.8GHz
+# ── 910B3 峰值 ──
+#   优先用 bench_910b3/hardware_peak.json 实测值 (run_bench.py 生成, 多变体取 max);
+#   没有则回退硬编码 (GM 理论 1.8TB/s, cube fp16 294.9 TFLOPS).
+def _load_measured_peaks() -> dict:
+    import json as _json
+    p = Path(__file__).resolve().parent.parent / "bench_910b3" / "hardware_peak.json"
+    try:
+        if p.exists():
+            d = _json.loads(p.read_text(encoding="utf-8"))
+            return d.get("peak", {})
+    except Exception:
+        pass
+    return {}
+
+_MEASURED = _load_measured_peaks()
+PEAK_MEM_BW_GB_S = float(_MEASURED.get("gm_bw_gb_s", 1800.0))          # 实测 GM 聚合峰值
+PEAK_COMPUTE_TFLOPS = float(_MEASURED.get("cube_fp16_tflops", 294.9))  # 实测 cube fp16
 
 
 def _classify(mem_util, comp_util):

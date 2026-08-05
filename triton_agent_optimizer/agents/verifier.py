@@ -383,7 +383,9 @@ if __name__ == "__main__":
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _read_target_duration(prof_out: Path) -> Optional[float]:
-    """读 op_summary, 取目标 kernel (非 aclnn) 的最大 Task Duration(us)。"""
+    """读 op_summary, 目标 kernel (非 aclnn) 的 Task Duration(us) 之和 = 端到端.
+    ★多 kernel (如 MLP: fc1+bias_gelu+fc2) 求和才是总耗时; 单 kernel 即本身.
+      排除 aclnn 框架 kernel — 与 task.json total_ns (baseline) 口径一致."""
     import csv as _csv
     summaries = sorted(prof_out.rglob("op_summary*.csv"))
     if not summaries:
@@ -393,16 +395,16 @@ def _read_target_duration(prof_out: Path) -> Optional[float]:
             rows = list(_csv.DictReader(f))
     except Exception:
         return None
-    dur_us = None
+    total_us = None
     for row in rows:
         dur = row.get("Task Duration(us)") or row.get("TaskDuration")
         op = row.get("Op Name") or row.get("OpName") or ""
         if dur and not op.lower().startswith("aclnn"):
             try:
-                dur_us = max(dur_us or 0, float(dur))
+                total_us = (total_us or 0) + float(dur)
             except ValueError:
                 pass
-    return dur_us
+    return total_us
 
 
 def verify_end_to_end(kernel_op: Path, round_dir: Path,

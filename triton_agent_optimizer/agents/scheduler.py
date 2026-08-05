@@ -411,12 +411,20 @@ class Scheduler:
             if st.get("baseline_ns") is None:
                 st["baseline_ns"] = ks0.get("total_ns")
                 st["num_kernels"] = ks0.get("num_kernels")
-                # 从 kernel config 算 initial_tflops (matmul: 2MNK / baseline_time), 供轨迹图
-                mnk = _extract_mnk(self.current_kernel.read_text(encoding="utf-8")
-                                   if self.current_kernel.exists() else "")
-                if mnk and st["baseline_ns"]:
+                # initial_tflops (供轨迹图):
+                #   ★优先用诊断的真实 cube_fops 之和 (多 matmul/多 kernel 正确, MLP=2×2MNK)
+                #   兜底用 config 的 2MNK (单 matmul)
+                cube_fops = sum((k.get("deep") or {}).get("compute", {}).get("cube_fops") or 0
+                                for k in (diagnosis.get("kernels") or []))
+                if cube_fops and st["baseline_ns"]:
                     st["initial_tflops"] = round(
-                        2 * mnk[0] * mnk[1] * mnk[2] / (st["baseline_ns"] / 1e9) / 1e12, 2)
+                        cube_fops / (st["baseline_ns"] / 1e9) / 1e12, 2)
+                else:
+                    mnk = _extract_mnk(self.current_kernel.read_text(encoding="utf-8")
+                                       if self.current_kernel.exists() else "")
+                    if mnk and st["baseline_ns"]:
+                        st["initial_tflops"] = round(
+                            2 * mnk[0] * mnk[1] * mnk[2] / (st["baseline_ns"] / 1e9) / 1e12, 2)
                 # 读 PyTorch 基准 (bench_910b3/pytorch_tflops.json, 由 bench_pytorch.py 生成)
                 pt = _PROJECT / "bench_910b3" / "pytorch_tflops.json"
                 if pt.exists():

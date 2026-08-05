@@ -174,8 +174,10 @@ echo "你是 Triton 优化 Planner。先调用 skill: skills/triton-op-planner/S
 | `VERIFY_RUNS` | 3 | 验证 msprof 轮数 |
 
 ### 6.5 加速比
-- **加速比 = 时间比**：`baseline_time / current_time`（msprof Task Duration），baseline = round1 采集的原始 kernel
-- 图上 TFLOPS = 同一比值的换算（M/N/K 固定时 2MNK/time）
+- **加速比 = 时间比**：`baseline_time / current_time`
+- **端到端耗时 = 目标 kernel (非 aclnn) Task Duration 之和**（多 kernel 如 MLP: fc1+bias_gelu+fc2 求和才是总耗时; 单 kernel 即本身; baseline 与 verify 同口径）
+- baseline = round1 采集的原始 kernel 端到端; current = 本轮验证 msprof 端到端
+- 图上 TFLOPS = 诊断 cube_fops 总和 / baseline_ns（多 matmul 正确, 非 2MNK 单算）
 - vs PyTorch = 我们算力 / torch.matmul 算力
 
 ---

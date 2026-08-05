@@ -334,8 +334,13 @@ def parse(base):
     def _max(k):
         vals = [x.get(k) for x in kernels if x.get(k)]
         return max(vals) if vals else None
-    total_ns = _max("task_duration_us")
-    total_ns = total_ns * 1000 if total_ns else None
+    # ★端到端耗时 = 目标 kernel (非 aclnn) Task Duration 之和
+    #   (多 kernel 如 MLP: fc1+bias_gelu+fc2 求和才是总耗时; 单 kernel 即本身)
+    #   排除 aclnn 框架 kernel — 与 verifier.verify_end_to_end 口径一致
+    target_durs = [k["task_duration_us"] for k in kernels
+                   if k.get("task_duration_us")
+                   and not (k.get("op_name") or "").lower().startswith("aclnn")]
+    total_ns = (sum(target_durs) * 1000) if target_durs else None
     kernel = next((k["op_name"] for k in kernels if k["op_name"]), None)
     # num_kernels = 去重后的 op 名数 (op_summary 每行是一次启动, 同名只算一个 kernel)
     #   ★只算非框架 kernel (优化目标); 框架 kernel (aclnn* torch 数据准备) 单列 framework_kernels

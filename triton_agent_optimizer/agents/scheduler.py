@@ -130,20 +130,22 @@ def _extract_mnk(code: str):
 
 def _clip(s: str, n: int) -> str:
     """截断到 ≤n 字符但保证括号成对 (避免 'grid = (triton.cdiv(' 这种半截表达式).
-    左括号多于右括号时延长到匹配的右括号; 超长末尾加 '...'."""
+    左括号多于右括号时向后扫描到括号归零 (★计嵌套: 内层 '(' 也要自己的 ')' 配平);
+    超长末尾加 '...'."""
     if len(s) <= n:
         return s
     cut = s[:n]
-    extra = cut.count("(") - cut.count(")")
-    if extra > 0:
-        rest = s[n:]
-        idx = -1
-        for _ in range(extra):
-            idx = rest.find(")", idx + 1)
-            if idx == -1:
-                break
-        if idx != -1:
-            return s[:n + idx + 1] + "..."
+    balance = cut.count("(") - cut.count(")")
+    if balance > 0:
+        i = n
+        while i < len(s) and balance > 0:
+            if s[i] == "(":
+                balance += 1
+            elif s[i] == ")":
+                balance -= 1
+            i += 1
+        if balance == 0:
+            return s[:i] + "..."
     return cut + "..."
 
 
@@ -201,17 +203,37 @@ def _get(d, path: str):
     return cur
 
 
+# ★全局摘要字段: 前层信号, 任何 tier 都喂 — 让 planner 做"前层优先检查"
+#   (算法/融合/算力/精度是否还有优化空间, 不能只闷头调本层参数)
+GLOBAL_FIELDS = [
+    ("summary.num_kernels", "目标kernel数 (多→融合空间Tier2)"),
+    ("summary.num_kernels_total", "总kernel数(含框架)"),
+    ("summary.api_overhead_total_us", "launch开销us (大→融合空间Tier2)"),
+    ("kernels[].deep.roofline.bottleneck_type", "瓶颈类型 (memory/compute/latency)"),
+    ("kernels[].deep.roofline.compute_utilization", "算力利用率 (低→算法Tier1?)"),
+    ("kernels[].deep.roofline.memory_utilization", "访存利用率"),
+    ("kernels[].deep.roofline.arithmetic_intensity", "算术强度 (→算法/访存判断)"),
+    ("kernels[].deep.compute.cube_fp16_ratio", "cube fp16占比 (低→精度Tier1/5?)"),
+]
+
+
 def extract_tier_fields(diagnosis: dict, tier: int) -> str:
-    """只提取当前 tier 的字段段 → 文本 (喂 Planner)。"""
-    lines = [f"# 当前 Tier {tier} ({TIER_LABEL.get(tier, '')}) — 只看这些字段"]
-    for path, desc in TIER_FIELDS.get(tier, []):
+    """喂 Planner: ★全局摘要(前层信号) + 当前 tier 字段段。
+    planner 靠全局摘要做"前层优先检查" (算法/融合/算力是否还有空间), 不只闷头调本层参数。"""
+
+    def _fmt(path: str, desc: str) -> str:
         v = _get(diagnosis, path)
         if v is None:
-            lines.append(f"- {desc} ({path}): (无数据)")
-        elif isinstance(v, (dict, list)):
-            lines.append(f"- {desc} ({path}): {json.dumps(v, ensure_ascii=False)[:300]}")
-        else:
-            lines.append(f"- {desc} ({path}): {v}")
+            return f"- {desc} ({path}): (无数据)"
+        if isinstance(v, (dict, list)):
+            return f"- {desc} ({path}): {json.dumps(v, ensure_ascii=False)[:300]}"
+        return f"- {desc} ({path}): {v}"
+
+    lines = [f"# 当前 Tier {tier} ({TIER_LABEL.get(tier, '')})"]
+    lines.append("# ══ 全局摘要 (前层信号: 算法/融合/算力/精度) ★任何轮都看 ══")
+    lines += [_fmt(p, d) for p, d in GLOBAL_FIELDS]
+    lines.append("# ══ 当前 Tier 专属字段 ══")
+    lines += [_fmt(p, d) for p, d in TIER_FIELDS.get(tier, [])]
     return "\n".join(lines)
 
 
@@ -326,9 +348,9 @@ class Scheduler:
         d7 = round_dir / f"07_tier{tier}_fields"
         d7.mkdir(parents=True, exist_ok=True)
         (d7 / f"tier{tier}_fields.txt").write_text(extracted, encoding="utf-8")
-        # 结构化 JSON: {字段说明: 值}
+        # 结构化 JSON: {字段说明: 值} (含全局摘要 + 当前 tier 字段)
         vals = {}
-        for path, desc in TIER_FIELDS.get(tier, []):
+        for path, desc in GLOBAL_FIELDS + TIER_FIELDS.get(tier, []):
             vals[desc] = _get(diagnosis, path)
         (d7 / f"tier{tier}_fields.json").write_text(
             json.dumps(vals, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
@@ -403,14 +425,18 @@ class Scheduler:
     # ── ⑥ 验证: 只跑 msprof 端到端 (验证本轮新 kernel) ──
     def _verify(self, round_dir: Path, baseline_ns: Optional[float]) -> dict:
         """只跑一次 msprof 端到端 → 端到端耗时 → 加速比。
-        验证的是 round_dir/kernel_op.py (本轮 coder 的新输出)。"""
+        验证的是 round_dir/kernel_op.py (本轮 coder 的新输出)。
+        传 num_kernels 给 verify 做行数合理性告警 (防漏记/循环丢失静默错数)."""
         kernel = round_dir / "kernel_op.py"
         try:
             from agents.verifier import verify_end_to_end
-            return verify_end_to_end(kernel, round_dir, baseline_ns)
+            nk = self.traj.get("state", {}).get("num_kernels")
+            return verify_end_to_end(kernel, round_dir, baseline_ns, num_kernels=nk)
         except Exception as e:
             print(f"  [Scheduler] verify stub: {e}")
-            return {"ok": True, "ns": None, "speedup": 1.0, "note": "stub(无真机)"}
+            # ★F1对齐: stub 也反推 ns (speedup=1.0 → ns=baseline), 不留 None 脏字段
+            return {"ok": True, "ns": round(baseline_ns, 1) if baseline_ns else None,
+                    "speedup": 1.0, "note": "stub(无真机)"}
 
     # ── 主循环 (无 round0: 首轮采集即基准, 全部轮次直接进 outputs/<op>/<tier>/roundN) ──
     def run(self):
@@ -434,6 +460,7 @@ class Scheduler:
                 print(f"  [Warm-up] ⚠ 预热失败: {str(e)[:120]} (继续, 后续调用再试)")
 
         total_start = time.time()
+        coll_fail = 0   # ★H2: 连续采集失败计数 (失败重试/跳过, 不是一停到底)
         while rn <= self.max_rounds:
             round_dir = self._round_dir(tier, rn)
             round_start = time.time()
@@ -443,8 +470,27 @@ class Scheduler:
             _t0 = time.time()
             diagnosis = self._run_optimize(round_dir, tier)
             if not diagnosis:
-                print("  ⚠ 采集失败, 停止")
-                break
+                # ★H2: 采集失败不再一票否决整个 run — 先重试同轮 1 次,
+                #   仍失败则跳过本轮(沿用当前 kernel 进下一轮), 连续 3 次才停
+                coll_fail += 1
+                if coll_fail <= 1:
+                    print(f"  ⚠ 采集失败(第{coll_fail}次), 重试同一轮 {round_dir}...")
+                    continue
+                if coll_fail >= 3:
+                    print(f"  ⚠ 连续 {coll_fail} 次采集失败, 停止")
+                    break
+                ps = st.get("current_speedup", 1.0)
+                self.traj["history"].append({"round": rn, "tier": tier,
+                    "strategy": "采集失败跳过", "change": "",
+                    "speedup": round(ps, 4), "prev_speedup": round(ps, 4),
+                    "ns": None, "decision": "FAIL", "result": "FAIL",
+                    "error": f"采集失败 {coll_fail} 次"})
+                print(f"  ⚠ 采集失败(第{coll_fail}次), 跳过本轮 → R{rn+1} (沿用当前 kernel)")
+                st["round"] = rn + 1
+                rn += 1
+                self._save_traj()
+                continue
+            coll_fail = 0
             print(f"  ⏱ ①采集+解析: {time.time()-_t0:.1f}s")
             # 诊断摘要
             ks0 = diagnosis.get("summary", {})
@@ -471,11 +517,15 @@ class Scheduler:
                 elif mnk and st["baseline_ns"]:
                     st["initial_tflops"] = round(
                         2 * mnk[0] * mnk[1] * mnk[2] / (st["baseline_ns"] / 1e9) / 1e12, 2)
-                # 读 PyTorch 基准 (bench_910b3/pytorch_tflops.json, 由 bench_pytorch.py 生成)
-                pt = _PROJECT / "bench_910b3" / "pytorch_tflops.json"
+                # ★F4: PyTorch 基准 — 多 kernel(MLP/attention) 用 bench_pytorch_mlp.py 的同形状 MLP 基准,
+                #   单 matmul 用 bench_pytorch.py; 都必须与 op 同尺寸同 dtype 才有意义 (见 H5/E4).
+                nk = st.get("num_kernels") or 0
+                pt_file = "pytorch_mlp_tflops.json" if nk > 1 else "pytorch_tflops.json"
+                pt = _PROJECT / "bench_910b3" / pt_file
                 if pt.exists():
                     try:
                         st["pytorch_tflops"] = json.loads(pt.read_text(encoding="utf-8"))["tflops"]
+                        st["pytorch_baseline"] = pt_file
                     except Exception:
                         pass
                 # ★基准复测: 诊断 total_ns 是单次 msprof 采样(噪声大),
@@ -485,8 +535,12 @@ class Scheduler:
                     try:
                         from agents.verifier import verify_end_to_end
                         base_rd = self.kernel_dir / "baseline_verify"
+                        if base_rd.exists():
+                            import shutil as _sh
+                            _sh.rmtree(base_rd)   # ★P1: 每次重测基准前清干净 (防跨 run 累积)
                         base_rd.mkdir(parents=True, exist_ok=True)
-                        vb = verify_end_to_end(self.current_kernel, base_rd, None)
+                        vb = verify_end_to_end(self.current_kernel, base_rd, None,
+                                               num_kernels=st.get("num_kernels"))
                         if vb.get("ok") and vb.get("ns"):
                             st["baseline_ns"] = vb["ns"]
                             if cube_fops:
@@ -526,33 +580,54 @@ class Scheduler:
             plan = self._plan(diagnosis, extracted, tier, rn, round_dir, fusion_analysis)
             print(f"  ⏱ ④Planner: {time.time()-_t0:.1f}s")
 
-            # ⑤ Coder → 改代码, 输出到 round_dir/kernel_op.py (不碰源文件) (报错同轮重改, ≤3次)
+            # ⑤ Coder → 改代码 / ★晋升轮原样输出, 输出到 round_dir/kernel_op.py (不碰源文件)
             prev_err, new_code = "", ""
             round_kernel = round_dir / "kernel_op.py"
             prev_speedup = st.get("current_speedup", 1.0)   # 上一轮已接受 kernel 的加速比 (基线=1.0)
             kept = False                                      # 本轮是否被采纳进 kernel 链
             pre_code = self.current_kernel.read_text(encoding="utf-8") \
                 if self.current_kernel.exists() else ""    # NOOP 对比用 (改之前的版本)
-            for attempt in range(3):
-                new_code = self._code(plan, rn, round_dir, prev_err)
-                round_kernel.write_text(new_code, encoding="utf-8")
-                # ⑥ 验证 (只 msprof 端到端, 验证本轮新 kernel)
-                v = self._verify(round_dir, st.get("baseline_ns"))
-                if v.get("ok"):
-                    # ★保留判定: speedup 始终 = 初始基线/本轮 (累计, 输出的就是这个);
-                    #   但"是否采纳进 kernel 链"对比上一轮已接受的加速比 (prev_speedup)
-                    speedup = v.get("speedup", 1.0)
-                    if speedup >= prev_speedup:
-                        self.current_kernel = round_kernel
-                        st["current_kernel"] = str(round_kernel)
-                        st["current_speedup"] = round(speedup, 4)
-                        kept = True
-                    else:
-                        print(f"  ↩ 回退: 本轮 {speedup:.3f}x < 上一轮 {prev_speedup:.3f}x, 沿用上一轮 kernel")
-                    self._save_traj()
-                    break
-                prev_err = v.get("error", "unknown error")
-                print(f"  ⚠ 运行失败(第{attempt+1}次): {prev_err[:200]}... 回传 Coder 同轮改")
+            if getattr(plan, "promote", False):
+                # ★晋升轮: 不调 LLM 改码, 原样拷贝当前 kernel → roundN/kernel_op.py
+                #   (保证每个 round 目录格式一致: 都有 kernel_op.py + diff.patch)
+                #   ★下一轮读 current_kernel.parent/kernel_op.py = 本轮 (链连续, 不回 input)
+                round_kernel.write_text(pre_code, encoding="utf-8")
+                (round_dir / "diff.patch").write_text("(promote, 无代码改动)", encoding="utf-8")
+                speedup = prev_speedup                        # 未改码 → 加速比与上一轮相同
+                _bns = st.get("baseline_ns")
+                v = {"ok": True,                             # ★F1: ns 反推, 不再留 None 脏字段
+                     "ns": round(_bns / speedup, 1) if _bns and speedup else None,
+                     "speedup": speedup, "note": "promote轮(无改动)"}
+                self.current_kernel = round_kernel
+                st["current_kernel"] = str(round_kernel)
+                st["current_speedup"] = round(speedup, 4)
+                kept = True
+                self._save_traj()
+            else:
+                for attempt in range(3):
+                    new_code = self._code(plan, rn, round_dir, prev_err)
+                    round_kernel.write_text(new_code, encoding="utf-8")
+                    # ⑥ 验证 (只 msprof 端到端, 验证本轮新 kernel)
+                    v = self._verify(round_dir, st.get("baseline_ns"))
+                    if v.get("ok"):
+                        # ★保留判定: speedup 始终 = 初始基线/本轮 (累计, 输出的就是这个);
+                        #   但"是否采纳进 kernel 链"对比上一轮已接受的加速比 (prev_speedup)
+                        speedup = v.get("speedup", 1.0)
+                        if speedup >= prev_speedup:
+                            self.current_kernel = round_kernel
+                            st["current_kernel"] = str(round_kernel)
+                            st["current_speedup"] = round(speedup, 4)
+                            kept = True
+                        else:
+                            print(f"  ↩ 回退: 本轮 {speedup:.3f}x < 上一轮 {prev_speedup:.3f}x, 沿用上一轮 kernel")
+                        self._save_traj()
+                        break
+                    prev_err = v.get("error", "unknown error")
+                    print(f"  ⚠ 运行失败(第{attempt+1}次): {prev_err[:200]}... 回传 Coder 同轮改")
+
+            # ★兜底: 保证每个 round 目录都有 kernel_op.py (格式一致)
+            if not round_kernel.exists():
+                round_kernel.write_text(pre_code or "", encoding="utf-8")
 
             speedup = v.get("speedup", 1.0)
             ns = v.get("ns")
@@ -578,6 +653,11 @@ class Scheduler:
                     "prev_speedup": round(prev_speedup, 4),   # 上一轮已接受 kernel 的加速比 (保留判定用)
                     "ns": ns, "decision": decision, "result": result,
                     "error": (prev_err[:120] if prev_err else "")}
+            # ★F3: 每轮真实 tflops (kernel 结构变化后 FLOPs 变, 轨迹图用 hist 值, 不再 initial×speedup 失真)
+            _cf = sum((k.get("deep") or {}).get("compute", {}).get("cube_fops") or 0
+                      for k in (diagnosis.get("kernels") or []))
+            if _cf and ns:
+                hist["tflops"] = round(_cf / (ns / 1e9) / 1e12, 2)
             if st.get("best_speedup") is None or speedup > st["best_speedup"]:
                 st["best_speedup"] = speedup
             self.traj["history"].append(hist)
@@ -599,14 +679,23 @@ class Scheduler:
                 self._save_traj()
                 break
             if planner_promote:
-                if tier >= 6:
+                target = getattr(plan, "promote_to", 0) or 0
+                if target and 1 <= target <= 6 and target != tier:
+                    # ★尊重 planner 的目标层: 支持回退前层(算法/融合) 和 晋升后层
+                    direction = "回退" if target < tier else "晋升"
+                    print(f"  → {direction} Tier{tier}→Tier{target} "
+                          f"(planner: {getattr(plan,'promote_reason','')})")
+                    tier = target
+                    st["tier"] = tier
+                elif tier >= 6:
                     print(f"  ⛔ planner 判瓶颈已非本tier且到Tier6, 停止 ({getattr(plan,'promote_reason','')})")
                     st["round"] = rn + 1
                     self._save_traj()
                     break
-                print(f"  → 晋升 Tier{tier}→Tier{tier+1} (planner: {getattr(plan,'promote_reason','瓶颈不属本tier')})")
-                tier += 1
-                st["tier"] = tier
+                else:
+                    print(f"  → 晋升 Tier{tier}→Tier{tier+1} (planner: {getattr(plan,'promote_reason','瓶颈不属本tier')})")
+                    tier += 1
+                    st["tier"] = tier
             elif no_improve >= 3 or tier >= 6:
                 if tier >= 6:
                     print("  ⛔ Tier6 连续无改进, 停止")

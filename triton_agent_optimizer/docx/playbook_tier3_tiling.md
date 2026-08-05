@@ -1,359 +1,284 @@
-# Triton 自动优化系统 Tier 3（编译配置与分块调优）优化策略指南
-## 层级定位与前置约束
-Tier 3 是全链路优化的最底层参数级优化，**必须在 Tier 1（算法结构）、Tier 2（算子融合）均完成并验证最优后执行**。本层不改变核心算法逻辑与算子融合结构，仅通过调整分块尺寸、编译流水线、访存对齐、数据精度等编译期参数，匹配 Ascend NPU 微架构特性，榨取硬件极限性能。
+# Triton 优化 Tier 3（分块配置）策略指南 — 针对 triton-ascend 910B3
 
-本手册严格适配以下环境约束：
-- 前端：Triton 3.4.0 + Python 3.9，仅使用 `@triton.jit` 装饰器，禁用 `@triton.autotune`
-- 中间链路：TTIR MLIR → HIVM MLIR 自定义转换，所有语法必须可被解析
-- 后端：CANN 9.0 + bisheng 编译器 + CMake 构建
-- 验证：msprof op simulator（CPU 周期精确 NPU 模拟器）
-- 核心铁律：`num_warps`、`num_stages` 不属于 `@triton.jit` 装饰器参数，必须通过编译配置传递
-
----
-
-## 一、核心优化维度与诊断触发规则
-所有优化动作完全由 HIVM ops 诊断数据驱动，以下为四大优化维度的触发阈值与对应动作，满足任意一条即执行对应调优。
-
-> **适配我们的环境**：
-> - `bw_utilization` 在 mock 环境下可能不准（使用预制 trace 时），优先参考 `SATURATION_PARAMS` 估算值
-> - `num_warps`/`num_stages` 由 `GPUTarget` 编译选项设置，Coder 只改 BLOCK_SIZE
-> - Agent 从 `per_op_statistics[].bw_utilization` 读取带宽利用率
-> - BLOCK_SIZE 约束：`BLOCK_SIZE × 4 × n_buffers ≤ 192KB` (UB 容量)
-
-| 优化维度 | 诊断指标 | 触发阈值 | 优化动作 |
-|----------|----------|----------|----------|
-| 分块尺寸调优 | 带宽利用率 `bw_utilization` | < 70% 且访存 op 占比 > 60% | 增大分块尺寸，提升访存连续性 |
-| 分块尺寸调优 | 单块数据量 `size_kb` | > 128KB 且存在缓存换出标记 | 减小分块尺寸，避免片上缓存溢出 |
-| 分块尺寸调优 | 边界掩码开销占比 | > 10% | 增大分块，降低边界处理占比 |
-| 软件流水线调优 | RAW 依赖等待占比 | > 15% | ⚠️triton-ascend 自动管理 num_stages, 不可 tune; 用增大 BLOCK_K 加深内循环粒度代替 |
-| 软件流水线调优 | 计算单元利用率 | < 60% | ⚠️triton-ascend 自动管理 num_warps, 不可 tune; 用增大 BLOCK_M/N 提升每核工作量代替 |
-| 软件流水线调优 | 寄存器溢出标记 | 存在 | ⚠️同上, 改用减小 BLOCK 尺寸代替 |
-| 访存对齐优化 | 访存 op 对齐标记 | 存在未对齐访问 | 注入对齐提示，调整分块对齐 |
-| 数据精度调优 | 带宽利用率 `bw_utilization` | > 90% 且计算 op 占比 < 20% | 存储精度降级为 FP16，减少访存带宽 |
-
-### Tier 3 最优判定标准
-同时满足以下所有条件时，判定 Tier 3 已达最优，全链路优化结束：
-1. 带宽利用率稳定在 **90%~95%** 区间，无明显带宽浪费或饱和瓶颈
-2. 软件流水线气泡占比 < 5%，RAW 依赖等待可忽略
-3. 所有全局访存均满足对齐要求，无未对齐访问标记
-4. 数据位宽已降至业务精度约束的最小值
-5. 单维度参数调整均无法带来正向性能收益
+> 本层**只调分块/调度参数**（BLOCK_M/N/K、BLOCK_SIZE、group swizzle、sub-block、mask），
+> **不改算法、不融合、不改精度**（Tier1/2/5）。违反 = 越层，fail。
+>
+> **★环境铁律（triton-ascend，违反必报错）**：
+> - `num_warps` / `num_stages` **禁止**传给 kernel（传了报 `please do not tune args`）
+> - 不用 `@triton.autotune`；只用裸 `@triton.jit`
+> - **分块必须 16 倍数**（Cube MMA 16×16 基础粒度；非 16 倍数掉到 ~10% 算力）
+> - `BLOCK_*` 必须 `tl.constexpr`
+> - L0 上限：L0A/B=64KB、L0C=128KB；UB=192KB → **超过就 `ub overflow` 编译失败**
 
 ---
 
-## 二、分块参数（BLOCK_*）调优指南
-分块尺寸是 Tier 3 的核心调优项，直接决定访存连续性、缓存命中率与并行效率，所有分块参数必须声明为 `tl.constexpr`。
+## 一、诊断触发规则（v4 字段 → 动作）+ 决策流程图
 
-### 2.1 通用分块原则（适配 NPU 架构）
-1. **2 的幂次对齐**：所有 `BLOCK_*` 尺寸必须为 2 的幂次（32/64/128/256/512/1024），匹配 NPU 内存控制器位宽，非 2 幂次分块会导致访存效率骤降 30% 以上。
-2. **单块数据量约束**：单块总数据量控制在 16KB~128KB 区间，匹配片上缓存容量；超过 128KB 会触发缓存换入换出，性能反向下降。
-3. **计算访存比匹配**：计算密集型算子（如 MatMul）采用小分块多迭代，访存密集型算子（如 Norm、Softmax）采用大分块少迭代。
+| v4 字段 | 触发 | 动作 |
+|---|---|---|
+| `task.block_dim` | **< 40**（核没吃满） | 减 BLOCK_M/N（§二-B） |
+| `engine_utilization.mte1` | 高（L1→L0 搬运瓶颈） | 增 BLOCK_K（§二-A） |
+| `engine_utilization.mte2` | 高（GM→L1 瓶颈） | 增 BLOCK_M/N（§二-A） |
+| `engine_utilization.cube` | 低（cube 没满） | 增 BLOCK_M/N（§二-A） |
+| `bandwidth_gb_s.l0a/l0b_read` | 低 | 增 BLOCK_M/N/K（§二-A）+ swizzle（§三） |
+| `roofline.bottleneck_type` | `compute_bound` | **不调分块**，promote Tier1/5（§二-C） |
+| `roofline.compute_utilization` | 极低(<0.3) | **回 Tier1 查算法**，不是分块 |
 
-### 2.2 分算子推荐分块范围
-| 算子类型 | 分块维度 | 推荐取值范围 | 最优初始值 | 调整方向 |
-|----------|----------|--------------|------------|----------|
-| 逐元素算子（GELU、Add等） | BLOCK_SIZE | 128 ~ 1024 | 256 | 带宽不足时增大，溢出时减小 |
-| 归约类算子（Softmax、RMSNorm） | BLOCK_SIZE | 128 ~ 512 | 256 | 归约维度优先 256，行优先匹配缓存 |
-| LayerNorm | BLOCK_SIZE | 128 ~ 512 | 256 | 与特征维度对齐，避免跨行分块 |
-| 矩阵乘 MatMul | BLOCK_M / BLOCK_N | 64 ~ 256 | 128 | **传输瓶颈时增大**（复用↑, GM流量↓）；计算瓶颈时保持够大让cube满, 不调小；延迟瓶颈(两者都低)才调小/增并行 |
-| 矩阵乘 MatMul | BLOCK_K | 32 ~ 64 | 32 | **传输瓶颈时增大**（每K迭代搬运↓, 复用↑）；精度敏感时减小 |
-
-### 2.3 诊断驱动调优流程
-1. **带宽不足场景**（bw_util < 70%）：分块尺寸 ×2，重新编译测试，直到带宽利用率进入 90% 区间或触发缓存溢出。
-2. **缓存溢出场景**（size_kb > 128KB）：分块尺寸 ÷2，直到溢出标记消失且性能最优。
-3. **边界开销过高**：当非对齐尺寸输入的边界掩码开销占比超过 10% 时，优先增大分块，降低边界处理的相对占比。
-
-### 代码示例：分块参数调整
-**Before（初始小分块）**
-```python
-@triton.jit
-def rmsnorm_tune_before(x_ptr, w_ptr, out_ptr, n_cols, eps, BLOCK_SIZE: tl.constexpr):
-    # 初始分块64，过小导致调度开销高、访存不连续
-    row_idx = tl.program_id(0)
-    base = row_idx * n_cols
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_cols
-
-    x = tl.load(x_ptr + base + offsets, mask=mask)
-    w = tl.load(w_ptr + offsets, mask=mask)
-    inv_std = tl.math.rsqrt(tl.sum(x * x, axis=0) / n_cols + eps)
-    tl.store(out_ptr + base + offsets, x * inv_std * w, mask=mask)
-
-# 调用（Coder 不修改这部分！）: BLOCK_SIZE=64
-grid = (M,)
-rmsnorm_tune_before[grid](x_ptr, w_ptr, out_ptr, n_cols, eps, BLOCK_SIZE=64)
 ```
-
-**After（优化后分块）**
-```python
-@triton.jit
-def rmsnorm_tune_after(x_ptr, w_ptr, out_ptr, n_cols, eps, BLOCK_SIZE: tl.constexpr):
-    # 分块调整为256，访存连续、调度开销降低
-    row_idx = tl.program_id(0)
-    base = row_idx * n_cols
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_cols
-
-    x = tl.load(x_ptr + base + offsets, mask=mask)
-    w = tl.load(w_ptr + offsets, mask=mask)
-    inv_std = tl.math.rsqrt(tl.sum(x * x, axis=0) / n_cols + eps)
-    tl.store(out_ptr + base + offsets, x * inv_std * w, mask=mask)
-
-# 调用（Coder 不修改这部分！）：BLOCK_SIZE=256
-grid = (M,)
-rmsnorm_tune_after[grid](x_ptr, w_ptr, out_ptr, n_cols, eps, BLOCK_SIZE=256)
+compute_utilization<0.3 → 回 Tier1;  compute_bound → promote Tier1/5
+block_dim<40 → 减 BLOCK (§二-B);  mte1高 → 增K;  mte2高/cube低/l0a低 → 增MN (§二-A)
+memory_bound → 增 tile + swizzle (§三);  否则 promote
 ```
 
 ---
 
-## 三、软件流水线与并行配置（num_warps / num_stages）
-### 3.1 官方正确用法说明（我们的环境）
+## §二-A：BLOCK_M/N/K 调优（matmul 核心）
 
-> **⚠️ 关键：我们的环境不通过调用时传参！**
-> `num_warps`、`num_stages` 在我们的 pipeline 中由 `GPUTarget` 编译选项统一设置：
-> ```python
-> triton_compile(src, target=GPUTarget("cuda",90,32),
->                options={"num_warps": 4, "num_stages": 1, "debug": False})
-> ```
-> **Coder Agent 不要修改 num_warps/num_stages！** 也不要在 kernel 调用代码中传这些参数。
-> 本章保留 num_warps/num_stages 调优策略作为 Planner 的参考知识，
-> 但 Coder 只改 BLOCK_SIZE 参数值，不改调用代码。
+**触发**：mte1/mte2 高 或 cube 低 或 l0a/l0b 低（传输/利用率瓶颈）。
+**怎么查**：搜 "triton matmul tiling L0C overflow" / "triton BLOCK_K ub overflow"。
 
-根据 Triton 3.4.0 官方规范，`num_warps`、`num_stages` **不属于 `@triton.jit` 装饰器入参**，它们在我们的 pipeline 中通过编译配置传递。
-
-### 3.2 num_warps 调优规则（⚠️ triton-ascend 自动管理，只作知识）
-`num_warps` 在 triton-ascend 上**由后端自动管理**，传给 kernel 会报 `please do not tune args ['num_warps','num_stages']`。
-**不要改它**。想让每核工作量更大 → 增大 `BLOCK_M`/`BLOCK_N`（每个 program 处理更大 tile）。
-
-### 3.3 num_stages 调优规则
-`num_stages` 控制软件流水线深度，通过预取后续迭代数据掩盖访存延迟，默认值为 3。
-- **访存密集型算子**（Norm、Softmax、逐元素）：推荐 2~3 级，过深会增加寄存器压力，收益边际递减。
-- **计算密集型算子**（MatMul）：推荐 3~4 级，通过预取权重/输入数据掩盖访存延迟。
-- **触发调优**：RAW 依赖等待占比 > 15% → 增加 1 级流水线；出现寄存器溢出 → 减少 1 级。
-- **禁忌**：分块尺寸 ≤ 64 时禁止开启多级流水线，调度开销会抵消收益。
-
-### 代码示例：流水线配置调整
-**Before（默认配置，无显式优化）**
+### ❌ 问题示例代码（盲目增大 BLOCK → L0 溢出）
 ```python
-@triton.jit
-def matmul_pipe_before(a_ptr, b_ptr, c_ptr, M, N, K,
-                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-    
-    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]  # K 必须是 tl.constexpr！否则 pointer type 报错
-    b_ptrs = b_ptr + offs_k[:, None] * N + offs_n[None, :]
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    
-    for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (k + offs_k < K), other=0.0)
-        b = tl.load(b_ptrs, mask=(k + offs_k < K) & (offs_n[None, :] < N), other=0.0)
-        acc += tl.dot(a, b)
-        a_ptrs += BLOCK_K
-        b_ptrs += BLOCK_K * N
-    
-    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc,
-             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
-
-# 调用：使用默认编译配置
-grid = (triton.cdiv(M, 128), triton.cdiv(N, 128))
-matmul_pipe_before[grid](a_ptr, b_ptr, c_ptr, M, N, K, BLOCK_M=128, BLOCK_N=128, BLOCK_K=32)
+# ① config — ❌ fp32 下 BLOCK_M=256, BLOCK_K=128 超 L0A
+BLOCK_M, BLOCK_N, BLOCK_K = 256, 128, 128
+# L0A = 256×128×4 = 128KB > 64KB(上限) → 编译报 ub overflow / L0 overflow
 ```
+**出现的问题**：只想着"增大分块提复用"，没算 L0A/L0B/L0C 上限。fp32 时 `BLOCK_M×BLOCK_K×4 ≤ 64KB`、`BLOCK_N×BLOCK_K×4 ≤ 64KB`、`BLOCK_M×BLOCK_N×4 ≤ 128KB`，超了就编译失败。
 
-**After（显式配置流水线与并行度）**
+### ✅ 修改后正确代码（先算约束再选值）
 ```python
-@triton.jit
-def matmul_pipe_after(a_ptr, b_ptr, c_ptr, M, N, K,
-                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
-    # 内核逻辑不变，仅通过调用参数调整编译配置
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-    
-    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
-    b_ptrs = b_ptr + offs_k[:, None] * N + offs_n[None, :]
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    
-    for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (k + offs_k < K), other=0.0)
-        b = tl.load(b_ptrs, mask=(k + offs_k < K) & (offs_n[None, :] < N), other=0.0)
-        acc += tl.dot(a, b)
-        a_ptrs += BLOCK_K
-        b_ptrs += BLOCK_K * N
-    
-    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc,
-             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
-
-# 调用：显式指定编译配置，匹配分块尺寸
-grid = (triton.cdiv(M, 128), triton.cdiv(N, 128))
-matmul_pipe_after[grid](
-    a_ptr, b_ptr, c_ptr, M, N, K,
-    BLOCK_M=128, BLOCK_N=128, BLOCK_K=32,
-    num_warps=8,    # 匹配128x128分块，提升并行度
-    num_stages=4    # 加深流水线，掩盖访存延迟
-)
-```
-
----
-
-## 四、访存对齐与地址优化
-### 4.1 优化原理
-Ascend NPU 内存控制器对对齐访问有显著性能加成，128 字节对齐的连续访存比未对齐访问效率高 20%~50%。通过注入编译期对齐提示，可让编译器生成更优的访存指令。
-
-### 4.2 实现方式
-使用 Triton 3.4.0 标准 API `tl.multiple_of` 声明指针对齐属性，该语法可正常通过 TTIR→HIVM 转换与 bisheng 编译。
-- 对齐字节数 = 分块元素数 × 单元素字节数；例如 FP32 + BLOCK_SIZE=256 → 对齐 1024 字节。
-- 仅对基址指针声明对齐，偏移后的指针自动继承对齐属性。
-
-### 代码示例：对齐提示注入
-**Before（无对齐提示）**
-```python
-@triton.jit
-def align_before(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    tl.store(out_ptr + offsets, x * 2.0, mask=mask)
-```
-
-**After（注入对齐提示）**
-```python
-@triton.jit
-def align_after(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    
-    # 声明指针对齐：BLOCK_SIZE个FP32元素，对齐4*BLOCK_SIZE字节
-    x_ptr = tl.multiple_of(x_ptr, 4 * BLOCK_SIZE)
-    out_ptr = tl.multiple_of(out_ptr, 4 * BLOCK_SIZE)
-    
-    x = tl.load(x_ptr + offsets, mask=mask)
-    tl.store(out_ptr + offsets, x * 2.0, mask=mask)
-```
-
----
-
-## 五、数据类型与精度优化
-### 5.1 优化原则
-访存瓶颈型算子（带宽利用率 > 90%），可通过降低存储位宽减少访存数据量，核心计算保持高精度以保证数值正确性。
-- **存储降级**：全局内存加载/存储使用 FP16，减少 50% 访存带宽。
-- **计算保精**：中间计算、归约、累加必须使用 FP32，避免溢出与精度损失。
-- **适用场景**：逐元素算子、Norm 类算子、矩阵乘的权重/输入存储。
-
-### 5.2 禁忌场景
-- 指数、对数、开方等运算禁止直接使用 FP16 计算，必须转 FP32 后运算。
-- 归约求和、累加器必须保持 FP32，禁止降级。
-
-### 代码示例：混合精度优化
-**Before（全FP32）**
-```python
-@triton.jit
-def precision_before(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    # 加载、计算、存储全为FP32，访存带宽占用高
-    x = tl.load(x_ptr + offsets, mask=mask)
-    out = x * 2.0 + 1.0
-    tl.store(out_ptr + offsets, out, mask=mask)
-```
-
-**After（存储FP16 + 计算FP32）**
-```python
-@triton.jit
-def precision_after(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    # FP16加载 → 转FP32计算 → FP16存储，访存量减半
-    x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
-    out = x * 2.0 + 1.0
-    tl.store(out_ptr + offsets, out.to(tl.float16), mask=mask)
-```
-
----
-
-## 六、优化收益量化预期
-| 优化维度 | 典型场景预期加速比 | 上限加速比 |
-|----------|--------------------|------------|
-| 分块尺寸调优 | 10% ~ 30% | 40%（初始分块极小时） |
-| 软件流水线调优 | 10% ~ 25% | 35%（初始无流水线时） |
-| 访存对齐优化 | 5% ~ 15% | 25%（完全未对齐场景） |
-| 数据精度优化 | 15% ~ 40% | 50%（纯访存瓶颈场景） |
-
-> 叠加收益：多维度优化可叠加，典型算子 Tier 3 整体收益可达 30% ~ 60%。
-
----
-
-## 七、不可调优边界与禁忌
-1. **禁止改变算法逻辑**：Tier 3 仅调整参数，禁止修改运算顺序、融合逻辑、归约方式，此类优化属于 Tier 1/Tier 2 范畴。
-2. **禁止使用 GPU 专属配置**：禁止设置 `num_ctas > 1`、`maxnreg`、TMA 相关参数，NPU 工具链不支持，会导致转换失败。
-3. **禁止分块越界**：逐元素算子分块不得小于 32，矩阵乘分块不得小于 32×32，否则调度开销会抵消所有收益。
-4. **禁止盲目降精度**：业务有精度约束时，不得随意降级数据类型，必须保证数值误差在允许范围内。
-5. **禁止过度流水线**：`num_stages` 最大不超过 4，过深会导致寄存器严重溢出，性能反向下降。
-
----
-
-## 八、常见错误与修复方案
-### 1. 编译参数写入 @triton.jit 装饰器
-- **错误现象**：`ast_to_ttir` 阶段报错，提示装饰器不支持 `num_warps` 参数。
-- **触发原因**：误将 `num_warps`、`num_stages` 写入 `@triton.jit()` 括号内。
-- **修复方案**：将编译参数移至内核调用时传递，装饰器仅保留官方合法参数。
-
-### 2. 分块非 2 的幂次
-- **错误现象**：bisheng 编译警告，NPU 访存效率骤降，bw_util 上不去。
-- **触发原因**：设置 BLOCK_SIZE=100、200 等非 2 幂次值。
-- **修复方案**：所有分块参数统一为 2 的幂次，按 32/64/128/256/512 档位调整。
-
-### 3. 流水线过深导致寄存器溢出
-- **错误现象**：编译通过但性能不升反降，HIVM 出现寄存器溢出标记。
-- **触发原因**：小分块配置高 `num_stages`，或同时开大 `num_warps` 与 `num_stages`。
-- **修复方案**：访存密集型 `num_stages` 最高 3 级，计算密集型最高 4 级；溢出时逐级降低参数。
-
-### 4. 对齐提示与分块不匹配
-- **错误现象**：TTIR→HIVM 转换失败，或运行时出现访存越界。
-- **触发原因**：`tl.multiple_of` 的对齐字节数与实际分块数据量不匹配。
-- **修复方案**：对齐字节数 = 元素字节数 × BLOCK_SIZE，确保分块大小是对齐值的整数倍。
-
-### 5. 计算精度降级导致数值错误
-- **错误现象**：输出结果误差过大，甚至出现 nan/inf。
-- **触发原因**：归约、指数运算直接使用 FP16 计算，导致溢出或精度丢失。
-- **修复方案**：所有中间计算、累加、归约必须使用 FP32，仅全局存储可降级为 FP16。
-
-### 6. 分块过小导致调度开销过高
-- **错误现象**：op 数量少但总周期高，计算单元利用率低。
-- **触发原因**：盲目减小分块，内核启动与调度开销占比超过 30%。
-- **修复方案**：遵循最小分块阈值，逐元素算子不小于 128，矩阵乘不小于 64×64。
-
-需要我补充某类算子（如 MatMul）的完整 Tier 3 调优决策树，或者对应的性能对比测试模板吗？
----
-
-## ★matmul 专属改码示例（纯 triton, 910B3 验证可行）
-
-### 分块尺寸 (BLOCK_M/N/K) — Ascend 偏好 512B 对齐
-
-**before（当前 64×64×32, fp32）:**
-```python
-BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
-```
-
-**after（增大到 128×128×64, fp32 128 元素=512B 对齐）:**
-```python
+# fp32: 保证 L0A/B ≤ 64KB, L0C ≤ 128KB
 BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+#   L0A=128×64×4=32KB ✓  L0B=32KB ✓  L0C=128×128×4=64KB ✓
+# 想更大: 512×64×64 (L0C=512×64×4=128KB 满) 或 128×128×128 (L0A=64KB 满)
+# fp16: BK 可更大 (×2 字节), 如 256×128×128 (L0A=64KB 满)
 ```
+**约束/坑**：分块 vs 带宽是**饱和曲线**——小分块程序开销主导（带宽≈分块翻倍），大分块记忆体带宽封顶（变平）。还在翻倍 = 没到平台可继续增；变平 = 到平台，再增无用。**BLOCK 必须 16 倍数**。
 
-**改哪**: ① config 区的 `BLOCK_M, BLOCK_N, BLOCK_K = ...` 整行。
-**判定**: Tier3 `block_dim < 40`（核没吃满）或 `mte1_ratio` 高 → 增大 BLOCK_K；`cube_ratio` 低 → 增大 BLOCK_M/N。
-**约束**: 
-- fp32 行宽 = BLOCK_N×4B 要 ≥512B（即 BLOCK_N≥128）；fp16 行宽 = BLOCK_N×2B 要 ≥512B（即 BLOCK_N≥256）
-- 单块 tile 数据量 = (BLOCK_M×BLOCK_K + BLOCK_K×BLOCK_N)×dtype 要 ≤ UB 192KB（fp32 时 128×128×64 ≈ 4MB? 不, 是 tile 加载尺寸, 编译器自动分块, 但别一次塞太大）
-- BLOCK_M/N 取 2 的幂（64/128/256）
-**grid 会变**: BLOCK 变大 → grid 变小 → 每核工作量增大。
+---
 
+## §二-B：block_dim < 40 → 缩小 BLOCK 增并行
+
+**触发**：`block_dim` < 40（20 AI Core），grid 太小核闲着。
+**怎么查**：搜 "triton grid too small block dimension"。
+
+### ❌ 问题示例代码（减 BLOCK 减到非 16 倍数）
+```python
+# ① config — ❌ 为增大 grid 把 BLOCK 减成 100
+BLOCK_M, BLOCK_N, BLOCK_K = 100, 128, 64   # 100 不是 16 倍数 → cube 掉到 ~10% 算力
+```
+**出现的问题**：目的对（减 BLOCK 让 grid 变大），但 `100` 非 16 倍数 → Cube MMA 无法触发 → 性能反而崩。
+
+### ✅ 修改后正确代码
+```python
+# grid = M/BM × N/BN, 减 BM 增 grid, 但保持 16 倍数
+BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64     # M=N=2048: grid=16×16=256 (核吃满)
+# 或更小: 96×128×64 (grid≈21×16=336), 但 96=16×6 仍是 16 倍数
+```
+**约束/坑**：减到够用就行（block_dim≥40）；太小 grid 超大 → 调度开销反升（见 §六 SUB_BLOCK）。
+
+---
+
+## §二-C：计算瓶颈（compute_bound）→ 不调分块
+
+**触发**：`bottleneck_type=compute_bound`（comp≥0.8 且 mem<0.5）→ cube 已满。
+**怎么查**：搜 "compute bound matmul tiling no benefit"。
+
+### ❌ 问题示例（错误动作：compute_bound 下还调 BLOCK）
+```python
+# ❌ compute_bound 时: cube 已 100% 满, 调 BLOCK_K 64→128 徒劳
+BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64   # 改 128, 128, 128 → L0 可能溢出 + 无收益
+# 加速比不变 (cube 已满, 分块对吞吐无帮助)
+```
+**出现的问题**：compute_bound 下分块已到收益上限，继续调 BLOCK 浪费轮次，甚至引发 L0 溢出。**分块不是瓶颈**。
+### ✅ 正确动作（不调分块，promote）
+```python
+# promote=true, promote_to=1 (算法: fp16 计算 / cube_fp16_ratio 低)
+# 或 promote_to=5 (计算占用: 冲突/标量拖累)
+# 铁律: 计算瓶颈下禁止乱调 BLOCK 假装优化
+```
+**约束/坑**：`compute_utilization` 低但算力已满 → 算法选错（Tier1），不是分块。
+
+---
+
+## §二-D：逐元素/softmax 的 BLOCK_SIZE（vector 引擎）
+
+**触发**：`engine_utilization.vec` 低 或 grid 太大（调度开销）。
+**怎么查**：搜 "triton BLOCK_SIZE ub overflow elementwise"。
+
+### ❌ 问题示例代码（BLOCK_SIZE 太大 → UB 溢出）
+```python
+# ① config — ❌ bias_gelu 3 缓冲, BLOCK_SIZE 32768 超 UB
+BLOCK_SIZE = 32768
+# bias_gelu 读 x + 读 bias + 写 h = 3 缓冲 → 32768×4×3 = 384KB > 192KB → ub overflow
+```
+**出现的问题**：逐元素 kernel 的 UB 占用 = `BLOCK_SIZE × 字节 × n_bufs`。3 缓冲的 bias_gelu 上限 16384（×4×3=192KB 满），32768 直接溢出。
+
+### ✅ 修改后正确代码
+```python
+BLOCK_SIZE = 8192     # 8192×4×3 = 96KB < 192KB (安全)
+# 或 BLOCK_SIZE = 16384 (×4×3=192KB 极限, 可能报错→fail-fast)
+# softmax 特例: softmax_kernel 每行一个 program, BLOCK_S ≥ seq (我们 seq=2048 → BLOCK_S=2048)
+```
+**约束/坑**：BLOCK_SIZE 16 倍数；想更大用 §六 SUB_BLOCK 内层分片。
+
+---
+
+## §三：★Group Launch / Swizzle（GROUP_SIZE_M，大 GEMM 最高收益）
+
+**触发**：`l0a/l0b_read_gb_s` 低、`main_mem_read` 高（GM 反复搬同一 B 块）。
+**收益**：vLLM 实测 1.17~1.98×。
+**怎么查**：搜 "triton matmul group pid swizzle GROUP_SIZE_M"。
+
+### ❌ 问题示例代码（swizzle 漏边缘处理 → 越界/错 tile）
+```python
+    pid = tl.program_id(axis=0)
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    num_pid_in_group = GROUP_SIZE_M * grid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    pid_m = first_pid_m + (pid % GROUP_SIZE_M)     # ← BUG: 没算 group_size_m
+    pid_n = (pid % num_pid_in_group) // GROUP_SIZE_M
+```
+**出现的问题**：`grid_m` 不是 `GROUP_SIZE_M` 整数倍时（如 grid_m=5, GROUP_SIZE_M=8），最后组的 `pid_m = first_pid_m + (pid % 8)` 会**越界到 grid_m 之外** → 读越界/错 tile。
+
+### ✅ 修改后正确代码（min 处理边缘）
+```python
+    num_pid_in_group = GROUP_SIZE_M * grid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(grid_m - first_pid_m, GROUP_SIZE_M)   # ✅ 最后不满一组
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+```
+**完整改动清单**：① config 加 `GROUP_M=8`；② kernel 签名加 `GROUP_SIZE_M: tl.constexpr`；③ 调用传 `GROUP_SIZE_M=GROUP_M`；④ pid 解码换 swizzle。
+**约束/坑**：GROUP_SIZE_M=1 退化为 row-major（安全兜底）；`GROUP_SIZE_M` 是 constexpr。
+
+---
+
+## §四：Cube 16×16 对齐
+
+**触发**：`cube_instr_number` 异常低 / cube 利用率上不去但 block_dim≥40。
+**怎么查**：搜 "triton tl.dot 16 alignment cube"。
+
+### ❌ 问题示例代码（非 16 倍数）
+```python
+# ① config — ❌ BLOCK 非 16 倍数
+BLOCK_M, BLOCK_N, BLOCK_K = 100, 96, 40
+# 编译器要做布局转换(NC1HWC0 重排) → cube 利用率掉到 ~10%
+```
+**出现的问题**：Cube MMA 要求 16×16 基础粒度，非 16 倍数触发布局转换 + 冗余搬运 → 算力崩。
+
+### ✅ 修改后正确代码
+```python
+BLOCK_M, BLOCK_N, BLOCK_K = 96, 96, 32    # 都是 16 倍数 (96=16×6, 32=16×2)
+# 或 128, 128, 64
+```
+**约束/坑**：BLOCK_M/N/K 全部 16 倍数（64/80/96/112/128...）。
+
+---
+
+## §五：EVEN_K 快路径（K % BLOCK_K == 0 免 mask）
+
+**触发**：K 整除 BLOCK_K 但 K 循环仍带边界 mask（浪费）。
+**怎么查**：搜 "triton EVEN_K no mask fast path"。
+
+### ❌ 问题示例代码（`if EVEN_K` 不是 constexpr）
+```python
+# ② kernel — ❌ EVEN_K 是运行时 bool, 不是 tl.constexpr
+EVEN_K = (K % BLOCK_K == 0)          # K 是 runtime 参数
+for k in range(0, K, BLOCK_K):
+    if EVEN_K:                        # 运行时判断 → 两支都编译, mask 没省掉
+        a = tl.load(a_ptrs)
+    else:
+        a = tl.load(a_ptrs, mask=offs_k[None,:] < K-k, other=0.0)
+```
+**出现的问题**：`EVEN_K` 若不是 constexpr，`if` 在运行时判断、**两支都生成**，省不了 mask 开销。
+
+### ✅ 修改后正确代码
+```python
+# ① config: EVEN_K 由调用处按 K 算好传入 (constexpr)
+# ② kernel 签名加: EVEN_K: tl.constexpr
+# ③ 调用: EVEN_K=(K % BLOCK_K == 0)
+# ② kernel:
+    for k in range(0, K, BLOCK_K):
+        if EVEN_K:                    # ✅ constexpr 分支, 编译期消掉另一支
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(a_ptrs, mask=offs_k[None,:] < (K-k), other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:,None] < (K-k), other=0.0)
+        acc = tl.dot(a, b, acc)
+```
+**约束/坑**：`if EVEN_K:` 是 constexpr 分支，编译器只保留一支，零运行时开销。
+
+---
+
+## §六：两层分块（SUB_BLOCK）— UB 溢出/调度开销
+
+**触发**：编译报 `ub overflow`，或 grid 比核数大太多调度慢。
+**怎么查**：搜 "triton SUB_BLOCK tiling ub overflow"（43µs→7µs 案例：BLOCK 匹配核数 + SUB_BLOCK 控 UB）。
+
+### ❌ 问题示例代码（整数除法漏余数）
+```python
+# ② kernel — ❌ num_sub 用整数除法, BLOCK 不是 SUB_BLOCK 整数倍时漏处理
+num_sub = BLOCK_SIZE // BLOCK_SIZE_SUB        # 假设整除 → 若有余数, 尾部元素没处理
+for i in range(num_sub):
+    offs = base + i*BLOCK_SIZE_SUB + tl.arange(0, BLOCK_SIZE_SUB)
+    ...
+```
+**出现的问题**：`BLOCK_SIZE=25000, BLOCK_SIZE_SUB=10000` 时，`25000//10000=2`，剩 5000 元素没处理 → 尾部结果错。
+
+### ✅ 修改后正确代码（cdiv 向上取整 + mask）
+```python
+num_sub = tl.cdiv(BLOCK_SIZE, BLOCK_SIZE_SUB)   # ✅ 向上取整
+for i in range(num_sub):
+    offs = base + i*BLOCK_SIZE_SUB + tl.arange(0, BLOCK_SIZE_SUB)
+    mask = offs < n_elements                     # ✅ 尾部 mask 兜底
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    tl.store(out_ptr + offs, x*2.0, mask=mask)
+```
+**约束/坑**：`BLOCK_SIZE_SUB×dtype ≤ 192KB/n_bufs`（double buffer 时 ÷2）；外层 BLOCK 决定 grid（匹配核数）。
+
+---
+
+## §七：care_padding=False（去 mask 默认填充）
+
+**触发**：masked load 造成 MTE2 与 vector 的依赖，`vec` 占比低。
+**怎么查**：搜 "triton care_padding=False"。
+
+### ❌ 问题示例代码（误用：填充值被后续用到）
+```python
+# ❌ 若 mask 外的填充值后续被读 → care_padding=False 会读到垃圾
+x = tl.load(x_ptr + offs, mask=mask, care_padding=False)   # 未填充区域=未定义
+y = tl.where(use_other, x, other_val)    # ← 若 use_other 覆盖 x 的填充区, 这里读到垃圾
+```
+**出现的问题**：`care_padding=False` 跳过默认置零，**未填充区域的值未定义**。如果后续计算读那些位置 → 垃圾值。
+
+### ✅ 修改后正确代码（确认安全才用）
+```python
+# ✅ 仅当 mask 未覆盖部分不影响结果时用 (如: 结果只写 mask 内的位置)
+x = tl.load(x_ptr + offs, mask=mask, care_padding=False)   # 提速
+tl.store(out_ptr + offs, x * 2.0, mask=mask)               # store 也 mask → 垃圾不外泄
+# ⚠ triton-ascend 若版本不支持该参数 → 去掉 (宁缺勿错, fail-fast)
+```
+**约束/坑**：安全条件 = 未填充值绝不参与后续结果；否则保留默认 padding。
+
+---
+
+## 八、禁忌 + 收益 + 常见错误
+
+**禁忌**：禁 num_warps/autotune/非 16 倍数/超 L0·UB/计算瓶颈乱调/算法·融合·精度（越层）。
+**收益**：BLOCK_K 增 10~40%；BLOCK_M/N 增 10~30%；**swizzle 15~100%**；EVEN_K 5~15%；care_padding 5~15%。
+
+| 错误 | 现象 | 修复 |
+|---|---|---|
+| BLOCK 超 L0/UB | `ub overflow` 编译失败 | 先算 L0A/B≤64KB、L0C≤128KB、UB≤192KB |
+| 非 16 倍数 | cube 利用率 ~10% | BLOCK 改 16 倍数 |
+| swizzle 漏 min | 越界/错 tile | `group_size_m = min(grid_m-first_pid_m, GROUP_SIZE_M)` |
+| EVEN_K 非 constexpr | mask 没省掉 | 调用处算好传 constexpr |
+| SUB_BLOCK 整数除 | 尾部漏处理 | `tl.cdiv` + 尾部 mask |
+| care_padding 误用 | 垃圾值 | 仅未填充值不影响结果时用 |
+| grid < 40 | 核没吃满 | 减 BLOCK_M/N 或减 BLOCK_SIZE |
+| compute_bound 还调分块 | 浪费轮次 | promote Tier1/5 |

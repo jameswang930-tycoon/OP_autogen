@@ -58,7 +58,8 @@ class RoundPlan:
     expected_impact: str
     verification_method: str
     plan_text: str = ""
-    promote: bool = False          # planner 决策: 是否晋升下一 tier
+    promote: bool = False          # planner 决策: 是否换层 (晋升/回退)
+    promote_to: int = 0            # ★目标层: 0=本层, <当前=回退前层, >当前=晋升后层
     promote_reason: str = ""
 
 
@@ -207,6 +208,23 @@ def _format_history(history: list) -> str:
         return "(no history)"
     recent = history[-5:]   # 只看最近5轮, 紧凑
     lines = ["## 历史梗概 (最近5轮: 改了啥 → 加速比 [结果])"]
+    # ★前层进度: 每层最佳加速比 + 轮数 → planner 了解整体做过什么 (前层优先检查用)
+    tier_best, tier_rounds, tier_best_change = {}, {}, {}
+    for r in history:
+        t = r.get("tier")
+        sp = r.get("speedup")
+        tier_rounds[t] = tier_rounds.get(t, 0) + 1
+        if sp is not None and (t not in tier_best or sp > tier_best[t]):
+            tier_best[t] = sp
+            tier_best_change[t] = (r.get("change") or r.get("strategy") or "")[:40]
+    if tier_best:
+        parts = []
+        for t, v in sorted(tier_best.items()):
+            s = f"T{t}:{v:.2f}x({tier_rounds.get(t, 0)}轮)"
+            if tier_best_change.get(t):
+                s += f", 最好改:{tier_best_change[t]}"   # ★E3: 前层做过什么也带上, 不只加速比
+            parts.append(s)
+        lines.append(f"## 前层进度 (每层最佳加速比×轮数×促成改动): {', '.join(parts)}")
     for r in recent:
         change = r.get("change") or r.get("strategy", "?")
         sp = r.get("speedup")
@@ -341,26 +359,31 @@ class PlannerAgent:
             f"2. 读优化策略文档: {playbook_path}  (只看『优化内容』表 + 『决策依据』段)\n"
             f"3. 读当前单文件 (★当前正在优化的版本, 不是源文件): {current_kernel or (op_dir / 'kernel_op.py' if op_dir else '(未给)')}  (重点 ② kernel 区)\n"
             f"4. 读诊断字段文件: {d7_path or '(未给, 用下面内联字段)'}\n\n"
-            f"## 内联诊断字段 (当前 tier 筛好的, 若第4步文件读不到就用这些):\n{extracted}\n\n"
+            f"## 内联诊断字段 (当前 tier 筛好的, 若第4步文件读不到就用这些):\n{extracted[:1600]}\n\n"
             f"## config 常量:\n{config_text or '(无)'}\n"
             f"## 历史 (最近几轮):\n{history_text}\n"
             f"## 融合分析 (Tier2 才有):\n{fusion_text}\n\n"
             f"## 任务:\n"
-            f"1. 先判断: 当前瓶颈是否属于 Tier{tier}({TIER_NAMES.get(tier,'?')}) 的优化范畴?\n"
-            f"   - 属于 → promote=false, 给出 changes[]\n"
-            f"   - 不属于 → promote=true, promote_reason 说明该晋升到哪个 tier\n"
-            f"2. changes[] 的 old_code 必须与 kernel_op.py 某段【逐字符】相同 (coder 精确替换用); 拿不准就不改, 宁缺勿错\n"
-            f"3. 只改单文件 kernel_op.py ①config/②kernel, 不碰其他文件; 不引入 num_warps/num_stages 到 @triton.jit()\n"
-            f"4. 目标加速比 1.05~1.5x\n\n"
+            f"1. ★先做前层优先检查: 判断瓶颈是否在前层(算法/融合)还有优化空间?\n"
+            f"   - 算力利用率低/cube没吃满 → 算法可能非最优 (Tier1 有空间)\n"
+            f"   - 多kernel串行+launch开销大 → 有融合空间 (Tier2 有空间)\n"
+            f"   - 有 → promote=true, promote_to=<前层>, 允许回退; ★绝不在本层硬调\n"
+            f"2. 然后判断: 当前瓶颈是否属于 Tier{tier}({TIER_NAMES.get(tier,'?')}) 的优化范畴?\n"
+            f"   - 属于 → promote=false, promote_to=0, 给出 changes[]\n"
+            f"   - 不属于且前层无空间 → promote=true, promote_to=<下一层>\n"
+            f"3. ★changes[] 只允许对应当前 tier 的策略 (Tier3 只改 BLOCK_*, 禁止改 DTYPE/算法/融合; 各 tier 归属见 SKILL 铁律表)\n"
+            f"4. changes[] 的 old_code 必须与 kernel_op.py 某段【逐字符】相同 (coder 精确替换用); 拿不准就不改, 宁缺勿错\n"
+            f"5. 只改单文件 kernel_op.py ①config/②kernel, 不碰其他文件; 不引入 num_warps/num_stages 到 @triton.jit()\n"
+            f"6. 目标加速比 1.05~1.5x\n\n"
             f"## 输出 JSON only (★先看真实示例再写):\n"
             f"例: 想把 BLOCK_K 增大 → \n"
             f'{{"strategy":"增大BLOCK_K减MTE1次数","target_speedup":1.1,\n'
-            f'  "changes":[{{"old_code":"BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32","new_code":"BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64","reason":"Tier3: mte1_ratio高, 增大BLOCK_K减少MTE1搬运","section":"① config"}}],\n'
-            f'  "expected_impact":"MTE1搬运次数减半","promote":false,"promote_reason":""}}\n'
-            f"格式 (old_code 必须逐字符匹配当前 kernel):\n"
+            f'  "changes":[{{"old_code":"BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32","new_code":"BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64","reason":"Tier3: mte1_ratio高, 增大BLOCK_K减少MTE1搬运","section":"① config","tier":3}}],\n'
+            f'  "expected_impact":"MTE1搬运次数减半","promote":false,"promote_to":0,"promote_reason":""}}\n'
+            f"格式 (old_code 必须逐字符匹配当前 kernel; tier 必须=当前层):\n"
             f'{{"strategy":"...","target_speedup":1.1,\n'
-            f'  "changes":[{{"old_code":"被替换的整行","new_code":"替换后的整行","reason":"为什么","section":"① config/② kernel"}}],\n'
-            f'  "expected_impact":"...","promote":false,"promote_reason":"..."}}'
+            f'  "changes":[{{"old_code":"被替换的整行","new_code":"替换后的整行","reason":"为什么","section":"① config/② kernel","tier":N}}],\n'
+            f'  "expected_impact":"...","promote":false,"promote_to":0,"promote_reason":"..."}}'
         )
 
         # v4: 统一走 LLMClient (api / nga run CLI / stub), 并引用 planner skill
@@ -388,6 +411,7 @@ class PlannerAgent:
             verification_method="msprof end-to-end",
             plan_text=json.dumps(plan_dict, ensure_ascii=False, indent=2),
             promote=bool(plan_dict.get("promote", False)),
+            promote_to=int(plan_dict.get("promote_to", 0) or 0),   # 目标层 (0=本层)
             promote_reason=str(plan_dict.get("promote_reason", "")),
         )
 

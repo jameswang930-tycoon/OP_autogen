@@ -1,265 +1,254 @@
-# Triton 自动优化系统 Tier 2（Operator Fusion）优化策略指南
-## 层级定位与优化目标
-Tier 2 位于 Tier 1（算法结构优化）之后、Tier 3（分块参数与硬件配置优化）之前，属于**运算与访存的结构级合并优化**，核心目标是在不改变核心算法逻辑的前提下，识别并合并相邻的逐元素运算、冗余内存访问，减少全局内存读写次数、压缩算子总数、缩短 RAW 数据依赖链，提升计算密度与访存带宽利用率。
+# Triton 优化 Tier 2（算子融合）策略指南 — 针对 triton-ascend 910B3
 
-本层优化完全基于 HIVM ops 诊断数据（op 类型、依赖链、访存模式、管线通道）驱动。
-
-> **环境约束（Coder Agent 必读）**：同 CODING_GUIDE.md — WSL2 + Python3.9 + triton3.4.0
-> - 仅用 `@triton.jit`，禁用 `@triton.autotune`
-> - `num_warps`/`num_stages` 不在 `@triton.jit` 参数中
-> - 所有修改必须通过 `ast_to_ttir()` → `ttir_to_hivm.py` → `bisheng` 三层编译
-
-所有修改必须兼容 Triton 3.4.0 语法、可通过 TTIR→HIVM 转换、可被 bisheng 编译器正确编译。
+> 本层在 Tier1（算法）之后：**合并相邻算子，消除中间 GM 往返**，不改变算法逻辑。
+> 本层**只做融合**，**不改算法选择**（Tier1）、**不调分块**（Tier3）。
+>
+> **★环境铁律（triton-ascend，违反必报错）**：
+> - `num_warps` / `num_stages` **禁止**传给 kernel；不用 `@triton.autotune`
+> - 激活用 **`tl.math.tanh`**，不用 `tl.erf`
+> - 融合后单块数据量 ≤ UB 192KB（超了 `ub overflow`）
+> - **epilogue 融合的 N 维要 32B 对齐**（fp16 时 BLOCK_N×2 是 32 的倍数；否则 UB 越界写）
 
 ---
 
-## 一、可融合模式对照表
-本层共三类核心可融合模式，可独立执行也可叠加组合，覆盖绝大多数逐元素访存与运算冗余场景。
+## 一、诊断触发规则（v4 字段 → 融合决策）
 
-| 融合模式 | 模式定义 | 典型触发场景 | 核心收益 |
-|----------|----------|--------------|----------|
-| 连续VecUnit逐元素融合 | 同一执行流中，多个连续的逐元素算术/数学运算，中间无全局内存写入、无分支跳转，可合并为单个融合向量运算单元 | 偏置加法+激活函数、多步逐元素四则运算、归一化后接仿射变换 | 消除中间临时变量，减少算子调度开销，缩短数据依赖链 |
-| 同指针冗余Load融合 | 同一基址指针、相同偏移范围、相同掩码条件的多次全局加载操作，中间无对该地址的写入，可合并为单次加载后寄存器复用 | 同一输入被多个运算分支重复读取、计算链中重复引用同一源数据 | 减少全局内存访问次数，降低带宽占用，消除重复访存开销 |
-| 串行算术链融合 | 由 RAW 依赖串联的多步算术运算链，中间无全局存储、无副作用操作，可整体折叠为单条融合运算流 | 多步多项式计算、归一化公式展开、连续类型转换 | 将长依赖链压缩为单步运算，消除串行等待开销，提升指令级并行度 |
+看 `07_tier2_fields.txt`（含全局摘要 + 融合字段）：
 
-> 组合规则：三类模式可叠加执行，通常先合并冗余 Load，再将 Load 后的连续算术链整体融合为单个 VecUnit 算子，收益最大化。
+| v4 字段 | 触发 | 融合决策 |
+|---|---|---|
+| `summary.num_kernels` | >1 且各 kernel 是 matmul→逐元素→matmul 链 | 把逐元素并进 matmul epilogue（情况A/B） |
+| `summary.api_overhead_total_us` | 大（launch 开销占端到端比例高） | 合并 kernel 减 launch |
+| **全局摘要** `roofline.bottleneck_type` | `memory_bound` 且中间张量大 | 消除中间 GM 往返（情况A/B） |
+| `kernels[].task.pipes_us` | 中间 kernel 耗时大且是纯搬运/逐元素 | 值得融合 |
+| `main_mem_read/write_gb_s` | 高但算力利用率低 | 中间量在 GM 来回 → 融合 |
 
----
-
-## 二、HIVM 诊断触发规则
-所有诊断基于静态分析输出的 HIVM ops 数据，满足对应阈值即判定存在融合空间，必须执行融合优化。
-
-### 2.1 分模式触发阈值
-| 融合模式 | 触发条件（满足任意一条即执行） | 强制执行阈值 |
-|----------|--------------------------------|--------------|
-| 连续VecUnit逐元素融合 | 1. 同管线通道内，连续逐元素算术/math op 数量 ≥ 2<br>2. 相邻 op 之间无全局 store、原子操作、分支跳转 | 连续逐元素 op ≥ 3 且中间无 store |
-| 同指针冗余Load融合 | 1. 同一基址指针、同 size_kb、同掩码的 load op 出现次数 ≥ 2<br>2. 两次 load 之间无对应地址的 store 操作 | 同条件 load 重复 ≥ 2 次 |
-| 串行算术链融合 | 1. 纯逐元素运算构成的 RAW 依赖链长度 ≥ 3<br>2. 链中无任何内存写入、副作用操作 | RAW 链长度 ≥ 4 且全为算术 op |
-
-### 2.2 辅助判定与最优标准
-
-> **适配我们的 bottleneck_diagnoser**：
-> Agent 从 `merged_report.json` 获取以下指标判断融合机会：
-> - `per_op_statistics[].op_type` — 统计 VecUnit op 连续出现次数（≥2 可融合）
-> - `per_op_statistics[].pipeline_channel` — 确认同管线（VECTOR）且中间无 MTE3（store）
-> - `dependencies_summary.raw_chains` — RAW 链长度 ≥ 3 触发算术链融合
-> - `per_op_statistics[].size_kb` — 同 size 同 memory_region 的 load op ≥ 2 触发 Load 合并
-- **辅助排查条件**：单 kernel 内逐元素 op 总数 ≥ 3，且访存 op / 计算 op 比值 > 2 → 强制全量扫描融合机会
-- **Tier 2 最优判定**：同时满足以下三条，可判定算子融合已达最优，允许进入 Tier 3
-  1. 同条件全局 load 无重复（同指针同偏移仅出现 1 次）
-  2. 连续逐元素运算最长链长度 ≤ 1
-  3. 纯算术 RAW 依赖链长度 ≤ 1，无中间临时全局写入
-
-> 前置约束：若 Tier 1 判定算法结构非最优，必须先完成 Tier 1 优化再执行 Tier 2 诊断，禁止跳过算法层直接做算子融合。
-
----
-
-## 三、各模式 Before/After 代码示例
-所有示例严格遵循 Triton 3.4.0 语法，仅使用 `@triton.jit` 装饰器，块尺寸参数标记 `tl.constexpr`，无 GPU 专属 API。
-
-### 3.1 模式一：连续VecUnit逐元素融合
-**场景**：偏置加法 + 缩放 + GELU 激活三步连续运算，中间无写回。
-
-**Before（拆分写法）**
-```python
-@triton.jit
-def fused_op_before(x_ptr, bias_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-
-    x = tl.load(x_ptr + offsets, mask=mask)
-    bias = tl.load(bias_ptr + offsets, mask=mask)
-    
-    # 三步拆分运算，生成3个独立VecUnit op
-    x_add = x + bias
-    x_mul = x_add * 0.5
-    x_gelu = 0.5 * x_mul * (1.0 + tl.erf(x_mul * 0.70710678118))
-    
-    tl.store(out_ptr + offsets, x_gelu, mask=mask)
+### ★决策流程图
 ```
-
-**After（融合写法）**
-```python
-@triton.jit
-def fused_op_after(x_ptr, bias_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-
-    x = tl.load(x_ptr + offsets, mask=mask)
-    bias = tl.load(bias_ptr + offsets, mask=mask)
-    
-    # 单表达式链式运算，编译器自动融合为1个VecUnit op
-    x_fused = x + bias
-    out = 0.5 * x_fused * (1.0 + tl.erf(x_fused * 0.35355339059))
-    
-    tl.store(out_ptr + offsets, out, mask=mask)
-```
-
-### 3.2 模式二：同指针冗余Load融合
-**场景**：同一输入数据被两次读取，分别用于不同计算分支，中间无修改。
-
-**Before（重复Load写法）**
-```python
-@triton.jit
-def redundant_load_before(x_ptr, out_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    base = row_idx * n_cols
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_cols
-
-    # 第一次读取x用于统计量计算
-    x1 = tl.load(x_ptr + base + offsets, mask=mask, other=-float('inf'))
-    row_max = tl.max(x1, axis=0)
-    x_exp = tl.exp(x1 - row_max)
-    
-    # 第二次重复读取同一地址的x，完全冗余
-    x2 = tl.load(x_ptr + base + offsets, mask=mask, other=-float('inf'))
-    x_out = x2 * x_exp / tl.sum(x_exp, axis=0)
-    
-    tl.store(out_ptr + base + offsets, x_out, mask=mask)
-```
-
-**After（单次Load复用写法）**
-```python
-@triton.jit
-def redundant_load_after(x_ptr, out_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    base = row_idx * n_cols
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_cols
-
-    # 单次加载，寄存器全链路复用
-    x = tl.load(x_ptr + base + offsets, mask=mask, other=-float('inf'))
-    row_max = tl.max(x, axis=0)
-    x_exp = tl.exp(x - row_max)
-    x_out = x * x_exp / tl.sum(x_exp, axis=0)
-    
-    tl.store(out_ptr + base + offsets, x_out, mask=mask)
-```
-
-### 3.3 模式三：串行算术链融合
-**场景**：归一化计算的多步算术串行链，连续的平方、求和、开方、除法运算。
-
-**Before（拆分长链写法）**
-```python
-@triton.jit
-def arith_chain_before(x_ptr, out_ptr, n_cols, eps, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    base = row_idx * n_cols
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_cols
-
-    x = tl.load(x_ptr + base + offsets, mask=mask)
-    # 4步串行算术运算，RAW依赖链长度=4
-    x_sq = x * x
-    sum_sq = tl.sum(x_sq, axis=0)
-    mean_sq = sum_sq / n_cols
-    var = mean_sq + eps
-    inv_std = tl.math.rsqrt(var)
-    out = x * inv_std
-    
-    tl.store(out_ptr + base + offsets, out, mask=mask)
-```
-
-**After（融合压缩写法）**
-```python
-@triton.jit
-def arith_chain_after(x_ptr, out_ptr, n_cols, eps, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    base = row_idx * n_cols
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_cols
-
-    x = tl.load(x_ptr + base + offsets, mask=mask)
-    # 归约后算术链整体融合，RAW依赖链压缩为1
-    inv_std = tl.math.rsqrt(tl.sum(x * x, axis=0) / n_cols + eps)
-    out = x * inv_std
-    
-    tl.store(out_ptr + base + offsets, out, mask=mask)
+多 kernel 且中间有 GM 往返 ?
+  ├─ matmul 后跟 独立 bias/激活 → 并进 epilogue (情况A)
+  ├─ 大 kernel 后跟 独立 add(残差) → 并进 epilogue (情况B)
+  ├─ 同一张量被读多次 → 单次 load 复用 (情况C)
+  └─ attention 内 scale/mask/softmax 是独立步骤 → 并入 QK^T/softmax (情况F)
+memory_bound 但算力利用率低 ?
+  ├─ 有隐式格式转换(GEMM 输出格式≠下游输入) → 消除转换 (情况G)
+  └─ 中间量无法消除 ? → 检查融合后 UB/对齐/寄存器 (情况D/E)
+无可融合 → 晋升 Tier3
 ```
 
 ---
 
-## 四、融合后 HIVM ops 预期变化
-> **在我们的 pipeline 中验证融合效果**：
-> 1. 融合后 `per_op_statistics` 中 VECTOR op 数量应减少
-> 2. HIVM `gm_to_ub` op 数量应减少（Load 合并）
-> 3. RAW 依赖链长度应缩短
-> 4. 若 op 数量不变 = 融合失败（Coder 改了等于没改）→ REVERT
+## 情况A：激活/偏置并入 matmul epilogue（★省中间 Z 的 GM 往返，我们 MLP/attention 最相关）
 
-### 4.1 量化收益表
-| 融合模式 | 优化前 op 数量 | 优化后 op 数量 | 算子压缩比例 | 依赖链变化 |
-|----------|----------------|----------------|--------------|------------|
-| 连续VecUnit逐元素融合 | N 个连续逐元素 op（N≥2） | 1 个融合 VecUnit op | 减少 N-1 个，压缩率 (N-1)/N | RAW 链长度从 N 缩短为 1 |
-| 同指针冗余Load融合 | N 次同条件 load（N≥2） | 1 次 load | 减少 N-1 个，压缩率 (N-1)/N | 消除 N-1 条冗余访存依赖 |
-| 串行算术链融合 | N 步串行算术 op（N≥3） | 1 条融合运算流 | 减少 N-1 个，压缩率 (N-1)/N | RAW 链长度从 N 缩短为 1 |
+**触发**：matmul 后跟独立逐元素 kernel（我们的 MLP：`fc1 → bias_gelu(独立) → fc2`），`main_mem` 流量大。
+**收益**：省中间 Z 的写+读 GM（Z[2048²] fp32 = 16MB 写 + 16MB 读 = 32MB 无谓流量）。
+**怎么查**：搜 "triton matmul epilogue bias gelu fused" / "fused matmul epilogue UB alignment"。
 
-### 4.2 典型场景收益示例
-- 偏置+缩放+激活（3个 arith/math op）→ 融合后 1 个 op，op 数量减少 67%
-- 同一输入重复读取 2 次 + 3 步连续运算 → 融合后 load 减少 1 个、运算减少 2 个，总 op 数减少 50% 以上
-- 附带收益：融合后单条指令计算密度提升，全局带宽利用率通常可提升 10%~30%
+### ❌ 问题示例代码（独立 bias_gelu kernel，中间 Z 落 GM）
+```python
+# ❌ fc1 把结果 Z 写回 GM, bias_gelu 再读回来
+matmul_kernel[g](x, w1, z, ...)          # ① Z = X@W1 → 写 GM [M,H] (16MB)
+bias_gelu_kernel[g](z, b1, h, ...)       # ② 读 Z(16MB) → GELU → 写 H → GM
+matmul_kernel[g](h, w2, y, ...)          # ③ 读 H
+# Z 的 32MB 无谓 GM 往返, memory_bound 下浪费大
+```
+**出现的问题**：Z 是中间结果，写 GM 再读回 = 2 次无谓传输（memory_bound 时占瓶颈）。3 个 kernel → 2 次 launch 开销。
 
----
-
-## 五、不可融合的边界场景
-以下场景严格禁止融合，Agent 必须遵守边界规则，避免逻辑错误或性能回退。
-
-1. **中间存在全局 Store 操作**
-   两个运算之间存在对全局内存的写入操作，数据生命周期跨内存，无法跨 store 融合；即使写入地址不同，也禁止跨 store 合并运算流。
-
-2. **跨 Tile / 跨循环迭代边界**
-   分块循环内外的运算、不同循环迭代的运算，属于不同执行上下文，数据依赖不明确，禁止跨迭代融合。
-
-3. **依赖链包含非逐元素操作**
-   运算链中间插入归约（sum/max）、矩阵乘、原子操作、条件分支等非逐元素算子时，禁止跨算子融合；仅归约前后的独立逐元素链可分别融合。
-
-4. **掩码 / 偏移范围不一致**
-   待融合的多个操作对应的内存偏移范围、掩码条件不一致时，强行融合会导致边界越界或数值错误，禁止融合。
-
-5. **存在副作用操作**
-   运算之间包含 `tl.device_print`、`tl.device_assert` 等带副作用的调试操作，禁止跨越副作用操作融合。
-
-6. **寄存器压力临界场景**
-   融合后单块张量数据总 `size_kb` 超过寄存器/片上缓存阈值，会导致寄存器溢出、数据换入换出，反而性能下降。当单块运算张量数 ≥ 8 或总数据量 ≥ 64KB 时，需评估后再融合。
-
-7. **数据类型存在精度风险**
-   多步运算包含不同精度类型转换（如 FP32→FP16→FP32），融合可能改变精度与舍入行为，导致数值偏差，需保留显式类型转换步骤。
+### ✅ 修改后正确代码（bias+gelu 并进 fc1 的 epilogue）
+```python
+@triton.jit
+def fc1_gelu_kernel(a_ptr, w_ptr, b_ptr, c_ptr, M, N, K, ...,
+                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    ...
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, mask=..., other=0.0)
+        w = tl.load(w_ptrs, mask=..., other=0.0)
+        acc = tl.dot(a, w, acc)                       # matmul
+        a_ptrs += BLOCK_K; w_ptrs += BLOCK_K
+    bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+    val = acc + bias[None, :]                         # ✅ bias 在 epilogue
+    cdf = 0.5 * (1.0 + tl.math.tanh(0.7978845 * (val + 0.044715 * val*val*val)))
+    y = val * cdf                                     # ✅ GELU 在 epilogue
+    tl.store(c_ptrs, y, mask=...)                     # 直接写最终结果, Z 不进 GM
+```
+**约束/坑**：
+- **N 维 32B 对齐**（web 实测：epilogue 融合时 N 不满足 32B 对齐 → UB 越界写）。fp16 时 `BLOCK_N×2` 是 32 倍数；fp32 时 `BLOCK_N×4`
+- 融合后单块 = acc(L0C) + bias + val + y（UB/L0 压力↑）→ 监控 UB，超了减小 BLOCK 或拆
+- 我们的 `mlp_gelu_kernel` 已是这个模式（正确样例）
 
 ---
 
-## 六、常见错误与修复方案
-### 1. 掩码不一致导致边界错误
-- **错误描述**：待融合的两个操作 mask 范围不同，强行融合后边界处出现越界读写或数值错误。
-- **触发场景**：两个运算的分块偏移不同、边界条件不同。
-- **修复方案**：融合前校验所有操作的偏移基址、掩码逻辑完全一致；若不一致，先统一边界处理逻辑，再执行融合。
-- **校验方法**：对比 HIVM 中对应 load/store op 的 mask 表达式，完全等价才可融合。
+## 情况B：残差并入前一 kernel epilogue（省 O 的往返）
 
-### 2. 过度融合导致寄存器溢出
-- **错误描述**：无限制合并大量运算，单周期驻留寄存器的张量过多，超出硬件寄存器上限，触发寄存器溢出到片上内存，性能反而下降。
-- **触发场景**：一次性融合 ≥ 6 个输入张量的复杂运算、分块尺寸过大同时融合多算子。
-- **修复方案**：通过 HIVM 的 `size_kb` 指标监控单块总数据量，超过阈值时拆分融合链，保留 2~3 级融合深度；优先融合访存开销最高的相邻运算。
+**触发**：大 matmul 后跟独立 `add` kernel（我们 attention 的 `Out = Z + O` 是独立 `add_kernel`）。
+**收益**：省 Z/O 的一次 GM 往返。
+**怎么查**：搜 "triton residual add fused epilogue"。
 
-### 3. 运算重排导致浮点精度偏差
-- **错误描述**：融合时为了简化表达式调整了浮点运算顺序，改变了舍入行为，导致输出结果与原算法存在精度差异。
-- **触发场景**：多步乘加、多项式计算融合时随意调整结合顺序。
-- **修复方案**：严格保持原运算的运算顺序与结合性，禁止重新排列浮点运算；仅可合并完全等价的常量运算。
-- **验证方法**：融合前后与参考实现做数值对比，FP32 下最大绝对误差不超过 1e-6。
+### ❌ 问题示例代码（独立 add kernel）
+```python
+matmul_kernel[g](y, w2, z, ...)    # Z = Y@W2 → GM
+add_kernel[g](z, o, out, ...)      # 读 Z + 读 O → out → GM   (残差多一次往返)
+```
+**出现的问题**：残差 `+O` 单独一个 kernel，Z 和 O 都要从 GM 读回再写 out = 多 2 次 GM 传输 + 1 次 launch。
 
-### 4. 误融合跨迭代操作
-- **错误描述**：将循环内的运算与循环外的运算、不同循环迭代的运算强行融合，破坏程序逻辑，导致结果错误。
-- **触发场景**：优化分块循环时，将循环初始化、循环体、循环收尾的运算跨步骤合并。
-- **修复方案**：仅融合同一控制流、同一循环迭代内的相邻操作；跨迭代的累积运算（如累加器）禁止与单次迭代运算融合。
+### ✅ 修改后正确代码（残差并入 Z 的 epilogue）
+```python
+@triton.jit
+def fc2_residual_kernel(a_ptr, w_ptr, res_ptr, c_ptr, M, N, K, ...):
+    ...
+    acc = tl.dot(a, w, acc)       # Z = Y@W2
+    c_ptrs = c_ptr + (offs_m[:,None]*stride_cm + offs_n[None,:]*stride_cn)
+    res = tl.load(res_ptr + 同样的偏移, mask=...)          # ✅ 残差 O 直接在 UB
+    tl.store(c_ptrs, acc + res, mask=...)                  # ✅ Z+O 一次写
+```
+**约束/坑**：残差张量 O 必须与 acc 同 tile 对齐（同 offs_m/offs_n）；`res` load 与 `acc` 的 tile 形状一致。
 
-### 5. 遗漏公共子表达式提取
-- **错误描述**：仅合并了表层运算，未提取重复的公共子计算，融合收益未最大化。
-- **触发场景**：两个分支重复计算相同的子表达式，仅做了外层融合。
-- **修复方案**：融合同时识别重复的子计算逻辑，提取为公共变量，进一步减少运算量。
+---
 
-### 6. 融合后引入冗余类型转换
-- **错误描述**：多步运算各自带类型转换，融合后出现连续的冗余 cast 操作，增加不必要开销。
-- **触发场景**：多步运算混合 FP16/FP32 类型，融合后保留了中间转换步骤。
-- **修复方案**：合并连续的同方向类型转换，统一为单次最终类型转换；中间计算优先使用高精度，输出时再做类型转换。
+## 情况C：冗余 Load 融合（同一张量读多次）
 
-需要我补充融合收益的量化评估公式，或者针对特定算子（如 RMSNorm+Activation）的融合模板吗？
+**触发**：同一指针同一偏移被 load ≥2 次（中间无 store）。
+**收益**：减 GM 读次数。
+**怎么查**：搜 "triton redundant load register reuse"。
+
+### ❌ 问题示例代码（x 读两次）
+```python
+x1 = tl.load(x_ptr + offs, mask=mask, other=-float("inf"))   # 第一次
+row_max = tl.max(x1, axis=0)
+x_exp = tl.exp(x1 - row_max)
+x2 = tl.load(x_ptr + offs, mask=mask, other=-float("inf"))   # ← BUG: 重复读
+out = x2 * x_exp / tl.sum(x_exp, axis=0)
+```
+**出现的问题**：同一地址 load 两次 = 2 次 GM 读（或 L1 命中但多一次指令），冗余。
+
+### ✅ 修改后正确代码
+```python
+x = tl.load(x_ptr + offs, mask=mask, other=-float("inf"))   # 读一次, 寄存器复用
+row_max = tl.max(x, axis=0)
+x_exp = tl.exp(x - row_max)
+out = x * x_exp / tl.sum(x_exp, axis=0)
+```
+**约束/坑**：仅当两次 load 之间无对 x 的写；mask/偏移一致。
+
+---
+
+## 情况D：算术链融合（精度风险）
+
+**触发**：RAW 链上多步纯算术（平方→求和→开方→除法），中间无 store。
+**收益**：依赖链压缩，减 op 数。
+**怎么查**：搜 "triton fused arithmetic chain precision"。
+
+### ❌ 问题示例代码（融合时改了浮点顺序 → 精度偏差）
+```python
+# ❌ 为"简化"重排了运算顺序
+inv_std = tl.math.rsqrt(tl.sum(x*x, axis=0)/n_cols + eps)    # 先平方和再开方, 顺序对
+out = x * inv_std
+# 但若改成: inv_std = tl.math.rsqrt(tl.sum((x/n_cols)**2, axis=0) ...) ← 改顺序, 精度变
+```
+**出现的问题**：融合时**重排浮点运算**会改变舍入 → 与参考差 >1e-6，`MATCH_VERIFY` 失败。融合只允许"合并表达式"，**禁止改运算顺序/结合性**。
+
+### ✅ 修改后正确代码（保序融合）
+```python
+# ✅ 只合并中间变量, 严格保持原运算顺序
+x_sq = x * x
+inv_std = tl.math.rsqrt(tl.sum(x_sq, axis=0) / n_cols + eps)   # 顺序不变
+out = x * inv_std
+```
+**约束/坑**：FP32 下融合前后最大绝对误差 ≤ 1e-6；归约（sum/max）不参与逐元素融合。
+
+---
+
+## 情况E：过度融合（寄存器/UB 溢出）
+
+**触发**：想融合更多，但融合后单块张量太多/太大。
+**怎么查**：搜 "triton fused kernel register spill UB"。
+
+### ❌ 问题示例代码（融合过多输入 → 寄存器溢出）
+```python
+# ❌ 一个 kernel 塞 6+ 个输入张量 (a,b,c,d,e,f) + 计算 → 寄存器/L0C 溢出 → 性能反而降
+y = f(a,b,c,d,e,f, acc, res, ...)    # 寄存器爆 → spill 到 GM → 更慢
+```
+**出现的问题**：融合收益有上限——**融合过多输入导致寄存器/L0C 溢出**（web：PyTorch 模板 epilogue 融合在 XPU 因寄存器溢出无法提速）。单块张量数 ≥6 或数据量 ≥64KB 时评估后再融。
+
+### ✅ 修改后正确代码（控制融合深度）
+```python
+# ✅ 只融合访存开销最高的相邻 2~3 级 (bias+激活), 不贪多
+# 溢出信号: 编译报 register spill / L0C overflow → 减小 BLOCK 或拆融合链
+```
+**约束/坑**：融合深度 2~3 级；监控 `l0c` 占用（BLOCK_M×BLOCK_N×4 ≤ 128KB）；溢出就拆。
+
+---
+
+## 情况F：scale/mask 并入 attention（融合 attention 内的小算子）
+
+**触发**：attention 的 `scale`（÷√dim）或 `mask` 是独立 kernel 或单独乘法步骤；我们 `attention_scores_kernel` 已把 scale 乘进 acc（这是正确样例）。
+**收益**：省 scale/mask 的额外 GM 读写 + launch；企业级融合 attention（GEMM+scale+mask+softmax）实测 **3.9×**。
+**怎么查**：搜 "triton fused attention scale mask softmax" / "flash attention causal mask before max"。
+
+### ❌ 问题示例代码（mask 在 max 之后 → 归一化被污染）
+```python
+# ❌ mask 加在 exp 之后, max 还是看到被 mask 位置的值
+S_tile = tl.dot(Q_tile, K_tile.T) * scale
+m_new = tl.maximum(m_row, tl.max(S_tile, axis=1))   # ← BUG: max 没先 mask
+S_tile = tl.where(mask, S_tile, float("-inf"))       # mask 在 max 之后 → 白 mask
+P_tile = tl.exp(S_tile - m_new)
+```
+**出现的问题**：`tl.max` 在 mask 前 → 无效(未来/边界)位置的大值污染 `m_new`，整个 softmax 归一化偏移（flash 最常见 bug 之一）。scale 若也是独立 kernel → 多一次 GM 往返。
+
+### ✅ 修改后正确代码（mask 先于 max，scale 并进 acc）
+```python
+# ✅ scale 乘进 acc (我们 attention_scores 已做): s = acc * scale 再 store
+# ✅ mask 必须先于 max:
+S_tile = tl.dot(Q_tile, K_tile.T) * scale
+S_tile = tl.where(mask, S_tile, float("-inf"))       # ✅ 先 mask
+m_new = tl.maximum(m_row, tl.max(S_tile, axis=1))    # max 只看到有效位置
+P_tile = tl.exp(S_tile - m_new)
+```
+**约束/坑**：`mask` 用 `-inf` 不是 0（0 的 exp=1 混进 sum）；K 越界 load `other=-inf`、V 越界 `other=0`。
+
+---
+
+## 情况G：消除隐式格式转换（Ascend 特有，memory_bound + 算力利用率低）
+
+**触发**：`main_mem` 流量大但 `compute_utilization` 低，怀疑 **GEMM 输出格式（NC1HWC0）与下游算子的 ND 输入不匹配 → 隐式格式转换 kernel 白白跑**。真实案例：attention 35ms→11ms（3.2×），主因就是消除 GEMM↔Softmax 的隐式格式转换。
+**收益**：消除隐式转换的额外 GM 搬运（可达 2~3×）。
+**怎么查**：搜 "ascend NC1HWC0 format conversion implicit kernel" / "triton-ascend layout conversion fusion"。
+
+### ❌ 问题示例（融合了但格式不匹配 → 隐式转换仍跑）
+```python
+# ❌ 融合了算子, 但 GEMM 输出是 NC1HWC0 布局, 下游读它当 ND → 编译器插隐式转换 kernel
+#    表现为: op 数没少多少, main_mem 流量还大, 算力利用率低
+```
+**出现的问题**：Ascend 上 GEMM 输出常用 NC1HWC0（5D）布局，若下游逐元素算子按 ND（2D）读，编译器会插一个**隐式格式转换 kernel**（额外 GM 读写）→ 融合白做。
+### ✅ 修改后正确代码（保持布局一致 / 融合中访问）
+```python
+# ✅ 融合进同一 kernel 内, 在 UB 里按 GEMM 输出布局直接做后续逐元素, 不落 GM 再转
+# 判断: 融合后 op 数应减少, main_mem 流量应降 — 若没降, 查是否有隐式转换
+```
+**约束/坑**：Ascend 特有；看 `main_mem` 里是否有额外转换搬运；融合尽量在**同一 kernel** 内完成，避免跨 kernel 格式不匹配。
+
+---
+
+## 不可融合边界（必须遵守）
+
+1. **中间有 GM store**（数据跨内存生命周期）→ 不跨 store 融合
+2. **跨 tile/循环迭代**（不同执行上下文）→ 不跨迭代融合
+3. **链里有归约/原子/条件分支**（非逐元素）→ 只融合归约前后的独立逐元素链
+4. **mask/偏移不一致** → 先统一边界再融合
+5. **有副作用**（`tl.device_print`/`tl.device_assert`）→ 不跨副作用
+6. **寄存器/UB 临界**（单块 ≥64KB 或张量 ≥6）→ 评估后拆
+7. **精度风险**（FP16/FP32 混转）→ 保留显式类型转换
+
+---
+
+## 常见错误与修复
+
+| 错误 | 现象 | 修复 |
+|---|---|---|
+| 独立中间 kernel 落 GM | memory_bound 还慢 | 并进前一 matmul epilogue（情况A/B） |
+| epilogue N 未 32B 对齐 | UB 越界写/垃圾 | 对齐 BLOCK_N（fp16×2/fp32×4 是 32 倍数） |
+| 融合改浮点顺序 | 精度差 >1e-6 | 严格保序，只合并表达式 |
+| 过度融合 | 寄存器溢出/更慢 | 融合深度 2~3 级，监控 L0C |
+| 用 tl.erf | 编译失败 | 换 tl.math.tanh |
+| 跨迭代/跨 store 融合 | 结果错 | 遵守不可融合边界 |

@@ -1,309 +1,268 @@
-Triton 自动优化系统 Tier 1（算法结构层）优化策略指南
-定位与优先级说明
-Tier 1 是全链路优化的最高优先级层级，聚焦算法结构级替换，从数学逻辑与访存模式层面根本降低运算开销。本层优化必须最先执行 —— 一旦算法结构变更，后续 Tier 2（指令调度 / 流水线）、Tier 3（硬件配置 / 分块参数）的所有优化必须全部重置重做。
-**环境约束**：WSL2 Ubuntu 24.04 + Python 3.9 + triton 3.4.0。仅用 ，禁用 。/ 不在装饰器参数中，通过  编译选项设置。、、 在 triton 3.4.0 中全部可用。
+# Triton 优化 Tier 1（算法结构）策略指南 — 针对 triton-ascend 910B3
 
-所有策略均基于 HIVM ops 诊断数据（op 类型、数量、size_kb、管线通道、RAW/WAR 依赖链、bw_utilization）驱动。
+> 本层是**最高优先级，最先做**：选对算法 / 精度 / 结构。算法一变，后续 Tier2(融合)/Tier3(分块) 全要重置重做。
+> 本层**只改算法结构 / 精度 / kernel 重组**，**不调分块细节**（Tier3）、**不做逐元素融合**（Tier2）。
+>
+> **★环境铁律（triton-ascend，违反必报错）**：
+> - `num_warps` / `num_stages` **禁止**传给 kernel（自动管理）
+> - 不用 `@triton.autotune` / `@libentry`；只用裸 `@triton.jit`
+> - **累加器/归约必须 fp32**（triton 不自动提升 fp16 归约精度）
+> - 激活**别用 `tl.erf`**（triton-ascend 支持不确定）——用 `tl.math.tanh` 近似
+> - 分块 16 倍数；`tl.dot(a, b, acc)` 带 fp32 acc
 
-> **环境约束（Coder Agent 必读）**：
-> - WSL2 Ubuntu 24.04 + Python 3.9 + triton 3.4.0
-> - 仅用 `@triton.jit`，禁用 `@triton.autotune`（mock 环境不支持）
-> - `num_warps`/`num_stages` **不在** `@triton.jit` 参数中
-> - `[:,None]`, `tl.zeros(2D)`, `tl.dot` 在 triton 3.4.0 中全部可用
-> - 所有 BLOCK_SIZE/DIM 参数必须标记 `tl.constexpr`
-> - runtime 参数不能与 `program_id` 做乘法（pointer type 报错）
+---
 
-严格适配 Triton 3.4.0 语法，仅使用 @triton.jit 装饰器，不依赖 @triton.autotune 与 GPU 专属硬件特性。
-一、算子→算法对照表
-表格
-算子类型	常规朴素算法	Tier 1 最优算法	切换触发条件（HIVM 指标）	预期加速比（相对朴素版）
-Softmax	朴素分块实现：分块计算 max → 写回全局 → 分块计算 exp 与 sum → 写回全局 → 分块归一化。中间结果多次落盘全局内存，访存冗余严重。	在线分块 Softmax（Online Block Softmax）：分块计算局部 max 与局部指数和，通过在线合并公式跨块聚合统计量；仅需 1 次读输入、1 次写输出，中间统计量无需落盘全局内存。	1. 全局 load/store op 总数 ≥ 4
-2. 归约 op（max/sum）数量 ≥ 3
-3. bw_util > 85% 且计算 op 占比 < 20%（访存瓶颈型低效）	短序列（≤1024）：1.2~1.5x
-长序列（≥4096）：1.8~2.8x
-RMSNorm	三步式实现：逐元素平方 → 全局求和 → 逐元素归一化乘权重。计算步骤分散，存在冗余访存与依赖链。	单遍融合 RMSNorm：一次加载输入数据，寄存器内完成平方累加、方差计算、归一化、权重乘法全流程；仅 1 次读输入、1 次读权重、1 次写输出。	1. 全局 load/store op 总数 ≥ 3
-2. RAW 依赖链长度 ≥ 3
-3. 算术 op 数量 ≥ 6（步骤拆分过度）	1.4~2.1x
-LayerNorm	多步归约实现：求均值 → 减均值写回 → 求方差 → 归一化 → 仿射变换。至少 2 次独立归约、3 次全局读写。	双统计量融合 LayerNorm：单遍读入同时计算 sum 与 sum_sq，一次归约得到均值和方差；第二遍完成减均值、归一化、伽马贝塔仿射全融合，仅 2 次读、1 次写。	1. 全局 load/store op 总数 ≥ 4
-2. 归约 op 数量 ≥ 3
-3. RAW 依赖链长度 ≥ 4	1.5~2.3x
-GELU	分步算术实现：拆分 erf/tanh 近似公式为多步独立算术运算，无融合，常与前后算子拆分部署。	融合式快速 GELU：单指令流完成完整近似计算，支持与前置偏置加法、后续逐元素操作融合，消除中间全局写回。	1. 算术 op 数量 ≥ 7
-2. 前后相邻均为逐元素 op 且未融合	单独算子：1.1~1.3x
-融合前后算子：1.6~2.2x
-MatMul	朴素二维分块：固定小分块、无软件流水线、无预取、外积计算效率低，访存占比过高。	标准分层分块 MatMul：合理配置 BLOCK_M/N/K 分块比例，循环外预计算指针，K 维循环触发编译器自动软件流水线，最大化计算访存比。	1. bw_util > 80% 且计算密度（FLOP/Byte）< 2
-2. 循环内 load op 占比 > 40%
-3. 单块计算 op 数量 < 16	2.0~4.5x（取决于初始实现质量）
-二、HIVM 诊断触发规则
-所有诊断基于 HIVM 静态分析输出指标，满足任意一条即判定算法非最优，必须执行 Tier 1 算法替换。
-2.1 通用诊断规则（所有算子通用）
-全局内存操作数超标：全局 load + store 算子总数 ≥ 3（单输入单输出算子理论最优为 2 次；带权重算子最优为 3 次以内）
-依赖链过长：RAW（写后读）数据依赖链长度 ≥ 3，说明计算步骤串行拆分过度，存在融合空间
-访存瓶颈严重：带宽利用率 bw_utilization > 85%，同时计算类算子占总 op 比例 < 25%，说明算法引入了冗余访存
-归约次数冗余：同维度归约算子（sum/max/min）数量 ≥ 2，说明可通过单遍多统计量融合减少归约次数
-2.2 分算子专属阈值
-表格
-算子	专属触发阈值
-Softmax	归约 op 总数 ≥ 3，或中间临时内存写入 size_kb ≥ 输入 size 的 50%
-RMSNorm	算术 op 数量 ≥ 6，或存在独立的平方、求和、归一化三段串行 op
-LayerNorm	归约 op 数量 ≥ 3，或存在均值、方差两次独立的全局归约
-GELU	单算子算术 op 数 ≥ 7，或前后相邻均为逐元素 op 且未融合
-MatMul	K 维循环内 load/op 比例 > 0.5，或分块 size_kb < 16KB（分块过小）
-三、Tier 1 最优性判定标准
-只有同时满足以下三个条件，才可判定该算子在算法结构层已达最优，允许进入后续层级优化：
-总 op 数量 ≤ 3：核心计算逻辑压缩为 1~3 个融合 op，无多余拆分步骤
-RAW 依赖链长度 ≤ 1：数据依赖扁平化，无多步串行依赖，可充分并行
-带宽利用率 bw_util > 90%：全局内存带宽接近打满，无冗余访存开销
-判定规则：三个条件为与逻辑，缺一不可。若任意一条不满足，必须返回对应算法优化策略，禁止直接进入下一层优化。
+## 一、诊断触发规则（v4 字段 → 算法决策）
 
-> **适配我们系统的 bottleneck_diagnoser**：
-> 我们的诊断器不区分算子类型，Agent 按以下优先级读取 `merged_report.json`：
-> 1. `execution_summary.num_ops` — op 总数是否超标（基础阈值 > 3）
-> 2. `dependencies_summary.raw_chains` — RAW 依赖链长度（阈值 > 1）
-> 3. `per_op_statistics[].bw_utilization` — 仅当 msprof 是本 kernel 真实 trace 时参考；
->    否则用 `SATURATION_PARAMS` 公式估算值（标记为 ESTIMATED）
-> 4. `per_op_statistics[].op_type` — 统计各类型 op 数量判断是否需要算法替换
+看 `07_tier1_fields.txt`（含**全局摘要** + 本层字段）：
 
-> **适配说明**：我们系统的 bottleneck_diagnoser 不区分算子类型（Softmax/RMSNorm等），按以下优先级判断：
-> ①  是否超标（> 3 为基础阈值）
-> ②  依赖链长度（> 1 为超标）
-> ③ （仅当 msprof 是本 kernel 真实 trace 时参考，否则用 SATURATION_PARAMS 估算值）
-> Agent 读取  +  即可获得所需指标。
-四、算法替换代码示例（Triton 3.4.0 语法）
-所有示例严格遵循约束：仅使用 @triton.jit 装饰器，块尺寸参数标记 tl.constexpr，无 GPU 专属 API，可直接通过 ast_to_ttir 编译。
-4.1 Softmax：朴素分块 → 在线分块
-Before（朴素算法）
-python
-运行
-import triton
-import triton.language as tl
+| v4 字段 | 触发 | 算法决策 |
+|---|---|---|
+| `roofline.compute_utilization` | **低 (<0.3)** 且非 memory | 算法选错 → 换算法 |
+| `compute.cube_fp16_ratio` | 低 且 compute_bound | fp16 计算 + fp32 累加（情况A） |
+| `roofline.bottleneck_type` | `memory_bound` 且算术强度低 | 冗余访存（如 S 中间量）→ flash（情况B） |
+| `summary.num_kernels` / `api_overhead_total_us` | 多同结构 matmul / launch 大 | QKV 三合一 / persistent（情况C/F） |
+| `roofline.arithmetic_intensity` | 明显低于平衡点(≈86) | 算法/访存结构问题 |
 
+### ★决策流程图
+```
+compute_bound 且 cube_fp16_ratio 低 ? → fp16 (情况A)
+memory_bound 且 巨大中间张量(S[seq²]) ? → flash 省 S (情况B)
+多个同结构小 matmul 串行 ? → 合并一个 GEMM (情况C)
+归约类算子多遍扫数据 ? → online/单遍 (情况D)
+compute_utilization 极低但算法看着对 ? → 分块/融合问题, 回 Tier2/3
+否则 → 算法层已最优, 晋升 Tier2
+```
+
+---
+
+## 情况A：fp16 计算 + fp32 累加（compute_bound，我们 MLP/attention 最相关）
+
+**触发**：`bottleneck_type=compute_bound`（comp≥0.8）且 `cube_fp16_ratio` 低。
+**收益**：fp16 cube 313 vs fp32 74 TFLOPS → 计算瓶颈下 ~4×。
+**怎么查**：搜 "triton matmul fp16 fp32 accumulate" / "triton fp16 reduction precision"。
+
+### ❌ 问题示例代码（fp16 累加 bug）
+```python
+# ① config
+DTYPE = torch.float16
+
+# ② kernel — ❌ acc 也用了 fp16
 @triton.jit
-def softmax_naive(x_ptr, out_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    offsets = row_idx * n_cols + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < (row_idx + 1) * n_cols
-
-    # 冗余两次全局读取
-    x = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
-    row_max = tl.max(x, axis=0)
-    x = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
-    x_exp = tl.exp(x - row_max)
-    row_sum = tl.sum(x_exp, axis=0)
-
-    out = x_exp / row_sum
-    tl.store(out_ptr + offsets, out, mask=mask)
-After（最优在线算法）
-python
-运行
-import triton
-import triton.language as tl
-
-@triton.jit
-def softmax_online(x_ptr, out_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < n_cols
-    base = row_idx * n_cols
-
-    # 单次全局读入，全流程寄存器内计算
-    x = tl.load(x_ptr + base + col_offsets, mask=mask, other=-float('inf'))
-    row_max = tl.max(x, axis=0)
-    x_exp = tl.exp(x - row_max)
-    row_sum = tl.sum(x_exp, axis=0)
-    
-    # 单次写回，无中间结果落盘
-    tl.store(out_ptr + base + col_offsets, x_exp / row_sum, mask=mask)
-核心改动：消除冗余全局读取，所有计算在寄存器内完成；长序列扩展分块循环时，保留在线合并 max/sum 逻辑，避免中间结果落盘。
-4.2 RMSNorm：三步式 → 单遍融合
-Before（朴素三步式）
-python
-运行
-@triton.jit
-def rmsnorm_naive(x_ptr, w_ptr, out_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    offsets = row_idx * n_cols + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < (row_idx + 1) * n_cols
-
-    x = tl.load(x_ptr + offsets, mask=mask)
-    x_sq = x * x
-    var = tl.sum(x_sq, axis=0) / n_cols
-    rms = tl.math.rsqrt(var + 1e-6)
-    w = tl.load(w_ptr + tl.arange(0, BLOCK_SIZE), mask=mask)
-    out = x * rms * w
-    tl.store(out_ptr + offsets, out, mask=mask)
-After（单遍融合最优版）
-python
-运行
-@triton.jit
-def rmsnorm_fused(x_ptr, w_ptr, out_ptr, n_cols, eps, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < n_cols
-    base = row_idx * n_cols
-
-    # 单次加载输入与权重，全流程寄存器内融合
-    x = tl.load(x_ptr + base + col_offsets, mask=mask)
-    w = tl.load(w_ptr + col_offsets, mask=mask)
-    
-    var = tl.sum(x * x, axis=0) / n_cols
-    out = x * tl.math.rsqrt(var + eps) * w
-    tl.store(out_ptr + base + col_offsets, out, mask=mask)
-核心改动：合并所有计算步骤，消除中间变量的全局内存驻留，确保仅 2 次 load、1 次 store。
-4.3 LayerNorm：多步归约 → 双统计量融合
-Before（朴素多步归约）
-python
-运行
-@triton.jit
-def layernorm_naive(x_ptr, gamma_ptr, beta_ptr, out_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    offsets = row_idx * n_cols + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < (row_idx + 1) * n_cols
-
-    x = tl.load(x_ptr + offsets, mask=mask)
-    mean = tl.sum(x, axis=0) / n_cols
-    x_centered = x - mean
-    var = tl.sum(x_centered * x_centered, axis=0) / n_cols
-    inv_std = tl.math.rsqrt(var + 1e-5)
-    gamma = tl.load(gamma_ptr + tl.arange(0, BLOCK_SIZE), mask=mask)
-    beta = tl.load(beta_ptr + tl.arange(0, BLOCK_SIZE), mask=mask)
-    out = gamma * (x_centered * inv_std) + beta
-    tl.store(out_ptr + offsets, out, mask=mask)
-After（融合最优版）
-python
-运行
-@triton.jit
-def layernorm_fused(x_ptr, gamma_ptr, beta_ptr, out_ptr, n_cols, eps, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < n_cols
-    base = row_idx * n_cols
-
-    # 单遍遍历同时计算sum和sum_sq，减少一次数据遍历
-    x = tl.load(x_ptr + base + col_offsets, mask=mask)
-    sum_x = tl.sum(x, axis=0)
-    sum_x2 = tl.sum(x * x, axis=0)
-    
-    # 寄存器内完成均值、方差、归一化、仿射全融合
-    mean = sum_x / n_cols
-    var = sum_x2 / n_cols - mean * mean
-    inv_std = tl.math.rsqrt(var + eps)
-    gamma = tl.load(gamma_ptr + col_offsets, mask=mask)
-    beta = tl.load(beta_ptr + col_offsets, mask=mask)
-    
-    out = gamma * (x - mean) * inv_std + beta
-    tl.store(out_ptr + base + col_offsets, out, mask=mask)
-核心改动：用 sum(x) + sum(x*x) 一次遍历得到均值和方差，替代 “减均值再算方差” 的两次遍历，减少寄存器压力与计算步骤。
-4.4 GELU：分步计算 → 融合近似
-Before（分步朴素版）
-python
-运行
-@triton.jit
-def gelu_naive(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    
-    sqrt_2 = 1.41421356237
-    cdf = 0.5 * (1.0 + tl.erf(x / sqrt_2))
-    out = x * cdf
-    tl.store(out_ptr + offsets, out, mask=mask)
-After（融合最优版，支持偏置融合）
-python
-运行
-@triton.jit
-def gelu_fused(x_ptr, bias_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    bias = tl.load(bias_ptr + offsets, mask=mask)
-    
-    # 单表达式融合偏置+GELU，触发编译器指令融合
-    x_b = x + bias
-    out = 0.5 * x_b * (1.0 + tl.erf(x_b * 0.70710678118))
-    tl.store(out_ptr + offsets, out, mask=mask)
-核心改动：合并常量运算，支持前置偏置融合，减少独立算术 op 数量；无需偏置时去掉 bias 加载即可。
-4.5 MatMul：朴素分块 → 标准分层分块
-Before（朴素分块版）
-python
-运行
-@triton.jit
-def matmul_naive(a_ptr, b_ptr, c_ptr, M, N, K,
-                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-    
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, ...,
+                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    ...
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float16)   # ← BUG: 累加器该 fp32
     for k in range(0, K, BLOCK_K):
-        # 无流水线，每次循环等待读写完成
-        a = tl.load(a_ptr + offs_m[:, None] * K + k + offs_k[None, :],
-                    mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K), other=0.0)
-        b = tl.load(b_ptr + (k + offs_k[:, None]) * N + offs_n[None, :],
-                    mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
-        acc += tl.dot(a, b)
-    
-    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc,
-             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
-After（最优分层分块 + 自动流水线）
-python
-运行
-@triton.jit
-def matmul_opt(a_ptr, b_ptr, c_ptr, M, N, K,
-               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-    
-    # 循环外预计算指针（stride必须声明为tl.constexpr避免类型错误）
-    stride_ak: tl.constexpr = 1
-    stride_bn: tl.constexpr = N  # N作为constexpr传入
-    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bn + offs_n[None, :]
-    
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        ...
+        acc = tl.dot(a, b, acc)      # fp16 累加 → K=2048 次累加精度损失大
+    tl.store(c_ptrs, acc, ...)
+```
+**出现的问题**：
+- fp16 尾数仅 10 位，2048 次 `tl.dot` 累加后相对误差 ~1e-2+，大矩阵结果错（`MATMUL_VERIFY` 会 CHECK/FAIL）
+- triton **不自动**把 fp16 归约提升到 fp32（PyTorch 都专门修过这个问题）——你不显式 fp32，它就 fp16 累加
+
+### ✅ 修改后正确代码
+```python
+    # ② kernel 内只改这一处: acc 用 fp32 (fp16 输入自动提升到 fp32 计算)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)   # ✅ 累加器 fp32
     for k in range(0, K, BLOCK_K):
-        mask_k = k + offs_k < K
-        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & mask_k[None, :], other=0.0)
-        b = tl.load(b_ptrs, mask=mask_k[:, None] & (offs_n[None, :] < N), other=0.0)
-        acc += tl.dot(a, b)
-        # 常量步进指针，触发编译器自动软件流水线
-        a_ptrs += BLOCK_K
-        b_ptrs += BLOCK_K * N
-    
-    tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc,
-             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
-核心改动：循环外预计算指针、循环内常量步进，触发编译器自动软件流水线；分块比例遵循计算访存比最优原则（通常 BLOCK_K 取 32/64）。
-五、Agent 算法替换常见错误与修复方案
-1. 数值稳定性错误
-错误描述：替换 Softmax/LayerNorm 时遗漏减 max、epsilon 偏移，导致大数溢出、除零错误，输出 nan/inf。
-触发场景：Online Softmax 合并、LayerNorm 方差计算时。
-修复方案：Softmax 必须保留 x - row_max 步骤，指数运算输入必须非正；归一化分母必须加 eps（默认 1e-5~1e-6），禁止直接 tl.math.rsqrt(var)。
-验证方法：输入大数值张量（如 1e3 量级），检查输出无 nan、inf。
-2. 分块边界越界错误
-错误描述：算法替换后分块循环的 mask 计算错误，导致越界读写、结果边缘数值错误。
-触发场景：长序列分块、矩阵乘非对齐尺寸。
-修复方案：所有内存操作必须显式带 mask，禁止假设输入尺寸是 BLOCK_SIZE 整数倍；mask 基于全局坐标计算，而非相对分块坐标。
-验证方法：测试非 2 次幂、非对齐尺寸输入，与官方实现做数值校验。
-3. 过度融合导致寄存器溢出
-错误描述：强行融合过多算子，单块数据量过大，导致寄存器 / 片上缓存溢出，性能反而下降甚至编译失败。
-触发场景：同时融合 Norm+Activation+Linear 三层以上，分块尺寸设置过大。
-修复方案：通过 HIVM 的 size_kb 指标监控，单块总数据量超过 64KB 时拆分融合逻辑；逐元素算子融合不超过 3 层，归约算子最多与 1 层逐元素算子融合。
-验证方法：对比融合前后的编译产物寄存器用量，确保性能正向提升。
-4. constexpr 参数漏标
-错误描述：算法替换新增的分块尺寸、循环步长参数未标记 tl.constexpr，导致 ast_to_ttir 编译失败。
-触发场景：新增 BLOCK_K、循环步长等参数时遗漏装饰。
-修复方案：所有块大小、循环边界、步长参数必须在函数签名中标记 tl.constexpr；循环范围必须是编译期可确定的静态范围，禁止使用动态变量作为循环边界。
-验证方法：执行 triton.compile 检查 ast_to_ttir 阶段无报错。
-5. 误用 GPU 专属 API
-错误描述：照搬 NVIDIA Triton 示例，引入 tl.async_copy、warp shuffle、TMA 描述符等 GPU 专属 API，导致 TTIR→HIVM 转换失败。
-触发场景：直接复用社区 GPU 优化代码时。
-修复方案：Tier 1 算法优化仅使用标准算术、归约、内存读写 API，禁止使用硬件原语；软件流水线依赖编译器自动优化，不手动调用异步拷贝指令。
-验证方法：检查生成的 TTIR 中无 GPU 专属 op，可通过 HIVM 转换器解析。
+        ...
+        acc = tl.dot(a, b, acc)      # fp16 输入 + fp32 累加 = 标准做法
+    tl.store(c_ptrs, acc.to(DTYPE), ...)   # 写回时降精度, 不要提前降
+```
+**约束/坑**：
+- 累加器、归约、`m/l` 统计量**一律 fp32**；只有输入和最终存储才 fp16
+- kernel 内归约（`tl.sum` 等）如果输入是 fp16，**先 `.to(tl.float32)` 再归约**
+- 激活（tanh）对 fp16 输入敏感：kernel 内 `val.to(tl.float32)` 算激活再存
+- 验证 `MATMUL_VERIFY=1`，误差阈值放宽到 ~1e-2（fp16 输入 + fp32 累加 vs torch fp16 参考）
+
+---
+
+## 情况B：Flash Attention（省 S 中间量，memory_bound 的 attention）
+
+**触发**：`bottleneck_type=memory_bound` 且我们 attention 的 `S=Q@K^T`=[seq,seq]=2048² 大中间量（写 16MB + 读 16MB = 32MB 无谓流量）。
+**收益**：省 S 的 GM 往返 → attention 端到端 2~4×。
+**怎么查**：搜 "triton flash attention fwd kernel" / "online softmax matmul"。
+
+### ❌ 问题示例代码（在线 softmax 合并公式 bug）
+```python
+# 核心思路: 不写 S 到 GM, 在线合并行 max/sum 直接累加进 O
+m_row = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+l_row = tl.zeros((BLOCK_M,), dtype=tl.float32)
+acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+for n_tile in range(0, seq, BLOCK_N):
+    S_tile = tl.dot(Q_tile, K_tile.T) * scale
+    m_new = tl.maximum(m_row, tl.max(S_tile, axis=1))
+    P_tile = tl.exp(S_tile - m_new)
+    acc += tl.dot(P_tile, V_tile)          # ← BUG1: 没乘 alpha=exp(m_row-m_new) 重标度
+    l_row += tl.sum(P_tile, axis=1)        # ← BUG2: l_row 也没重标度
+    m_row = m_new
+O = acc / l_row[:, None]
+```
+**出现的问题**：
+- **B1 漏重标度**：`m_new > m_row` 时，之前累加的 `acc` 和 `l_row` 是按旧 max 的 scale，直接 `+=` 会让输出**偏向后面处理的 KV 块** → 结果错。这是 flash 最常见的 bug，`corr = exp(m_row - m_new)` 必须同时乘到 acc 和 l_row（只乘一个也错）
+- **B2 数值溢出**：`exp(m_row - m_new)` 当 max 变化大时可能 overflow/underflow
+
+### ✅ 修改后正确代码
+```python
+m_row = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+l_row = tl.zeros((BLOCK_M,), dtype=tl.float32)
+acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+for n_tile in range(0, seq, BLOCK_N):
+    S_tile = tl.dot(Q_tile, K_tile.T) * scale     # S 在 UB, 不进 GM
+    m_new = tl.maximum(m_row, tl.max(S_tile, axis=1))
+    alpha = tl.exp(m_row - m_new)                 # ✅ 重标度因子
+    P_tile = tl.exp(S_tile - m_new)
+    acc = acc * alpha[:, None] + tl.dot(P_tile, V_tile)        # ✅ acc 和 l 都要乘 alpha
+    l_row = l_row * alpha + tl.sum(P_tile, axis=1)
+    m_row = m_new
+O = acc / l_row[:, None]
+```
+**约束/坑**：
+- `m_row/l_row/acc` **必须 fp32**（fp16 的 max 上限 65504，长序列会饱和）
+- **causal/边界 mask 必须在 `tl.max` 之前**（先 mask 再求 max，否则无效位置污染归一化）
+- K 越界 load 的 `other` 用 **`-inf`**（不是 0——0 会贡献进 sum）
+- 这是算法级大改，必须 `MATCH_VERIFY=1` 数值校验；fp32 参考下 online 版可能差 ~1e-5（顺序不同），可接受
+
+---
+
+## 情况C：QKV 三合一（多个同结构 matmul → 一个 GEMM）
+
+**触发**：`num_kernels` 里多个同结构 matmul（我们 attention 的 Q/K/V 三个 `X@W`），launch_count 高。
+**收益**：3 launch → 1，X 只 load 一次。
+**怎么查**：搜 "triton attention fused QKV projection" / "qkv stride view bug"。
+
+### ❌ 问题示例代码（QKV 拼接 stride 错位 bug）
+```python
+# 主机端拼 W → 一次 matmul
+W_qkv = torch.cat([Wq, Wk, Wv], dim=1)          # [dim, 3*dim]
+qkv = matmul_kernel[g](x, W_qkv, qkv_out, seq, 3*dim, dim, ...)   # [seq, 3*dim]
+# Q/K/V 切片视图
+Q = qkv[:, :dim]      # ← 这是 [seq, dim] 视图, 但列 stride = 3*dim (不是 dim!)
+# 后续 kernel 若假设 Q 连续 (stride=dim) → 读错位置 → 垃圾值/NaN
+```
+**出现的问题**：`Q = qkv[:, :dim]` 是 strided 视图（列步长 `3*dim` 而非 `dim`）。如果下游 kernel 硬编码 `stride=dim` 或 `.view()`，就读错内存 → 垃圾值。**stride 假设错误是融合投影最常见的 bug**（vLLM/sglang 一堆修这个的 PR）。
+
+### ✅ 修改后正确代码（两种方案）
+```python
+# 方案1 (推荐, 零拷贝): 显式传 qkv 的列 stride 给下游 kernel
+#   下游 kernel 的 b_ptrs 用 stride_bn = 3*dim (不是 dim), 读 Q 的 [seq, dim] 视图
+matmul_kernel(qkv_ptr, ...)   # 通过 stride 参数指定从 qkv 里读 Q/K/V
+
+# 方案2 (简单, 多一次拷贝): 主机端 .contiguous() 切出独立张量
+Q = qkv[:, :dim].contiguous(); K = qkv[:, dim:2*dim].contiguous(); V = qkv[:, 2*dim:].contiguous()
+```
+**约束/坑**：`3*dim` 编译期常量；方案1 要改下游 kernel 的 stride 参数（改对，不然又是 stride bug）；方案2 多一次 GM 拷贝但最稳。
+
+---
+
+## 情况D：Online Softmax（归约类算子，我们 softmax_kernel 已是单遍）
+
+**触发**：softmax/norm 多遍扫数据（max 一遍 + exp/sum 一遍 + 写回）。
+**收益**：1.2~2.8×（长序列）。
+**怎么查**：搜 "triton online softmax single pass"。
+
+### ❌ 问题示例代码（没减 max → 溢出）
+```python
+@triton.jit
+def softmax_bug(x_ptr, y_ptr, rows, cols, BLOCK: tl.constexpr):
+    row = tl.program_id(axis=0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < cols
+    x = tl.load(x_ptr + row*cols + offs, mask=mask, other=0.0)   # ← BUG: other 该 -inf
+    e = tl.exp(x)                       # ← BUG: 没减 max → 大值溢出
+    denom = tl.sum(e, axis=0)
+    tl.store(y_ptr + row*cols + offs, e / denom, mask=mask)
+```
+**出现的问题**：x 值大（如 100）时 `exp(100)` 溢出 → `nan/inf`；且没减 max 数值极不稳定。mask 的 `other=0` 也会污染（0 的 exp=1 混进 sum）。
+
+### ✅ 修改后正确代码
+```python
+@triton.jit
+def softmax_fixed(x_ptr, y_ptr, rows, cols, BLOCK: tl.constexpr):
+    row = tl.program_id(axis=0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < cols
+    x = tl.load(x_ptr + row*cols + offs, mask=mask, other=float("-inf"))   # ✅ -inf
+    m = tl.max(x, axis=0)              # ✅ 先减 max (数值稳定)
+    e = tl.exp(x - m)
+    denom = tl.sum(e, axis=0)
+    tl.store(y_ptr + row*cols + offs, e / denom, mask=mask)
+```
+**约束/坑**：`other=float("-inf")` 保证 exp(-inf)=0 不污染；`m/denom` 保持 fp32。
+
+---
+
+## 情况E：Split-K（超大 K 分解）
+
+**触发**：K 非常大（>4096）且 `compute_utilization` 低。
+**收益**：K 并行到多 program。
+**怎么查**：搜 "triton matmul split k parallel reduce"。
+
+### ❌ 问题示例代码（部分和覆盖 bug）
+```python
+# 每个 program 算部分 K 的 acc, 直接 store → 覆盖, 只留最后一块
+for k in range(k_start, k_end, BLOCK_K):
+    ...
+    acc += tl.dot(a, b)
+tl.store(c_ptr + offs, acc, ...)    # ← BUG: 不同 program 写同一位置, 覆盖
+```
+**出现的问题**：split-k 的多个 program 各算一份部分和，直接 store 会互相覆盖 → 只留最后一块，结果错。
+
+### ✅ 修改后正确代码（归约）
+```python
+# 方案1: 第二 kernel 归约 (每个 program 输出部分和到临时, 再求和)
+# 方案2: 原子加 (tl.atomic_add, 精度低些)
+# 方案3: tl.sum 归约 (把部分和沿 K 维 reduce)
+```
+**约束/坑**：K 不够大别用（归约开销倒挂）；我们 attention K=2048 一般不需要。
+
+---
+
+## 情况F：Persistent Kernel（小 grid + 高 launch 开销）
+
+**触发**：`num_kernels` 少、`api_overhead_total_us` 大。
+**收益**：减 launch 次数。
+**怎么查**：搜 "triton persistent kernel matmul"。
+
+### ❌ 问题示例代码（tile_id 越界 bug）
+```python
+# persistent program 循环处理 tile_id, 但没判越界
+for tile_id in range(pid, num_tiles, num_programs):
+    ...   # ← BUG: 若 num_tiles 不是 num_programs 整数倍, 部分 program 空转/越界
+```
+**出现的问题**：`num_tiles % num_programs != 0` 时，最后的 program 循环到越界 tile → 读越界。
+
+### ✅ 修改后正确代码
+```python
+for tile_id in range(pid, num_tiles, num_programs):
+    if tile_id >= num_tiles:
+        break    # ✅ 越界保护
+    ...
+```
+**约束/坑**：我们 2048³ grid=1024，launch 开销一般不大，慎用。
+
+---
+
+## 通用算法替换原则
+
+1. **先判瓶颈类型再选算法**：compute_bound → 精度/算法效率；memory_bound → 省访存（online/flash/合并）。
+2. **算法级改动必须 `MATCH_VERIFY=1` 数值校验**，尤其 softmax/flash 的合并公式（online 版 vs torch fp32 参考可能差 ~1e-5，顺序不同可接受）。
+3. **GPU 版代码适配规则**：1D grid（`pid//grid_n`）、`tl.dot(a,b,acc)` 带 fp32 acc、去掉 num_warps/autotune、分块 16 倍数、激活用 tanh。
+4. **算法改完后续层全要重做**（回 Tier2/3）。
+
+---
+
+## 常见错误与修复
+
+| 错误 | 现象 | 修复 |
+|---|---|---|
+| acc/归约 用 fp16 | 大矩阵精度崩 | 全用 fp32；只有输入/存储 fp16 |
+| flash 漏 rescale | 输出偏向后面的块 | `acc=acc*alpha + P@V`, `l=l*alpha+sum(P)` 都要 |
+| flash mask 在 max 后 | 归一化被无效位污染 | 先 mask 再 max |
+| K 越界 other=0 | sum 被污染 | other 用 `-inf` |
+| softmax 没减 max | exp 溢出 nan | 减 max + other=-inf |
+| QKV 拼接 stride 错 | 读错位置垃圾值 | 显式 stride 或 .contiguous() |
+| 用 tl.erf | 编译失败 | 换 tl.math.tanh |
+| 算法改完不重调后续 | 收益被掩盖 | 回 Tier2/3 重做 |

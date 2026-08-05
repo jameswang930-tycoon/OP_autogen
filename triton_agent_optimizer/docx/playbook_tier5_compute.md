@@ -1,265 +1,207 @@
-# Triton 自动优化系统 Tier 5（Compute & Occupancy）优化策略指南
-## 层级定位与前置约束
-Tier 5 是全链路优化的最终指令级计算优化层，**必须在 Tier 1~Tier 4 全部完成并验证最优后执行**。本层不改变核心算法、算子融合结构、分块尺寸与访存模式，仅通过等价指令替换、计算融合、冗余变量消除等手段，适配 Ascend NPU 向量计算单元（VecUnit）硬件特性，提升计算单元占用率、降低单运算周期、减少寄存器冗余占用，榨取计算侧极限性能。
+# Triton 优化 Tier 5（计算占用）策略指南 — 针对 triton-ascend 910B3
 
-> **环境约束（Coder Agent 必读）**：同 CODING_GUIDE.md
-> - WSL2 + Python3.9 + triton3.4.0，仅用 @triton.jit
-> - num_warps/num_stages 由 GPUTarget 设置，Coder 不修改
-> - **数学函数用 `tl.math.*` 命名空间**（我们的 ttir_to_hivm.py 以 `math.xxx` 为 key）
-> - `tl.fma` 谨慎使用——直接写 `x*w+b` 让 bisheng 自动融合更安全
-
-本手册严格适配环境约束：
-- 前端：Triton 3.4.0 + Python 3.9，仅使用 `@triton.jit` 装饰器，禁用 `@triton.autotune`
-- 中间链路：TTIR → HIVM 自定义转换，所有语法必须可解析
-- 后端：CANN 9.0 + bisheng 编译器 + CMake 构建
-- 验证：msprof op simulator 周期精确模拟
-- 核心边界：`num_warps`、`num_stages` 不属于 `@triton.jit` 参数，仅通过调用配置传递
+> 本层在 Tier1~4 之后：**指令级计算优化**（向量化/原生指令/ILP/冲突/标量），**不改算法/融合/分块/访存模式**。
+> 昇腾计算优化的核心：**引导编译器做对向量化加载、原生数学指令、循环展开**，消灭标量降级和计算空等。
+>
+> **★环境铁律（triton-ascend）**：
+> - `num_warps`/`num_stages` **禁止**传；不用 `@triton.autotune`
+> - **数学函数用 `tl.math.*`**（`tl.math.tanh`/`tl.math.rsqrt` 已验证可行）；**别用 `tl.erf`**
+> - **mask/指针别用 int64/div/mod**（会触发标量降级 → 性能崩）
+> - 累加器/归约 fp32；热路径**别用 `tensor.item()`**（CPU-NPU 同步）
+> - 优先级：**正确性 > 泛化性 > 性能**
 
 ---
 
-## 一、核心优化策略
-按优先级从高到低分为三类，均为等价语义优化，不改变数值逻辑（仅浮点舍入次数存在可控微小差异）。
+## 一、诊断触发规则（v4 字段 → 动作）
 
-### 1. 原生数学指令替换
-- **优化原理**：用硬件原生支持的专用数学指令，替代手动组合的等价运算，减少指令条数、降低运算延迟、减少寄存器占用。核心替换场景为**倒数平方根**：使用 `tl.math.rsqrt` 替代 `1.0 / tl.sqrt(x)`，将「开方+除法」两条指令合并为单条原生指令，运算周期减少 40%~60%。
-- **适用场景**：归一化算子（RMSNorm、LayerNorm）中的标准差倒数计算、所有需要除以根号的运算场景。
-- **扩展替换**：同类可替换模式还包括 `tl.exp2` / `tl.log2` 替代带常数缩放的 `tl.exp` / `tl.log`，进一步消除常数乘法开销。
+看 `07_tier5_fields.txt`（含全局摘要）：
 
-### 2. 融合乘加（FMA）指令化
-- **优化原理**：将独立的「乘法 + 加法」串行运算对，合并为单条融合乘加（Fused Multiply-Add, FMA）指令，仅做一次浮点舍入，节省一个指令周期，同时减少一次中间结果的寄存器占用。
-- **适用场景**：偏置加法（`y = w*x + b`）、缩放平移、多项式计算、激活函数中的乘加组合等所有 `a*b + c` 模式的运算。
-- **实现方式**：显式调用 `tl.fma(a, b, c)`（语义等价于 `a*b + c`），确保 bisheng 编译器稳定触发硬件 FMA 指令，避免编译器因浮点精度保守而不自动融合。
+| v4 字段 | 触发 | 动作 |
+|---|---|---|
+| `task.pipes_us.aic_scalar_time_us` / `engine_utilization.scalar` | 高（标量拖累） | 消除标量降级（情况A） |
+| `compute.vector_fops` / `vec` 利用率 | 低 | 向量化加载（情况B） |
+| 数学运算慢（cube 已满） | 用了 1/sqrt 等手动组合 | 原生指令（情况C） |
+| `compute.cube_fp16_ratio` | 低 | 精度（回 Tier1 A，本层引用） |
+| `conflict.bank_cflt_ratio` | >4~5% | 调整访问/swizzle（情况F） |
+| 性能不升反降 | 寄存器溢出 | 控制展开/ILP（情况E） |
 
-### 3. 冗余中间变量消除
-- **优化原理**：消除计算链中无意义的中转中间变量，将串行的简单算术运算合并为连续表达式，缩短数据依赖链，提升指令级并行度，同时减少不必要的寄存器分配。
-- **适用场景**：单步运算就赋值一个中间变量、无跨分支复用价值的串行计算链；仅做数据中转、无逻辑意义的临时变量。
-- **边界约束**：关键统计量（如均值、方差、求和结果）、跨分支复用的变量必须保留，仅消除纯中转性质的冗余变量。
+### ★决策流程图
+```
+scalar_time/ratio 高 ?
+  ├─ mask/指针用了 int64/div/mod → 改 int32/消除 (情况A)
+  └─ 逐元素标量加载 → 向量化 (情况B)
+数学运算慢 ?
+  ├─ 1/sqrt → tl.math.rsqrt; erf → tanh (情况C)
+  └─ mul+add 没自动融合 → 直接 x*w+b (情况D)
+bank_cflt_ratio >4% → 访问调整 (情况F)
+性能不升反降/寄存器溢出 → 控制展开/ILP (情况E)
+否则 → 晋升 Tier6
+```
 
 ---
 
-## 二、HIVM 诊断触发规则
-所有优化动作由 HIVM ops 诊断数据驱动，满足对应阈值即执行对应优化。
+## 情况A：消除标量降级（int64 mask / div-mod 指针）★最容易被忽略
 
-> **适配我们的 bottleneck_diagnoser**：
-> Agent 从 `merged_report.json` 获取以下指标判断计算优化机会：
-> - `per_op_statistics[].op_type` — 统计 VECTOR 管线 op 数量（vadd/vmul/vdiv）
-> - `per_op_statistics[].pipeline_channel` — 确认是 VECTOR 管线
-> - `execution_summary.engine_usage_pct` — VecUnit 占比 > 60% 触发计算优化
-> - 连续的 `vmul` + `vadd` RAW 链（无中间 store）→ FMA 候选
+**触发**：`scalar_time`/`scalar` 占比高，但算法/分块都合理。
+**收益**：消除标量降级后向量化执行 → 显著提速（昇腾上 mask 用 int64 会把整个 load 降级成标量循环）。
+**怎么查**：搜 "triton-ascend scalar degradation int64 mask" / "triton div mod pointer scalar"。
 
-### 2.1 通用与专项触发阈值
-| 触发类型 | 判定规则 | 执行动作 |
-|----------|----------|----------|
-| 核心触发 | VecUnit 类运算 op（算术、数学函数）占总 op 数量比例 **> 60%**，且全局带宽利用率 `bw_util < 70%` | 判定为计算瓶颈型负载，执行全量计算优化扫描 |
-| 专项触发1 | HIVM 识别到 `div(sqrt(x), 1.0)` 等价运算模式，或存在手动组合的可替换数学运算 | 执行原生数学指令替换 |
-| 专项触发2 | 存在连续的乘法 op + 加法 op，两者为 RAW 直连依赖、无其他分支、无中间存储 | 执行乘加 FMA 融合 |
-| 专项触发3 | 单计算链内仅做数据中转的中间变量数量 ≥ 2，且无跨分支复用 | 执行冗余中间变量消除 |
+### ❌ 问题示例代码（mask/指针 int64 或 div-mod → 标量降级）
+```python
+# ❌ offs 默认 int64 → mask `offs < cols` 触发标量比较; 或指针里 div/mod
+offs = tl.arange(0, BLOCK)                        # int64
+mask = offs < n_elements                          # ← int64 比较 → 标量降级
+x = tl.load(x_ptr + offs, mask=mask, ...)
+# ❌ 指针里 % 运算: 如 bias_gelu 的 offs % N → 非结构化标量寻址
+b = tl.load(bias_ptr + (offs % N), mask=mask, ...)   # % → 标量逐元素寻址
+```
+**出现的问题**：昇腾对 int64 比较 / div-mod 寻址会把 load/store 降级成**逐元素标量循环**（不再走 NDA 向量指令），带宽和吞吐崩。
 
-### 2.2 Tier 5 最优判定标准
-同时满足以下所有条件，判定计算与占用率层已达最优，全链路优化结束：
-1. 所有数学运算均使用硬件原生指令，无手动组合的等价运算
-2. 所有可融合的乘加对均已转化为 FMA 指令
-3. 计算链无冗余中转变量，依赖链长度最短
-4. VecUnit 计算单元占用率 ≥ 90%，无明显计算气泡
-5. 单指令级调整无法带来正向性能收益
+### ✅ 修改后正确代码（int32 + 消除 div-mod）
+```python
+# ✅ offs 显式 int32; mask 用 int32 比较 → 向量化
+offs = tl.arange(0, BLOCK).to(tl.int32)
+mask = offs < n_elements
+x = tl.load(x_ptr + offs, mask=mask, ...)
+# ✅ 避免指针里的 %: 把 bias 按列广播改成 2D 索引 (offs_n 直接乘 stride)
+b = tl.load(bias_ptr + offs_n, mask=offs_n < N, ...)   # 没有 %, 连续寻址
+```
+**约束/坑**：`tl.arange` 默认 int32（我们 bias_gelu 的 `offs % N` 是风险点，改 2D 索引）；mask 用 int32。
 
 ---
 
-## 三、优化前后代码示例（Triton 3.4.0 语法）
-所有示例严格遵循官方语法，仅使用标准 `@triton.jit` 装饰器，无 GPU 专属 API，可通过全链路编译。
+## 情况B：向量化加载（逐元素标量 load → 一次向量 load）
 
-### 3.1 原生 rsqrt 替代 1/sqrt
-**典型场景**：RMSNorm 中的倒数平方根计算
+**触发**：`vector_fops`/`vec` 利用率低，带宽远低于峰值（Memory Throughput 低）。
+**收益**：向量加载（128-bit）vs 标量逐元素，带宽利用率差 5~10 倍。
+**怎么查**：搜 "triton vectorized load scalar load bandwidth"。
 
-**Before（手动组合写法）**
+### ❌ 问题示例代码（逐元素标量加载）
 ```python
-@triton.jit
-def rsqrt_before(x_ptr, out_ptr, n_cols, eps, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    base = row_idx * n_cols
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_cols
-
-    x = tl.load(x_ptr + base + offsets, mask=mask)
-    var = tl.sum(x * x, axis=0) / n_cols
-    # 两步运算：先开方，再求倒数，对应2条VecUnit指令
-    inv_std = 1.0 / tl.sqrt(var + eps)
-    out = x * inv_std
-
-    tl.store(out_ptr + base + offsets, out, mask=mask)
+# ❌ 循环里逐个元素 load → 每次 1 个 float, 无向量化
+for i in range(BLOCK):
+    val = tl.load(x_ptr + offsets[i])   # 标量 load × BLOCK 次 → 带宽极低
+    ...
 ```
+**出现的问题**：逐元素标量 load 一次只搬 4 字节，不走向量加载指令 → 带宽利用率 ~10%。
 
-**After（原生指令写法）**
+### ✅ 修改后正确代码（一次向量 load）
 ```python
-@triton.jit
-def rsqrt_after(x_ptr, out_ptr, n_cols, eps, BLOCK_SIZE: tl.constexpr):
-    row_idx = tl.program_id(0)
-    base = row_idx * n_cols
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_cols
-
-    x = tl.load(x_ptr + base + offsets, mask=mask)
-    var = tl.sum(x * x, axis=0) / n_cols
-    # 单条原生倒数平方根指令，等价于1/sqrt，运算周期更短
-    inv_std = tl.math.rsqrt(var + eps)  # 单条指令替代 1.0/tl.sqrt()，减少50% VecUnit ops
-    out = x * inv_std
-
-    tl.store(out_ptr + base + offsets, out, mask=mask)
+# ✅ 一次 load 整个 BLOCK 向量 → 编译器生成 128-bit 向量加载
+offs = tl.arange(0, BLOCK).to(tl.int32)
+mask = offs < n_elements
+x = tl.load(x_ptr + offs, mask=mask, other=0.0)   # 向量 load, 连续 → 向量指令
 ```
-> 说明：在我们的环境（triton 3.4.0 + 自定义 TTIR→HIVM 转换器）中，
-> **使用 `tl.math.rsqrt`**（已验证通过编译和转换）。
-> 不要用 `tl.math.rsqrt`——我们的转换器的 ARITH_TO_HIVM 映射以 `math.rsqrt` 为 key。
-
-### 3.2 融合乘加（FMA）指令化（谨慎使用）
-**典型场景**：线性层偏置加法、仿射变换
-
-> **⚠️ 注意**：`tl.fma` 在我们的 TTIR→HIVM 转换器中**可能不被识别**。
-> `ARITH_TO_HIVM` 映射表里没有 `fma` 条目，会生成未映射的 TTIR op。
-> **推荐方案**：直接写 `x * w + b`，bisheng 编译器会自动融合为 FMA 指令。
-> 仅当 HIVM 明确显示两条独立 VecUnit op（mul + add）且未自动融合时，才尝试显式 `tl.fma`。
-
-**Before（拆分乘加写法）**
-```python
-@triton.jit
-def fma_before(x_ptr, w_ptr, b_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-
-    x = tl.load(x_ptr + offsets, mask=mask)
-    w = tl.load(w_ptr + offsets, mask=mask)
-    b = tl.load(b_ptr + offsets, mask=mask)
-    # 两步运算：先乘后加，对应2条VecUnit指令
-    mul = x * w
-    out = mul + b
-
-    tl.store(out_ptr + offsets, out, mask=mask)
-```
-
-**After（显式FMA写法）**
-```python
-@triton.jit
-def fma_after(x_ptr, w_ptr, b_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-
-    x = tl.load(x_ptr + offsets, mask=mask)
-    w = tl.load(w_ptr + offsets, mask=mask)
-    b = tl.load(b_ptr + offsets, mask=mask)
-    # 单条融合乘加指令，等价于x*w + b，一次舍入更高效
-    out = tl.fma(x, w, b)
-
-    tl.store(out_ptr + offsets, out, mask=mask)
-```
-
-### 3.3 冗余中间变量消除
-**典型场景**：串行多步逐元素运算，无复用的中转变量
-
-**Before（冗余变量写法）**
-```python
-@triton.jit
-def var_elim_before(x_ptr, out_ptr, scale, bias, alpha, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-
-    x = tl.load(x_ptr + offsets, mask=mask)
-    # 3个无复用中转变量，对应3次独立指令调度
-    x_scaled = x * scale
-    x_biased = x_scaled + bias
-    x_alpha = x_biased * alpha
-    out = tl.erf(x_alpha)
-
-    tl.store(out_ptr + offsets, out, mask=mask)
-```
-
-**After（变量消除写法）**
-```python
-@triton.jit
-def var_elim_after(x_ptr, out_ptr, scale, bias, alpha, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-
-    x = tl.load(x_ptr + offsets, mask=mask)
-    # 合并串行运算，消除中转变量，编译器自动做指令融合
-    out = tl.erf((x * scale + bias) * alpha)  # 编译器自动融合 mul+add 为 FMA
-
-    tl.store(out_ptr + offsets, out, mask=mask)
-```
-> 说明：仅消除纯中转、无复用的变量；关键统计量、跨分支复用变量必须保留，避免破坏逻辑可读性与调试性。
+**约束/坑**：offs 连续、对齐；2D 时最快维匹配布局（tier4 情况A）。
 
 ---
 
-## 四、常见错误与修复方案
-### 1. 指令替换导致数值精度超差
-- **错误现象**：替换 `tl.math.rsqrt`、`tl.fma` 后，输出结果与原实现存在数值差异，超出业务精度阈值。
-- **触发原因**：原生融合指令仅做一次浮点舍入，拆分运算为多次舍入，IEEE 浮点标准下存在固有微小差异；部分硬件快速近似指令精度更低。
-- **修复方案**：
-  1. 优先使用标准 IEEE 兼容指令（`tl.math.rsqrt`、`tl.fma`），禁止使用快速近似版本
-  2. 精度敏感场景先做误差评估，FP32 下最大绝对误差应 ≤ 1e-6，超出则回退为拆分写法
-  3. 归约累加、统计量计算等关键路径，优先保证精度，不强行替换
-- **校验方法**：优化前后与参考实现做全量数值对比，误差在允许范围内再落地。
+## 情况C：原生数学指令（rsqrt / tanh，别用手动组合）
 
-### 2. API 命名空间错误导致编译失败
-- **错误现象**：`ast_to_ttir` 阶段报错，提示 `tl.math` 模块不存在或函数未定义。
-- **触发原因**：误用 `tl.math.rsqrt` 等子命名空间 API，Triton 3.4.0 标准数学函数统一位于 `tl` 顶层命名空间，`tl.math` 为实验性别名，自定义 TTIR→HIVM 转换器可能不支持。
-- **修复方案**：统一使用顶层标准 API，如 `tl.math.rsqrt`、`tl.fma`、`tl.exp`、`tl.log`，避免使用 `tl.math.*` 子命名空间，保证全链路编译兼容。
+**触发**：数学运算多步手动组合（如 `1.0 / tl.sqrt(x)`），`scalar_time` 高。
+**收益**：rsqrt 一条指令替代"开方+除法"两条，周期降 40~60%。
+**怎么查**：搜 "triton tl.math.rsqrt native instruction"。
 
-### 3. 过度消除变量导致寄存器溢出
-- **错误现象**：消除中间变量后，性能不升反降，HIVM 出现寄存器溢出标记。
-- **触发原因**：单计算链合并运算过多，同时驻留寄存器的张量数量超出硬件上限，触发寄存器溢出到片上缓存，引入额外访存开销。
-- **修复方案**：
-  1. 长计算链保留 2~3 级中间变量，平衡融合收益与寄存器压力
-  2. 优先消除短链、无复用的中转变量，长计算链分步执行
-  3. 结合 HIVM 寄存器占用指标调整，溢出时回退部分变量
+### ❌ 问题示例代码（手动组合 + erf 不支持）
+```python
+# ❌ 两步: 先开方再除法 → 2 条指令
+inv_std = 1.0 / tl.sqrt(var + eps)
+# ❌ tl.erf 在 triton-ascend 可能不支持 → 编译失败
+out = tl.erf(x)
+```
+**出现的问题**：手动组合多 1 条指令；`tl.erf` 不确定支持 → 编译风险。
 
-### 4. 跨依赖强行 FMA 融合导致语义错误
-- **错误现象**：融合后结果偏差较大，甚至出现数值溢出。
-- **触发原因**：错误地将存在精度转换、多步依赖的运算强行合并为 FMA，改变了运算优先级与舍入次数，破坏了原语义。
-- **修复方案**：
-  1. 仅对纯 `a*b + c` 模式、无中间精度转换、无其他依赖的乘加对进行融合
-  2. 禁止跨类型转换、跨归约、跨分支进行 FMA 融合
-  3. 融合前后严格校验运算语义等价，禁止改变运算顺序
+### ✅ 修改后正确代码（原生指令）
+```python
+inv_std = tl.math.rsqrt(var + eps)        # ✅ 单条原生指令 (与我们 tl.math.tanh 同命名空间)
+# 激活用 tanh 近似 (已验证可行):
+cdf = 0.5 * (1.0 + tl.math.tanh(0.7978845 * (val + 0.044715 * val*val*val)))
+```
+**约束/坑**：`tl.math.*` 命名空间（`tl.math.rsqrt`/`tl.math.tanh` 验证可行）；fp32 计算；精度差 >1e-6 回退。
 
-### 5. 消除关键变量导致调试困难
-- **错误现象**：优化后出现数值错误，但无法定位具体计算步骤。
-- **触发原因**：过度消除所有中间变量，包括关键统计节点、调试观测点，导致问题无法定位。
-- **修复方案**：
-  1. 仅消除纯中转、无逻辑意义的临时变量
-  2. 均值、方差、求和、归一化系数等关键统计量必须保留独立变量
-  3. 调试模式下可临时保留中间变量，定位问题后再做优化
-
-### 6. 重复优化与上层层级冲突
-- **错误现象**：优化后与 Tier 2 算子融合结果重复，无额外收益，甚至引入冗余。
-- **触发原因**：Tier 2 已完成算子融合，Tier 5 重复做同层级优化，浪费优化轮次。
-- **修复方案**：严格遵循优化层级顺序，Tier 5 仅做 Tier 2 未覆盖的指令级精细优化；Tier 2 已融合的算子不再重复处理，仅针对未融合的残余计算链优化。
-
-需要我补充某个算子的完整 Tier 5 优化示例，或者计算单元占用率的评估公式吗？
 ---
 
-## ★matmul 专属改码示例（纯 triton, 910B3 验证可行）
+## 情况D：FMA（mul+add 自动融合）
 
-### 精度: fp16 计算 + fp32 累加 (cube 更快)
+**触发**：HIVM 里 `vmul` + `vadd` 独立两条，未自动融合。
+**收益**：FMA 一条指令（1 次舍入），省 1 条。
+**怎么查**：搜 "triton fma automatic fusion mul add"。
 
-**before（当前 fp32 计算, cube fp32 慢）:**
+### ❌ 问题示例代码（显式 tl.fma 可能不支持）
 ```python
-DTYPE = torch.float32
-# kernel 里: acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-#            a = tl.load(...); b = tl.load(...); acc = tl.dot(a, b, acc)
+# ❌ 显式 tl.fma 在我们的转换器可能不识别 (ARITH_TO_HIVM 无 fma 条目)
+out = tl.fma(x, w, b)   # → 未映射 TTIR op → 编译失败
 ```
+**出现的问题**：`tl.fma` 的 TTIR 映射缺失 → 编译失败；或强制 FMA 改变了舍入语义。
 
-**after（输入转 fp16, 累加保持 fp32）:**
+### ✅ 修改后正确代码（直接 x*w+b 让编译器自动融合）
 ```python
-DTYPE = torch.float16          # ① config: 输入精度改 fp16
-# kernel 里: acc 保持 fp32, tl.dot 会自动 fp16×fp16→fp32 累加 (无需改)
+out = x * w + b    # ✅ bisheng 自动融合为 FMA (1 次舍入)
 ```
+**约束/坑**：直接写 `x*w+b` 最稳；仅当 HIVM 明确显示两条独立且未融合时才考虑显式干预。
 
-**改哪**: ① config 区 `DTYPE = torch.float32` → `torch.float16`。
-**判定**: Tier5 `cube_ratio` 低 / `compute_utilization` 低 → fp16 提升 cube 吞吐（910B3 fp16 是 fp32 的 ~2 倍）。
-**注意**: 
-- 累加器 `acc = tl.zeros(..., dtype=tl.float32)` **保持 fp32**（精度）
-- 正确性: fp16 值域 ±65504, matmul 中间累加在 fp32 内, 一般够; 若精度不达标回退 fp32
-- 这同时减半 GM 读带宽（A/B 各减半）→ Tier4 也受益
+---
 
+## 情况E：寄存器溢出 / ILP（过度展开的代价）
+
+**触发**：性能不升反降，或编译报寄存器溢出（spill）。
+**收益**：控制展开/中间变量，平衡 ILP 与寄存器压力。
+**怎么查**：搜 "triton loop unroll register spill" / "triton ILP instruction scheduling"。
+
+### ❌ 问题示例代码（过度展开 → 寄存器溢出）
+```python
+# ❌ 手动展开 8 次 K 循环 → 寄存器暴涨 → spill 到 GM → 更慢
+for k in range(0, K, BLOCK_K):    # 编译器展开过多 → VGPR/寄存器溢出
+    acc = tl.dot(tl.load(a_ptrs + k*...), tl.load(b_ptrs + k*...), acc)
+```
+**出现的问题**：过度展开（unroll）导致寄存器溢出，数据被写回慢速内存 → 性能不升反降（web：AMD 都专门修过 unroll 导致 spill 的问题）。
+
+### ✅ 修改后正确代码（让编译器平衡展开，控制中间变量）
+```python
+# ✅ 保持循环原样 (编译器自动决定展开); 中间变量只留 2~3 级
+for k in range(0, K, BLOCK_K):
+    a = tl.load(a_ptrs, mask=..., other=0.0)
+    b = tl.load(b_ptrs, mask=..., other=0.0)
+    acc = tl.dot(a, b, acc)
+    a_ptrs += BLOCK_K; b_ptrs += BLOCK_K
+# 需要强展开时用 tl.static_range(0, K, BLOCK_K) (提示编译器, 但监控寄存器)
+```
+**约束/坑**：展开 vs 寄存器是权衡；spill 就回退；中间变量控制 2~3 级。
+
+---
+
+## 情况F：bank 冲突（UB 访问冲突）
+
+**触发**：`conflict.bank_cflt_ratio` >4~5%。
+**收益**：消除冲突后访存效率提升。
+**怎么查**：搜 "triton bank conflict shared memory swizzle"。
+
+### ❌ 问题示例（同一 bank 同时访问）
+```python
+# ❌ 多个核/线程同时读同一 bank 的 UB 地址 → N-way 冲突 → 带宽掉到 1/N
+# 表现为 conflict.bank_cflt_ratio 高
+```
+**出现的问题**：UB 有多个 bank，若并发访问落在同一 bank → 冲突 → 吞吐掉到 1/N。
+
+### ✅ 修改后正确代码（访问顺序调整 / swizzle）
+```python
+# ✅ 调整访问顺序或分块 (swizzle 消除 bank 冲突, 见 tier3 §三 / tier4 §C)
+# 编译器也自动 swizzle layout 最小化冲突 (triton-ascend 有相关优化)
+# 手动时: 错开 bank 索引 (让并发访问落在不同 bank)
+```
+**约束/坑**：先看 `conflict.bank_cflt_ratio` 是否真高；多数情况编译器已自动处理，别手动硬调。
+
+---
+
+## 常见错误与修复
+
+| 错误 | 现象 | 修复 |
+|---|---|---|
+| int64 mask/指针 div-mod | 标量降级性能崩 | int32 + 消除 div-mod |
+| 逐元素标量 load | 带宽 ~10% | 一次向量 load |
+| 手动 1/sqrt | 多 1 指令 | tl.math.rsqrt |
+| tl.erf | 编译失败 | tl.math.tanh |
+| 显式 tl.fma | 编译失败 | 直接 x*w+b |
+| 过度展开 | 寄存器溢出更慢 | 控制展开/中间变量 |
+| tensor.item() 热路径 | CPU-NPU 同步 | 避免 |
+| 归约不升精度 | 精度崩 | 累加器/归约 fp32 |

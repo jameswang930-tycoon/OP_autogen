@@ -1,265 +1,218 @@
-# Triton 自动优化系统 Tier 6（Pipeline & Toolchain）优化策略指南
-## 层级定位与前置约束
-Tier 6 是全链路优化的最终工具链适配层，**必须在 Tier 1~Tier 5 全部完成并验证通过后执行**。本层不改变算法逻辑、算子融合结构、分块参数、访存模式与计算指令，仅通过调整 Triton 代码的书写风格、语法子集与结构组织，适配自研的 TTIR→HIVM 转换器、AscendC 代码生成器与 msprof 性能模拟器，消除转换过程中的性能损耗、提升后端代码质量、保证性能统计的完整性与准确性。
+# Triton 优化 Tier 6（910B3 架构专属）策略指南 — 针对 triton-ascend 910B3
 
-> **环境约束（Coder Agent 必读）**：同 CODING_GUIDE.md
-> - WSL2 + Python3.9 + triton3.4.0，仅用 @triton.jit
-> - 全链路：ast_to_ttir() → ttir_to_hivm.py → hivm_to_ascendc.py → bisheng → msprof
-> - `tl.math.*` 命名空间是我们的转换器支持的（以 `math.xxx` 为 key）
-> - `tl.fma` 未映射——写 `x*w+b` 让 bisheng 自动融合
-> - num_warps/num_stages 由 GPUTarget 管理，Coder 不修改
-
-本手册严格适配自研全链路工具与环境约束：
-- 前端：Triton 3.4.0 + Python 3.9，仅使用 `@triton.jit` 装饰器，禁用 `@triton.autotune`
-- 编译链路：Triton Python → TTIR MLIR → 自研 HIVM 转换器 → 自研 AscendC 生成器 → bisheng 编译器
-- 验证：msprof op simulator（CPU 周期精确 NPU 模拟器）
-- 核心边界：`num_warps`、`num_stages` 不属于 `@triton.jit` 参数，仅通过调用配置传递
+> 本层是**最后兜底**：Tier1~5 都做完后，只剩**架构级信号**（引擎失衡/阻塞/冲突/核数不匹配）没解决。
+> 本层**不新增优化方向**，而是把架构信号映射到具体该回哪一层做，或做最后的代码风格适配。
+>
+> **★环境铁律（triton-ascend）**：
+> - `num_warps`/`num_stages`/`multibuffer`/`unit_flag` 等是**编译器自动管理**，kernel 代码里**不能设置**（只能看信号，别硬调）
+> - 矩阵运算**必须用 `tl.dot`**（否则不触发 Cube → 掉到 ~10% 算力）
+> - 数学函数用 `tl.math.*`（`tl.math.tanh`/`tl.math.rsqrt`）；别用 `tl.erf`
+> - 循环用静态 `for-range`；维度全 `tl.constexpr`；避免动态 shape/while
 
 ---
 
-## 一、核心优化策略
-### 1. TTIR→HIVM 转换损耗消减
-目标是让 TTIR 算子与 HIVM 算子实现 1:1 原生映射
+## 一、诊断触发规则（v4 架构字段 → 动作）
 
-> **我们的转换器已知限制**：
-> - `ARITH_TO_HIVM` 映射了 12 个 op（vadd/vsub/vmul/vdiv/vexp/vabs/vmax/vsqrt/vrelu/vtanh/load/store）
-> - **未映射的 op 会被跳过**（SCALAR op），不影响 msprof 但不产生 HIVM 事件
-> - `tl.dot` → `tt.dot` → 我们的转换器映射为 `matmul`（CubeUnit），但 AscendC 代码生成跳过 CubeUnit
-> - 标量索引（`tensor[0]`）被跳过——这是预期行为，不是 bug，避免转换过程中插入冗余兼容 op、触发通用降级路径，最大化消除转换侧性能损失。
+看 `07_tier6_fields.txt`（含全局摘要）：
 
-- **标准 API 优先原则**：仅使用转换器原生支持的核心语法子集，包括 `tl.load/store`、标准算术运算、`tl.sum/max/min` 归约、`tl.dot` 矩阵乘、`tl.arange/broadcast_to/transpose` 维度操作、`tl.fma/rsqrt` 等专用指令；禁止使用实验性 API、自定义聚合类型、高阶函数，避免触发未识别 op 降级。
-> **注意**：我们的 `ttir_to_hivm.py` 的 `ARITH_TO_HIVM` 映射以 `math.xxx` 为 key，
-> 所以 `tl.math.rsqrt`、`tl.math.exp` 等 **必须使用 `tl.math.*` 命名空间**（已验证）。
-> 仅 `tl.fma` 例外——我们的转换器没有 fma 映射，建议写 `x*w+b` 让 bisheng 自动融合。
-- **消除转换期冗余**：移除无意义的恒等运算、空 reshape、重复类型转换，这类节点在 TTIR 中存在但无实际计算价值，转换器会插入兼容搬运 op，凭空增加 HIVM 算子数量与调度开销。
-- **统一运算表达范式**：同一种运算仅使用一种标准写法，如倒数平方根统一用 `tl.math.rsqrt`、乘加写 `x*w + b` 让编译器自动融合（我们的转换器没有 fma 映射），避免转换器对不同写法生成质量差异较大的 HIVM 代码。
-- **降低 IR 结构复杂度**：保持计算图扁平，减少嵌套分支与深层表达式嵌套，降低转换器解析难度，避免因结构复杂触发通用降级路径。
+| v4 字段 | 触发 | 含义 | 动作 |
+|---|---|---|---|
+| `conflict.wait_ratio` | 高（vec 被阻塞） | 计算在等数据 | 回 Tier4（流水线/load 独立） |
+| `conflict.mte_cflt_ratio` | 高 | MTE 搬运冲突 | 回 Tier4/3（传输/分块） |
+| `conflict.bank_cflt_ratio` | >4% | UB bank 冲突 | 回 Tier5 F（swizzle/访问） |
+| `engine_utilization.cube` | 低但任务是 matmul | cube 没用上 | 检查是否用 `tl.dot`（情况D） |
+| `engine_utilization` 整体 | cube/vec 严重失衡 | 结构问题 | 回 Tier2（融合平衡引擎） |
+| `task.task_type` | 非 cube 但该算 matmul | 走错引擎 | 用 `tl.dot`（情况D） |
+| `task.block_dim` | 远小于 40 | 核没吃满 | 回 Tier3（分块） |
 
-### 2. AscendC 代码生成质量优化
-目标是让自研生成器输出简洁、规整、可被 bisheng 编译器深度优化的 AscendC 代码，避免生成冗余循环、临时变量与未对齐访存。
-
-- **循环结构标准化**：统一使用静态 `for-range` 循环，生成器可直接识别并自动插入软件流水线、循环展开等硬件优化；非标准循环会生成朴素跳转代码，bisheng 无法做深度指令调度。
-- **访存对齐显式化**：通过 `tl.multiple_of` 标注指针对齐属性，生成器可直接输出对齐的内存访问指令，触发 bisheng 的突发传输优化。
-- **计算单元清晰映射**：矩阵运算用标准 `tl.dot`（映射 CUBE 单元）、逐元素运算用标准向量 op（映射 VECTOR 单元）、内存操作用标准 `load/store`（映射 MTE 单元），便于生成器直接映射到对应硬件指令集。
-- **减少动态分支**：边界逻辑优先使用向量化 mask，避免多层 `if-else` 分支，生成器可输出无分支的向量掩码指令，提升流水线效率。
-
----
-
-## 二、诊断触发规则
-所有优化基于编译链路各阶段的输出数据驱动，满足以下阈值即触发对应优化。
-
-### 2.1 核心触发规则
-1. **代码膨胀判定（强制触发）**
-   - 核心指标：**TTIR 字符数（chars）环比增长 ≥ 10%，但 HIVM 有效 op 数量无减少甚至增加**
-   - 判定结论：TTIR 存在大量冗余节点、无效表达式与嵌套结构，属于无效代码膨胀，必须精简代码结构、消除冗余表达式
-   - 辅助阈值：单 op 对应 TTIR 字符数 > 500 → IR 过于冗长，存在优化空间
-
-2. **转换损耗判定**
-   - 转换损耗率 = HIVM op 总数 / TTIR op 总数
-   - 损耗率 > 1.1 → 轻度损耗，存在少量兼容冗余 op
-   - 损耗率 > 1.2 → 重度损耗，已触发通用降级路径，必须立即优化
-   - 硬触发：HIVM 中出现 `fallback_generic`、`unknown_op` 等降级标记 → 立即替换为标准 API 实现
-
-3. **生成质量判定**
-   - AscendC 生成阶段输出未识别 IR 节点、强制降级、动态分支告警 → 对应调整代码写法
-   - 生成的 AscendC 代码行数 / HIVM op 数 > 20 → 代码过于冗余，存在精简空间
-
-4. **模拟器完整性判定**
-   - msprof 输出缺失 CUBE / VECTOR / MTE 任意一类管线事件 → 时序统计失真，必须调整代码映射方式
-
-### 2.2 Tier 6 最优判定标准
-同时满足以下所有条件，判定工具链适配层已达最优，全链路优化结束：
-1. 转换损耗率 ≤ 1.05，几乎无转换开销
-2. 无任何降级 op 与生成告警
-3. TTIR 结构精简，无无效代码膨胀
-4. msprof 输出 CUBE、VECTOR、MTE 三类管线事件完整，周期统计有效
-
----
-
-## 三、代码风格与 IR 强制规范
-所有 Triton 代码必须遵循以下规范，确保转换器与生成器最优解析，避免降级与损耗。
-
-### 3.1 循环规范：强制使用静态 for-range
-- 所有循环必须使用 `for i in range(start, end, step)` 静态范围循环，`start`/`end`/`step` 必须均为 `tl.constexpr` 编译期常量。
-- 禁止使用 `while` 循环、动态边界循环、`break`/`continue` 跳出逻辑；自研转换器对静态 `for-range` 支持最完善，可自动做循环展开、软件流水线优化。
-- 循环体保持扁平，嵌套循环不得超过 2 层，且内层外层均必须为静态 `for-range`。
-
-### 3.2 形状规范：禁止动态 shape
-- 所有分块尺寸、张量维度、循环边界必须声明为 `tl.constexpr`，编译期完全可确定。
-- 禁止使用运行时动态参数作为 `tl.reshape`、`tl.transpose` 的维度参数，所有维度变换必须静态可推导。
-- 禁止依赖运行时输入的动态 shape 分支，所有尺寸分支必须在编译期通过 constexpr 特化完成。
-- 指针 stride 优先使用常量表达式，避免运行时变量作为步长。
-
-### 3.3 IR 扁平化要求
-- 条件分支层级不超过 2 层，优先使用 `tl.where` 向量化掩码替代多层 `if-else`。
-- 计算表达式嵌套不超过 3 层，过长表达式拆分为 2~3 个有意义的中间变量，平衡 IR 复杂度与可读性。
-- 禁止过度内联自定义辅助函数，避免单 kernel 的 IR 节点爆炸、结构混乱。
-- 归约操作仅嵌套 1 层算术运算，禁止归约内部嵌套复杂函数调用。
-
-### 3.4 显式化原则
-- 所有类型转换必须显式使用 `.to(dtype)`，禁止依赖隐式类型转换（如 int 转 float、FP16 转 FP32），避免转换器插入冗余 cast op。
-- 所有张量广播必须显式调用 `tl.broadcast_to`，禁止依赖形状不匹配的隐式广播。
-- 所有指针运算采用「基址 + 偏移」的显式格式，避免复杂指针表达式导致转换器解析错误。
-
----
-
-## 四、与 msprof 模拟器的配合规范
-msprof op simulator 基于硬件管线事件统计周期，**必须同时产生 CUBE、VECTOR、MTE 三类管线事件，才能输出完整、精确的 timing 数据**，缺少任意一类都会导致周期统计缺失、性能评估失真。
-
-### 4.1 三类管线事件对应关系
-| 管线单元 | 对应运算类型 | Triton 标准 API | 统计作用 |
-|----------|--------------|----------------|----------|
-| CUBE | 矩阵乘、张量核心运算 | `tl.dot` | 矩阵乘法计算周期统计 |
-| VECTOR | 逐元素算术、数学函数、归约 | `tl.add/mul/fma`、`tl.math.rsqrt/exp`、`tl.sum/max` | 向量计算周期统计 |
-| MTE | 全局内存读写、数据搬运 | `tl.load`、`tl.store`（映射为 HIVM `gm_to_ub`/`ub_to_gm`）| 内存传输周期统计 |
-
-### 4.2 模拟器适配规则
-1. **标准 API 强制映射**：所有核心运算必须使用上表中的标准 API 实现，禁止用逐元素循环模拟矩阵乘、用标量运算模拟归约，否则生成器无法识别对应硬件单元，导致事件缺失。
-2. **单 kernel 功能聚焦**：一个 kernel 内核心运算类型不超过 2 类，避免混合过多不同单元的运算导致模拟器调度统计混乱。
-3. **分块匹配硬件粒度**：分块尺寸匹配 CUBE 单元最优计算粒度（16/32 的整数倍），访存对齐匹配 MTE 突发传输粒度（128 字节对齐），确保模拟器周期计算与真实硬件一致。
-4. **消除无效运算**：禁止插入无副作用的空运算、恒等运算，避免产生无效管线事件，干扰周期统计。
-
-> **在我们的 pipeline 中验证 Tier 6 效果**：
-> 1. TTIR chars 减少但 HIVM ops 不增加 = 代码精简有效
-> 2. AscendC Build OK + msprof 有 event = 工具链兼容
-> 3. HIVM ops 数量不变但 msprof timing 变好 = 生成的 AscendC 代码质量提升
-> 4. TTIR chars 增大但 HIVM ops 不变 = 代码膨胀 → 需要精简
-
-### 4.3 事件完整性校验流程
-1. 每轮优化后运行 msprof，检查输出中是否包含三类事件的独立周期统计
-2. 若缺失某类事件：回溯对应运算的实现方式，替换为标准 API，确保生成器可正确映射
-3. 若某类事件占比异常（如纯计算算子 MTE 事件占比过高）：检查是否存在转换期冗余访存，对应精简 IR
-
----
-
-## 五、典型场景 Before/After 代码示例
-所有示例语义完全等价，仅调整书写风格适配工具链，不改变算法与计算逻辑。
-
-### 示例1：循环写法优化（while → 静态 for-range）
-**Before（易触发降级的 while 循环）**
-```python
-@triton.jit
-def loop_while_before(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    i = 0
-    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    # 动态边界while循环，转换器无法做流水线优化
-    while i < n:
-        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE) + i
-        mask = offsets < n
-        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-        acc += x
-        i += BLOCK_SIZE
-    tl.store(out_ptr + pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), acc)
+### ★决策流程图
 ```
-
-**After（适配工具链的静态 for-range）**
-```python
-@triton.jit
-def loop_for_after(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr, NUM_ITER: tl.constexpr):
-    pid = tl.program_id(0)
-    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    base = pid * BLOCK_SIZE
-    # 编译期确定迭代次数，转换器可自动生成流水线/展开代码
-    for i in range(NUM_ITER):
-        offsets = base + i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n
-        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-        acc += x
-    tl.store(out_ptr + base + tl.arange(0, BLOCK_SIZE), acc)
-```
-
-### 示例2：动态 shape → 全静态维度优化
-**Before（动态维度，触发通用降级）**
-```python
-@triton.jit
-def dynamic_shape_before(x_ptr, out_ptr, M, N, BLOCK_M: tl.constexpr):
-    pid = tl.program_id(0)
-    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask = rows < M
-    # 转置维度运行时确定，转换器无法静态解析
-    x = tl.load(x_ptr + rows[:, None] * N + tl.arange(0, 16)[None, :], mask=mask[:, None])
-    x_t = tl.transpose(x)
-    tl.store(out_ptr + tl.arange(0, 16)[:, None] * M + rows[None, :], x_t, mask=mask[None, :])
-```
-
-**After（全静态维度，原生支持）**
-```python
-@triton.jit
-def static_shape_after(x_ptr, out_ptr, M, N,
-                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
-    pid = tl.program_id(0)
-    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    cols = tl.arange(0, BLOCK_N)
-    mask_m = rows < M
-    mask_n = cols < N
-    # 所有维度均为constexpr，转换器可静态解析转置操作
-    x = tl.load(x_ptr + rows[:, None] * N + cols[None, :],
-                mask=mask_m[:, None] & mask_n[None, :], other=0.0)
-    x_t = tl.transpose(x)
-    tl.store(out_ptr + cols[:, None] * M + rows[None, :], x_t,
-             mask=mask_n[:, None] & mask_m[None, :])
-```
-
-### 示例3：隐式广播 → 显式广播优化
-**Before（隐式广播，转换插入冗余 op）**
-```python
-@triton.jit
-def implicit_broadcast_before(x_ptr, scale, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    # 标量与向量隐式广播，转换器可能插入独立broadcast op
-    out = x * scale
-    tl.store(out_ptr + offsets, out, mask=mask)
-```
-
-**After（显式广播，转换零损耗）**
-```python
-@triton.jit
-def explicit_broadcast_after(x_ptr, scale, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    # 显式广播，转换器直接识别，无冗余op生成
-    scale_vec = tl.broadcast_to(scale, (BLOCK_SIZE,))
-    out = x * scale_vec
-    tl.store(out_ptr + offsets, out, mask=mask)
+wait_ratio 高 / mte_cflt 高 → 回 Tier4 (流水线/传输) 或 Tier3 (分块)
+bank/bankgroup_cflt >4% → 回 Tier5 F (swizzle/访问)
+cube 利用率低 且 任务是 matmul ?
+  ├─ 没用 tl.dot (vector 模拟) → 用 tl.dot (情况D)
+  └─ 用了 tl.dot 但 cube 低 → 回 Tier3 (分块/16倍数) 或 Tier1 (算法)
+cube/vec 严重失衡 → 回 Tier2 (融合平衡)
+代码风格有 while/动态shape/非math命名空间 → 适配 (情况F)
+全无 → Tier6 已最优, 停止
 ```
 
 ---
 
-## 六、常见错误与修复方案
-### 1. while 循环导致转换降级
-- **现象**：HIVM 出现循环跳转标记，转换损耗率 > 1.2，性能比 for-range 版本低 30% 以上
-- **原因**：自研转换器对 while 循环支持不完善，无法做流水线和展开优化，生成通用跳转代码
-- **修复**：全部替换为静态 `for-range` 循环，迭代次数通过 `tl.constexpr` 参数传入
+## 情况A：wait_ratio 高（vec 被阻塞等数据）
 
-### 2. 动态 shape 触发通用降级路径
-- **现象**：msprof 中全是 VECTOR 通用事件，无专用指令优化，性能远低于预期
-- **原因**：运行时动态维度无法被转换器静态解析，退化为通用标量运算，无法映射到专用硬件指令
-- **修复**：所有维度、分块、步长全部声明为 `tl.constexpr`，确保编译期完全可确定
+**触发**：`conflict.wait_ratio` 高（vector 大量 cycle 在等数据/上一条完成）。
+**含义**：计算单元在空等（搬运没和计算重叠，或依赖链串行）。
+**怎么查**：搜 "ascend aiv_vec_wait_ratio optimization pipeline overlap"。
 
-### 3. 隐式类型转换导致转换损耗过高
-- **现象**：HIVM 中出现大量冗余 cast op，转换损耗率 > 1.1
-- **原因**：Triton 前端自动插入隐式类型转换，转换器无法合并，生成独立算子
-- **修复**：所有类型转换显式使用 `.to()`，保持运算过程中类型一致，减少不必要的转换
+### ❌ 问题示例代码（load→compute 强耦合，计算空等搬运）
+```python
+# ❌ 循环里 load 结果立即被算, 且没有让编译器预取的结构 → vec 等 MTE
+for k in range(0, K, BLOCK_K):
+    acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc)   # load 完才算 → 每轮等搬运
+    a_ptrs += BLOCK_K; b_ptrs += BLOCK_K
+# msprof: aiv_vec_wait_ratio 高, 计算有大量空等
+```
+**出现的问题**：计算与搬运串行（等 load 完成才算）→ vector 单元大量 cycle 空等，`wait_ratio` 高。
 
-### 4. IR 嵌套过深导致解析错误
-- **现象**：TTIR→HIVM 转换失败，或生成的 AscendC 代码逻辑错误
-- **原因**：表达式嵌套超过转换器支持的深度，解析时出现逻辑遗漏或栈溢出
-- **修复**：拆分复杂表达式为 2~3 级中间变量，保持 IR 结构扁平，嵌套不超过 3 层
+### ✅ 修改后正确代码（load 独立成步骤，让编译器流水线重叠）
+```python
+# ✅ load 独立清晰步骤, 常量步进 → 编译器自动双缓冲/流水线 (Ascend 默认)
+for k in range(0, K, BLOCK_K):
+    a = tl.load(a_ptrs, mask=..., other=0.0)   # MTE 预取
+    b = tl.load(b_ptrs, mask=..., other=0.0)
+    acc = tl.dot(a, b, acc)                    # 与下一轮 load 重叠
+    a_ptrs += BLOCK_K * stride_ak
+    b_ptrs += BLOCK_K * stride_bk
+```
+**约束/坑**：这是 Tier4 的核心（本层只指路）；若结构已最优仍高 → 看是否有跨 kernel 的串行依赖（回 Tier2 融合）。
 
-### 5. 非标准实现导致 msprof 事件缺失
-- **现象**：矩阵乘算子 msprof 输出缺少 CUBE 事件，只有 VECTOR 事件，周期统计严重失真
-- **原因**：用逐元素循环模拟矩阵乘，未使用标准 `tl.dot`，生成器无法识别为 CUBE 运算
-- **修复**：矩阵运算必须使用标准 `tl.dot` API，确保映射到 CUBE 单元，获得准确周期统计
+---
 
-### 6. 代码冗余膨胀导致编译效率下降
-- **现象**：TTIR 字符数大幅增加但 HIVM op 数不变，编译时间变长，性能无提升
-- **原因**：过度内联、冗余中间变量、无意义运算导致 TTIR 膨胀，转换器处理效率下降
-- **修复**：精简代码，消除恒等运算和无意义中转变量，保持计算逻辑简洁清晰
+## 情况B：mte_cflt 高（MTE 搬运冲突）
 
-需要我补充工具链各阶段的自动校验脚本模板，或者针对某类算子的 Tier 6 适配最佳实践吗？
+**触发**：`conflict.mte_cflt_ratio` 高（vector 指令被 MTE 搬运阻塞）。
+**含义**：搬运与计算抢资源，或搬运指令本身冲突。
+**怎么查**：搜 "ascend aiv_vec_mte_cflt_ratio" / "triton mte conflict double buffer"。
+
+### ❌ 问题示例代码（大量小搬运并发 → MTE 冲突）
+```python
+# ❌ 循环里多次小 load (每次几 KB) → MTE 指令密集, 互相冲突
+for i in range(many):
+    val = tl.load(x_ptr + tiny_offsets[i], ...)   # 多个小搬运
+```
+**出现的问题**：多个小 MTE 搬运并发 → MTE 冲突，`mte_cflt` 高。
+
+### ✅ 修改后正确代码（大块连续搬运，减少 MTE 指令数）
+```python
+# ✅ 一次大连续 load (向量) → 减少 MTE 指令数, 冲突少
+offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int32)
+mask = offs < n_elements
+x = tl.load(x_ptr + offs, mask=mask, other=0.0)   # 一次大搬运
+```
+**约束/坑**：本质是 Tier4（连续/合并搬运）；本层指路。UB ≤192KB 留双缓冲空间。
+
+---
+
+## 情况C：bank/bankgroup 冲突
+
+**触发**：`conflict.bank_cflt_ratio` 或 `bankgroup_cflt_ratio` >4%。
+**含义**：并发访问同一 UB bank（bank）或同一 bank group（bankgroup，block stride 不合理）。
+**怎么查**：搜 "ascend aiv_vec_bank_cflt_ratio swizzle"。
+
+### ❌ 问题示例代码（并发访问同 bank 的 UB 地址）
+```python
+# ❌ 多个并发操作访问同一 bank 的 UB → N-way 冲突 → 吞吐 1/N
+#   表现为 conflict.bank_cflt_ratio / bankgroup_cflt_ratio 高
+```
+**出现的问题**：UB 多 bank，并发落在同一 bank → 冲突 → 带宽掉 1/N（bankgroup = block stride 设置不合理）。
+
+### ✅ 修改后正确代码（访问顺序/swizzle，回 Tier3/5）
+```python
+# ✅ 调整访问顺序或分块 (swizzle 消除冲突, 见 tier3 §三 / tier5 F)
+# 编译器 triton-ascend 已自动 swizzle layout 最小化冲突; 手动时错开 bank 索引
+```
+**约束/坑**：先确认 `bank_cflt_ratio` 真高；多数已自动处理，别手动硬调。
+
+---
+
+## 情况D：cube 利用率低但该算 matmul（用 vector 模拟了）
+
+**触发**：`engine_utilization.cube` 极低 或 `task.task_type` 非 cube，但算的是矩阵乘。
+**收益**：用 `tl.dot` 触发 Cube → 从 ~10% 到接近峰值。
+**怎么查**：搜 "triton tl.dot cube mmad" / "ascend cube utilization low vector emulation"。
+
+### ❌ 问题示例代码（用逐元素循环模拟矩阵乘 → 不触发 Cube）
+```python
+# ❌ 用向量循环模拟 matmul → 只在 vector 跑, cube 闲置
+for i in range(BLOCK_M):
+    for j in range(BLOCK_N):
+        acc = 0.0
+        for k in range(K):
+            acc += tl.load(a_ptr + ...) * tl.load(b_ptr + ...)   # 标量/向量模拟
+        tl.store(c_ptr + ...)
+# → task_type 不是 cube, cube_utilization ~0, 性能 ~10%
+```
+**出现的问题**：没用 `tl.dot` → 编译器不生成 Cube 的 mmad 指令 → 矩阵乘在 vector 上慢跑（~10% 算力），cube 闲置。
+
+### ✅ 修改后正确代码（用 tl.dot 触发 Cube）
+```python
+@triton.jit
+def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, ...,
+                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    ...
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, mask=..., other=0.0)
+        b = tl.load(b_ptrs, mask=..., other=0.0)
+        acc = tl.dot(a, b, acc)          # ✅ 触发 Cube mmad
+    tl.store(c_ptrs, acc, mask=...)
+```
+**约束/坑**：`tl.dot` 输入维度 16 倍数（Cube 粒度）；累加器 fp32；我们 kernel 已用 `tl.dot`（正确样例）。
+
+---
+
+## 情况E：cube/vec 引擎严重失衡
+
+**触发**：`engine_utilization` 里 cube 和 vec 严重失衡（一个 ~100% 一个 ~10%）。
+**含义**：算子结构让一个引擎空转（如巨大 gelu 全在 vector，cube 闲着；或反之）。
+**怎么查**：搜 "ascend cube vector engine balance fusion"。
+
+### ❌ 问题示例代码（matmul 和 大 elementwise 分离 → 引擎轮流空转）
+```python
+# ❌ matmul(cube) → 巨大独立 gelu(vector) → matmul(cube): 引擎轮流空等
+matmul_kernel[g](x, w1, z, ...)        # cube 忙, vector 闲
+gelu_kernel[g](z, h, ...)              # vector 忙, cube 闲
+matmul_kernel[g](h, w2, y, ...)        # cube 忙, vector 闲
+```
+**出现的问题**：cube 和 vector 串行轮流用，一个忙时另一个空转 → 引擎利用率失衡。
+
+### ✅ 修改后正确代码（融合平衡引擎，回 Tier2）
+```python
+# ✅ 把 gelu 并进 matmul epilogue (tier2 情况A) → cube 算完直接 vector 处理, 引擎更均衡
+#   或把小的 vector 工作合并到 cube kernel 的 epilogue
+# 铁律: 引擎失衡的解法在 Tier2(融合)/Tier1(算法), 不是本层硬调
+```
+**约束/坑**：这是结构问题（Tier2 融合解决）；本层只诊断指路。
+
+---
+
+## 情况F：代码风格适配（后端最优解析）
+
+**触发**：编译告警/降级（while 循环、动态 shape、非 `tl.math` 命名空间）。
+**含义**：代码写法让后端解析差（不能流水线/展开/映射原生指令）。
+**怎么查**：搜 "triton-ascend while loop static range migration"。
+
+### ❌ 问题示例代码（while + 非 math 命名空间 + 隐式广播）
+```python
+# ❌ while 循环 → 后端无法流水线; tl.erf → 不支持; 隐式广播
+i = 0
+while i < n:                      # 动态循环, 后端只能朴素跳转
+    ...
+    out = tl.erf(x)               # 可能不支持
+```
+**出现的问题**：while 循环后端没法做流水线/展开；`tl.erf` 不支持；隐式广播插入冗余 op。
+
+### ✅ 修改后正确代码（静态 for-range + tl.math 命名空间 + 显式）
+```python
+# ✅ 静态 for-range (迭代次数 constexpr) → 后端可流水线/展开
+for i in range(NUM_ITER):                    # NUM_ITER: tl.constexpr
+    ...
+    out = x * 0.5 * (1.0 + tl.math.tanh(...))   # ✅ tl.math.* 命名空间
+# 维度全 tl.constexpr; 类型转换显式 .to(); 不用动态 shape
+```
+**约束/坑**：循环边界、分块、步长全 `tl.constexpr`；数学函数 `tl.math.*`；显式 `.to()`；避免 while/动态 shape。
+
+---
+
+## 常见错误与修复
+
+| 错误 | 现象 | 修复 |
+|---|---|---|
+| vector 模拟 matmul | cube 利用率 ~0 | 用 `tl.dot` |
+| load→compute 强耦合 | wait_ratio 高 | load 独立步骤让编译器流水线（回 Tier4） |
+| 小搬运密集 | mte_cflt 高 | 大连续 load（回 Tier4） |
+| 引擎失衡 | cube/vec 一满一闲 | 回 Tier2 融合平衡 |
+| while/动态 shape | 后端降级 | 静态 for-range + constexpr |
+| tl.erf | 编译失败 | tl.math.tanh |
+| 想设 num_warps/multibuffer | 报错/无效 | 编译器自动管理，别硬调 |

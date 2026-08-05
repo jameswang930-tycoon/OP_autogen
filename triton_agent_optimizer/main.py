@@ -110,16 +110,6 @@ def main():
         print(f"[ERROR] Not found: {op_dir}")
         return 1
 
-    # ① 单文件 kernel_op.py (★源文件, coder 直接改它, 不覆盖)
-    #    若缺 (旧式三文件 op) → 用 merge_single_file.py 生成一次
-    kernel_op = op_dir / "kernel_op.py"
-    if not kernel_op.exists():
-        merge(op_dir, kernel_op)
-    if not kernel_op.exists():
-        print(f"[ERROR] 单文件不存在: {kernel_op}")
-        return 1
-    print(f"[main] 单文件: {kernel_op}")
-
     # ①.5 --fresh: 清旧产物 + 重置 trajectory (从头开始)
     if args.fresh:
         import shutil

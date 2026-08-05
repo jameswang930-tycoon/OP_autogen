@@ -202,8 +202,11 @@ PYEOF
 )
 echo "  检测到 kernel 数: $N_KERNELS"
 MULTI=0
+# ★H3: HIVM 融合编译只有 Tier2 需要 (多算子融合分析) — 其余 tier 多 kernel 也跳过, 省分钟级编译.
+#   TIER 未设(=独立手工跑) 默认走 2, 保持旧行为; 调度器每轮传 TIER, 自动只在本层放行.
 if [ "${ENABLE_HIVM:-auto}" = "1" ]; then MULTI=1; echo "  (ENABLE_HIVM=1 强制走多算子路径)"
-elif [ "$N_KERNELS" -gt 1 ]; then MULTI=1; echo "  (多个 kernel → 多算子: 需看结构做融合)"
+elif [ "$N_KERNELS" -gt 1 ] && [ "${TIER:-2}" = "2" ]; then MULTI=1; echo "  (多个 kernel + Tier2 → 多算子融合分析)"
+elif [ "$N_KERNELS" -gt 1 ]; then echo "  (多个 kernel 但 TIER!=2 → 跳过 HIVM 融合编译, 只有 Tier2 需要)"
 else echo "  (单个 kernel → 单算子: roofline 诊断够用, 走 Tier3-6)"; fi
 
 if [ "$MULTI" = "1" ]; then

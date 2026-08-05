@@ -442,6 +442,10 @@ def add_kernel(x_ptr, y_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
         "strategy": "increase_tile_size",
         "specific_change": "BLOCK_SIZE: 256 → 8192",
         "expected_impact": "bw_util from 21% to 90%+",
+        # ★F5: 自测必须带 changes[] — 否则 Step0 无替换 → stub 返回原码 = no-op → success=False
+        "changes": [{"old_code": "BLOCK_SIZE: tl.constexpr",
+                     "new_code": "BLOCK_SIZE: tl.constexpr, NUM_STAGES: tl.constexpr",
+                     "reason": "自测", "section": "② kernel"}],
     }, indent=2)
 
     # Stub 测试

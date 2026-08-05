@@ -68,7 +68,13 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     # TFLOPS: 从 state.baseline_ns 算 (需 M/N/K, 存在 state 里) 或默认
     initial_tflops = state.get("initial_tflops") or 6.4
     pytorch_tflops = state.get("pytorch_tflops") or 9.2
-    tflops_arr = np.array([initial_tflops * cs for cs in cum_speeds])
+    # ★F3: hist 若存了每轮真实 tflops (kernel 结构变化后 FLOPs 变) 就逐轮用, 否则 initial×speedup 兜底
+    hist_tflops = [r.get("tflops") for r in history]
+    per_round_tf = [
+        (h if isinstance(h, (int, float)) else initial_tflops * cs)
+        for h, cs in zip(hist_tflops, cum_speeds[1:])
+    ]
+    tflops_arr = np.array([initial_tflops] + per_round_tf)
 
     # ── Tier ranges ──
     tier_ranges = []

@@ -92,7 +92,7 @@ class LLMClient:
 
     def _call_cli(self, system: str, user: str) -> str:
         cmd = os.environ.get("LLM_CLI_COMMAND", "nga run")
-        timeout = int(os.environ.get("LLM_CLI_TIMEOUT", "1200"))   # 冷启动/大prompt/慢 nga, 默认1200s
+        timeout = int(os.environ.get("LLM_CLI_TIMEOUT", "3600"))   # nga 超时, 默认1h (夜里挂跑防偶发卡顿)
         # 合并 system prompt 和 user prompt 为一个输入
         full_prompt = f"{system}\n\n---\n\n{user}"
 

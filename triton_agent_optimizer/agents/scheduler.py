@@ -289,10 +289,26 @@ class Scheduler:
         print(f"  ⏳ 采集进行中 (msprof 需几分钟, 期间无输出是正常的; 超时 {self.optimize_timeout}s)...")
         env = dict(os.environ)
         env["TIER"] = str(tier)
+        # ★流式打印 run_optimize 输出 → 终端 + 运行日志 (outputs/<op>/optimization.log)
         try:
-            subprocess.run(cmd, check=False, timeout=self.optimize_timeout, env=env)
-        except subprocess.TimeoutExpired:
-            print(f"  ❌ run_optimize 超时 ({self.optimize_timeout}s), 看 {round_dir}/05_task/task_run.txt")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, encoding="utf-8", errors="replace", env=env)
+            import threading as _th
+
+            def _drain():
+                for line in proc.stdout:
+                    print(line, end="", flush=True)
+            _t = _th.Thread(target=_drain, daemon=True)
+            _t.start()
+            try:
+                proc.wait(timeout=self.optimize_timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                print(f"  ❌ run_optimize 超时 ({self.optimize_timeout}s), 看 {round_dir}/05_task/task_run.txt")
+                return None
+            _t.join()
+        except Exception as e:
+            print(f"  ❌ run_optimize 启动失败: {str(e)[:150]}")
             return None
         dgn = round_dir / "06_diagnosis" / "diagnosis.json"
         if dgn.exists():

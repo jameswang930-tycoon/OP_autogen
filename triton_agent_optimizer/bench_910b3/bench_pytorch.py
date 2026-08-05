@@ -44,8 +44,9 @@ def main():
     p.add_argument("--n", type=int, default=int(os.environ.get("N", "512")))
     p.add_argument("--k", type=int, default=int(os.environ.get("K", "512")))
     p.add_argument("--dtype", type=str, default=os.environ.get("DTYPE", "float16"))
-    p.add_argument("--warmup", type=int, default=2)
-    p.add_argument("--rounds", type=int, default=5)
+    p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--measure", type=int, default=int(os.environ.get("BENCH_PT_MEASURE", "30")),
+                   help="一次 Event 窗口内 matmul 次数, ÷N 求单次平均 (默认 30)")
     args = p.parse_args()
 
     if not torch.npu.is_available():
@@ -63,19 +64,16 @@ def main():
         c = torch.matmul(a, b)
         torch.npu.synchronize()
 
-    # measure (用事件计时)
-    times_s = []
-    for _ in range(args.rounds):
-        start = torch.npu.Event(enable_timing=True)
-        end = torch.npu.Event(enable_timing=True)
-        start.record()
+    # measure: 一次 Event 窗口内 matmul measure 次, ÷measure = 单次平均
+    start = torch.npu.Event(enable_timing=True)
+    end = torch.npu.Event(enable_timing=True)
+    start.record()
+    for _ in range(args.measure):
         c = torch.matmul(a, b)
-        end.record()
-        torch.npu.synchronize()
-        times_s.append(start.elapsed_time(end) / 1000.0)   # ms → s
-        print(f"    run: {times_s[-1]*1e6:.1f}us")
-
-    avg_s = sum(times_s) / len(times_s)
+    end.record()
+    torch.npu.synchronize()
+    avg_s = start.elapsed_time(end) / 1000.0 / args.measure   # ms → s → ÷N
+    print(f"    {args.measure} 次窗口平均: {avg_s*1e6:.1f}us/次")
     flops = 2 * M * N * K
     tflops = flops / 1e12 / avg_s
     print(f"\n  torch.matmul({M}x{K}@{K}x{N}, {args.dtype}): "
@@ -85,7 +83,7 @@ def main():
         "tflops": round(tflops, 2), "time_us": round(avg_s * 1e6, 1),
         "M": M, "N": N, "K": K, "dtype": args.dtype,
         "measured_at": datetime.now().isoformat(),
-        "rounds": args.rounds,
+        "measure": args.measure,
     }, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"  → {OUT}")
 

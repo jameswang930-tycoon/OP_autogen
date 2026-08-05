@@ -56,6 +56,41 @@ from analyzers.merge_single_file import merge  # noqa: E402
 from config import config  # noqa: E402,F401 — 触发 _load_dotenv() 加载 .env (LLM_CLI_COMMAND 等)
 
 
+class _Tee:
+    """把 stdout/stderr 同时写终端 + 运行日志文件 (outputs/<op>/optimization.log)."""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            try:
+                s.write(data)
+                s.flush()   # 保证 log 实时可读
+            except Exception:
+                pass
+
+    def flush(self):
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return self.streams[0].fileno()
+
+    def reconfigure(self, *args, **kwargs):
+        """agent 模块会调 sys.stdout.reconfigure(encoding='utf-8') — 传播给所有流."""
+        for s in self.streams:
+            try:
+                s.reconfigure(*args, **kwargs)
+            except Exception:
+                pass
+
+
 def main():
     p = argparse.ArgumentParser(description="Triton Agent Optimizer v4")
     p.add_argument("op_dir", type=str, help="input/<op> 目录 (含 triton_kernel.py + config.json + test)")
@@ -102,6 +137,19 @@ def main():
         print(f"[ERROR] 单文件不存在: {kernel_op}")
         return 1
     print(f"[main] 单文件: {kernel_op}")
+
+    # ★运行日志: 全部终端输出同时写入 outputs/<op>/optimization.log (每算子一个)
+    #   (放在 --fresh 清理之后, 避免清掉 log; 追加模式保留历史运行)
+    from datetime import datetime as _dt
+    out_dir = _PROJECT / "outputs" / op_dir.name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_path = out_dir / "optimization.log"
+    _log_f = open(log_path, "a", encoding="utf-8")
+    _log_f.write(f"\n{'=' * 60}\n运行开始 {_dt.now().isoformat()}\n{'=' * 60}\n")
+    _log_f.flush()
+    sys.stdout = _Tee(sys.__stdout__, _log_f)
+    sys.stderr = _Tee(sys.__stderr__, _log_f)
+    print(f"[main] 运行日志 → {log_path}")
 
     # ② Scheduler 循环 (默认每次初始化; --resume 续跑)
     from agents.scheduler import Scheduler

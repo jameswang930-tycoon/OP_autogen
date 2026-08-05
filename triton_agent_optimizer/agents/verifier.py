@@ -382,74 +382,76 @@ if __name__ == "__main__":
 #  v4: 只跑 msprof 端到端 (整文件) → 端到端耗时 → 加速比
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _read_target_duration(prof_out: Path) -> Optional[float]:
-    """读 op_summary, 目标 kernel (非 aclnn) 的 Task Duration(us) 之和 = 端到端.
-    ★多 kernel (如 MLP: fc1+bias_gelu+fc2) 求和才是总耗时; 单 kernel 即本身.
+def _read_target_duration(prof_out: Path) -> tuple:
+    """读 op_summary, 返回 (目标 kernel 非 aclnn 的 Task Duration(us) 之和, 行数).
+    ★求和 = 一次执行的端到端 (多 kernel 如 MLP: fc1+bias_gelu+fc2 求和);
+      KERNEL_LOOP=N 时行数=N×kernel数, 和=N×端到端 → 除 N 得单次.
+      msprof 合并同名连续 kernel 也不影响总和 (时间不丢), 故求和法稳健.
       排除 aclnn 框架 kernel — 与 task.json total_ns (baseline) 口径一致."""
     import csv as _csv
     summaries = sorted(prof_out.rglob("op_summary*.csv"))
     if not summaries:
-        return None
+        return None, 0
     try:
         with open(summaries[0], encoding="utf-8") as f:
             rows = list(_csv.DictReader(f))
     except Exception:
-        return None
-    total_us = None
+        return None, 0
+    total_us, count = None, 0
     for row in rows:
         dur = row.get("Task Duration(us)") or row.get("TaskDuration")
         op = row.get("Op Name") or row.get("OpName") or ""
         if dur and not op.lower().startswith("aclnn"):
             try:
                 total_us = (total_us or 0) + float(dur)
+                count += 1
             except ValueError:
                 pass
-    return total_us
+    return total_us, count
 
 
 def verify_end_to_end(kernel_op: Path, round_dir: Path,
                       baseline_ns: Optional[float] = None) -> dict:
-    """v4 验证: warmup + 多轮 msprof 端到端取平均 (整文件), 不提取字段、不跑 msprof op。
+    """v4 验证: warmup + 一次 msprof 内循环 KERNEL_LOOP 次取平均 (整文件).
 
-    策略:
-      warmup = VERIFY_WARMUP (默认1): 先裸跑 kernel_op.py N 次 (JIT 编译/冷cache 预热)
-      runs   = VERIFY_RUNS (默认3):   跑 N 次 msprof, 每次读目标 kernel Task Duration(us),
-                                       取各轮 max 的平均 (去抖动)
+    策略 (与 bench_910b3 同技术, 取代旧的 3 次独立 msprof — 每次 msprof 有 ~1-2min 启动开销):
+      warmup = VERIFY_WARMUP (默认3): 先裸跑 kernel_op.py (KERNEL_LOOP 次) 预热 JIT/cache
+      loop   = VERIFY_LOOP (默认30):  **一次 msprof** 内 kernel_op.py 内部循环 loop 次,
+                                       读 op_summary 目标 kernel 耗时之和 → ÷loop = 单次端到端
+      (msprof 合并同名 kernel 不影响总和; 求和法稳健)
 
     返回:
-      ok=True  → {"ok": True, "ns": 平均端到端ns, "speedup": baseline/ns}
+      ok=True  → {"ok": True, "ns": 单次端到端ns, "speedup": baseline/ns}
       ok=False → {"ok": False, "error": 报错文本}  (回传 Coder 同轮改)
     """
     import os as _os
     import subprocess
-    warmup = int(_os.environ.get("VERIFY_WARMUP", "3"))   # 裸跑热身 (JIT/冷cache), 便宜
-    runs = int(_os.environ.get("VERIFY_RUNS", "3"))       # msprof 轮数 (每次~1-2min, 别调太大)
+    warmup = int(_os.environ.get("VERIFY_WARMUP", "3"))
+    loop = int(_os.environ.get("VERIFY_LOOP", "30"))
     py = "python3"
+    env = dict(_os.environ, KERNEL_LOOP=str(loop))   # kernel_op.py main() 内部循环 loop 次
 
-    # warmup: 裸跑预热 (不 profile)
+    # warmup: 裸跑预热 (KERNEL_LOOP=loop, JIT 编译/冷cache 预热; 便宜)
     for i in range(warmup):
-        subprocess.run([py, str(kernel_op)], capture_output=True, text=True, timeout=1800)
-    print(f"  [Verify] warmup x{warmup} done, 测 {runs} 轮 msprof...")
+        subprocess.run([py, str(kernel_op)], capture_output=True, text=True, timeout=1800, env=env)
+    print(f"  [Verify] warmup x{warmup} (每轮内部 {loop} 次) done, 1 次 msprof 测 {loop} 次平均...")
 
-    # measure: runs 次 msprof, 每次独立输出目录
-    durations_us = []
-    for i in range(runs):
-        msprof_out = round_dir / f"msprof_run{i}"
-        msprof_out.mkdir(parents=True, exist_ok=True)
-        cmd = ["msprof", f"--output={msprof_out}",
-               f"--application={py} {kernel_op}", "--ai-core=on"]
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-        except Exception as e:
-            return {"ok": False, "error": f"msprof run failed: {e}"}
-        d = _read_target_duration(msprof_out)
-        if d is None:
-            tail = (r.stderr or "")[-800:] + (r.stdout or "")[-800:]
-            return {"ok": False, "error": tail.strip() or f"msprof_run{i} 无 op_summary/目标kernel"}
-        durations_us.append(d)
-        print(f"    run{i}: {d:.1f}us")
-
-    ns = sum(durations_us) / len(durations_us) * 1000   # 平均 (us→ns)
+    # measure: 一次 msprof, app 内部循环 loop 次 → 和 ÷loop = 单次端到端
+    msprof_out = round_dir / "msprof_0"
+    msprof_out.mkdir(parents=True, exist_ok=True)
+    cmd = ["msprof", f"--output={msprof_out}",
+           f"--application={py} {kernel_op}", "--ai-core=on"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200, env=env)
+    except Exception as e:
+        return {"ok": False, "error": f"msprof run failed: {e}"}
+    total_us, n_rows = _read_target_duration(msprof_out)
+    if total_us is None or n_rows < 1:
+        tail = (r.stderr or "")[-800:] + (r.stdout or "")[-800:]
+        return {"ok": False, "error": tail.strip() or "msprof 无目标 kernel"}
+    per_pass_us = total_us / loop
+    ns = per_pass_us * 1000
     speedup = (baseline_ns / ns) if baseline_ns else 1.0
+    print(f"    msprof 记录 {n_rows} 行目标 kernel (loop={loop}), 单次端到端={per_pass_us:.1f}us")
     return {"ok": True, "ns": round(ns, 1), "speedup": round(speedup, 4),
-            "runs": runs, "durations_us": durations_us}
+            "loop": loop, "rows": n_rows, "durations_us": [round(per_pass_us, 1)]}

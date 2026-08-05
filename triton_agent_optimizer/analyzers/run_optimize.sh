@@ -236,21 +236,23 @@ if [ "$MULTI" = "1" ]; then
 fi
 
 # ═══════════ 字段校验 (check_fields.py: OK / 列名不匹配 / 源无) ═══════════
+# ★check_fields 的"列名不匹配/缺字段"调试明细不打印终端, 重定向到 field_check.log (终端只留 pass/fail 摘要)
 echo ""; echo "══════════ 字段校验 ══════════"
 CF_RC=0
+FCHK="$OUT/05_task/field_check.log"; : > "$FCHK"
 if [ -f "$D/task.json" ]; then
   DGN=""
   [ -f "$D/diagnosis.json" ] && DGN="$D/diagnosis.json"
   if ls "$D"/board_*.json >/dev/null 2>&1; then
     for b in "$D"/board_*.json; do
-      echo "── 校验 $(basename "$b") ──"
-      "$PY" "$SCRIPT_DIR/check_fields.py" "$b" "$D/task.json" $DGN || CF_RC=1
+      echo "── 校验 $(basename "$b") (明细→$FCHK) ──"
+      "$PY" "$SCRIPT_DIR/check_fields.py" "$b" "$D/task.json" $DGN >> "$FCHK" 2>&1 || CF_RC=1
     done
   else
-    echo "── 校验 task.json (无 board) ──"
-    "$PY" "$SCRIPT_DIR/check_fields.py" "$D/task.json" "$D/task.json" $DGN || CF_RC=1
+    echo "── 校验 task.json (无 board, 明细→$FCHK) ──"
+    "$PY" "$SCRIPT_DIR/check_fields.py" "$D/task.json" "$D/task.json" $DGN >> "$FCHK" 2>&1 || CF_RC=1
   fi
-  [ "$CF_RC" -eq 0 ] && pass "字段校验: 无列名不匹配 (合法缺属正常)" || fail "字段校验: 有列名不匹配 (看 raw 修 parser)"
+  [ "$CF_RC" -eq 0 ] && pass "字段校验: 无列名不匹配 (合法缺属正常)" || fail "字段校验: 有列名不匹配 (看 $FCHK)"
 else
   fail "字段校验: task.json 缺失"
 fi

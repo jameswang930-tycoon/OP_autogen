@@ -39,8 +39,9 @@ def main():
     p.add_argument("--n", type=int, default=int(os.environ.get("N", "2048")))
     p.add_argument("--hidden", type=int, default=int(os.environ.get("HIDDEN", "2048")))
     p.add_argument("--dtype", type=str, default=os.environ.get("DTYPE", "float32"))
-    p.add_argument("--warmup", type=int, default=2)
-    p.add_argument("--rounds", type=int, default=5)
+    p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--measure", type=int, default=int(os.environ.get("BENCH_PT_MEASURE", "30")),
+                   help="一次 Event 窗口内 forward 次数, ÷N 求单次平均 (默认 30)")
     args = p.parse_args()
 
     if not torch.npu.is_available():
@@ -68,19 +69,16 @@ def main():
         y = forward()
         torch.npu.synchronize()
 
-    # measure (torch.npu.Event 计时)
-    times_s = []
-    for _ in range(args.rounds):
-        s = torch.npu.Event(enable_timing=True)
-        e = torch.npu.Event(enable_timing=True)
-        s.record()
+    # measure: 一次 Event 窗口内 forward measure 次, ÷measure = 单次平均 (摊薄 Event 开销/抖动)
+    s = torch.npu.Event(enable_timing=True)
+    e = torch.npu.Event(enable_timing=True)
+    s.record()
+    for _ in range(args.measure):
         y = forward()
-        e.record()
-        torch.npu.synchronize()
-        times_s.append(s.elapsed_time(e) / 1000.0)   # ms → s
-        print(f"    run: {times_s[-1]*1e6:.1f}us")
-
-    avg_s = sum(times_s) / len(times_s)
+    e.record()
+    torch.npu.synchronize()
+    avg_s = s.elapsed_time(e) / 1000.0 / args.measure   # ms → s → ÷N
+    print(f"    {args.measure} 次窗口平均: {avg_s*1e6:.1f}us/次")
     flops = 2 * M * K * H + 2 * M * H * N            # 两个 matmul 真实 FLOPs
     tflops = flops / 1e12 / avg_s
     print(f"\n  torch MLP({M}x{K}@{K}x{H}→GELU→{H}x{N}, {args.dtype}): "
@@ -90,7 +88,7 @@ def main():
         "tflops": round(tflops, 2), "time_us": round(avg_s * 1e6, 1),
         "M": M, "K": K, "N": N, "H": H, "dtype": args.dtype, "flops": flops,
         "measured_at": datetime.now().isoformat(),
-        "rounds": args.rounds,
+        "measure": args.measure,
     }, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"  → {OUT}")
 

@@ -3,13 +3,8 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 #  单文件 kernel_op.py — 两层 MLP (X→FC1→GELU→FC2→Y) 合一体 (v4)
 #  ★ 优化循环里 coder 只改这一个文件; 读取/运行/测试都只看这一个文件
-#  分三个区: ① 场景 config (改尺寸/分块/精度)  ② 算子 kernel (优化核心)  ③ 测试 main
-#
-#  相比单一 matmul (512³ fp32, ~µs, 访存受限, 跑不满):
-#    - 尺寸大 (2048³, 单 matmul 17.2 GFLOP), 端到端 ~百µs, 真机跑得满
-#    - 3 个 kernel (fc1 / bias_gelu / fc2) → Tier2 融合空间 (bias_gelu 并入 fc1 epilogue 省 Z 的 GM 往返)
-#    - 流程长 (matmul→激活→matmul), 各 tier 都有优化点
-#    - 保持 fp32 起步 → tier1 留有"切 fp16"杠杆
+#  分三个区: ① 场景 config  ② 算子 kernel  ③ 测试 main
+#  运算链: Y = GELU(X@W1 + b1) @ W2
 # ═══════════════════════════════════════════════════════════════════════════════
 import os
 import sys
@@ -20,22 +15,21 @@ import triton.language as tl
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  ① 场景 config — 改这里调尺寸、精度、分块 (tier3 优化点: BLOCK_*)
-#   两层 MLP: Y = GELU(X@W1 + b1) @ W2
+#  ① 场景 config — 尺寸/精度/分块
 #   形状: X[M,K] @ W1[K,HIDDEN] → Z[M,HIDDEN] → GELU(Z+b1) → H[M,HIDDEN] @ W2[HIDDEN,N] → Y[M,N]
 # ═══════════════════════════════════════════════════════════════════════════════
 M  = int(os.environ.get("MATMUL_M", 2048))
 N  = int(os.environ.get("MATMUL_N", 2048))
 K  = int(os.environ.get("MATMUL_K", 2048))
-HIDDEN = int(os.environ.get("MLP_HIDDEN", 2048))   # 隐藏层宽度 (= 两个 matmul 的中间维度)
-DTYPE = torch.float32                    # 精度 (tier1/tier5 优化点: fp16 计算 + fp32 累加)
-BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32   # matmul 分块 (tier3 优化点)
+HIDDEN = int(os.environ.get("MLP_HIDDEN", 2048))   # 隐藏层宽度
+DTYPE = torch.float32
+BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
 BLOCK_SIZE = 1024                        # 逐元素 kernel (bias_gelu) 分块
 # 注意: 不传 num_warps/num_stages — triton-ascend 禁止 tune 这两个参数, 自动管理 tiling/流水
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  ② 算子 kernel — 优化核心 (tier1 算法 / tier2 融合 / tier3 分块 / tier4 访存 / tier5 计算 / tier6 架构)
+#  ② 算子 kernel
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # FC1: Z = X @ W1   (matmul, fp32 累加)
@@ -149,30 +143,34 @@ def main():
     print(f"[info] fc1 grid={grid1[0]}  fc2 grid={grid2[0]}  bias_gelu grid={grid_g[0]}  "
           f"block={BLOCK_M}x{BLOCK_N}x{BLOCK_K}")
 
-    # FC1: Z = X @ W1
-    matmul_kernel[grid1](
-        x, w1, z,
-        M, HIDDEN, K,
-        x.stride(0), x.stride(1),
-        w1.stride(0), w1.stride(1),
-        z.stride(0), z.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-    )
-    # bias + GELU: H = GELU(Z + b1)
-    bias_gelu_kernel[grid_g](
-        z, b1, h,
-        M * HIDDEN, HIDDEN,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    # FC2: Y = H @ W2
-    matmul_kernel2[grid2](
-        h, w2, y,
-        M, N, HIDDEN,
-        h.stride(0), h.stride(1),
-        w2.stride(0), w2.stride(1),
-        y.stride(0), y.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-    )
+    # ★KERNEL_LOOP: verify/bench 用它 (一次 msprof 内循环 N 次, 求单次平均; 分配只做一次复用)
+    #   默认 1 = 正常跑一遍; verify 设 VERIFY_LOOP(默认30)
+    LOOP = int(os.environ.get("KERNEL_LOOP", "1"))
+    for _ in range(LOOP):
+        # FC1: Z = X @ W1
+        matmul_kernel[grid1](
+            x, w1, z,
+            M, HIDDEN, K,
+            x.stride(0), x.stride(1),
+            w1.stride(0), w1.stride(1),
+            z.stride(0), z.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        )
+        # bias + GELU: H = GELU(Z + b1)
+        bias_gelu_kernel[grid_g](
+            z, b1, h,
+            M * HIDDEN, HIDDEN,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        # FC2: Y = H @ W2
+        matmul_kernel2[grid2](
+            h, w2, y,
+            M, N, HIDDEN,
+            h.stride(0), h.stride(1),
+            w2.stride(0), w2.stride(1),
+            y.stride(0), y.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        )
     torch.npu.synchronize()
     print("[info] MLP launched & synced OK")
 

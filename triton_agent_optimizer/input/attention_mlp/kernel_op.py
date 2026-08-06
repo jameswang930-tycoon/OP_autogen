@@ -121,7 +121,7 @@ def mlp_gelu_kernel(a_ptr, w_ptr, b_ptr, c_ptr,
                     BLOCK_M: tl.constexpr,
                     BLOCK_N: tl.constexpr,
                     BLOCK_K: tl.constexpr):
-    # Y = GELU(A @ W + b) — matmul + bias + tanh-GELU epilogue, fp32 累加
+    # Y = GELU(A @ W + b) — matmul + bias + tanh-GELU 激活, fp32 累加
     pid = tl.program_id(axis=0)
     grid_n = (N + BLOCK_N - 1) // BLOCK_N
     pid_m = pid // grid_n

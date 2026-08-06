@@ -102,7 +102,7 @@ def matmul_kernel2(a_ptr, b_ptr, c_ptr,
     tl.store(c_ptrs, acc, mask=c_mask)
 
 
-# bias + GELU: H = GELU(Z + b1)  (逐元素, Tier2 融合目标: 并入 fc1 epilogue 省一次 Z 的 GM 写+读)
+# bias + GELU: H = GELU(Z + b1)  (逐元素: 加 bias 后 tanh-GELU 激活)
 @triton.jit
 def bias_gelu_kernel(x_ptr, bias_ptr, y_ptr,
                      n_elements, N,

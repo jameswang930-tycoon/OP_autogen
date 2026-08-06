@@ -53,8 +53,8 @@ def build_deep(bd):
     b_sum = bd.get("execution_summary", {})
     bw = b_norm.get("bandwidth_gb_s", {})
     comp = b_norm.get("compute", {})
-    achieved_mem = max([bw.get("main_mem_read_gb_s"), bw.get("main_mem_write_gb_s")],
-                       key=lambda x: x or 0) or 0
+    # ★C3: 用 读+写 之和 (原 max 只取单向, 写多读少时访存利用率/算术强度偏低)
+    achieved_mem = (bw.get("main_mem_read_gb_s") or 0) + (bw.get("main_mem_write_gb_s") or 0)
     cube_fops = comp.get("cube_fops") or 0
     vec_fops = comp.get("vector_fops") or 0
     achieved_compute = (cube_fops + vec_fops) / 1e12 if (cube_fops or vec_fops) else 0

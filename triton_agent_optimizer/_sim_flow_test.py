@@ -149,6 +149,7 @@ def fake_run_optimize(self, round_dir, tier):
 def setup():
     OP.mkdir(parents=True, exist_ok=True)
     (OP / "kernel_op.py").write_text(FAKE_KERNEL, encoding="utf-8")
+    os.environ["KEEP_FLOOR"] = "1.0"   # 隔离噪声地板, 测试核心 keep/revert 机制
 
 def teardown():
     shutil.rmtree(OP, ignore_errors=True)

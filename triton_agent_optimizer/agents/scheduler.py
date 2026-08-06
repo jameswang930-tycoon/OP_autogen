@@ -113,6 +113,12 @@ TIER_FIELDS = {
 }
 
 
+def _keep_floor() -> float:
+    """★#2 噪声地板: 采纳需 speedup ≥ prev_speedup×floor (默认 1.01, env KEEP_FLOOR 可调).
+    防 msprof ±1% 噪声让实际变慢的 kernel 被采纳进链 (v3 轨迹 0.97~1.01 全是噪声的教训)."""
+    return float(os.environ.get("KEEP_FLOOR", "1.01"))
+
+
 def _extract_mnk(code: str):
     """从 kernel_op.py ①config 区提取 M/N/K (默认值) → (M,N,K) 或 None。"""
     import re
@@ -232,6 +238,19 @@ def extract_tier_fields(diagnosis: dict, tier: int) -> str:
     lines = [f"# 当前 Tier {tier} ({TIER_LABEL.get(tier, '')})"]
     lines.append("# ══ 全局摘要 (前层信号: 算法/融合/算力/精度) ★任何轮都看 ══")
     lines += [_fmt(p, d) for p, d in GLOBAL_FIELDS]
+    # ★#3: Per-Kernel 耗时占比 — planner 必须知道"哪个 kernel 占大头", 优化才不打错目标
+    lines.append("# ══ Per-Kernel 耗时占比 (★优化要打中占比最大的 kernel) ══")
+    _total_us = (diagnosis.get("summary") or {}).get("total_ns")
+    _total_us = (_total_us / 1000) if _total_us else None
+    for _k in (diagnosis.get("kernels") or []):
+        _name = _k.get("kernel_name", "?")
+        _dur = (_k.get("task") or {}).get("task_duration_us")
+        if _dur and _total_us:
+            lines.append(f"- {_name}: {_dur}us ({_dur/_total_us*100:.1f}% of 端到端)")
+        elif _dur:
+            lines.append(f"- {_name}: {_dur}us")
+        else:
+            lines.append(f"- {_name}: (无耗时)")
     lines.append("# ══ 当前 Tier 专属字段 ══")
     lines += [_fmt(p, d) for p, d in TIER_FIELDS.get(tier, [])]
     return "\n".join(lines)
@@ -253,6 +272,7 @@ class Scheduler:
         self.kernel_dir = self.outputs / self.kernel_name
         self.traj_path = self.kernel_dir / "optimization_trajectory.json"
         self.traj = self._load_traj()
+        self.stage_times = []   # ★每轮各阶段耗时收集 (stats 输出用)
         # ★默认每次初始化 (round1/tier1 重来, 避免读旧路径错位); --resume 才续跑
         if not resume or not self.traj.get("state", {}).get("current_kernel"):
             self._reset_state()
@@ -288,6 +308,36 @@ class Scheduler:
         self.traj_path.parent.mkdir(parents=True, exist_ok=True)
         self.traj_path.write_text(json.dumps(self.traj, ensure_ascii=False, indent=2),
                                   encoding="utf-8")
+
+    def _write_timing_stats(self):
+        """★每轮各阶段耗时统计 → outputs/<op>/stats/timing_stats.json (找项目自身瓶颈).
+        aggregate: 各阶段 总/平均/占本轮总时%, 标出耗时最大的阶段."""
+        if not self.stage_times:
+            return
+        stats_dir = self.kernel_dir / "stats"
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        stages = ("collect_s", "diag_s", "fusion_s", "planner_s", "coder_s", "verify_s")
+        total_round = sum(r["round_s"] for r in self.stage_times) or 1e-9
+        agg = {}
+        for k in stages:
+            vals = [r[k] for r in self.stage_times]
+            agg[k] = {"total_s": round(sum(vals), 2),
+                      "avg_s": round(sum(vals) / len(vals), 2),
+                      "pct_of_round": round(sum(vals) / total_round * 100, 1)}
+        bottleneck = max(agg, key=lambda k: agg[k]["total_s"])
+        out = {
+            "op": self.kernel_name,
+            "rounds": self.stage_times,
+            "aggregate": agg,
+            "bottleneck_stage": bottleneck,   # 耗时最大阶段 (项目自身瓶颈)
+            "generated_at": datetime.now().isoformat(),
+        }
+        (stats_dir / "timing_stats.json").write_text(
+            json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"\n  [Stats] 各阶段耗时统计 → {stats_dir}/timing_stats.json")
+        print(f"         瓶颈阶段: {bottleneck} (总 {agg[bottleneck]['total_s']}s, "
+              f"占本轮总时 {agg[bottleneck]['pct_of_round']}%)")
+        print(f"         各阶段平均: " + ", ".join(f"{k.replace('_s','')}={agg[k]['avg_s']}s" for k in stages))
 
     # ── 轮目录 ──
     def _round_dir(self, tier: int, rn: int) -> Path:
@@ -399,7 +449,10 @@ class Scheduler:
         return plan
 
     # ── ⑤ Coder (读 current_kernel, 精确应用 changes[], 输出 round_dir/kernel_op.py) ──
-    def _code(self, plan, rn: int, round_dir: Path, prev_err: str = "") -> str:
+    def _code(self, plan, rn: int, round_dir: Path, prev_err: str = "") -> tuple:
+        """应用计划 → (优化后代码, 是否成功应用, 错误文本).
+        ★B2: 返回 success/error — coder 应用失败(old_code没匹配/语法错/LLM超时/no-op)时,
+        调度器把错误记进 history → 下一轮 planner 能看到, 不再重复提同样的错 old_code."""
         from agents.coder import CoderAgent, CoderResult
         original = self.current_kernel.read_text(encoding="utf-8") if self.current_kernel.exists() else ""
         skill = _PROJECT / "skills" / "triton-op-coder" / "SKILL.md"
@@ -421,7 +474,7 @@ class Scheduler:
             print(f"  [Coder] ✅ 应用 {n_changes} 处 changes → {lines} 行改动 → diff.patch")
         else:
             print(f"  [Coder] ⚠ 未成功: {result.error_message[:200]}")
-        return result.optimized_code
+        return result.optimized_code, result.success, result.error_message
 
     # ── ⑥ 验证: 只跑 msprof 端到端 (验证本轮新 kernel) ──
     def _verify(self, round_dir: Path, baseline_ns: Optional[float]) -> dict:
@@ -492,7 +545,8 @@ class Scheduler:
                 self._save_traj()
                 continue
             coll_fail = 0
-            print(f"  ⏱ ①采集+解析: {time.time()-_t0:.1f}s")
+            t_collect = time.time() - _t0
+            print(f"  ⏱ ①采集+解析: {t_collect:.1f}s")
             # 诊断摘要
             ks0 = diagnosis.get("summary", {})
             k0 = (diagnosis.get("kernels") or [{}])[0]
@@ -549,6 +603,15 @@ class Scheduler:
                                     cube_fops / (vb["ns"] / 1e9) / 1e12, 2)
                             print(f"  [基准] 复测平均 baseline_ns={vb['ns']}ns "
                                   f"(warmup+msprof 平均, 与后续轮同口径)")
+                        else:
+                            berr = vb.get("error", "")
+                            print(f"  [基准] 复测失败: {berr[:200]} → 用诊断 total_ns")
+                            if "正确性" in berr:
+                                # ★A3: 源 kernel 正确性校验失败 → 源代码本身算错, 后面优化全白跑 → 停
+                                print("  ⛔ 源 kernel 正确性校验失败 → 停止 (源代码算错了, 先修 input/<op>)")
+                                st["round"] = rn + 1
+                                self._save_traj()
+                                break
                     except Exception as e:
                         print(f"  [基准] 复测失败({str(e)[:100]}), 用诊断 total_ns")
                 if st.get("baseline_ns") is None:
@@ -573,21 +636,28 @@ class Scheduler:
             # ③ 诊断: 按当前阶段筛选字段 → 写 07
             _t0 = time.time()
             extracted = self._diagnose(diagnosis, tier, round_dir)
-            print(f"  ⏱ ②诊断筛字段: {time.time()-_t0:.1f}s")
+            t_diag = time.time() - _t0
+            print(f"  ⏱ ②诊断筛字段: {t_diag:.1f}s")
 
             # ③.5 Tier2 融合: 多走一步 — 编译 HIVM MLIR → nga run 分析依赖 → 08_fusion/
             fusion_analysis = None
+            t_fusion = 0.0
             if tier == 2:
                 _t0 = time.time()
                 fusion_analysis = self._run_fusion(round_dir)
-                print(f"  ⏱ ③融合分析: {time.time()-_t0:.1f}s")
+                t_fusion = time.time() - _t0
+                print(f"  ⏱ ③融合分析: {t_fusion:.1f}s")
 
             # ④ Planner → plan + 晋升决策 (只喂 07 筛好的字段 + 融合分析)
             _t0 = time.time()
             plan = self._plan(diagnosis, extracted, tier, rn, round_dir, fusion_analysis)
-            print(f"  ⏱ ④Planner: {time.time()-_t0:.1f}s")
+            t_plan = time.time() - _t0
+            print(f"  ⏱ ④Planner: {t_plan:.1f}s")
 
             # ⑤ Coder → 改代码 / ★晋升轮原样输出, 输出到 round_dir/kernel_op.py (不碰源文件)
+            # ★计时修复: 重置 _t0 (之前没重置, ⑤ 把 ④ planner 的时间也算进去了)
+            _t0 = time.time()
+            t_code = t_verify = 0.0
             prev_err, new_code = "", ""
             round_kernel = round_dir / "kernel_op.py"
             prev_speedup = st.get("current_speedup", 1.0)   # 上一轮已接受 kernel 的加速比 (基线=1.0)
@@ -611,26 +681,42 @@ class Scheduler:
                 kept = True
                 self._save_traj()
             else:
+                v = None
                 for attempt in range(3):
-                    new_code = self._code(plan, rn, round_dir, prev_err)
+                    _tc = time.time()
+                    new_code, code_ok, code_err = self._code(plan, rn, round_dir, prev_err)
+                    t_code += time.time() - _tc
                     round_kernel.write_text(new_code, encoding="utf-8")
+                    if not code_ok:
+                        # ★B2: coder 应用失败(old_code没匹配/语法错/超时/no-op) → 错误进 prev_err → history →
+                        #   planner 下轮可见; 不测假加速比, 重试(下次带错误走 LLM 修复)
+                        prev_err = code_err
+                        print(f"  ⚠ coder 未成功应用(第{attempt+1}次): {code_err[:160]}...")
+                        continue
                     # ⑥ 验证 (只 msprof 端到端, 验证本轮新 kernel)
+                    _tv = time.time()
                     v = self._verify(round_dir, st.get("baseline_ns"))
+                    t_verify += time.time() - _tv
                     if v.get("ok"):
                         # ★保留判定: speedup 始终 = 初始基线/本轮 (累计, 输出的就是这个);
                         #   但"是否采纳进 kernel 链"对比上一轮已接受的加速比 (prev_speedup)
                         speedup = v.get("speedup", 1.0) or 1.0   # None→1.0 防御 (baseline 缺失时 verify 返回 None)
-                        if speedup >= prev_speedup:
+                        floor = _keep_floor()
+                        if speedup >= prev_speedup * floor:
                             self.current_kernel = round_kernel
                             st["current_kernel"] = str(round_kernel)
                             st["current_speedup"] = round(speedup, 4)
                             kept = True
                         else:
-                            print(f"  ↩ 回退: 本轮 {speedup:.3f}x < 上一轮 {prev_speedup:.3f}x, 沿用上一轮 kernel")
+                            print(f"  ↩ 回退: 本轮 {speedup:.3f}x < 上一轮 {prev_speedup:.3f}x×{floor} (噪声地板), 沿用上一轮 kernel")
                         self._save_traj()
                         break
                     prev_err = v.get("error", "unknown error")
                     print(f"  ⚠ 运行失败(第{attempt+1}次): {prev_err[:200]}... 回传 Coder 同轮改")
+                if v is None:
+                    # ★3次都是 coder 应用失败 → 本轮 FAIL (不产生假 speedup), 错误已在 prev_err → history
+                    v = {"ok": False, "error": f"coder 连续3次未成功应用: {(prev_err or '')[:160]}",
+                         "speedup": 1.0, "ns": None}
 
             # ★兜底: 保证每个 round 目录都有 kernel_op.py (格式一致)
             if not round_kernel.exists():
@@ -640,8 +726,18 @@ class Scheduler:
             ns = v.get("ns")
             print(f"  加速比: {speedup:.3f}x (vs 初始基线 {st.get('baseline_ns')}ns; 上一轮 {prev_speedup:.3f}x)"
                   + ("  ✅采纳" if kept else "  ↩未采纳"))
-            print(f"  ⏱ ⑤Coder+验证: {time.time()-_t0:.1f}s")
-            print(f"  ⏱ 本轮总时: {time.time()-round_start:.1f}s  (总用时 {time.time()-total_start:.1f}s)")
+            t_round = time.time() - round_start
+            print(f"  ⏱ ⑤Coder: {t_code:.1f}s")
+            print(f"  ⏱ ⑥Verify: {t_verify:.1f}s")
+            print(f"  ⏱ 本轮总时: {t_round:.1f}s  (总用时 {time.time()-total_start:.1f}s)")
+            # ★每轮各阶段耗时收集 → stats (找项目自身瓶颈)
+            self.stage_times.append({
+                "round": rn, "tier": tier,
+                "collect_s": round(t_collect, 2), "diag_s": round(t_diag, 2),
+                "fusion_s": round(t_fusion, 2), "planner_s": round(t_plan, 2),
+                "coder_s": round(t_code, 2), "verify_s": round(t_verify, 2),
+                "round_s": round(t_round, 2),
+            })
 
             # ⑦ 记录 + 晋升决策 (hist 记"改了啥+结果"梗概, 让 planner 知道试过什么)
             ok = v.get("ok", False)
@@ -671,13 +767,14 @@ class Scheduler:
 
             # 晋升决策: planner.promote (读瓶颈判断) + 连续3轮无改进兜底 + 达标/到Tier6停止
             planner_promote = getattr(plan, "promote", False)
-            # ★无改进 = 本轮加速比没超过上一轮已接受的 (speedup <= prev_speedup);
-            #   数"本 tier 连续无改进"轮数 (跨 tier 边界即断)
+            # ★无改进 = 本轮加速比没超过上一轮已接受×噪声地板 (speedup <= prev_speedup×floor);
+            #   数"本 tier 连续无改进"轮数 (跨 tier 边界即断) — 与 KEEP 地板同步
             no_improve = 0
+            floor = _keep_floor()
             for h in reversed(self.traj["history"]):
                 if h.get("tier") != tier:
                     break
-                if h.get("speedup", 0) > h.get("prev_speedup", 0):
+                if h.get("speedup", 0) > h.get("prev_speedup", 0) * floor:
                     break
                 no_improve += 1
             if self.target_speedup > 0 and speedup >= self.target_speedup:
@@ -705,17 +802,22 @@ class Scheduler:
                     st["tier"] = tier
             elif no_improve >= 3 or tier >= 6:
                 if tier >= 6:
-                    print("  ⛔ Tier6 连续无改进, 停止")
-                    st["round"] = rn + 1
-                    self._save_traj()
-                    break
-                print(f"  → 晋升 Tier{tier}→Tier{tier+1} (本tier连续{no_improve}轮无改进)")
-                tier += 1
-                st["tier"] = tier
+                    if no_improve >= 3:
+                        print("  ⛔ Tier6 连续3轮无改进, 停止")
+                        st["round"] = rn + 1
+                        self._save_traj()
+                        break
+                    # ★B1修复: Tier6 有改进 → 继续 (README 写的"连续无改进才停"; 原来一轮即停是 bug)
+                    print(f"  → Tier6 有改进(no_improve={no_improve}), 继续")
+                else:
+                    print(f"  → 晋升 Tier{tier}→Tier{tier+1} (本tier连续{no_improve}轮无改进)")
+                    tier += 1
+                    st["tier"] = tier
             st["round"] = rn + 1
             rn += 1
             self._save_traj()
 
+        self._write_timing_stats()   # ★各阶段耗时统计 (项目自身瓶颈)
         print(f"\n══ 完成: best_speedup={st.get('best_speedup')}x ══")
         return 0
 

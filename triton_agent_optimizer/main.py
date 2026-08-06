@@ -24,10 +24,14 @@ LLM 调用（服务器无 Claude API, 用本地 codeagent）:
   1. 单文件能跑:
      python3 input/matmul/kernel_op.py
      # 预期: [info] kernel launched & synced OK
-  2. 完整优化循环 (一键; input/ 下算子目录, 例 matmul / attention_mlp):
-     LLM_CLI_COMMAND="nga run" python3 main.py input/matmul --max-rounds 2
-     LLM_CLI_COMMAND="nga run" python3 main.py input/attention_mlp --fresh --max-rounds 15   # 复杂算子
-     # 每轮: 采集→07字段→planner→coder→msprof端到端→加速比
+  2. 完整优化循环 (一键; input/ 下任一算子目录, 都是标准 kernel_op.py 单文件):
+     LLM_CLI_COMMAND="nga run" python3 main.py input/matmul --fresh --max-rounds 15          # 两层 MLP (3 kernel)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/attention_mlp --fresh --max-rounds 15   # 自注意力+MLP (5 kernel)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/rms_norm --fresh --max-rounds 15        # 归约 (Tier2/5)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/flash_attention --fresh --max-rounds 15 # 多头因果 flash (Tier1/2)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/conv2d --fresh --max-rounds 15          # 卷积 (内存瓶颈 Tier4/5)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/conv_bias_relu --fresh --max-rounds 15  # conv+bias+relu 3kernel (Tier2 融合)
+     # 每轮: 采集→07字段→planner→coder→正确性校验→msprof端到端→加速比
      # 从头开始(清 outputs/<op> + 重置): 加 --fresh
      # 续跑(从上次 round 继续, 不清旧产物): 不加 --fresh
   3. 只采集+解析 (不跑优化):
@@ -92,6 +96,32 @@ class _Tee:
                 pass
 
 
+def validate_kernel_op(kernel_op: Path) -> list:
+    """★#5 新算子启动校验 — 防 A1/A3 隐性耦合, 返回警告列表.
+    检查: KERNEL_LOOP / MATMUL_VERIFY / __main__ / 同名 kernel 多次调用(A1 聚合风险)."""
+    import re
+    code = kernel_op.read_text(encoding="utf-8") if kernel_op.exists() else ""
+    warns = []
+    if not code:
+        return [f"❌ 空文件: {kernel_op}"]
+    if "KERNEL_LOOP" not in code:
+        warns.append("⚠ 缺 KERNEL_LOOP → verify 无法 ÷N 取单次端到端 (加速比会错)")
+    if "MATMUL_VERIFY" not in code:
+        warns.append("⚠ 缺 MATMUL_VERIFY 正确性校验块 → verify 每轮会 FAIL (正确性未通过)")
+    if 'if __name__ == "__main__":' not in code:
+        warns.append("⚠ 缺 __main__ 入口 → 无法直接运行")
+    if "@triton.jit" not in code:
+        warns.append("⚠ 无 @triton.jit kernel")
+    # A1: 同名 kernel 被多次调用 → msprof op 按名聚合 → deep 画像混合 (不同形状时)
+    jit_fns = set(re.findall(r"@triton\.jit\s*\ndef\s+(\w+)\s*\(", code))
+    for fn in jit_fns:
+        calls = len(re.findall(rf"\b{fn}\s*\[", code))
+        if calls > 1:
+            warns.append(f"⚠ kernel '{fn}' 被调用 {calls} 次 — 若形状/角色不同会被 msprof 同名聚合, "
+                         f"deep 画像混合; 建议拆独立函数名 (如 matmul_kernel2)")
+    return warns
+
+
 def main():
     p = argparse.ArgumentParser(description="Triton Agent Optimizer v4")
     p.add_argument("op_dir", type=str, help="input/<op> 目录 (含 triton_kernel.py + config.json + test)")
@@ -128,6 +158,10 @@ def main():
         print(f"[ERROR] 单文件不存在: {kernel_op}")
         return 1
     print(f"[main] 单文件: {kernel_op}")
+
+    # ★#5 启动前校验 kernel_op.py 结构 (防 A1/A3 隐性耦合, 只警告不阻塞)
+    for w in validate_kernel_op(kernel_op):
+        print(f"[校验] {w}")
 
     # ★运行日志: 全部终端输出同时写入 outputs/<op>/optimization.log (每算子一个)
     #   (放在 --fresh 清理之后, 避免清掉 log; 追加模式保留历史运行)

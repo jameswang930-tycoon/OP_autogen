@@ -9,6 +9,11 @@
 > - **分块必须 16 倍数**（Cube MMA 16×16 基础粒度；非 16 倍数掉到 ~10% 算力）
 > - `BLOCK_*` 必须 `tl.constexpr`
 > - L0 上限：L0A/B=64KB、L0C=128KB；UB=192KB → **超过就 `ub overflow` 编译失败**
+>
+> **★实战教训（rms_norm 17 轮无果根因）**：
+> - 若 `bottleneck_type = memory_bound` 且 `memory_utilization` 已 ≥80%（带宽接近峰值）→ **别调 BLOCK**，
+>   分块已到记忆体带宽上限，怎么调都是噪声（±1% 波动）
+> - 此时应 `promote_to` 回算法层(Tier1)确认算法，或直接晋升；**绝不在本层反复调 BLOCK 空转 3 轮**
 
 ---
 

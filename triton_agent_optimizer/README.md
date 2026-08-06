@@ -168,10 +168,10 @@ echo "你是 Triton 优化 Planner。先调用 skill: skills/triton-op-planner/S
 ### 6.4 超时设置
 | env | 默认 | 作用 |
 |---|---|---|
-| `LLM_CLI_TIMEOUT` | 1200 | nga run 调用 (超时自动兜底不崩循环) |
+| `LLM_CLI_TIMEOUT` | 3600 | nga run 调用 (超时自动兜底不崩循环) |
 | `OPTIMIZE_TIMEOUT` | 3600 | run_optimize 采集 |
-| `VERIFY_WARMUP` | 1 | 验证热身裸跑 |
-| `VERIFY_RUNS` | 3 | 验证 msprof 轮数 |
+| `VERIFY_WARMUP` | 3 | 验证热身裸跑次数 |
+| `VERIFY_LOOP` | 30 | 一次 msprof 内 kernel 内部循环次数 (÷N 取单次) |
 
 ### 6.5 加速比
 - **加速比 = 时间比**：`baseline_time / current_time`
@@ -278,6 +278,21 @@ python3 input/matmul/real_report.py <round_dir>/06_diagnosis/diagnosis.json
   - 硬件基准套件 bench_910b3 + PyTorch 基准线
   - 轨迹图 v4 兼容
   - 全部提交 commit `2c53616`
+
+---
+
+## 10. 后续开发计划
+
+- **Tier3 确定性 sweep（规划中，未实现）**：分块层(BLOCK_M/N/K)是确定性小空间(16 倍数×UB/L0 约束)，
+  用穷举替代笨 LLM 调参更稳更快。拟做成 `TIER3_SWEEP=1` opt-in 模式（默认 OFF，不碰现有流程）：
+  到 Tier3 时对 BLOCK 候选逐个 verify 选最优。**注意：每个候选=一次真机 msprof（分钟级），
+  10-20 候选约半小时+，需先 sim 验证逻辑再真机试。**
+- **A1 修复**：attention_mlp 的 `matmul_kernel` 被 5 种形状复用 → msprof 同名聚合 deep 画像混合，
+  应拆独立函数名（对齐 matmul 算子 matmul_kernel2 的纪律）。
+- **测量完整性**：verify 增加 per-kernel 期望 launch 校验（防漏记虚高）；
+  双次 msprof 稳定性门控（成本高，待定）。
+- **项目自身瓶颈分析**：`outputs/<op>/stats/timing_stats.json` 已输出各阶段耗时，
+  后续可按瓶颈阶段优化流程本身（如采集太慢→hash 缓存诊断）。
 
 ---
 

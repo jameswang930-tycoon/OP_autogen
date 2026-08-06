@@ -318,7 +318,13 @@ def extract_tier_fields(diagnosis: dict, tier: int) -> str:
     for _k in (diagnosis.get("kernels") or []):
         _name = _k.get("kernel_name", "?")
         _dur = (_k.get("task") or {}).get("task_duration_us")
-        _pct = f"{_dur/_total_us*100:.1f}%" if (_dur and _total_us) else "?"
+        # ★bug 修复: 占比必须 × launch_count — total_ns 是所有 launch 之和,
+        #   而 task_duration_us 是该 kernel 首次 launch 的单次耗时。
+        #   重复调用 kernel (如 attention 的 matmul_kernel 被 QKV 复用 3 次)
+        #   若用单次耗时占比会被严重低估 (3×300=900 却显示 300)。
+        _launch = _k.get("launch_count") or 1
+        _dur_total = (_dur * _launch) if _dur else None
+        _pct = f"{_dur_total/_total_us*100:.1f}%" if (_dur_total and _total_us) else "?"
         _parts = []
         for _path, _label in _pk_fields:
             _v = _pk_get(_k, _path)
@@ -328,7 +334,9 @@ def extract_tier_fields(diagnosis: dict, tier: int) -> str:
                 else:
                     _parts.append(f"{_label}={_fnum(_v)}")
         _pk = " | " + " ".join(_parts) if _parts else ""
-        lines.append(f"- {_name}: {_pct} ({_dur}us){_pk}")
+        _dur_show = f"{_dur_total:.0f}us" if _dur_total else ("无耗时" if not _dur else f"{_dur}us")
+        _lbl = f" x{_launch}" if _launch > 1 else ""
+        lines.append(f"- {_name}: {_pct} ({_dur_show}{_lbl}){_pk}")
 
     # 本层附加字段: 只留非 kernel 级路径 (per-kernel 已在上表; summary.* 已在全局)
     _tier_extra = [(p, d) for p, d in TIER_FIELDS.get(tier, [])
@@ -425,7 +433,11 @@ class Scheduler:
         }
         (stats_dir / "timing_stats.json").write_text(
             json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+        n = len(self.stage_times)
+        total_all = sum(r["round_s"] for r in self.stage_times)
+        avg_round = total_all / n if n else 0
         print(f"\n  [Stats] 各阶段耗时统计 → {stats_dir}/timing_stats.json")
+        print(f"         共 {n} 轮, 总耗时 {total_all:.0f}s, 平均每轮 {avg_round:.0f}s")
         print(f"         瓶颈阶段: {bottleneck} (总 {agg[bottleneck]['total_s']}s, "
               f"占本轮总时 {agg[bottleneck]['pct_of_round']}%)")
         print(f"         各阶段平均: " + ", ".join(f"{k.replace('_s','')}={agg[k]['avg_s']}s" for k in stages))
@@ -483,6 +495,36 @@ class Scheduler:
             return json.loads(alt.read_text(encoding="utf-8"))
         print("  [Scheduler] ❌ diagnosis.json 未生成")
         return None
+
+    def _print_kernel_breakdown(self, diagnosis: dict):
+        """★终端打印每个算子的耗时占比 (端到端口径, 与 total_ns 同源, 多 launch 计入).
+        total_ns = 所有 target kernel 单次耗时之和×1000; 每 kernel 占比 = 单次耗时×launch_count/端到端.
+        附每 kernel 关键瓶颈字段, 优化一眼看打中谁."""
+        ks = diagnosis.get("kernels") or []
+        total_ns = (diagnosis.get("summary") or {}).get("total_ns")
+        total_us = total_ns / 1000 if total_ns else None
+        if not ks:
+            return
+        _tus = f"{total_us:.0f}us" if total_us else "?"
+        print(f"  [每算子耗时占比] 端到端 total_ns={total_ns}ns ({_tus}), "
+              f"{len(ks)} 个目标 kernel:")
+        for _k in ks:
+            _name = _k.get("kernel_name", "?")
+            _dur = (_k.get("task") or {}).get("task_duration_us")
+            _launch = _k.get("launch_count") or 1
+            _dur_total = (_dur * _launch) if _dur else None
+            _pct = f"{_dur_total / total_us * 100:.1f}%" if (_dur_total and total_us) else "?"
+            _d = _k.get("deep") or {}
+            _rl = _d.get("roofline") or {}
+            _bn = _rl.get("bottleneck_type") or "?"
+            _cu = _rl.get("compute_utilization")
+            _mu = _rl.get("memory_utilization")
+            _cu_s = f"{_cu:.2f}" if isinstance(_cu, (int, float)) else "?"
+            _mu_s = f"{_mu:.2f}" if isinstance(_mu, (int, float)) else "?"
+            _launch_s = f" x{_launch}" if _launch > 1 else ""
+            _dur_s = f"{_dur_total:.0f}us" if _dur_total else "无耗时"
+            print(f"    {_name}: {_dur_s} ({_pct}){_launch_s}  "
+                  f"bottleneck={_bn} cube_util={_cu_s} mem_util={_mu_s}")
 
     # ── ③ 诊断: 按当前阶段筛选字段 → 写 07 (planner 只读这个) ──
     def _diagnose(self, diagnosis: dict, tier: int, round_dir: Path) -> str:
@@ -755,15 +797,11 @@ class Scheduler:
             st["baseline_ns"] = new_base
             st["current_speedup"] = round(new_speedup, 4) if new_speedup else st.get("current_speedup", 1.0)
             st["last_rebase_round"] = rn
-            self.traj["history"].append({
-                "round": rn, "tier": tier, "strategy": "REBASELINE",
-                "change": "", "changes_full": [], "speedup": round(new_speedup, 4) if new_speedup else 1.0,
-                "prev_speedup": 1.0, "ns": round(cur["ns"], 1),
-                "decision": "REBASELINE", "result": "OK",
-                "error": f"环境漂移 {drift:.3f}x, 重归一基准"})
+            # ★不进 history (避免与正常轮同 round 号, trajectory 图点重叠):
+            #   REBASELINE 是测量事件不是优化轮, 只更新 state; 换基后后续轮 speedup 用新基准.
             self._save_traj()
             print(f"  [重基准] R{rn}: baseline {drift:.3f}x 漂移 → 新基准 {new_base:.0f}ns, "
-                  f"当前 kernel 累计 {new_speedup:.3f}x (校正后)")
+                  f"当前 kernel 累计 {new_speedup:.3f}x (校正后, 不进 history)")
         except Exception as e:
             print(f"  [重基准] R{rn} 异常: {str(e)[:120]} (跳过)")
 
@@ -832,12 +870,13 @@ class Scheduler:
             coll_fail = 0
             t_collect = time.time() - _t0
             print(f"  ⏱ ①采集+解析: {t_collect:.1f}s")
-            # 诊断摘要
+            # 诊断摘要 + ★每算子耗时占比 (端到端口径, 与 total_ns 同源, 优化打中占比大的 kernel)
             ks0 = diagnosis.get("summary", {})
             k0 = (diagnosis.get("kernels") or [{}])[0]
             ro = (k0.get("deep") or {}).get("roofline", {})
             print(f"  [诊断] kernels={ks0.get('num_kernels')} total_ns={ks0.get('total_ns')} "
                   f"bottleneck={ro.get('bottleneck_type')} 产物→{round_dir}")
+            self._print_kernel_breakdown(diagnosis)
             # 首轮 (原始 kernel_op.py 未改) 采集 = 基准
             if st.get("baseline_ns") is None:
                 st["baseline_ns"] = ks0.get("total_ns")
@@ -942,23 +981,23 @@ class Scheduler:
             # ★D1-Tier3: 自动分块实测 — 进分块层先跑候选 BLOCK 收集各 config 实测数据,
             #   喂给 planner 决策 (不是这里猜/写死). 报错/无可扫 → None, 正常走 LLM (兜底).
             #   TIER3_SWEEP=1 默认; 每 op 首次进 Tier3 触发一次.
+            # ★计时: t_plan 从 sweep 前开始计 (sweep 是 planner 决策的数据准备, 计入 planner 阶段)
+            _t_plan0 = time.time()
             tier3_sweep = None
             if tier == 3 and os.environ.get("TIER3_SWEEP", "1") == "1" and not st.get("tier3_swept"):
                 st["tier3_swept"] = True
-                _t0 = time.time()
                 tier3_sweep = self._tier3_sweep_data(tier, rn, round_dir)
                 if tier3_sweep and tier3_sweep.get("available"):
                     print(f"  ⏱ Tier3 分块实测完成: {len(tier3_sweep['configs'])} config, "
                           f"最优 {tier3_sweep['best']['block']} {tier3_sweep['best']['ns']:.0f}ns "
-                          f"({time.time()-_t0:.0f}s) → 数据喂 planner 决策")
+                          f"({time.time()-_t_plan0:.0f}s) → 数据喂 planner 决策")
                 else:
                     print(f"  [Tier3] 分块实测不可用 "
                           f"({(tier3_sweep or {}).get('error','行级/无候选')}) → 走 LLM (兜底)")
 
             # ④ Planner → plan + 晋升决策 (只喂 07 筛好的字段 + 融合分析 + Tier3 分块实测数据)
-            _t0 = time.time()
             plan = self._plan(diagnosis, extracted, tier, rn, round_dir, fusion_analysis, tier3_sweep)
-            t_plan = time.time() - _t0
+            t_plan = time.time() - _t_plan0
             print(f"  ⏱ ④Planner: {t_plan:.1f}s")
 
             # ⑤ Coder → 改代码 / ★晋升轮原样输出, 输出到 round_dir/kernel_op.py (不碰源文件)
@@ -1155,7 +1194,17 @@ class Scheduler:
             self._save_traj()
 
         self._write_timing_stats()   # ★各阶段耗时统计 (项目自身瓶颈)
+        # ★最后产出汇总: 总轮次/总耗时/平均每轮/最终 kernel 的 ns 与 speedup
+        _bs = st.get("baseline_ns")
+        _cur_ns = round(_bs / st.get("current_speedup", 1.0), 1) if (_bs and st.get("current_speedup")) else None
+        _prom = st.get("promote_budget", 0)
+        _n_eff = st.get("total_rounds", 0) - _prom
         print(f"\n══ 完成: best_speedup={st.get('best_speedup')}x ══")
+        print(f"  [产出] 总执行 {st.get('total_rounds', 0)} 轮 (含 {_prom} 次 promote, 有效优化 {_n_eff} 轮), "
+              f"总耗时 {time.time()-total_start:.0f}s")
+        print(f"  [产出] 最终 kernel 累计加速比 {st.get('current_speedup')}x "
+              f"(baseline {_bs}ns → 当前 {_cur_ns}ns); best {st.get('best_speedup')}x")
+        print(f"  [产出] 最终 kernel 文件 → {st.get('current_kernel')}")
         return 0
 
 

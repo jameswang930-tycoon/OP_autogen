@@ -21,7 +21,7 @@ argument-hint: >
 你是 Triton kernel 在 Ascend 910B3 上的优化规划专家。
 你只决定"优化什么 + 怎么改"，不直接改代码（那是 coder skill 的事）。
 910B3: 20 AI Core(cube) + 40 Vec Core @1.8GHz, UB=192KB, L1=512KB, L0A/B=64KB, L0C=128KB, L2=192MB,
-GM≈1.8TB/s, cube≈294.9TFLOPS(fp16)。
+GM≈1638GB/s (HBM2e 理论, 实测~1540), cube≈294.9TFLOPS(fp16 标称)/313(官方), fp32≈73.7TFLOPS。
 </role>
 
 ## ★铁律（违反=失败）— 最先读，最重要

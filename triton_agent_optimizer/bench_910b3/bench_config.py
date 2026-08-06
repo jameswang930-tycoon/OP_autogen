@@ -16,43 +16,44 @@ BENCHES = {
     #   小 BLOCK: 每 program 固定开销主导 (program数=N/BLOCK 多), 带宽≈BLOCK → 翻倍翻倍属正常
     #   大 BLOCK: 数据搬运主导, 带宽收敛于峰值 (取这个为 GM 峰值)
     #   UB 上限 192KB: read/write 单块 ≤49152 元素; copy 双缓冲 ≤24576; 保守取 16384 全兼容
+    # ★L2 污染修复 (2026-08): 工作集必须 >> L2 (192MB), 否则 30 次重复读命中 L2 → 测到 L2 带宽
+    #   fp32: 1<<27 = 512MB (2.7×L2), 1<<28 = 1GB (5.3×L2) — 保证真 GM
     "gm_read": {
-        "desc": "GM 读带宽 (128MB 固定, BLOCK 512→32768 扫描)",
+        "desc": "GM 读带宽 (512MB~1GB 固定, BLOCK 512→32768 扫描)",
         "type": "read", "kernel_name": "read_kernel",
         "variants": [
-            {"N": 1 << 25, "BLOCK": 512},      # 128MB, 小分块 (未饱和)
-            {"N": 1 << 25, "BLOCK": 1024},
-            {"N": 1 << 25, "BLOCK": 2048},
-            {"N": 1 << 25, "BLOCK": 4096},
-            {"N": 1 << 25, "BLOCK": 8192},
-            {"N": 1 << 25, "BLOCK": 16384},    # 64KB/块
-            {"N": 1 << 25, "BLOCK": 32768},    # 128KB/块 (UB 192KB 内; 若报错说明到编译器/UB 极限)
-            {"N": 1 << 26, "BLOCK": 8192},     # 256MB 确认饱和
+            {"N": 1 << 27, "BLOCK": 512},      # 512MB, 小分块 (未饱和)
+            {"N": 1 << 27, "BLOCK": 2048},
+            {"N": 1 << 27, "BLOCK": 8192},
+            {"N": 1 << 27, "BLOCK": 16384},    # 64KB/块
+            {"N": 1 << 28, "BLOCK": 8192},     # 1GB (5.3×L2) 确认饱和
+            {"N": 1 << 28, "BLOCK": 16384},
+            {"N": 1 << 28, "BLOCK": 32768},    # 128KB/块 (UB 192KB 内; 若报错说明到编译器/UB 极限)
         ],
     },
     "gm_write": {
-        "desc": "GM 写带宽 (128MB 固定, BLOCK 512→32768)",
+        "desc": "GM 写带宽 (512MB~1GB 固定, BLOCK 512→32768)",
         "type": "write", "kernel_name": "write_kernel",
         "variants": [
-            {"N": 1 << 25, "BLOCK": 512},
-            {"N": 1 << 25, "BLOCK": 1024},
-            {"N": 1 << 25, "BLOCK": 2048},
-            {"N": 1 << 25, "BLOCK": 4096},
-            {"N": 1 << 25, "BLOCK": 8192},
-            {"N": 1 << 25, "BLOCK": 16384},
-            {"N": 1 << 25, "BLOCK": 32768},
+            {"N": 1 << 27, "BLOCK": 512},
+            {"N": 1 << 27, "BLOCK": 2048},
+            {"N": 1 << 27, "BLOCK": 8192},
+            {"N": 1 << 27, "BLOCK": 16384},
+            {"N": 1 << 28, "BLOCK": 8192},
+            {"N": 1 << 28, "BLOCK": 16384},
+            {"N": 1 << 28, "BLOCK": 32768},
         ],
     },
     "gm_copy": {
-        "desc": "GM 拷贝带宽 (128MB 固定, BLOCK 512→16384)",
+        "desc": "GM 拷贝带宽 (512MB~1GB 固定, BLOCK 512→16384; 读A写B 双向)",
         "type": "copy", "kernel_name": "copy_kernel",
         "variants": [
-            {"N": 1 << 25, "BLOCK": 512},
-            {"N": 1 << 25, "BLOCK": 1024},
-            {"N": 1 << 25, "BLOCK": 2048},
-            {"N": 1 << 25, "BLOCK": 4096},
-            {"N": 1 << 25, "BLOCK": 8192},
-            {"N": 1 << 25, "BLOCK": 16384},
+            {"N": 1 << 27, "BLOCK": 512},
+            {"N": 1 << 27, "BLOCK": 2048},
+            {"N": 1 << 27, "BLOCK": 8192},
+            {"N": 1 << 27, "BLOCK": 16384},
+            {"N": 1 << 28, "BLOCK": 8192},
+            {"N": 1 << 28, "BLOCK": 16384},
         ],
     },
     "l2_read": {
@@ -130,3 +131,18 @@ def variant_bytes_flops(btype: str, v: dict) -> tuple:
     if btype == "vec":
         return 3 * v["N"] * 4, 0              # 读A + 读B + 写C
     raise ValueError(f"未知 bench 类型: {btype}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PyTorch 基准 json 按算子映射 (bench_pytorch_*.py 输出文件名)
+#  scheduler.py / trajectory_chart.py 用它找每个 op 的 torch 基准线
+#  ★映射依据 kernel_op.py 的运算链, 非目录名直觉 (matmul 目录实为两层 MLP)
+# ═══════════════════════════════════════════════════════════════════════
+PT_BENCH_MAP = {
+    "matmul": "pytorch_mlp_tflops.json",            # 两层 MLP: GELU(X@W1+b1)@W2
+    "attention_mlp": "pytorch_attention_tflops.json",  # 自注意力+MLP
+    "rms_norm": "pytorch_rms_norm_tflops.json",
+    "flash_attention": "pytorch_flash_attention_tflops.json",
+    "conv2d": "pytorch_conv2d_tflops.json",
+    "conv_bias_relu": "pytorch_conv_bias_relu_tflops.json",
+}

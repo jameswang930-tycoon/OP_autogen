@@ -64,7 +64,7 @@ diagnosis.json
 │   │   └── roofline {}         ← ★计算（用上面 deep 的带宽+算力）
 │   │         bottleneck_type / achieved_memory_bw_gb_s / memory_utilization
 │   │         / achieved_compute_tflops / compute_utilization / arithmetic_intensity
-│   │         （对 1.8TB/s 和 294.9TFLOPS 判 memory/compute/latency/balanced bound）
+│   │         （对 1638.4GB/s 和 294.9/73.7TFLOPS fp16/fp32 判 memory/compute/latency/balanced bound）
 │   │
 │   └── filled_by             ← "msprof op"（有 deep）/ "msprof only"（没跑到 op）
 │

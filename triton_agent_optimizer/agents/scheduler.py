@@ -572,10 +572,16 @@ class Scheduler:
                 elif mnk and st["baseline_ns"]:
                     st["initial_tflops"] = round(
                         2 * mnk[0] * mnk[1] * mnk[2] / (st["baseline_ns"] / 1e9) / 1e12, 2)
-                # ★F4: PyTorch 基准 — 多 kernel(MLP/attention) 用 bench_pytorch_mlp.py 的同形状 MLP 基准,
-                #   单 matmul 用 bench_pytorch.py; 都必须与 op 同尺寸同 dtype 才有意义 (见 H5/E4).
-                nk = st.get("num_kernels") or 0
-                pt_file = "pytorch_mlp_tflops.json" if nk > 1 else "pytorch_tflops.json"
+                # ★F4: PyTorch 基准 — 按算子显式映射 (bench_910b3/bench_pytorch_*.py 输出),
+                #   显式映射缺时回退旧启发式 (多 kernel→MLP, 单→单 matmul); 必须与 op 同尺寸同 dtype (见 H5/E4).
+                try:
+                    from bench_910b3.bench_config import PT_BENCH_MAP
+                except Exception:
+                    PT_BENCH_MAP = {}
+                pt_file = PT_BENCH_MAP.get(self.kernel_dir.name)
+                if not pt_file:
+                    nk = st.get("num_kernels") or 0
+                    pt_file = "pytorch_mlp_tflops.json" if nk > 1 else "pytorch_tflops.json"
                 pt = _PROJECT / "bench_910b3" / pt_file
                 if pt.exists():
                     try:

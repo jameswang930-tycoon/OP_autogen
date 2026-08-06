@@ -49,6 +49,17 @@ def _load_pytorch_tflops(kernel_dir: Path, state: dict):
         return st_val
     bench_dir = _PROJECT_DIR / "bench_910b3"
     op = kernel_dir.name.lower()
+    # ★显式算子映射优先 (bench_910b3/bench_config.PT_BENCH_MAP); 旧启发式兜底
+    try:
+        from bench_910b3.bench_config import PT_BENCH_MAP
+        f = PT_BENCH_MAP.get(op)
+        if f and (bench_dir / f).exists():
+            try:
+                return json.loads((bench_dir / f).read_text(encoding="utf-8"))["tflops"]
+            except Exception:
+                pass
+    except Exception:
+        pass
     cands = (["pytorch_attention_tflops.json", "pytorch_mlp_tflops.json", "pytorch_tflops.json"]
              if "attention" in op
              else ["pytorch_mlp_tflops.json", "pytorch_tflops.json"])

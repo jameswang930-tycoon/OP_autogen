@@ -75,7 +75,7 @@
 
 | 字段 | 含义 | 优化用途 |
 |---|---|---|
-| `aic_main_mem_read_bw` / `aic_main_mem_write_bw` | **主存(GM)读/写带宽** | roofline 访存分子（对 1.8TB/s 峰值） |
+| `aic_main_mem_read_bw` / `aic_main_mem_write_bw` | **主存(GM)读/写带宽** | roofline 访存分子（对 1638.4GB/s 峰值, HBM2e 理论） |
 | `aic_l1_read_bw` / `aic_l1_write_bw` | L1 读/写带宽 | L1 带宽瓶颈 |
 | `aiv_gm_to_ub_bw` | **GM→UB 带宽（MTE2 load）** | 搬运通路 |
 | `aiv_ub_to_gm_bw` | **UB→GM 带宽（MTE3 store）** | 搬运通路 |
@@ -264,7 +264,7 @@
 
 | normalized 字段（中文） | 来源 | 用途/判据 |
 |---|---|---|
-| `deep.bandwidth_gb_s.main_mem_read/write` | msprof op / Memory `aic_main_mem_read/write_bw` | 接近 1.8TB/s → memory_bound → 减数据量/升精度 |
+| `deep.bandwidth_gb_s.main_mem_read/write` | msprof op / Memory `aic_main_mem_read/write_bw` | 接近 1638.4GB/s → memory_bound → 减数据量/升精度 |
 | `deep.bandwidth_gb_s.gm_to_ub/ub_to_gm` | msprof op / Memory `aiv_gm_to_ub_bw`/`aiv_ub_to_gm_bw` | 搬运通路（纯cube kernel 为 NA，正常） |
 | `deep.l2_hit_rate` | msprof op / L2Cache | 低 → 数据复用差 → 调分块驻留 L2 |
 | `kernels[].task.pipes_us.aic_mte2_time` | 通用 msprof / op_summary（归一化自 mac/mte3） | GM 读耗时 |
@@ -466,8 +466,8 @@
 
 | 指标 | 值 | 备注 |
 |---|---|---|
-| GM 带宽 | 1.8 TB/s | 对 `main_mem_*_bw` |
-| cube 算力 | 294.9 TFLOPS (fp16) | 20核 × 16³ FMA × 1.8GHz |
+| GM 带宽 | 1638.4 GB/s (HBM2e 理论, 旧 1.8TB/s 是错的) | 对 `main_mem_*_bw` |
+| cube 算力 | 294.9 TFLOPS (fp16 标称) / 313 (官方) | 20核 × 16×16×16 cube × 1.8GHz |
 | UB | 192 KB | — |
 | L1 | 512 KB | — |
 | L0A / L0B / L0C | 64 / 64 / 128 KB | — |

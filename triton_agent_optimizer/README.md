@@ -260,9 +260,9 @@ python3 input/matmul/real_report.py <round_dir>/06_diagnosis/diagnosis.json
 
 ## 9. 910B3 硬件参数
 
-**✅ 准确**：20 AI + 40 Vec cores @1.8GHz；UB=192KB、L1=512KB、L0A/L0B=64KB、L0C=128KB、L2=192MB、HBM=64GB；GM 峰值 1.8TB/s；cube 峰值 294.9 TFLOPS(fp16)。
+**✅ 准确**：20 AI + 40 Vec cores @1.8GHz；UB=192KB、L1=512KB、L0A/L0B=64KB、L0C=128KB、L2=192MB、HBM=64GB；GM 峰值 **1638.4 GB/s**（HBM2e 4×409.6，联网核实 2026-08）；cube 峰值 **294.9** TFLOPS(fp16 标称) / **313**（官方）/ fp32 **73.7**。理论峰值由 `bench_910b3/bench_theory.py` 公式推导。
 
-**⚠️ 占位未实测**（`timing_estimator.py` SATURATION_PARAMS）：GM→L1 37.5 / L1→L0 100 / CubeUnit 150 / L0→GM 37.5（PLACEHOLDER）。用 `bench_910b3/run_bench.py` 实测填。
+**微路径带宽**（GM→UB / UB→GM / L0A/L0B feed / MTE 占比）：由 `bench_910b3/run_bench.py` 的 msprof op per-path 实测填 `hardware_peak.json`（v4 已弃用 timing_estimator 静态成本模型）。
 
 ---
 

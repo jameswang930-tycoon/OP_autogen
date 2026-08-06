@@ -5,7 +5,7 @@
   1. task.json = 通用 msprof 骨架 (kernel_slots[]: distinct kernel, task 填满, deep=null)
   2. 每 kernel 一个 board.json = msprof op 深层 (bandwidth/engine/compute/conflict/l2/freq)
   3. 按 kernel 名匹配 → kernels[i].deep 填满, filled_by 标记
-  4. roofline 每 kernel 一个 (带宽对1.8TB/s, 算力对294.9TFLOPS)
+  4. roofline 每 kernel 一个 (带宽对1638.4GB/s, 算力对294.9/73.7TFLOPS fp16/fp32)
 
 用法: python integrate.py <task.json> <out.json> [board_*.json...]
 """
@@ -19,7 +19,10 @@ from pipeline_schema import read_json, write_json  # noqa: E402
 
 # ── 910B3 峰值 ──
 #   优先用 bench_910b3/hardware_peak.json 实测值 (run_bench.py 生成, 多变体取 max);
-#   没有则回退硬编码 (GM 理论 1.8TB/s, cube fp16 294.9 TFLOPS).
+#   没有则回退理论推导值 (联网核实 2026-08):
+#     GM = HBM2e 4×1024bit@3.2Gbps = 1638.4 GB/s (旧硬编码 1800 是错的)
+#     cube fp16 = 20 核×8192FLOP/cyc×1.8GHz = 294.9 TFLOPS (标称; 官方标称 313@1.91GHz)
+#     cube fp32 = fp16/4 = 73.7 TFLOPS
 def _load_measured_peaks() -> dict:
     import json as _json
     p = Path(__file__).resolve().parent.parent / "bench_910b3" / "hardware_peak.json"
@@ -32,8 +35,9 @@ def _load_measured_peaks() -> dict:
     return {}
 
 _MEASURED = _load_measured_peaks()
-PEAK_MEM_BW_GB_S = float(_MEASURED.get("gm_bw_gb_s", 1800.0))          # 实测 GM 聚合峰值
-PEAK_COMPUTE_TFLOPS = float(_MEASURED.get("cube_fp16_tflops", 294.9))  # 实测 cube fp16
+PEAK_MEM_BW_GB_S = float(_MEASURED.get("gm_bw_gb_s", 1638.4))           # 实测 GM 峰值 / 理论 HBM2e 1.6384TB/s
+PEAK_COMPUTE_TFLOPS = float(_MEASURED.get("cube_fp16_tflops", 294.9))   # 实测 cube fp16 / 标称推导
+PEAK_COMPUTE_FP32_TFLOPS = float(_MEASURED.get("cube_fp32_tflops", 73.7))  # fp32 roofline 用
 
 
 def _classify(mem_util, comp_util):
@@ -59,7 +63,10 @@ def build_deep(bd):
     vec_fops = comp.get("vector_fops") or 0
     achieved_compute = (cube_fops + vec_fops) / 1e12 if (cube_fops or vec_fops) else 0
     mem_util = achieved_mem / PEAK_MEM_BW_GB_S if PEAK_MEM_BW_GB_S else 0
-    comp_util = achieved_compute / PEAK_COMPUTE_TFLOPS if PEAK_COMPUTE_TFLOPS else 0
+    # ★fp32 kernel 的 cube 峰值 = fp16/4; 用 max 避免 fp32 高占用被 fp16 峰值低估成 20%
+    comp_util_fp16 = achieved_compute / PEAK_COMPUTE_TFLOPS if PEAK_COMPUTE_TFLOPS else 0
+    comp_util_fp32 = achieved_compute / PEAK_COMPUTE_FP32_TFLOPS if PEAK_COMPUTE_FP32_TFLOPS else 0
+    comp_util = max(comp_util_fp16, comp_util_fp32)
     return {
         "freq_mhz": b_sum.get("freq_mhz"),
         "bandwidth_gb_s": bw,
@@ -73,7 +80,10 @@ def build_deep(bd):
             "memory_utilization": round(mem_util, 3),
             "achieved_compute_tflops": round(achieved_compute, 2),
             "peak_compute_tflops": PEAK_COMPUTE_TFLOPS,
+            "peak_compute_fp32_tflops": PEAK_COMPUTE_FP32_TFLOPS,
             "compute_utilization": round(comp_util, 3),
+            "compute_utilization_fp16": round(comp_util_fp16, 3),
+            "compute_utilization_fp32": round(comp_util_fp32, 3),
             "arithmetic_intensity": round(achieved_compute * 1e12 / achieved_mem / 1e9, 2)
                                  if achieved_mem else None,
             "bottleneck_type": _classify(mem_util, comp_util),
@@ -132,7 +142,8 @@ def integrate(task_p, out_p, board_paths):
         "api_overhead": t_norm.get("api_overhead", []),
         "multi_kernel": t_norm.get("multi_kernel", []),
         "notes": ["骨架=通用msprof(task.json); deep=msprof op 按 kernel 名填充 (见 docx/aggregation_rules.md)",
-                  "roofline 每 kernel 一个: 带宽对1.8TB/s, 算力对294.9TFLOPS",
+                  "roofline 每 kernel 一个: 带宽对1638.4GB/s(HBM2e 理论), 算力对294.9/73.7TFLOPS(fp16/fp32, 标称推导; 官方 313/78.3)",
+                  "峰值优先取 bench_910b3/hardware_peak.json 实测, 无则回退上述理论值",
                   "filled_by='msprof only' = 该 kernel 没跑到 op (deep=null)",
                   "kernels[].task.transfers 的 bytes 为估算 (每元素每通路搬一次)"],
     }

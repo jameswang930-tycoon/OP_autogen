@@ -107,8 +107,8 @@
 - board 有、骨架无 → 告警（op 跑到参考 kernel 被漏，正常）。
 
 ### 规则 M12 — roofline 用该 kernel 自己的 deep 算
-- `achieved_mem_bw = max(main_mem_read/write)` 对 1.8TB/s
-- `achieved_compute = (cube_fops + vector_fops)/1e12` 对 294.9TFLOPS
+- `achieved_mem_bw = max(main_mem_read/write)` 对 **1638.4 GB/s**（HBM2e 理论，旧 1.8TB/s 是错的）
+- `achieved_compute = (cube_fops + vector_fops)/1e12` 对 294.9TFLOPS（fp16 标称；fp32 用 73.7）
 - → 判 `memory / compute / latency / balanced bound`（每 kernel 一个，不是全局一个）
 
 ### 规则 M13 — 校验收尾

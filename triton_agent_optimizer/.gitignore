@@ -1,2 +1,42 @@
+# ═══ Python ═══
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
 
-# v4 生成的单文件 (由 main.py 首次合并产生, 不入库)
+# ═══ v4 生成产物 (运行输出, 不入库) ═══
+outputs/
+output/
+*.log
+pytorch_tflops.json
+pytorch_mlp_tflops.json
+pytorch_attention_tflops.json
+pytorch_rms_norm_tflops.json
+pytorch_flash_attention_tflops.json
+pytorch_conv2d_tflops.json
+pytorch_conv_bias_relu_tflops.json
+hardware_peak.json
+hardware_theory.json
+results.json
+results.txt
+
+# ═══ 构建产物 ═══
+build/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.so
+*.a
+
+# ═══ CANN 工具生成 (非项目代码) ═══
+autogen/
+
+# ═══ 环境/密钥 ═══
+.env
+
+# ═══ 临时/备份 ═══
+_cleanup_backup*/
+
+# ═══ 编辑器 ═══
+.vscode/
+.idea/

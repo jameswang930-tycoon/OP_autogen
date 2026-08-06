@@ -102,46 +102,6 @@ def _load_playbook(tier: int, playbook_dir: Optional[Path] = None) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Memory 检索 (对接 memory/ 模块)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _retrieve_similar_cases(diagnosis, max_cases: int = 3) -> str:
-    """从 memory/ 经验库检索相似案例。"""
-    try:
-        from memory.experience_retriever import retrieve, format_for_prompt
-
-        cases = retrieve(
-            op_type=getattr(diagnosis, "bottleneck_op_type", ""),
-            bottleneck_type=getattr(diagnosis, "bottleneck_type", ""),
-            engine=getattr(diagnosis, "bottleneck_engine", ""),
-            tier=getattr(diagnosis, "current_tier", 1),
-            max_results=max_cases,
-        )
-        if cases:
-            return format_for_prompt(cases)
-    except Exception:
-        pass
-    # Fallback: 尝试旧的 memory/ 模块
-    try:
-        from memory import compute_fingerprint, retrieve, format_context
-        fp = compute_fingerprint({
-            "op_type": getattr(diagnosis, "bottleneck_op_type", "?"),
-            "bottleneck_type": getattr(diagnosis, "bottleneck_type", "?"),
-            "engine": getattr(diagnosis, "bottleneck_engine", "?"),
-        })
-        from memory.store import ExperienceStore
-        store_path = _PROJECT_DIR / "memory" / "experience" / "store.json"
-        if store_path.exists():
-            store = ExperienceStore(store_path)
-            hits = retrieve(store, fp, n=max_cases)
-            if hits:
-                return format_context(hits)
-    except Exception:
-        pass
-    return "(no similar cases found)"
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 #  Prompt 构建
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -247,62 +207,6 @@ class PlannerAgent:
                  use_llm: bool = True):
         self.playbook_dir = playbook_dir or (_PROJECT_DIR / "docx")
         self.use_llm = use_llm
-
-    def generate(
-        self,
-        diagnosis,
-        extracted_text: str,
-        tier: int,
-        history: list,
-        kernel_code: str,
-        round_num: int,
-    ) -> RoundPlan:
-        """生成本轮优化计划。"""
-
-        # Step 1: 加载 Playbook
-        playbook = _load_playbook(tier, self.playbook_dir)
-
-        # Step 2: 检索相似案例
-        similar_cases = _retrieve_similar_cases(diagnosis)
-
-        # Step 3: 构建 Prompt (使用 ContextManager 做 token 管理)
-        from memory.context_manager import build_context, format_diagnosis, estimate_tokens
-
-        diagnosis_text = format_diagnosis(diagnosis)
-        history_text = _format_history(history)
-        full_prompt = build_context(
-            diagnosis_text=diagnosis_text,
-            extracted_text=extracted_text,
-            playbook_text=playbook,
-            history_text=history_text,
-            similar_cases_text=similar_cases,
-            kernel_code=kernel_code,
-        )
-        system_prompt = _build_system_prompt(tier, playbook)
-        print(f"  [Planner] prompt ~{estimate_tokens(system_prompt + full_prompt):,} tokens")
-
-        # Step 4: 调用 LLM (或 stub)
-        if self.use_llm:
-            try:
-                plan_dict = self._call_llm(system_prompt, full_prompt)
-            except Exception as e:
-                print(f"  [Planner] LLM call failed: {e}, falling back to stub")
-                plan_dict = self._stub_plan(diagnosis, tier)
-        else:
-            plan_dict = self._stub_plan(diagnosis, tier)
-
-        # Step 5: 返回 RoundPlan
-        return RoundPlan(
-            round_num=round_num,
-            tier=tier,
-            tier_name=TIER_NAMES.get(tier, "?"),
-            strategy=plan_dict.get("strategy", "unknown"),
-            target_speedup=float(plan_dict.get("target_speedup", 1.05)),
-            specific_change=str(plan_dict.get("specific_change", "")),
-            expected_impact=str(plan_dict.get("expected_impact", "")),
-            verification_method=str(plan_dict.get("verification_method", "")),
-            plan_text=json.dumps(plan_dict, indent=2, ensure_ascii=False),
-        )
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  v4: 只喂当前 tier 提取的字段段 + 策略文档 + 单文件 + config → plan + 晋升决策

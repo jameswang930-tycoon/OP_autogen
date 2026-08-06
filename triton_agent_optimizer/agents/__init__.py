@@ -2,9 +2,9 @@
 
 from .planner import PlannerAgent, PLAYBOOK_FILES, TIER_NAMES
 from .coder import CoderAgent
-from .verifier import VerifierAgent
+from .verifier import verify_end_to_end
 
 __all__ = [
-    "PlannerAgent", "CoderAgent", "VerifierAgent",
+    "PlannerAgent", "CoderAgent", "verify_end_to_end",
     "PLAYBOOK_FILES", "TIER_NAMES",
 ]

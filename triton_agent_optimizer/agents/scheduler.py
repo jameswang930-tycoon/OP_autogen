@@ -832,6 +832,7 @@ class Scheduler:
         # ★D7: 总预算 = max_rounds + 已用 promote 额度 (promote 轮免费, 不挤占有效优化轮)
         while total_rounds < self.max_rounds + int(st.get("promote_budget", 0)):
             total_rounds += 1
+            st["total_rounds"] = total_rounds   # ★bug 修复: 立即更新内存 (break 停止时也有正确轮数, 由 break 前 _save_traj 落盘)
             round_dir = self._round_dir(tier, rn)
             round_start = time.time()
             print(f"\n══ Tier{tier}({TIER_LABEL.get(tier)}) Round{rn} ══")

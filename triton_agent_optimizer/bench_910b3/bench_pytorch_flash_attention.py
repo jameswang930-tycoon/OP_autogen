@@ -66,11 +66,15 @@ def main():
     causal = torch.triu(torch.ones(seq, seq, dtype=torch.bool, device=npu), diagonal=1)
 
     def forward():
-        # [seq, nh, seq] = [seq, nh, dim] @ [seq, dim, nh]^T (批量 matmul)
-        s = (q @ k.transpose(-2, -1)) * scale
-        s = s.masked_fill(causal, float("-inf"))
+        # ★布局 [seq,nh,dim] 的 batch 维是 seq, 直接 @ 会把 seq 当 batch → 必须先 permute 成 [nh,seq,dim]
+        q_h = q.permute(1, 0, 2)    # [nh, seq, dim]
+        k_h = k.permute(1, 0, 2)
+        v_h = v.permute(1, 0, 2)
+        s = (q_h @ k_h.transpose(-2, -1)) * scale   # [nh, seq, seq]
+        s = s.masked_fill(causal, float("-inf"))    # causal [seq,seq] 沿 nh 广播
         p = torch.softmax(s, dim=-1)
-        return p @ v
+        o = p @ v_h                                 # [nh, seq, dim]
+        return o.permute(1, 0, 2)                   # 回 [seq, nh, dim]
 
     # warmup (JIT/图编译预热)
     for _ in range(args.warmup):

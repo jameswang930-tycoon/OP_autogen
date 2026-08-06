@@ -195,8 +195,12 @@ def _extract_changes(plan_text: str) -> list:
 
 
 def _apply_plan_changes(code: str, changes: list):
-    """确定性应用 changes[]: old_code → new_code 精确替换（★全部出现处, 不只第一处）。
-    old_code 必须是完整行 (planner skill 铁律), 若同段在文件出现多次, 视为同一定义全改。"""
+    """确定性应用 changes[]: old_code → new_code 替换（★全部出现处, 不只第一处）。
+    1) 精确匹配优先 (old_code 为整行, planner 铁律);
+    2) ★容错: 单行 old_code 精确没匹配上时, 按行去首尾空白/CRLF 归一化再匹配
+       — 处理 planner 从旧版本/示例复制 old_code 导致的缩进/尾随空格/换行符差异
+       (保持原行缩进 + 原换行符替换)。多行 old_code 只走精确匹配(安全)。
+    """
     applied, missing = [], []
     for ch in changes:
         old = (ch or {}).get("old_code", "")
@@ -206,8 +210,24 @@ def _apply_plan_changes(code: str, changes: list):
         if old in code:
             code = code.replace(old, new)   # replace all (old_code 为整行, 所有出现都该改)
             applied.append(ch)
-        else:
-            missing.append(old[:60])
+            continue
+        # ★容错: 单行归一化匹配
+        old_norm = old.strip()
+        if old_norm and "\n" not in old_norm:
+            lines = code.splitlines(keepends=True)
+            hit = None
+            for i, line in enumerate(lines):
+                if line.rstrip("\r\n").strip() == old_norm:
+                    hit = i
+                    break
+            if hit is not None:
+                nl = "\r\n" if "\r\n" in lines[hit] else "\n"
+                indent = lines[hit][:len(lines[hit]) - len(lines[hit].lstrip())]
+                lines[hit] = indent + new.strip() + nl
+                code = "".join(lines)
+                applied.append(ch)
+                continue
+        missing.append(old[:60])
     return code, applied, missing
 
 

@@ -29,6 +29,7 @@ def _compile_hivm(single_file: Path, work_dir: Path):
     env = dict(os.environ, TRITON_DEBUG="1", TRITON_DISABLE_CACHE="1")
     subprocess.run("rm -rf ~/.triton", shell=True, check=False)
     r = subprocess.run(["python3", str(single_file)], capture_output=True, text=True,
+                       encoding="utf-8", errors="backslashreplace",
                        timeout=1800, env=env, cwd=str(single_file.parent))
     if r.returncode != 0:
         return None, f"编译失败: {(r.stderr or r.stdout)[-600:]}"
@@ -46,9 +47,13 @@ def _compile_hivm(single_file: Path, work_dir: Path):
                f"--bishengir-print-ir-after={pass_name}",
                ttadapter, "-o", "/tmp/k_fusion.o"]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                           encoding="utf-8", errors="backslashreplace",
                            cwd=str(single_file.parent))
-        if "hivm.hir" in (r.stdout or ""):
-            return r.stdout, None
+        # ★bug 修复: bishengir 把 hivm.hir 打到 stderr (run_optimize.sh 用 > f 2>&1 合并才 grep 到),
+        #   之前只查 r.stdout → 永远"无 hivm.hir" → 融合分析从不生成. 现在合并 stdout+stderr 一起查.
+        combined = (r.stdout or "") + (r.stderr or "")
+        if "hivm.hir" in combined:
+            return combined, None
     return None, "bishengir 输出无 hivm.hir (看 pass 名/ttadapter)"
 
 

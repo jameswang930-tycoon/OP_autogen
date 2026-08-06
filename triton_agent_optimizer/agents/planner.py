@@ -372,17 +372,18 @@ class PlannerAgent:
             f"   - 属于 → promote=false, promote_to=0, 给出 changes[]\n"
             f"   - 不属于且前层无空间 → promote=true, promote_to=<下一层>\n"
             f"3. ★changes[] 只允许对应当前 tier 的策略 (Tier3 只改 BLOCK_*, 禁止改 DTYPE/算法/融合; 各 tier 归属见 SKILL 铁律表)\n"
-            f"4. changes[] 的 old_code 必须与 kernel_op.py 某段【逐字符】相同 (coder 精确替换用); 拿不准就不改, 宁缺勿错\n"
+            f"4. changes[] 的 old_code 必须与【当前读到的 kernel_op.py(已含之前所有轮次 coder 的修改累积)】某段【逐字符】相同\n"
+            f"   (★从读到的文件逐字复制, 绝不用示例/记忆里的旧值; 拿不准就不改, 宁缺勿错)\n"
             f"5. 只改单文件 kernel_op.py ①config/②kernel, 不碰其他文件; 不引入 num_warps/num_stages 到 @triton.jit()\n"
             f"6. 目标加速比 1.05~1.5x\n\n"
             f"## 输出 JSON only (★先看真实示例再写):\n"
-            f"例: 想把 BLOCK_K 增大 → \n"
+            f"例: 想把 BLOCK_K 增大 → ★old_code 必须逐字复制自【你读到的当前 kernel】, 不是示例里的数值\n"
             f'{{"strategy":"增大BLOCK_K减MTE1次数","target_speedup":1.1,\n'
-            f'  "changes":[{{"old_code":"BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32","new_code":"BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64","reason":"Tier3: mte1_ratio高, 增大BLOCK_K减少MTE1搬运","section":"① config","tier":3}}],\n'
-            f'  "expected_impact":"MTE1搬运次数减半","promote":false,"promote_to":0,"promote_reason":""}}\n'
-            f"格式 (old_code 必须逐字符匹配当前 kernel; tier 必须=当前层):\n"
+            f'  "changes":[{{"old_code":"<从你读到的kernel里逐字复制要替换的那一行>","new_code":"<替换后的整行>","reason":"为什么","section":"① config/② kernel","tier":当前tier}}],\n'
+            f'  "expected_impact":"...","promote":false,"promote_to":0,"promote_reason":""}}\n'
+            f"格式 (★old_code 必须逐字符来自【当前读到的 kernel_op.py = 源 + 之前所有轮次修改累积】; 别用示例/记忆里的旧值; 拿不准就不改; tier 必须=当前层):\n"
             f'{{"strategy":"...","target_speedup":1.1,\n'
-            f'  "changes":[{{"old_code":"被替换的整行","new_code":"替换后的整行","reason":"为什么","section":"① config/② kernel","tier":N}}],\n'
+            f'  "changes":[{{"old_code":"被替换的整行(逐字复制自当前kernel)","new_code":"替换后的整行","reason":"为什么","section":"① config/② kernel","tier":N}}],\n'
             f'  "expected_impact":"...","promote":false,"promote_to":0,"promote_reason":"..."}}'
         )
 

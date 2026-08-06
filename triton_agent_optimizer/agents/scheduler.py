@@ -551,6 +551,12 @@ class Scheduler:
                                   f"(warmup+msprof 平均, 与后续轮同口径)")
                     except Exception as e:
                         print(f"  [基准] 复测失败({str(e)[:100]}), 用诊断 total_ns")
+                if st.get("baseline_ns") is None:
+                    # ★基准必须能算加速比: 诊断 total_ns 和验证复测都失败 → 停, 别带着假 baseline 跑
+                    print("  ⛔ 基准未设置 (诊断 total_ns 与验证复测都失败) → 停止, 先修采集/验证")
+                    st["round"] = rn + 1
+                    self._save_traj()
+                    break
                 self._save_traj()
                 print(f"  [基准] total_ns={ks0.get('total_ns')} kernels={ks0.get('num_kernels')} "
                       f"initial_tflops={st.get('initial_tflops')} (加速比基准)")
@@ -613,7 +619,7 @@ class Scheduler:
                     if v.get("ok"):
                         # ★保留判定: speedup 始终 = 初始基线/本轮 (累计, 输出的就是这个);
                         #   但"是否采纳进 kernel 链"对比上一轮已接受的加速比 (prev_speedup)
-                        speedup = v.get("speedup", 1.0)
+                        speedup = v.get("speedup", 1.0) or 1.0   # None→1.0 防御 (baseline 缺失时 verify 返回 None)
                         if speedup >= prev_speedup:
                             self.current_kernel = round_kernel
                             st["current_kernel"] = str(round_kernel)
@@ -630,7 +636,7 @@ class Scheduler:
             if not round_kernel.exists():
                 round_kernel.write_text(pre_code or "", encoding="utf-8")
 
-            speedup = v.get("speedup", 1.0)
+            speedup = v.get("speedup", 1.0) or 1.0   # None→1.0 防御 (round1 已保证 baseline 存在, 正常到不了)
             ns = v.get("ns")
             print(f"  加速比: {speedup:.3f}x (vs 初始基线 {st.get('baseline_ns')}ns; 上一轮 {prev_speedup:.3f}x)"
                   + ("  ✅采纳" if kept else "  ↩未采纳"))

@@ -440,6 +440,20 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
                        encoding="utf-8", errors="backslashreplace", timeout=1800, env=env)
     print(f"  [Verify] warmup x{warmup} (每轮内部 {loop} 次) done, 1 次 msprof 测 {loop} 次平均...")
 
+    # ★正确性验证 (v4 曾只测性能不测数值): 单独跑一次 MATMUL_VERIFY=1, 结果必须 PASS.
+    #   kernel_op.py main() 里 MATMUL_VERIFY=1 时对 torch 参考算 diff, 打印 "result check: PASS/CHECK".
+    #   不 PASS(数值错/无校验) → 本轮 FAIL, 防"优化把结果改错还通过".
+    chk_env = dict(_os.environ, KERNEL_LOOP="1", MATMUL_VERIFY="1")
+    try:
+        rc = subprocess.run([py, str(kernel_op)], capture_output=True, text=True,
+                            encoding="utf-8", errors="backslashreplace", timeout=1800, env=chk_env)
+    except Exception as e:
+        return {"ok": False, "error": f"正确性校验运行失败: {e}"}
+    _chk_out = (rc.stdout or "") + (rc.stderr or "")
+    if "result check: PASS" not in _chk_out:
+        return {"ok": False, "error": f"正确性未通过 (MATMUL_VERIFY 需输出 result check: PASS): {_chk_out.strip()[-400:]}"}
+    print("    [Verify] ✅ 正确性 PASS (MATMUL_VERIFY)")
+
     # measure: 一次 msprof, app 内部循环 loop 次 → 和 ÷loop = 单次端到端
     msprof_out = round_dir / "msprof_0"
     msprof_out.mkdir(parents=True, exist_ok=True)
@@ -472,12 +486,15 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
               f"→ 用实测 {divisor} 遍平均, 不再 ÷{loop}")
     per_pass_us = total_us / divisor
     ns = per_pass_us * 1000
-    speedup = (baseline_ns / ns) if baseline_ns else 1.0
+    # ★显式处理 baseline 缺失: 基准测量调用(baseline_ns=None)不算加速比 → None;
+    #   轮次验证若 baseline 缺失 → None → 调度器告警, 不再静默当 1.0 (曾导致永远 1.000x)
+    speedup = (baseline_ns / ns) if baseline_ns else None
     print(f"    msprof 记录 {n_rows} 行目标 kernel (期望 ~{loop}×{num_kernels or '?'}), "
           f"有效遍数={divisor}, 单次端到端={per_pass_us:.1f}us")
     # ★合理性告警: 行数远少于期望 → 循环丢失 或 msprof 严重漏记 (暴露, 不静默)
     if n_rows < loop:
         print(f"    ⚠ 警告! 目标 kernel 行数 {n_rows} < loop({loop}) "
               f"(coder 丢掉了 KERNEL_LOOP 循环? 或 msprof 漏记) → 单次端到端可能不准, 加速比存疑!")
-    return {"ok": True, "ns": round(ns, 1), "speedup": round(speedup, 4),
+    return {"ok": True, "ns": round(ns, 1),
+            "speedup": round(speedup, 4) if speedup is not None else None,
             "loop": loop, "rows": n_rows, "duration_us": round(per_pass_us, 1)}

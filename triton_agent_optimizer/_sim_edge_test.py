@@ -66,7 +66,9 @@ def test_verify_e2e():
             outdir = Path(cmd[1].split("=")[1])
             outdir.mkdir(parents=True, exist_ok=True)
             (outdir / "op_summary_0.csv").write_text(results["csv"], encoding="utf-8")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        # 非 msprof (warmup / MATMUL_VERIFY 正确性校验): 返回 PASS 让正确性检查通过
+        return subprocess.CompletedProcess(cmd, 0, "[info] result check: PASS", "")
     subprocess.run = fake_run   # verify_end_to_end 函数内 import subprocess → 补模块级 run
 
     kernel = OP / "kernel_op.py"

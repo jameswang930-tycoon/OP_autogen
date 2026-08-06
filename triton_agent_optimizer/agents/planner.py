@@ -201,43 +201,25 @@ def _extract_config_constants(kernel_code: str) -> str:
 
 
 def _format_history(history: list) -> str:
-    """将 history 格式化为紧凑梗概 (每轮一行: 改了啥 → 加速比 [结果])。
-    ★读 speedup (不是 actual_speedup — 旧 bug 恒显示 1.00x)。
-    ★REVERT(变慢回退) 轮标「↩回退」— planner 知道别重复这个坏改动。"""
+    """将 history 格式化为 ★每层全量 梗概 (不只最近5轮):
+    每层: 轮数 / best / 最近2轮试了啥→结果(+报错) → planner 能判断该层是否已探索完、避免重复和回退死循环.
+    ★REVERT 标「↩回退」; ★err 带报错 (coder old_code 没匹配等)."""
     if not history:
         return "(no history)"
-    recent = history[-5:]   # 只看最近5轮, 紧凑
-    lines = ["## 历史梗概 (最近5轮: 改了啥 → 加速比 [结果])"]
-    # ★前层进度: 每层最佳加速比 + 轮数 → planner 了解整体做过什么 (前层优先检查用)
-    tier_best, tier_rounds, tier_best_change = {}, {}, {}
+    by_tier = {}
     for r in history:
-        t = r.get("tier")
-        sp = r.get("speedup")
-        tier_rounds[t] = tier_rounds.get(t, 0) + 1
-        if sp is not None and (t not in tier_best or sp > tier_best[t]):
-            tier_best[t] = sp
-            tier_best_change[t] = (r.get("change") or r.get("strategy") or "")[:40]
-    if tier_best:
-        parts = []
-        for t, v in sorted(tier_best.items()):
-            s = f"T{t}:{v:.2f}x({tier_rounds.get(t, 0)}轮)"
-            if tier_best_change.get(t):
-                s += f", 最好改:{tier_best_change[t]}"   # ★E3: 前层做过什么也带上, 不只加速比
-            parts.append(s)
-        lines.append(f"## 前层进度 (每层最佳加速比×轮数×促成改动): {', '.join(parts)}")
-    for r in recent:
-        change = r.get("change") or r.get("strategy", "?")
-        sp = r.get("speedup")
-        sp_s = f"{sp:.2f}x" if isinstance(sp, (int, float)) else "?"
-        res = r.get("result", "")
-        line = f"- R{r.get('round','?')} t{r.get('tier','?')}: {change} → {sp_s}"
-        if r.get("decision") == "REVERT":
-            line += " ↩回退"          # 变慢/未采纳 → 明确标记, 防重复优化
-        if res:
-            line += f" [{res}]"
-        if r.get("error"):
-            line += f" (err: {r['error'][:50]})"
-        lines.append(line)
+        by_tier.setdefault(r.get("tier"), []).append(r)
+    lines = ["## 历史梗概 (★每层试过什么→结果, 判断该层还有没有空间/是否已探索完)"]
+    for t in sorted(by_tier):
+        rs = by_tier[t]
+        best = max((r.get("speedup") or 0) for r in rs)
+        last = rs[-2:]   # 最近2轮
+        detail = "; ".join(
+            (f"{r.get('change') or r.get('strategy','?')}→{r.get('speedup')}x[{r.get('result','')}]"
+             + ("↩回退" if r.get("decision") == "REVERT" else "")
+             + (f"(err:{r.get('error','')[:30]})" if r.get("error") else ""))
+            for r in last)
+        lines.append(f"- T{t}: {len(rs)}轮, best {best:.2f}x | 最近试: {detail}")
     return "\n".join(lines)
 
 

@@ -787,10 +787,26 @@ class Scheduler:
                 if target and 1 <= target <= 6 and target != tier:
                     # ★尊重 planner 的目标层: 支持回退前层(算法/融合) 和 晋升后层
                     direction = "回退" if target < tier else "晋升"
-                    print(f"  → {direction} Tier{tier}→Tier{target} "
-                          f"(planner: {getattr(plan,'promote_reason','')})")
-                    tier = target
-                    st["tier"] = tier
+                    # ★防死循环: 回退到已充分探索(≥3轮)的层 → 拒绝, 改晋升
+                    #   (planner 可能 T3 说"前面有空间"→回 T1 → T1 又跳回 T3 → 无限循环)
+                    _t_rounds = {}
+                    for _h in self.traj["history"]:
+                        _t_rounds[_h.get("tier")] = _t_rounds.get(_h.get("tier"), 0) + 1
+                    if target < tier and _t_rounds.get(target, 0) >= 3:
+                        print(f"  ⛔ 拒绝回退: Tier{target} 已探索 {_t_rounds[target]} 轮 (防 T{target}↔T{tier} 死循环), 改晋升")
+                        if tier >= 6:
+                            print(f"  ⛔ 且已到 Tier6, 停止")
+                            st["round"] = rn + 1
+                            self._save_traj()
+                            break
+                        print(f"  → 晋升 Tier{tier}→Tier{tier+1} (回退被拒)")
+                        tier += 1
+                        st["tier"] = tier
+                    else:
+                        print(f"  → {direction} Tier{tier}→Tier{target} "
+                              f"(planner: {getattr(plan,'promote_reason','')})")
+                        tier = target
+                        st["tier"] = tier
                 elif tier >= 6:
                     print(f"  ⛔ planner 判瓶颈已非本tier且到Tier6, 停止 ({getattr(plan,'promote_reason','')})")
                     st["round"] = rn + 1

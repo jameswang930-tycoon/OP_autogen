@@ -93,11 +93,11 @@ def _load_playbook(tier: int, playbook_dir: Optional[Path] = None) -> str:
     guide_path = playbook_dir / "CODING_GUIDE.md"
     if guide_path.exists():
         parts.append("## Coding Guide (MUST FOLLOW)\n" + guide_path.read_text(encoding="utf-8")[:1500])
-    # 主 Playbook (只取前 2500, 含优化内容表 + 决策依据; 避免 18KB 全文拖慢 nga)
+    # 主 Playbook (只取前 3500 — 关键约束表都提到文件最前, 保证进 prompt; 避免 18KB 全文拖慢 nga)
     if fname:
         fpath = playbook_dir / fname
         if fpath.exists():
-            parts.append(fpath.read_text(encoding="utf-8")[:2500])
+            parts.append(fpath.read_text(encoding="utf-8")[:3500])
     return "\n\n".join(parts) if parts else "(no playbook for this tier)"
 
 
@@ -216,6 +216,9 @@ def _format_history(history: list) -> str:
         last = rs[-2:]   # 最近2轮
         detail = "; ".join(
             (f"{r.get('change') or r.get('strategy','?')}→{r.get('speedup')}x[{r.get('result','')}]"
+             # ★D2: 预期 vs 实际 — planner 记得自己上轮预期多少、实际多少 → 避免反复提同款无效策略
+             + (f"(预期{r.get('expected_impact','?')} vs 实{r.get('speedup')}x)"
+                if r.get("expected_impact") else "")
              + ("↩回退" if r.get("decision") == "REVERT" else "")
              + (f"(err:{r.get('error','')[:30]})" if r.get("error") else ""))
             for r in last)

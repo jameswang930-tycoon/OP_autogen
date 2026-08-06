@@ -200,6 +200,8 @@ def _apply_plan_changes(code: str, changes: list):
     2) ★容错: 单行 old_code 精确没匹配上时, 按行去首尾空白/CRLF 归一化再匹配
        — 处理 planner 从旧版本/示例复制 old_code 导致的缩进/尾随空格/换行符差异
        (保持原行缩进 + 原换行符替换)。多行 old_code 只走精确匹配(安全)。
+    ★D4 同名 kernel 防误伤: old_code 匹配 >1 处时打警告 — 若只想改一处
+      (如 attention_mlp 多个 matmul_kernel 共用 BLOCK), 需带函数名/调用处上下文使唯一.
     """
     applied, missing = [], []
     for ch in changes:
@@ -207,6 +209,10 @@ def _apply_plan_changes(code: str, changes: list):
         new = (ch or {}).get("new_code", "")
         if not old:
             continue
+        n_hits = code.count(old)
+        if n_hits > 1:
+            print(f"    ⚠ D4: old_code 匹配 {n_hits} 处 '{old.strip()[:50]}...' "
+                  f"(全部替换; 若只想改一处请带函数名上下文)")
         if old in code:
             code = code.replace(old, new)   # replace all (old_code 为整行, 所有出现都该改)
             applied.append(ch)

@@ -49,6 +49,12 @@ argument-hint: >
 4. 改完跑语法检查，确保仍是合法 Python。
 5. 只有当 `changes[]` 为空、或 previous_error 需要 LLM 修报错时，才自己改码。
 
+### ★D4 同名 kernel 防误伤（多 kernel 文件必读）
+- 若 `old_code` 在**多个 kernel 函数里都出现**（如 attention_mlp 多个 `matmul_kernel` 共用 `BLOCK_M, BLOCK_N, BLOCK_K` 配置、或 `BLOCK_SIZE`），
+  **精确替换会全部改到**——若只想改其中一个 kernel，必须让 old_code 带**函数名/调用处上下文**使唯一（如把调用行 `matmul_kernel[g_hidden](x, wq, q, ...)` 一起包进 old_code）。
+- **全局配置定义**（如 `BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64` 在 config 区）全部改是正确的——那本来就是共享的。
+- 判断标准：old_code 是否属于"所有 kernel 共享的全局配置"？是 → 全改；否 → 带上下文只改目标 kernel。
+
 ## 修改原则
 
 ### 最小改动

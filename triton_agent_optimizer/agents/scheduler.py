@@ -211,48 +211,131 @@ def _get(d, path: str):
 
 # ★全局摘要字段: 前层信号, 任何 tier 都喂 — 让 planner 做"前层优先检查"
 #   (算法/融合/算力/精度是否还有优化空间, 不能只闷头调本层参数)
+#   ★不喂 kernels[].deep.* — 那些必须 per-kernel 展示 (见 TIER_PER_KERNEL), 只取第一个 kernel 会误导
 GLOBAL_FIELDS = [
     ("summary.num_kernels", "目标kernel数 (多→融合空间Tier2)"),
     ("summary.num_kernels_total", "总kernel数(含框架)"),
     ("summary.api_overhead_total_us", "launch开销us (大→融合空间Tier2)"),
-    ("kernels[].deep.roofline.bottleneck_type", "瓶颈类型 (memory/compute/latency)"),
-    ("kernels[].deep.roofline.compute_utilization", "算力利用率 (低→算法Tier1?)"),
-    ("kernels[].deep.roofline.memory_utilization", "访存利用率"),
-    ("kernels[].deep.roofline.arithmetic_intensity", "算术强度 (→算法/访存判断)"),
-    ("kernels[].deep.compute.cube_fp16_ratio", "cube fp16占比 (低→精度Tier1/5?)"),
 ]
+
+# ★每 tier 的 per-kernel 关键指标 — 多 kernel 算子 (MLP/attention_mlp/conv_bias_relu) 每个 kernel 都列,
+#   解决 _get("kernels[].xxx") 只取第一个 kernel 的致命缺陷 (planner 误以为所有 kernel 都一样).
+#   值来自 kernel_slots[i].task (pipes_us/block_dim/est_bytes) 和 .deep (board 填充的 roofline/带宽/引擎/冲突)
+TIER_PER_KERNEL = {
+    1: [("deep.roofline.compute_utilization", "cube_util"),
+        ("deep.roofline.bottleneck_type", "bottleneck"),
+        ("deep.roofline.arithmetic_intensity", "AI"),
+        ("deep.compute.cube_ratio", "cube_r"),
+        ("deep.compute.cube_fp16_ratio", "fp16_r"),
+        ("deep.compute.vector_fops", "vec_fops"),
+        ("task.pipes_us.aiv_vec_time_us", "vec_us")],   # ★vec 耗时 (rms_norm/softmax/bias_gelu 命门)
+    2: [("task.task_type", "type"),
+        ("deep.roofline.compute_utilization", "cube_util"),
+        ("deep.roofline.bottleneck_type", "bottleneck"),
+        ("launch_count", "launches")],
+    3: [("task.block_dim", "cores"),
+        ("deep.engine_utilization.cube", "cube"),
+        ("deep.engine_utilization.mte1", "mte1"),
+        ("deep.engine_utilization.mte2", "mte2"),
+        ("deep.bandwidth_gb_s.l0a_read_gb_s", "l0a_r"),
+        ("deep.bandwidth_gb_s.l0b_read_gb_s", "l0b_r"),
+        ("task.pipes_us.aic_mte1_time_us", "mte1_us"),  # ★L1→L0A/B 搬运耗时
+        ("deep.conflict.bank_cflt_ratio", "bank_cflt")],
+    4: [("deep.bandwidth_gb_s.main_mem_read_gb_s", "gm_r"),
+        ("deep.bandwidth_gb_s.main_mem_write_gb_s", "gm_w"),
+        ("deep.bandwidth_gb_s.gm_to_ub_gb_s", "gm2ub"),
+        ("deep.bandwidth_gb_s.ub_to_gm_gb_s", "ub2gm"),
+        ("deep.l2_hit_rate", "l2"),
+        ("task.est_bytes_in", "in_B"),                  # ★绝对搬运量 (L2 复用/降搬运判断)
+        ("task.est_bytes_out", "out_B")],
+    5: [("task.pipes_us.aic_cube_time_us", "cube_us"),
+        ("task.pipes_us.aic_scalar_time_us", "scalar_us"),
+        ("deep.engine_utilization.scalar", "scalar"),
+        ("deep.conflict.bank_cflt_ratio", "bank_cflt"),
+        ("deep.conflict.wait_ratio", "wait")],
+    6: [("deep.engine_utilization.cube", "cube"),
+        ("deep.engine_utilization.vec", "vec"),
+        ("deep.engine_utilization.mte2", "mte2"),
+        ("deep.engine_utilization.mte3", "mte3"),
+        ("deep.conflict.wait_ratio", "wait"),
+        ("task.task_type", "type"),
+        ("task.block_dim", "cores"),
+        ("deep.roofline.bottleneck_type", "bottleneck")],
+}
+
+
+def _pk_get(k: dict, path: str):
+    """per-kernel 取值: 'task.X' → k['task']['X'], 'deep.Y.Z' → k['deep']['Y']['Z'], 否则 k[path]."""
+    cur = k
+    for p in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        if p in cur:
+            cur = cur[p]
+        else:                       # 大小写不敏感兜底 (如 column 名小写差异)
+            nxt = next((v for kk, v in cur.items() if p.lower() in str(kk).lower()), None)
+            if nxt is None:
+                return None
+            cur = nxt
+    return cur if not isinstance(cur, (dict, list)) else None
+
+
+def _fnum(v):
+    """统一数值格式化: 整数直出, 小值(利用率/占比) 3 位小数, 大值(带宽/耗时) 1 位."""
+    if v is None:
+        return "?"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if f == int(f):
+        return str(int(f))
+    return f"{f:.3f}" if abs(f) < 10 else f"{f:.1f}"
 
 
 def extract_tier_fields(diagnosis: dict, tier: int) -> str:
-    """喂 Planner: ★全局摘要(前层信号) + 当前 tier 字段段。
-    planner 靠全局摘要做"前层优先检查" (算法/融合/算力是否还有空间), 不只闷头调本层参数。"""
+    """喂 Planner: ★全局摘要(前层信号) + Per-Kernel 概览(★每 kernel 该 tier 关键指标) + 本层附加字段。
+    ★多 kernel 算子每个 kernel 都列 (不再 _get 只取第一个 kernel 的值误导 planner);
+      per-kernel 深层指标 (算力/带宽/引擎/冲突) 必须逐 kernel 看, 才能打中占比最大的瓶颈 kernel。"""
 
     def _fmt(path: str, desc: str) -> str:
         v = _get(diagnosis, path)
         if v is None:
             return f"- {desc} ({path}): (无数据)"
         if isinstance(v, (dict, list)):
-            return f"- {desc} ({path}): {json.dumps(v, ensure_ascii=False)[:300]}"
+            return f"- {desc} ({path}): {json.dumps(v, ensure_ascii=False)[:600]}"
         return f"- {desc} ({path}): {v}"
 
     lines = [f"# 当前 Tier {tier} ({TIER_LABEL.get(tier, '')})"]
-    lines.append("# ══ 全局摘要 (前层信号: 算法/融合/算力/精度) ★任何轮都看 ══")
+    lines.append("# ══ 全局摘要 (前层信号: 融合空间/launch开销) ★任何轮都看 ══")
     lines += [_fmt(p, d) for p, d in GLOBAL_FIELDS]
-    # ★#3: Per-Kernel 耗时占比 — planner 必须知道"哪个 kernel 占大头", 优化才不打错目标
-    lines.append("# ══ Per-Kernel 耗时占比 (★优化要打中占比最大的 kernel) ══")
+
+    # ★每 kernel 一行: 耗时占比 + 该 tier 关键指标 (多 kernel 全列, 优化打中占比大的瓶颈 kernel)
+    lines.append("# ══ Per-Kernel 概览 (★每 kernel 该 tier 关键指标; 优化打中占比最大的 kernel) ══")
     _total_us = (diagnosis.get("summary") or {}).get("total_ns")
     _total_us = (_total_us / 1000) if _total_us else None
+    _pk_fields = TIER_PER_KERNEL.get(tier, [])
     for _k in (diagnosis.get("kernels") or []):
         _name = _k.get("kernel_name", "?")
         _dur = (_k.get("task") or {}).get("task_duration_us")
-        if _dur and _total_us:
-            lines.append(f"- {_name}: {_dur}us ({_dur/_total_us*100:.1f}% of 端到端)")
-        elif _dur:
-            lines.append(f"- {_name}: {_dur}us")
-        else:
-            lines.append(f"- {_name}: (无耗时)")
-    lines.append("# ══ 当前 Tier 专属字段 ══")
-    lines += [_fmt(p, d) for p, d in TIER_FIELDS.get(tier, [])]
+        _pct = f"{_dur/_total_us*100:.1f}%" if (_dur and _total_us) else "?"
+        _parts = []
+        for _path, _label in _pk_fields:
+            _v = _pk_get(_k, _path)
+            if _v is not None:
+                if _label.endswith("_B") and isinstance(_v, (int, float)):
+                    _parts.append(f"{_label}={_v / 2**20:.1f}MB")   # 字节 → MB 可读
+                else:
+                    _parts.append(f"{_label}={_fnum(_v)}")
+        _pk = " | " + " ".join(_parts) if _parts else ""
+        lines.append(f"- {_name}: {_pct} ({_dur}us){_pk}")
+
+    # 本层附加字段: 只留非 kernel 级路径 (per-kernel 已在上表; summary.* 已在全局)
+    _tier_extra = [(p, d) for p, d in TIER_FIELDS.get(tier, [])
+                   if not p.startswith("kernels[") and not p.startswith("summary.")]
+    if _tier_extra:
+        lines.append("# ══ 本层附加字段 ══")
+        lines += [_fmt(p, d) for p, d in _tier_extra]
     return "\n".join(lines)
 
 
@@ -287,9 +370,17 @@ class Scheduler:
         self.traj = {"v": 4, "state": {"tier": 1, "round": 1, "best_speedup": 1.0,
                                        "baseline_ns": None, "num_kernels": None,
                                        "current_speedup": 1.0,   # 当前已接受 kernel 的加速比 (基线=1.0)
-                                       "current_kernel": str(self.op_dir / "kernel_op.py")},
+                                       "current_kernel": str(self.op_dir / "kernel_op.py"),
+                                       "total_rounds": 0},       # ★D7: 含 promote 轮的总执行数 (防 promote 白耗 max_rounds)
                      "history": []}
         self.current_kernel = self.op_dir / "kernel_op.py"
+        # ★D6: 保存原始 kernel 副本 → 环境漂移时重测 baseline 用它 (优化后 current_kernel 已不是原始版)
+        try:
+            self.kernel_dir.mkdir(parents=True, exist_ok=True)
+            (self.kernel_dir / "baseline_kernel.py").write_text(
+                self.current_kernel.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass
 
     # ── 轨迹 ──
     def _load_traj(self) -> dict:
@@ -415,16 +506,30 @@ class Scheduler:
         print("  [Scheduler] Tier2 融合: 编译 HIVM MLIR → nga run 分析依赖 → 08_fusion/")
         return run_fusion(self.current_kernel, round_dir, use_llm=self.use_llm)
 
-    # ── ④ Planner (只喂当前阶段筛好的字段 + 融合分析) ──
+    # ── ④ Planner (只喂当前阶段筛好的字段 + 融合分析 + Tier3 分块实测数据) ──
     def _plan(self, diagnosis: dict, extracted: str, tier: int, rn: int, round_dir: Path,
-              fusion_analysis: Optional[dict] = None):
+              fusion_analysis: Optional[dict] = None, tier3_sweep: Optional[dict] = None):
         from agents.planner import PlannerAgent, _extract_config_constants
         kernel_code = self.current_kernel.read_text(encoding="utf-8") if self.current_kernel.exists() else ""
         skill = (_PROJECT / "skills" / "triton-op-planner" / "SKILL.md")
         cfg = _extract_config_constants(kernel_code)
+        # ★D1-Tier3: 分块实测数据追加进喂给 planner 的字段 (精简, 只给决策要用的 key 结果)
+        if tier3_sweep and tier3_sweep.get("available"):
+            sw = tier3_sweep
+            lines = ["", "# ══ Tier3 分块实测 (sweep, ★决策依据 — 用数据不是猜) ══",
+                     "各 config 实测 (ns 越小越快; 标★=实测最优; 标[当前]=当前块):"]
+            for c in sw["configs"]:
+                mark = " ★最优" if c is sw["best"] else (" [当前]" if c.get("is_current") else "")
+                sp = f" ({c['speedup']}x)" if c.get("speedup") else ""
+                lines.append(f"- {c['block']}: {c['ns']:.0f}ns{sp}{mark}")
+            lines.append("★分块层决策指引: 若最优比当前明显快 → changes[] 直接采用实测最优块; "
+                         "若当前已接近最优/无增益 → 分块已到位, promote 到下一层. "
+                         "禁止再猜一个新的 BLOCK 值 (实测数据就是答案).")
+            extracted = extracted + "\n" + "\n".join(lines)
         print(f"  [Planner] 输入: 07字段({len(extracted.splitlines())}行) + playbook_tier{tier} "
               f"+ {self.current_kernel}({len(kernel_code)}字符) + config[{cfg.splitlines()[0] if cfg else '?'}] "
-              f"+ 历史{len(self.traj.get('history', []))}轮")
+              f"+ 历史{len(self.traj.get('history', []))}轮"
+              + (" + Tier3分块实测数据" if (tier3_sweep and tier3_sweep.get("available")) else ""))
         print(f"  [Planner] 调 skill: {skill}")
         planner = PlannerAgent(use_llm=self.use_llm)
         plan = planner.generate_v4(
@@ -492,6 +597,176 @@ class Scheduler:
             return {"ok": True, "ns": round(baseline_ns, 1) if baseline_ns else None,
                     "speedup": 1.0, "note": "stub(无真机)"}
 
+    # ★D5: 场景泛化 sanity — 优化后 kernel 在相邻尺寸下仍正确 (防过拟合单一形状).
+    #   默认关 (SANITY_VERIFY=1 开); 只动主维度 (×0.5/×2), 失败仅警告不阻断 (主验证已过).
+    _SANITY_ENVS = {
+        "matmul": ["MATMUL_M", "MATMUL_N", "MATMUL_K"],
+        "attention_mlp": ["MATMUL_M", "MATMUL_N"],
+        "rms_norm": ["RMS_M", "RMS_N"],
+        "flash_attention": ["FA_SEQ"],
+        "conv2d": ["CONV_H", "CONV_W"],
+        "conv_bias_relu": ["CONV_H", "CONV_W"],
+    }
+
+    def _sanity_verify(self, kernel_path: Path):
+        import subprocess
+        op = self.kernel_name
+        envs = self._SANITY_ENVS.get(op, [])
+        if not envs or not kernel_path.exists():
+            return
+        # 主维度: matmul 用 config 的 M, 其余按 op 默认 (rms/attention/fa=2048, conv=64)
+        dim_key = envs[0]
+        base = _extract_mnk(kernel_path.read_text(encoding="utf-8"))
+        if op == "matmul" and base:
+            dim_val = base[0]
+        else:
+            dim_val = {"conv2d": 64, "conv_bias_relu": 64}.get(op, 2048)
+        for scale, label in ((0.5, "半"), (2, "双")):
+            new_dim = int(round(dim_val * scale / 16) * 16)   # 保持 16 倍数
+            if new_dim <= 0 or new_dim == dim_val:
+                continue
+            env = dict(os.environ, KERNEL_LOOP="1", MATMUL_VERIFY="1",
+                       **{dim_key: str(new_dim)})
+            try:
+                r = subprocess.run(["python3", str(kernel_path)], capture_output=True,
+                                   text=True, encoding="utf-8", errors="backslashreplace",
+                                   timeout=1800, env=env)
+                out = (r.stdout or "") + (r.stderr or "")
+                if "result check: PASS" in out:
+                    print(f"    [Sanity] {label}尺寸({dim_key}={new_dim}) 正确性 PASS")
+                else:
+                    print(f"    ⚠ [Sanity] {label}尺寸({dim_key}={new_dim}) 未通过: {out.strip()[-200:]}")
+            except Exception as e:
+                print(f"    ⚠ [Sanity] {label}尺寸异常: {str(e)[:120]}")
+
+    # ★D1-Tier3: 自动分块实测 — 到分块层时先跑一遍 L0 合法 BLOCK 候选, 收集各 config 实测数据
+    #   (含当前块对比), **喂给 planner 决策** (不是这里写死写回). 确定性 autotune 思想.
+    # 兜底: 任何异常/无可扫 → 返回 None 或 {"available": False}, 调用方继续正常走 LLM (不阻断迭代).
+    # 返回精简数据 (不含原始 msprof 输出/报错全文, 只给 planner 决策要用的关键结果).
+    def _tier3_sweep_data(self, tier: int, rn: int, round_dir: Path) -> Optional[dict]:
+        try:
+            from sweep_blocks import SWEEP, _read_current_block, _apply_block
+        except Exception as e:
+            return {"available": False, "error": f"sweep_blocks 不可用: {str(e)[:80]}"}
+        cfg = SWEEP.get(self.kernel_name)
+        kernel = self.current_kernel
+        if cfg is None or not kernel.exists():
+            return None                      # rms_norm 行级, 无自由分块参数 → 正常走 LLM
+        code = kernel.read_text(encoding="utf-8")
+        cur = _read_current_block(code, cfg["vars"])
+        if cur is None:
+            return {"available": False, "error": "读不到 BLOCK 值"}
+        # 候选 = 当前块(作对比) + L0 合法变体; TIER3_SWEEP_CANDS 限数(+1 含当前)
+        cands = [cur] + [c for c in cfg["cands"] if c != cur]
+        _lim = int(os.environ.get("TIER3_SWEEP_CANDS", "0"))
+        if _lim > 0:
+            cands = cands[:_lim + 1]
+        from agents.verifier import verify_end_to_end
+        base = self.traj["state"].get("baseline_ns")
+        # ★时间控制: sweep 只求"相对排序", 每 config 轻量计时 (VERIFY_LOOP=TIER3_SWEEP_LOOP 默认5,
+        #   warmup=1) — 单 config ~1-2min, 8 config ~10-15min; 防 tiling 卡死拉长总运行.
+        #   (最终 block 正确性由主流程 verify 严格查, sweep 阶段从轻)
+        sweep_loop = int(os.environ.get("TIER3_SWEEP_LOOP", "5"))
+        _ovl, _ovw = os.environ.get("VERIFY_LOOP"), os.environ.get("VERIFY_WARMUP")
+        os.environ["VERIFY_LOOP"] = str(sweep_loop)
+        os.environ["VERIFY_WARMUP"] = "1"
+        # 产物目录: roundN/09_tier3_sweep/ (对齐 07_tier3_fields/08_fusion)
+        sweep_dir = round_dir / "09_tier3_sweep"
+        sweep_dir.mkdir(parents=True, exist_ok=True)
+        configs = []
+        print(f"  [Tier3] 分块实测: 测 {len(cands)} 个 config (含当前 {cur}, 每 config {sweep_loop} 轮) → {sweep_dir}", flush=True)
+        try:
+            for vals in cands:
+                try:
+                    cand_code = _apply_block(code, cfg["vars"], vals)
+                    cfg_rd = sweep_dir / ("config_" + "_".join(map(str, vals)))
+                    cfg_rd.mkdir(parents=True, exist_ok=True)
+                    (cfg_rd / "kernel_op.py").write_text(cand_code, encoding="utf-8")
+                    v = verify_end_to_end(cfg_rd / "kernel_op.py", cfg_rd, None, num_kernels=None)
+                    if v.get("ok") and v.get("ns"):
+                        configs.append({"block": list(vals), "ns": v["ns"],
+                                        "speedup": round(base / v["ns"], 3) if base else None,
+                                        "is_current": list(vals) == list(cur)})
+                        print(f"      {vals}: {v['ns']:.0f}ns", flush=True)
+                    else:
+                        configs.append({"block": list(vals), "ns": None, "is_current": list(vals) == list(cur),
+                                        "error": str(v.get("error", ""))[:80]})
+                        print(f"      {vals}: FAIL {str(v.get('error',''))[:80]}", flush=True)
+                except Exception as e:
+                    configs.append({"block": list(vals), "ns": None, "is_current": list(vals) == list(cur),
+                                    "error": str(e)[:80]})
+        finally:
+            if _ovl is None:
+                os.environ.pop("VERIFY_LOOP", None)
+            else:
+                os.environ["VERIFY_LOOP"] = _ovl
+            if _ovw is None:
+                os.environ.pop("VERIFY_WARMUP", None)
+            else:
+                os.environ["VERIFY_WARMUP"] = _ovw
+        valid = [c for c in configs if c.get("ns")]
+        if not valid:
+            (sweep_dir / "sweep_result.json").write_text(
+                json.dumps({"available": False, "error": "所有候选实测失败", "configs": configs},
+                           ensure_ascii=False, indent=1), encoding="utf-8")
+            return {"available": False, "error": "所有候选实测失败"}
+        valid_sorted = sorted(valid, key=lambda c: c["ns"])
+        # 写 09 报告 (planner 可读, 也留档)
+        (sweep_dir / "sweep_result.json").write_text(json.dumps(
+            {"available": True, "vars": list(cfg["vars"]), "configs": valid_sorted,
+             "best": valid_sorted[0]}, ensure_ascii=False, indent=1), encoding="utf-8")
+        with open(sweep_dir / "sweep_result.txt", "w", encoding="utf-8") as f:
+            f.write("══ Tier3 分块实测 (ns 越小越快; ★最优; [当前]) ══\n")
+            for c in valid_sorted:
+                mark = " ★最优" if c is valid_sorted[0] else (" [当前]" if c.get("is_current") else "")
+                sp = f" ({c['speedup']}x)" if c.get("speedup") else ""
+                f.write(f"  {c['block']}: {c['ns']:.0f}ns{sp}{mark}\n")
+        print(f"  [Tier3] 实测报告 → {sweep_dir}")
+        return {"available": True, "configs": valid_sorted, "best": valid_sorted[0],
+                "vars": list(cfg["vars"])}
+
+    # ★D6: 环境漂移防护 — 每 N 轮重测原始 baseline kernel + 当前 kernel,
+    #   校正加速比基数 (长时运行跨时段温度/负载漂移会污染 baseline_ns).
+    #   只在校正 (不动 history 旧值; 轨迹图上从本轮起用新基准).
+    def _maybe_rebaseline(self, tier: int, rn: int):
+        st = self.traj["state"]
+        try:
+            from agents.verifier import verify_end_to_end
+            # 重测原始 baseline kernel (reset 时保存的副本)
+            base_kernel = self.kernel_dir / "baseline_kernel.py"
+            if not base_kernel.exists():
+                return
+            rb_dir = self.kernel_dir / "rebaseline"
+            rb_dir.mkdir(parents=True, exist_ok=True)
+            vb = verify_end_to_end(base_kernel, rb_dir / "base", None,
+                                   num_kernels=st.get("num_kernels"))
+            if not (vb.get("ok") and vb.get("ns")):
+                print(f"  [重基准] R{rn} 重测原始 kernel 失败: {str(vb.get('error',''))[:120]} (跳过)")
+                return
+            new_base = vb["ns"]
+            # 重测当前已接受 kernel → 新累计加速比
+            cur = verify_end_to_end(self.current_kernel, rb_dir / "cur", None,
+                                    num_kernels=st.get("num_kernels"))
+            if not (cur.get("ok") and cur.get("ns")):
+                print(f"  [重基准] R{rn} 重测当前 kernel 失败 (跳过, 沿用旧 baseline)")
+                return
+            new_speedup = new_base / cur["ns"] if cur["ns"] else None
+            drift = new_base / st["baseline_ns"] if st.get("baseline_ns") else 1.0
+            st["baseline_ns"] = new_base
+            st["current_speedup"] = round(new_speedup, 4) if new_speedup else st.get("current_speedup", 1.0)
+            st["last_rebase_round"] = rn
+            self.traj["history"].append({
+                "round": rn, "tier": tier, "strategy": "REBASELINE",
+                "change": "", "changes_full": [], "speedup": round(new_speedup, 4) if new_speedup else 1.0,
+                "prev_speedup": 1.0, "ns": round(cur["ns"], 1),
+                "decision": "REBASELINE", "result": "OK",
+                "error": f"环境漂移 {drift:.3f}x, 重归一基准"})
+            self._save_traj()
+            print(f"  [重基准] R{rn}: baseline {drift:.3f}x 漂移 → 新基准 {new_base:.0f}ns, "
+                  f"当前 kernel 累计 {new_speedup:.3f}x (校正后)")
+        except Exception as e:
+            print(f"  [重基准] R{rn} 异常: {str(e)[:120]} (跳过)")
+
     # ── 主循环 (无 round0: 首轮采集即基准, 全部轮次直接进 outputs/<op>/<tier>/roundN) ──
     def run(self):
         st = self.traj["state"]
@@ -515,10 +790,20 @@ class Scheduler:
 
         total_start = time.time()
         coll_fail = 0   # ★H2: 连续采集失败计数 (失败重试/跳过, 不是一停到底)
-        while rn <= self.max_rounds:
+        total_rounds = st.get("total_rounds", 0)
+        # ★D7: 总预算 = max_rounds + 已用 promote 额度 (promote 轮免费, 不挤占有效优化轮)
+        while total_rounds < self.max_rounds + int(st.get("promote_budget", 0)):
+            total_rounds += 1
             round_dir = self._round_dir(tier, rn)
             round_start = time.time()
             print(f"\n══ Tier{tier}({TIER_LABEL.get(tier)}) Round{rn} ══")
+
+            # ★D6: 环境漂移防护 — 每 N 轮重测 baseline (默认10), 校正加速比基数
+            rebase_every = int(os.environ.get("REBASELINE_EVERY", "10"))
+            if (rebase_every > 0 and rn > 1 and st.get("baseline_ns")
+                    and st.get("last_rebase_round", 0) != rn
+                    and rn % rebase_every == 0):
+                self._maybe_rebaseline(tier, rn)
 
             # ① 采集+解析 (run_optimize 自动产出 07_tier{N}_fields)
             _t0 = time.time()
@@ -654,9 +939,25 @@ class Scheduler:
                 t_fusion = time.time() - _t0
                 print(f"  ⏱ ③融合分析: {t_fusion:.1f}s")
 
-            # ④ Planner → plan + 晋升决策 (只喂 07 筛好的字段 + 融合分析)
+            # ★D1-Tier3: 自动分块实测 — 进分块层先跑候选 BLOCK 收集各 config 实测数据,
+            #   喂给 planner 决策 (不是这里猜/写死). 报错/无可扫 → None, 正常走 LLM (兜底).
+            #   TIER3_SWEEP=1 默认; 每 op 首次进 Tier3 触发一次.
+            tier3_sweep = None
+            if tier == 3 and os.environ.get("TIER3_SWEEP", "1") == "1" and not st.get("tier3_swept"):
+                st["tier3_swept"] = True
+                _t0 = time.time()
+                tier3_sweep = self._tier3_sweep_data(tier, rn, round_dir)
+                if tier3_sweep and tier3_sweep.get("available"):
+                    print(f"  ⏱ Tier3 分块实测完成: {len(tier3_sweep['configs'])} config, "
+                          f"最优 {tier3_sweep['best']['block']} {tier3_sweep['best']['ns']:.0f}ns "
+                          f"({time.time()-_t0:.0f}s) → 数据喂 planner 决策")
+                else:
+                    print(f"  [Tier3] 分块实测不可用 "
+                          f"({(tier3_sweep or {}).get('error','行级/无候选')}) → 走 LLM (兜底)")
+
+            # ④ Planner → plan + 晋升决策 (只喂 07 筛好的字段 + 融合分析 + Tier3 分块实测数据)
             _t0 = time.time()
-            plan = self._plan(diagnosis, extracted, tier, rn, round_dir, fusion_analysis)
+            plan = self._plan(diagnosis, extracted, tier, rn, round_dir, fusion_analysis, tier3_sweep)
             t_plan = time.time() - _t0
             print(f"  ⏱ ④Planner: {t_plan:.1f}s")
 
@@ -713,6 +1014,9 @@ class Scheduler:
                             st["current_kernel"] = str(round_kernel)
                             st["current_speedup"] = round(speedup, 4)
                             kept = True
+                            # ★D5: 场景泛化 sanity — 采纳后对相邻尺寸做正确性检查 (默认关 SANITY_VERIFY=1)
+                            if os.environ.get("SANITY_VERIFY", "0") == "1":
+                                self._sanity_verify(round_kernel)
                         else:
                             print(f"  ↩ 回退: 本轮 {speedup:.3f}x < 上一轮 {prev_speedup:.3f}x×{floor} (噪声地板), 沿用上一轮 kernel")
                         self._save_traj()
@@ -757,7 +1061,12 @@ class Scheduler:
             result = "NOOP" if noop else ("OK" if ok else "FAIL")
             decision = "KEEP" if kept else ("FAIL" if not ok else "REVERT")
             hist = {"round": rn, "tier": tier, "strategy": plan.strategy,
+                    # ★D2: expected_impact = planner 建议的预期加速比 (→ 下轮反馈"预期vs实际", 学习闭环)
+                    "expected_impact": getattr(plan, "expected_impact", ""),
+                    # ★change = 简短梗概 (planner 历史上下文 + 轨迹图标签用, 截断省 token);
                     "change": _summarize_changes(plan),       # 例: "BLOCK_M,BLOCK_N,BLOCK_K=64,64,64"
+                    # ★changes_full = 完整 changes[] 数组 (old_code/new_code 全文, 审计/复盘不丢信息)
+                    "changes_full": _extract_changes_from_plan(plan.plan_text) or [],
                     "speedup": round(speedup, 4),             # 加速比 = 初始基线/本轮 (累计)
                     "prev_speedup": round(prev_speedup, 4),   # 上一轮已接受 kernel 的加速比 (保留判定用)
                     "ns": ns, "decision": decision, "result": result,
@@ -784,10 +1093,10 @@ class Scheduler:
                     break
                 no_improve += 1
             if self.target_speedup > 0 and speedup >= self.target_speedup:
-                print("  🎯 加速比达标, 停止")
-                st["round"] = rn + 1
-                self._save_traj()
-                break
+                # ★D3: 达标不硬停 — 继续探后续层确认无更大空间, 由 no_improve/max_rounds 收尾.
+                #   (目标改成 -1 → 不再触发停; 否则一轮达标就过早停, 错过 Tier3+ 更大优化空间)
+                print(f"  🎯 已达标 {speedup:.3f}x ≥ target {self.target_speedup}x — 继续探后续层找更大空间")
+                self.target_speedup = -1
             if planner_promote:
                 target = getattr(plan, "promote_to", 0) or 0
                 if target and 1 <= target <= 6 and target != tier:
@@ -835,8 +1144,14 @@ class Scheduler:
                     print(f"  → 晋升 Tier{tier}→Tier{tier+1} (本tier连续{no_improve}轮无改进)")
                     tier += 1
                     st["tier"] = tier
+            # ★D7: promote 轮免费 — 不消耗 max_rounds 配额 (用 promote_budget 扩总预算),
+            #   但 rn 编号统一推进 (历史/目录编号一致, 不被 promote 打乱)
+            if getattr(plan, "promote", False):
+                st["promote_budget"] = int(st.get("promote_budget", 0)) + 1
+                print(f"  (promote 轮免费, 已用 {st['promote_budget']} 次 promote 额度)")
             st["round"] = rn + 1
             rn += 1
+            st["total_rounds"] = total_rounds   # 总执行轮 (含 promote)
             self._save_traj()
 
         self._write_timing_stats()   # ★各阶段耗时统计 (项目自身瓶颈)

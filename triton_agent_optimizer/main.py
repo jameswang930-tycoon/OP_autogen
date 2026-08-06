@@ -134,6 +134,10 @@ def main():
                    help="清空 outputs/<op>/ 旧产物 + 重置 trajectory, 从头开始")
     p.add_argument("--resume", action="store_true",
                    help="从上次 trajectory 续跑 (默认每次都初始化, 从 round1 重来)")
+    p.add_argument("--sweep-blocks", action="store_true",
+                   help="★D1: 优化前先扫 BLOCK 候选 (msprof 取最快写回 config), 固定好起点再进主循环")
+    p.add_argument("--sweep-quick", action="store_true",
+                   help="sweep 只扫前 4 个候选 (省时间)")
     args = p.parse_args()
 
     op_dir = Path(args.op_dir)
@@ -177,6 +181,16 @@ def main():
     print(f"[main] 运行日志 → {log_path}")
 
     # ② Scheduler 循环 (默认每次初始化; --resume 续跑)
+    # ★D1: 前置 BLOCK 扫描 — 先固定好块再进主循环 (分块是乘性地基, 块差会让后面所有层诊断失真)
+    if args.sweep_blocks:
+        try:
+            from sweep_blocks import sweep
+            print("\n[main] ══ 前置 BLOCK 扫描 (D1) ══")
+            r = sweep(op_dir, quick=args.sweep_quick)
+            if r.get("error"):
+                print(f"[main] sweep 失败: {r['error']} → 用当前 BLOCK 继续")
+        except Exception as e:
+            print(f"[main] sweep 异常: {str(e)[:200]} → 继续主循环 (不阻断)")
     from agents.scheduler import Scheduler
     s = Scheduler(op_dir, max_rounds=args.max_rounds,
                   target_speedup=args.target, stub=args.stub, resume=args.resume)

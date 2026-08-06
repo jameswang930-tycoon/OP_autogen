@@ -283,12 +283,12 @@ python3 input/matmul/real_report.py <round_dir>/06_diagnosis/diagnosis.json
 
 ## 10. 后续开发计划
 
-- **Tier3 确定性 sweep（规划中，未实现）**：分块层(BLOCK_M/N/K)是确定性小空间(16 倍数×UB/L0 约束)，
-  用穷举替代笨 LLM 调参更稳更快。拟做成 `TIER3_SWEEP=1` opt-in 模式（默认 OFF，不碰现有流程）：
-  到 Tier3 时对 BLOCK 候选逐个 verify 选最优。**注意：每个候选=一次真机 msprof（分钟级），
-  10-20 候选约半小时+，需先 sim 验证逻辑再真机试。**
+- ✅ **前置 BLOCK 扫描（已实现 `sweep_blocks.py` + `main.py --sweep-blocks`）**：
+  分块层(BLOCK_M/N/K)是确定性小空间(16 倍数×UB/L0 约束)，用穷举替代笨 LLM 调参更稳。
+  优化前先扫 L0 合法候选，msprof 取最快写回 config 区（固定"乘性地基"，防分块差几十倍）。
+  ⚠ 每个候选=一次真机 msprof（分钟级），8 候选约半小时+，一次性成本。
 - **A1 修复**：attention_mlp 的 `matmul_kernel` 被 5 种形状复用 → msprof 同名聚合 deep 画像混合，
-  应拆独立函数名（对齐 matmul 算子 matmul_kernel2 的纪律）。
+  应拆独立函数名（对齐 matmul 算子 matmul_kernel2 的纪律）；D4 已在 coder 加同名多匹配警告。
 - **测量完整性**：verify 增加 per-kernel 期望 launch 校验（防漏记虚高）；
   双次 msprof 稳定性门控（成本高，待定）。
 - **项目自身瓶颈分析**：`outputs/<op>/stats/timing_stats.json` 已输出各阶段耗时，

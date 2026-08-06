@@ -153,7 +153,7 @@ def test_promote_backoff():
     assert tiers[0] == 1 and tiers[1] == 2 and tiers[2] == 3 and tiers[3] == 1, tiers
     print("[4] ✅ promote_to 晋升(1→2→3) + 回退(3→1) 正确")
 
-# ═══ 5. 目标加速比达标即停 ═══
+# ═══ 5. ★D3: 目标加速比达标 → 不硬停, 继续探 (防过早停) ═══
 def test_target_stop():
     PlannerAgent.generate_v4 = flip_gen()
     def verify(kernel_op, round_dir, baseline_ns=None, num_kernels=None):
@@ -163,9 +163,11 @@ def test_target_stop():
     s = make_sched(optimize_ok, verify, max_rounds=15, target=1.2)
     s.run()
     st, hist = read_hist()
-    assert len(hist) == 1, len(hist)
+    # ★D3: 第1轮达 1.3x ≥ 1.2 → 达标不硬停, 继续探 (由 no_improve/max_rounds 收尾), 不止 1 轮
+    assert len(hist) >= 2, f"D3 达标应继续探, got {len(hist)} 轮"
+    assert st["best_speedup"] == 1.3
     assert hist[0]["speedup"] == 1.3
-    print(f"[5] ✅ target=1.2, round1 达 1.3x → 达标即停 (只跑 {len(hist)} 轮)")
+    print(f"[5] ✅ D3: target=1.2, round1 达 1.3x → 不硬停, 继续探 ({len(hist)} 轮), best={st['best_speedup']}x")
 
 # ═══ 6. 连续 3 轮无改进 → 兜底晋升 ═══
 def test_no_improve_promote():

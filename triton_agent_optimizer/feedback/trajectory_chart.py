@@ -40,6 +40,28 @@ TIER_FG   = ["#2e7d32","#e65100","#1565c0","#c62828","#6a1b9a","#00695c"]
 TIER_NAME = ["Algorithm","Fusion","Tiling","Memory","Compute","Architecture"]
 
 
+def _load_pytorch_tflops(kernel_dir: Path, state: dict):
+    """PyTorch 基准线 TFLOPS: 优先 state (scheduler 存好的), 缺则按算子自动读 bench json.
+    ★不再回退到误导的默认 9.2 — 没有真实基准就返回 None, 图上不画虚线.
+    按算子选基准: attention → pytorch_attention; 多matmul/MLP → pytorch_mlp; 单 matmul → pytorch."""
+    st_val = state.get("pytorch_tflops")
+    if st_val:
+        return st_val
+    bench_dir = _PROJECT_DIR / "bench_910b3"
+    op = kernel_dir.name.lower()
+    cands = (["pytorch_attention_tflops.json", "pytorch_mlp_tflops.json", "pytorch_tflops.json"]
+             if "attention" in op
+             else ["pytorch_mlp_tflops.json", "pytorch_tflops.json"])
+    for f in cands:
+        p = bench_dir / f
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))["tflops"]
+            except Exception:
+                continue
+    return None
+
+
 def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     traj_file = kernel_dir / "optimization_trajectory.json"
     if not traj_file.exists():
@@ -67,7 +89,8 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
 
     # TFLOPS: 从 state.baseline_ns 算 (需 M/N/K, 存在 state 里) 或默认
     initial_tflops = state.get("initial_tflops") or 6.4
-    pytorch_tflops = state.get("pytorch_tflops") or 9.2
+    # ★PyTorch 基准: 优先 state (scheduler 存的), 缺则自动按算子读 bench json; None = 无真实数据 → 不画误导虚线
+    pytorch_tflops = _load_pytorch_tflops(kernel_dir, state)
     # ★F3: hist 若存了每轮真实 tflops (kernel 结构变化后 FLOPs 变) 就逐轮用, 否则 initial×speedup 兜底
     hist_tflops = [r.get("tflops") for r in history]
     per_round_tf = [
@@ -109,14 +132,15 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
             ax.axvspan(start - 0.4, end + 0.4, alpha=0.55,
                        color=TIER_BG[(tier-1)%6], zorder=0)
 
-    # ═══ PyTorch baseline ═══
-    pytorch_speedup = pytorch_tflops / initial_tflops
-    ax.axhline(y=pytorch_speedup, color="gray", linestyle="--", linewidth=2.5,
-               alpha=0.8, zorder=1)
-    ax.text(len(rounds)-1, pytorch_speedup + 0.03,
-            f"PyTorch eager ({pytorch_tflops:.1f} TFLOPS)",
-            fontsize=10, color="gray", ha="right", va="bottom",
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
+    # ═══ PyTorch baseline (只有真实基准数据才画, 缺则不画误导虚线) ═══
+    if pytorch_tflops:
+        pytorch_speedup = pytorch_tflops / initial_tflops
+        ax.axhline(y=pytorch_speedup, color="gray", linestyle="--", linewidth=2.5,
+                   alpha=0.8, zorder=1)
+        ax.text(len(rounds)-1, pytorch_speedup + 0.03,
+                f"PyTorch eager ({pytorch_tflops:.1f} TFLOPS)",
+                fontsize=10, color="gray", ha="right", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
 
     # ═══ Running Best ═══
     running_best = np.maximum.accumulate(np.array(cum_speeds))
@@ -179,12 +203,13 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     total_rounds = len(rounds) - 1
     final_s = running_best[-1]
     final_t = tflops_arr[-1]
+    _vs_pt = (f"  |  vs PyTorch({pytorch_tflops:.1f} TFLOPS): {final_t/pytorch_tflops*100:.0f}%"
+              if pytorch_tflops else "")
     title = (
         f"Optimization Trajectory: {kernel_dir.name}     "
         f"Rounds: {total_rounds}  |  "
         f"TFLOPS: {initial_tflops:.1f} -> {final_t:.2f}  |  "
-        f"Speedup: {final_s:.2f}x  |  "
-        f"vs PyTorch({pytorch_tflops:.1f} TFLOPS): {final_t/pytorch_tflops*100:.0f}%"
+        f"Speedup: {final_s:.2f}x{_vs_pt}"
     )
     ax.set_title(title, fontsize=13, fontweight="bold", pad=22)
     ax.set_ylabel("Cumulative Speedup (x)", fontsize=13, color="#1565c0")

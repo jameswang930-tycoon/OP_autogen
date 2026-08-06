@@ -313,8 +313,9 @@ class Scheduler:
         env["TIER"] = str(tier)
         # ★流式打印 run_optimize 输出 → 终端 + 运行日志 (outputs/<op>/optimization.log)
         try:
+            # ★编码: backslashreplace 代替 replace — 非 UTF-8 字节转成 \xNN 保留信息, 不再变成 � 丢字节
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, encoding="utf-8", errors="replace", env=env)
+                                    text=True, encoding="utf-8", errors="backslashreplace", env=env)
             import threading as _th
 
             def _drain():

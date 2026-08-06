@@ -436,7 +436,8 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
 
     # warmup: 裸跑预热 (KERNEL_LOOP=loop, JIT 编译/冷cache 预热; 便宜)
     for i in range(warmup):
-        subprocess.run([py, str(kernel_op)], capture_output=True, text=True, timeout=1800, env=env)
+        subprocess.run([py, str(kernel_op)], capture_output=True, text=True,
+                       encoding="utf-8", errors="backslashreplace", timeout=1800, env=env)
     print(f"  [Verify] warmup x{warmup} (每轮内部 {loop} 次) done, 1 次 msprof 测 {loop} 次平均...")
 
     # measure: 一次 msprof, app 内部循环 loop 次 → 和 ÷loop = 单次端到端
@@ -445,7 +446,8 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
     cmd = ["msprof", f"--output={msprof_out}",
            f"--application={py} {kernel_op}", "--ai-core=on"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200, env=env)
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="backslashreplace", timeout=7200, env=env)
     except Exception as e:
         return {"ok": False, "error": f"msprof run failed: {e}"}
     total_us, n_rows = _read_target_duration(msprof_out)

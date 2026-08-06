@@ -111,7 +111,7 @@ class LLMClient:
             import threading
             proc = subprocess.Popen(["bash", "-c", shell_cmd],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, encoding="utf-8", errors="replace")
+                                    text=True, encoding="utf-8", errors="backslashreplace")
 
             out_lines, err_lines = [], []
 

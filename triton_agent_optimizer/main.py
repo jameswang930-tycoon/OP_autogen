@@ -25,15 +25,24 @@ LLM 调用（服务器无 Claude API, 用本地 codeagent）:
      python3 input/matmul/kernel_op.py
      # 预期: [info] kernel launched & synced OK
   2. 完整优化循环 (一键; input/ 下任一算子目录, 都是标准 kernel_op.py 单文件):
-     LLM_CLI_COMMAND="nga run" python3 main.py input/matmul --fresh --max-rounds 15          # 两层 MLP (3 kernel)
-     LLM_CLI_COMMAND="nga run" python3 main.py input/attention_mlp --fresh --max-rounds 15   # 自注意力+MLP (5 kernel)
-     LLM_CLI_COMMAND="nga run" python3 main.py input/rms_norm --fresh --max-rounds 15        # 归约 (Tier2/5)
-     LLM_CLI_COMMAND="nga run" python3 main.py input/flash_attention --fresh --max-rounds 15 # 多头因果 flash (Tier1/2)
-     LLM_CLI_COMMAND="nga run" python3 main.py input/conv2d --fresh --max-rounds 15          # 卷积 (内存瓶颈 Tier4/5)
-     LLM_CLI_COMMAND="nga run" python3 main.py input/conv_bias_relu --fresh --max-rounds 15  # conv+bias+relu 3kernel (Tier2 融合)
+     # ── 多 kernel / matmul 族 (融合 + 分块空间) ──
+     LLM_CLI_COMMAND="nga run" python3 main.py input/matmul --fresh --max-rounds 30            # 两层 MLP (3 kernel, Tier2 融合)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/attention_mlp --fresh --max-rounds 30     # 自注意力+MLP (5 kernel, Tier1/2)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/matmul_relu --fresh --max-rounds 30       # matmul+relu 2kernel (Tier2 epilogue 融合)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/matmul_transpose --fresh --max-rounds 30  # 转置 matmul (Tier4 strided→预转置)
+     # ── attention 族 (算法 + 融合) ──
+     LLM_CLI_COMMAND="nga run" python3 main.py input/flash_attention --fresh --max-rounds 30   # 多头因果 flash (Tier1 因果剪枝)
+     # ── 归约 / 逐元素 (访存 + 计算优化) ──
+     LLM_CLI_COMMAND="nga run" python3 main.py input/rms_norm --fresh --max-rounds 30          # RMSNorm 归约 (Tier4/5)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/layernorm --fresh --max-rounds 30         # LayerNorm 两遍扫 (Tier1 单遍合并)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/sigmoid --fresh --max-rounds 30           # 纯逐元素 sigmoid (Tier5 原生指令)
+     # ── 卷积族 (算法 im2col + 融合) ──
+     LLM_CLI_COMMAND="nga run" python3 main.py input/conv2d --fresh --max-rounds 30            # 卷积 (Tier1 im2col 走 cube)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/conv_bias_relu --fresh --max-rounds 30    # conv+bias+relu 3kernel (Tier2 融合)
      # 每轮: 采集→07字段→planner→coder→正确性校验→msprof端到端→加速比
      # 从头开始(清 outputs/<op> + 重置): 加 --fresh
      # 续跑(从上次 round 继续, 不清旧产物): 不加 --fresh
+     # 轮数 30 = 每个算子跑满 30 轮看最优 (默认 max_rounds=200, 这里用 30 省时间)
   3. 只采集+解析 (不跑优化):
      bash analyzers/run_optimize.sh input/matmul input/matmul/e2e_run
   4. 只看各 tier 筛字段:
@@ -45,7 +54,7 @@ LLM 调用（服务器无 Claude API, 用本地 codeagent）:
   ══════════════════════════════════════════════════════════
 
 Usage:
-  python main.py input/matmul [--max-rounds N] [--target 1.5] [--stub]
+  python main.py input/matmul --fresh --max-rounds 30 [--target 1.5] [--stub]
 """
 from __future__ import annotations
 

@@ -185,6 +185,77 @@ def _read_op_params(code: str) -> dict:
     return params
 
 
+def _build_runner_body(module_code: str, setup: str, cands_json: str,
+                       vars_: tuple, warmup: int, loop: int) -> str:
+    """构造 sweep runner 脚本 — ★修 indentation bug:
+    旧模板 textwrap.dedent 只包住第一行片段, 主体每行残留 4 空格 → 生成脚本第 2 行
+    IndentationError → subprocess 一跑就崩, sweep 从未正常生成.
+    现在: module_code/setup 先重缩进 4 空格与模板对齐, 整段统一缩进后 textwrap.dedent."""
+    import textwrap as _tw
+    # ★模板行统一 4 空格基线 (与 module_code/setup 重缩进对齐), 整段 dedent → 列0.
+    #   (之前模板行列0 + module_code缩进4 → 最小缩进=0, dedent 空转, module_code 残留4空格 → 生成脚本崩)
+    body = f"""\
+    import os, sys, json, math, time
+    import torch
+    import torch_npu
+    import triton
+    import triton.language as tl
+
+    # Module-level code from kernel_op.py (imports, config, kernel defs)
+    {_tw.indent(module_code, "    ")}
+
+    # Tensor setup + run_one
+    {_tw.indent(setup, "    ")}
+
+    # Sweep
+    CANDIDATES = {cands_json}
+    WARMUP = int(os.environ.get("SWEEP_WARMUP", "{warmup}"))
+    LOOP   = int(os.environ.get("SWEEP_LOOP", "{loop}"))
+    results = []
+    n_total = len(CANDIDATES)
+
+    print(f"[sweep] {{n_total}} candidates, warmup={{WARMUP}}, loop={{LOOP}}", flush=True)
+
+    for idx, cfg in enumerate(CANDIDATES):
+        {', '.join(f'{v}=cfg[{i}]' for i, v in enumerate(vars_))}
+        try:
+            for _ in range(WARMUP):
+                run_one({', '.join(vars_)})
+            torch.npu.synchronize()
+            times = []
+            for _ in range(LOOP):
+                ev_s = torch.npu.Event(enable_timing=True)
+                ev_e = torch.npu.Event(enable_timing=True)
+                ev_s.record()
+                run_one({', '.join(vars_)})
+                ev_e.record()
+                torch.npu.synchronize()
+                times.append(ev_s.elapsed_time(ev_e))
+            avg_ns = sum(times) / len(times) * 1e6
+            results.append({{"block": list(cfg), "ns": round(avg_ns, 1)}})
+            print(f"  [{{idx+1}}/{{n_total}}] {{cfg}}: {{avg_ns:.0f}}ns", flush=True)
+        except Exception as e:
+            results.append({{"block": list(cfg), "ns": None, "error": str(e)[:120]}})
+            print(f"  [{{idx+1}}/{{n_total}}] {{cfg}}: ERROR {{str(e)[:100]}}", flush=True)
+
+    valid = [r for r in results if r.get("ns")]
+    errs  = [r for r in results if not r.get("ns")]
+    valid.sort(key=lambda r: r["ns"])
+    out = {{"measured_at": __import__("datetime").datetime.now().isoformat(),
+           "total_candidates": n_total, "valid": len(valid), "errors": len(errs),
+           "warmup": WARMUP, "loop": LOOP,
+           "results": valid + errs}}
+    out_path = os.environ.get("SWEEP_OUTPUT", "sweep_result.json")
+    json.dump(out, open(out_path, "w"), ensure_ascii=False, indent=1)
+    print(f"\\n[sweep] Done: {{len(valid)}} valid + {{len(errs)}} errors -> {{out_path}}", flush=True)
+    if valid:
+        print(f"[sweep] Best: {{valid[0]['block']}} = {{valid[0]['ns']:.0f}}ns", flush=True)
+    """
+    return ("#!/usr/bin/env python3\n"
+            '"""Auto-generated BLOCK sweep runner — DO NOT EDIT."""\n'
+            + _tw.dedent(body))
+
+
 def _generate_matmul_runner(op_dir: Path, candidates: List[Tuple],
                             op_meta: dict, op_name: Optional[str] = None) -> str:
     """生成 matmul 型算子的 sweep runner 脚本.
@@ -321,70 +392,9 @@ def _generate_matmul_runner(op_dir: Path, candidates: List[Tuple],
     else:
         raise ValueError(f"未知 matmul 型算子: {op}")
 
-    runner = textwrap.dedent(f"""\
-    #!/usr/bin/env python3
-    """ + '"""Auto-generated BLOCK sweep runner — DO NOT EDIT."""' + f"""
-    import os, sys, json, math, time
-    import torch
-    import torch_npu
-    import triton
-    import triton.language as tl
-
-    # ── Module-level code from kernel_op.py (imports, config, kernel defs) ──
-    {module_code}
-
-    {setup}
-
-    # ── Sweep ──
-    CANDIDATES = {cands_json}
-    WARMUP = int(os.environ.get("SWEEP_WARMUP", "{DEFAULT_WARMUP}"))
-    LOOP   = int(os.environ.get("SWEEP_LOOP", "{DEFAULT_LOOP}"))
-    results = []
-    n_total = len(CANDIDATES)
-
-    print(f"[sweep] {{n_total}} candidates, warmup={{WARMUP}}, loop={{LOOP}}", flush=True)
-
-    for idx, cfg in enumerate(CANDIDATES):
-        {', '.join(f'{v}=cfg[{i}]' for i, v in enumerate(vars_))}
-        try:
-            # Warmup
-            for _ in range(WARMUP):
-                run_one({', '.join(vars_)})
-            torch.npu.synchronize()
-
-            # Timing
-            times = []
-            for _ in range(LOOP):
-                ev_s = torch.npu.Event(enable_timing=True)
-                ev_e = torch.npu.Event(enable_timing=True)
-                ev_s.record()
-                run_one({', '.join(vars_)})
-                ev_e.record()
-                torch.npu.synchronize()
-                times.append(ev_s.elapsed_time(ev_e))
-
-            avg_ns = sum(times) / len(times) * 1e6  # ms → ns
-            results.append({{"block": list(cfg), "ns": round(avg_ns, 1)}})
-            print(f"  [{{idx+1}}/{{n_total}}] {{cfg}}: {{avg_ns:.0f}}ns", flush=True)
-        except Exception as e:
-            results.append({{"block": list(cfg), "ns": None, "error": str(e)[:120]}})
-            print(f"  [{{idx+1}}/{{n_total}}] {{cfg}}: ERROR {{str(e)[:100]}}", flush=True)
-
-    # Sort & save
-    valid = [r for r in results if r.get("ns")]
-    errs  = [r for r in results if not r.get("ns")]
-    valid.sort(key=lambda r: r["ns"])
-    out = {{"measured_at": __import__("datetime").datetime.now().isoformat(),
-           "total_candidates": n_total, "valid": len(valid), "errors": len(errs),
-           "warmup": WARMUP, "loop": LOOP,
-           "results": valid + errs}}
-    out_path = os.environ.get("SWEEP_OUTPUT", "sweep_result.json")
-    json.dump(out, open(out_path, "w"), ensure_ascii=False, indent=1)
-    print(f"\\n[sweep] Done: {{len(valid)}} valid + {{len(errs)}} errors → {{out_path}}", flush=True)
-    if valid:
-        print(f"[sweep] Best: {{valid[0]['block']}} = {{valid[0]['ns']:.0f}}ns", flush=True)
-    """)
-    return runner
+    # ★修 indentation bug: 统一走 _build_runner_body (整体 dedent + module_code/setup 重缩进)
+    return _build_runner_body(module_code, setup, cands_json, vars_,
+                              DEFAULT_WARMUP, DEFAULT_LOOP)
 
 
 def _generate_conv2d_runner(op_dir: Path, candidates: List[Tuple],
@@ -439,67 +449,9 @@ def _generate_conv2d_runner(op_dir: Path, candidates: List[Tuple],
     else:
         raise ValueError(f"未知 conv2d 型算子: {op}")
 
-    runner = textwrap.dedent(f"""\
-    #!/usr/bin/env python3
-    """ + '"""Auto-generated BLOCK sweep runner — DO NOT EDIT."""' + f"""
-    import os, sys, json, math, time
-    import torch
-    import torch_npu
-    import triton
-    import triton.language as tl
-
-    # ── Module-level code from kernel_op.py ──
-    {module_code}
-
-    {setup}
-
-    # ── Sweep ──
-    CANDIDATES = {cands_json}
-    WARMUP = int(os.environ.get("SWEEP_WARMUP", "{DEFAULT_WARMUP}"))
-    LOOP   = int(os.environ.get("SWEEP_LOOP", "{DEFAULT_LOOP}"))
-    results = []
-    n_total = len(CANDIDATES)
-
-    print(f"[sweep] {{n_total}} candidates, warmup={{WARMUP}}, loop={{LOOP}}", flush=True)
-
-    for idx, cfg in enumerate(CANDIDATES):
-        {', '.join(f'{v}=cfg[{i}]' for i, v in enumerate(vars_))}
-        try:
-            for _ in range(WARMUP):
-                run_one({', '.join(vars_)})
-            torch.npu.synchronize()
-
-            times = []
-            for _ in range(LOOP):
-                ev_s = torch.npu.Event(enable_timing=True)
-                ev_e = torch.npu.Event(enable_timing=True)
-                ev_s.record()
-                run_one({', '.join(vars_)})
-                ev_e.record()
-                torch.npu.synchronize()
-                times.append(ev_s.elapsed_time(ev_e))
-
-            avg_ns = sum(times) / len(times) * 1e6
-            results.append({{"block": list(cfg), "ns": round(avg_ns, 1)}})
-            print(f"  [{{idx+1}}/{{n_total}}] {{cfg}}: {{avg_ns:.0f}}ns", flush=True)
-        except Exception as e:
-            results.append({{"block": list(cfg), "ns": None, "error": str(e)[:120]}})
-            print(f"  [{{idx+1}}/{{n_total}}] {{cfg}}: ERROR {{str(e)[:100]}}", flush=True)
-
-    valid = [r for r in results if r.get("ns")]
-    errs  = [r for r in results if not r.get("ns")]
-    valid.sort(key=lambda r: r["ns"])
-    out = {{"measured_at": __import__("datetime").datetime.now().isoformat(),
-           "total_candidates": n_total, "valid": len(valid), "errors": len(errs),
-           "warmup": WARMUP, "loop": LOOP,
-           "results": valid + errs}}
-    out_path = os.environ.get("SWEEP_OUTPUT", "sweep_result.json")
-    json.dump(out, open(out_path, "w"), ensure_ascii=False, indent=1)
-    print(f"\\n[sweep] Done: {{len(valid)}} valid + {{len(errs)}} errors → {{out_path}}", flush=True)
-    if valid:
-        print(f"[sweep] Best: {{valid[0]['block']}} = {{valid[0]['ns']:.0f}}ns", flush=True)
-    """)
-    return runner
+    # ★修 indentation bug: 统一走 _build_runner_body (整体 dedent + module_code/setup 重缩进)
+    return _build_runner_body(module_code, setup, cands_json, vars_,
+                              DEFAULT_WARMUP, DEFAULT_LOOP)
 
 
 def _generate_runner(op_dir: Path, candidates: List[Tuple],
@@ -685,6 +637,8 @@ def sweep(op_dir: Path, quick: bool = False, out_dir: Optional[Path] = None,
         print(f"[sweep] 无有效候选, 当前 {cur} 保留")
         return {"best_block": cur, "results": results, "unchanged": True}
 
+    # ★防御: 自己按 ns 升序排, 不依赖 runner 已排序 (runner 排序丢失/改动也不选错)
+    valid.sort(key=lambda r: r["ns"])
     best = valid[0]
     cur_result = next((r for r in valid if tuple(r["block"]) == cur_tuple), None)
     cur_ns = cur_result["ns"] if cur_result else None
@@ -708,9 +662,14 @@ def sweep(op_dir: Path, quick: bool = False, out_dir: Optional[Path] = None,
                 "candidates_tested": len(candidates)}
 
     if best_block == cur_tuple:
-        print(f"\n[sweep] 当前 {cur} ({cur_ns:.0f}ns) 已是 {len(valid)} 候选中最优, 保留")
+        # ★当前块若实测失败 (ns=None) 也在 valid 里出现不了 → 不会走到这; 仍防御
+        print(f"\n[sweep] 当前 {cur} ({cur_ns:.0f}ns) 已是 {len(valid)} 候选中最优, 保留"
+              if cur_ns else f"\n[sweep] 当前 {cur} 实测失败, 保留")
     else:
-        print(f"\n[sweep] 最优 {best_block} ({best['ns']:.0f}ns) 但 ≤ 当前 {cur_ns:.0f}ns, 保留当前")
+        # ★bug 修复: 当前块实测失败 (ns=None) 时 {cur_ns:.0f} 会崩 → 防御
+        print(f"\n[sweep] 最优 {best_block} ({best['ns']:.0f}ns) 但 ≤ 当前 {cur_ns:.0f}ns, 保留当前"
+              if cur_ns else
+              f"\n[sweep] 最优 {best_block} ({best['ns']:.0f}ns); 当前块实测失败, 保留当前")
     _write_report(out_root, cur, results, meta["vars"])
     return {"best_block": cur, "results": results, "unchanged": True,
             "candidates_tested": len(candidates)}

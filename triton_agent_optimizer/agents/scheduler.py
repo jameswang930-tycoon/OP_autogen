@@ -458,8 +458,13 @@ class Scheduler:
         else:
             ck = Path(self.traj["state"]["current_kernel"])
             self.current_kernel = ck if ck.exists() else (op_dir / "kernel_op.py")
-            print(f"  [Scheduler] 续跑: 从 tier{self.traj['state'].get('tier')} "
-                  f"round{self.traj['state'].get('round')} 继续, kernel={self.current_kernel}")
+            # ★Bug 8: resume 旧 trajectory 可能缺 handoff/tier_jumps 键 → 补上防后续 None 操作
+            _st = self.traj["state"]
+            _st.setdefault("handoff", None)
+            _st.setdefault("tier_jumps", [])
+            _st.setdefault("promote_budget", 0)
+            print(f"  [Scheduler] 续跑: 从 tier{_st.get('tier')} "
+                  f"round{_st.get('round')} 继续, kernel={self.current_kernel}")
 
     def _reset_state(self):
         """初始化: 从头开始 (round1/tier1 读源文件)。"""
@@ -919,11 +924,15 @@ class Scheduler:
         """
         planner_promote = getattr(plan, "promote", False)
         # ★无改进 = 本轮加速比没超过上一轮已接受×噪声地板; 数"本 tier 连续无改进"轮数 (跨 tier 即断)
+        # ★Bug 7: 仅"采集失败"轮不算无改进优化轮 (环境问题, 非优化本身失败);
+        #   coder/verify 失败 (decision=FAIL 但非采集失败) 仍计 no_improve (那是优化尝试失败=确实没改进)
         no_improve = 0
         floor = _keep_floor()
         for h in reversed(self.traj["history"]):
             if h.get("tier") != tier:
                 break
+            if "采集失败" in (h.get("strategy") or h.get("error") or ""):
+                continue   # ★采集失败是环境问题, 不算优化轮, 跳过
             if h.get("speedup", 0) > h.get("prev_speedup", 0) * floor:
                 break
             no_improve += 1
@@ -1317,8 +1326,9 @@ class Scheduler:
                     print(f"  ⚠ 运行失败(第{attempt+1}次): {prev_err[:200]}... 回传 Coder 同轮改")
                 if v is None:
                     # ★3次都是 coder 应用失败 → 本轮 FAIL (不产生假 speedup), 错误已在 prev_err → history
+                    # ★Bug 9: 用 prev_speedup 而非假 1.0, 否则 history 出现假掉点 + no_improve 误计
                     v = {"ok": False, "error": f"coder 连续3次未成功应用: {(prev_err or '')[:160]}",
-                         "speedup": 1.0, "ns": None}
+                         "speedup": prev_speedup, "ns": None}
 
             # ★兜底: 保证每个 round 目录都有 kernel_op.py (格式一致)
             if not round_kernel.exists():

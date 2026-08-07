@@ -58,7 +58,19 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 START_DIR="$(pwd)"    # 调用时 cwd — 相对路径参数归一化为绝对 (msprof/拷贝依赖绝对路径)
 INPUT_DIR="${1:-$REPO_ROOT/input/matmul}"
 OUT="${2:-$INPUT_DIR/e2e_run}"
-M=${3:-512}; N=${4:-512}; K=${5:-512}
+M=${3:-}; N=${4:-}; K=${5:-}
+# ★bug 修复: 旧默认 512 会覆盖 kernel 源码尺寸 — 调度器提取不到 M/N/K (如 coder 改了 config 格式)
+#   时, 采集跑 512³ 而 verify 跑源码默认 2048³ → 加速比虚高 (2048/512)³=64×, 静默无 guard.
+#   现在只在显式传 M/N/K 时才导出 MATMUL_*; 否则 kernel 用自己的 config 默认尺寸, 与 verify 同口径.
+if [ -n "$M" ] && [ -n "$N" ] && [ -n "$K" ]; then
+    export MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K
+    echo "  [尺寸] 显式 M/N/K=$M/$N/$K → 导出 MATMUL_* (覆盖 kernel 默认)"
+    echo "  ★注: M/N/K 只映射 matmul 族 (MATMUL_* env); 其余算子读各自 env"
+    echo "       (FA_SEQ/FA_HEADS/FA_DIM, RMS_M/RMS_N, CONV_*), 用 config 默认值 —"
+    echo "       需改尺寸请设对应 env, 不要指望 M/N/K 参数生效"
+else
+    echo "  [尺寸] 未指定 M/N/K → 用 kernel 源码 config 默认尺寸 (与 verify 同口径)"
+fi
 TIER=${TIER:-1}    # 当前优化阶段 1~6 (调度器传; 决定 07 筛哪层字段)
 # ★相对路径→绝对路径 (脚本内部 cd 换目录后, 相对路径会解析错位)
 case "$INPUT_DIR" in /*) ;; *) INPUT_DIR="$START_DIR/$INPUT_DIR";; esac
@@ -99,15 +111,17 @@ D="$OUT/06_diagnosis"
 #    msprof 首次 attach 可能漏掉前几个 kernel; 且首 launch 含 JIT 编译(秒级)。
 #    verify (verify_end_to_end) 已热身 → baseline 必须同口径, 否则 speedup 失真
 APP_ABS="$RUN_DIR/$RUN_PY"    # 绝对路径, 避免 msprof 从别的 cwd 解析不到
-MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K $PY "$APP_ABS" > "$OUT/05_task/warmup.txt" 2>&1 || true
+$PY "$APP_ABS" > "$OUT/05_task/warmup.txt" 2>&1 || true
 echo "  ⚡ warmup 裸跑 (JIT 编译/设备初始化) done"
 
 # 1a. 通用 msprof 先跑 (任务级 op_summary → distinct kernel 名 → 骨架)
 TASK_OUT="$OUT/05_task/task_prof"; rm -rf "$TASK_OUT"; mkdir -p "$TASK_OUT"
-MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof --output="$TASK_OUT" \
+msprof --output="$TASK_OUT" \
   --application="$PY $APP_ABS" --ai-core=on > "$OUT/05_task/task_run.txt" 2>&1
+MSPROF_RC=$?
+# ★bug 修复: 旧代码 `echo 退出码=$?` 在 find|wc 之后 → $? 是 find 的(恒0), 不是 msprof 的.
 OPSUM=$(find "$OUT/05_task" -name 'op_summary*.csv' 2>/dev/null | wc -l)
-echo "  通用 msprof 退出码=$? op_summary x$OPSUM (app=$APP_ABS)"
+echo "  通用 msprof 退出码=$MSPROF_RC op_summary x$OPSUM (app=$APP_ABS)"
 [ "$OPSUM" -gt 0 ] && pass "op_summary (骨架/kernel 数)" || fail "无 op_summary (看 $OUT/05_task/task_run.txt)"
 "$PY" "$SCRIPT_DIR/pipeline_parse_task.py" "$TASK_OUT" "$D/task.json" || true
 [ -f "$D/task.json" ] || echo '{}' > "$D/task.json"
@@ -144,7 +158,7 @@ for KNAME in "${KERNELS[@]}"; do
   IDX=$((IDX+1))
   BOUT="$OUT/04_board/op_${IDX}"
   rm -rf "$BOUT"; mkdir -p "$BOUT"
-  MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K msprof op --kernel-name="$KNAME" \
+  msprof op --kernel-name="$KNAME" \
     --output="$BOUT" --warm-up=10 $PY "$APP_ABS" > "$OUT/04_board/board_${IDX}.txt" 2>&1
   MC=$(find "$BOUT" -name 'Memory.csv' 2>/dev/null | head -1)
   if [ -n "$MC" ]; then
@@ -215,7 +229,7 @@ if [ "$MULTI" = "1" ]; then
   mkdir -p "$FUSION_DIR"
   rm -rf ~/.triton
   export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
-  (cd "$RUN_DIR" && MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K $PY "$APP_ABS" > "$OUT/04_board/compile.txt" 2>&1)
+  (cd "$RUN_DIR" && $PY "$APP_ABS" > "$OUT/04_board/compile.txt" 2>&1)
   cp ~/.triton/dump/*/kernel.ttadapter.mlir "$FUSION_DIR/" 2>/dev/null || \
     cp ~/.triton/dump/*/kernel.*.mlir "$FUSION_DIR/" 2>/dev/null || true
   HIVM_OK=0

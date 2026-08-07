@@ -94,7 +94,7 @@ def render_v4(d, llm=False):
     if llm:
         print("=== SUMMARY ===")
         print(f"num_kernels={s.get('num_kernels')}  filled={s.get('filled_kernels')}  "
-              f"total_ns={_f(s.get('total_ns'))}  cores={_f(s.get('num_cores'))}  "
+              f"total_ns={_f(s.get('total_ns'))}  grid={_f(s.get('num_cores'))}  "  # ★grid 非核数
               f"api_us={_f(s.get('api_overhead_total_us'))}  l2={_f(s.get('l2_hit_rate'))}")
         for k in d.get("kernels", []):
             print()
@@ -105,7 +105,7 @@ def render_v4(d, llm=False):
     print()
     print("=== SUMMARY ===")
     print(f"  num_kernels   = {s.get('num_kernels')}    filled = {s.get('filled_kernels')}")
-    print(f"  total_ns      = {_fmt_ns(s.get('total_ns'))}    num_cores = {_f(s.get('num_cores'))}")
+    print(f"  total_ns      = {_fmt_ns(s.get('total_ns'))}    grid = {_f(s.get('num_cores'))}")
     print(f"  api_overhead  = {_f(s.get('api_overhead_total_us'))}us    l2_hit_rate = {_f(s.get('l2_hit_rate'))}")
     print()
     print("=== KERNELS ===")

@@ -97,7 +97,11 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
     print("    [Verify] ✅ 正确性 PASS (MATMUL_VERIFY)")
 
     # measure: 一次 msprof, app 内部循环 loop 次 → 和 ÷loop = 单次端到端
+    # ★bug 修复: 同一 round_dir 可能重试多次 (scheduler 3次尝试), msprof 会把新 CSV 写进同一目录,
+    #   旧 CSV 残留 → _read_target_duration 读 sorted()[0] 会拿到旧数据. 每次先清目录.
+    import shutil as _shutil
     msprof_out = round_dir / "msprof_0"
+    _shutil.rmtree(msprof_out, ignore_errors=True)
     msprof_out.mkdir(parents=True, exist_ok=True)
     cmd = ["msprof", f"--output={msprof_out}",
            f"--application={py} {kernel_op}", "--ai-core=on"]

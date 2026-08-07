@@ -726,10 +726,15 @@ class Scheduler:
             nk = self.traj.get("state", {}).get("num_kernels")
             return verify_end_to_end(kernel, round_dir, baseline_ns, num_kernels=nk)
         except Exception as e:
-            print(f"  [Scheduler] verify stub: {e}")
-            # ★F1对齐: stub 也反推 ns (speedup=1.0 → ns=baseline), 不留 None 脏字段
-            return {"ok": True, "ns": round(baseline_ns, 1) if baseline_ns else None,
-                    "speedup": 1.0, "note": "stub(无真机)"}
+            # ★bug 修复: stub 假 PASS 只允许在 stub 模式 (use_llm=False).
+            #   生产环境 (use_llm=True) 验证异常必须返回 FAIL → 调度器记 FAIL + 回传 coder 修.
+            #   旧逻辑吞掉所有异常成 ok=True/speedup=1.0 → 真实失败被伪装成"无改进"轮, 永回退.
+            if not self.use_llm:
+                print(f"  [Scheduler] verify stub: {e}")
+                return {"ok": True, "ns": round(baseline_ns, 1) if baseline_ns else None,
+                        "speedup": 1.0, "note": "stub(无真机)"}
+            print(f"  [Scheduler] ⚠ verify 异常 (生产): {e}")
+            return {"ok": False, "error": f"verify 异常: {str(e)[:200]}"}
 
     # ★D5: 场景泛化 sanity — 优化后 kernel 在相邻尺寸下仍正确 (防过拟合单一形状).
     #   默认关 (SANITY_VERIFY=1 开); 只动主维度 (×0.5/×2), 失败仅警告不阻断 (主验证已过).
@@ -800,7 +805,10 @@ class Scheduler:
         print(f"  [Tier3] 分块实测 v2: 当前 BLOCK={cur}, "
               f"{'quick 采样' if _quick else '全量枚举'} L0 合法候选 → {sweep_out_dir}", flush=True)
 
-        result = sweep_blocks.sweep(kernel.parent, quick=_quick, out_dir=sweep_out_dir)
+        # ★bug 修复: kernel.parent 在 round>1 是 outputs/<op>/TierX/roundN (name="roundN"),
+        #   sweep() 用 op_dir.name 查 SWEEP_META 会 miss → 静默跳过. 显式传 op_name=self.kernel_name.
+        result = sweep_blocks.sweep(kernel.parent, quick=_quick, out_dir=sweep_out_dir,
+                                    op_name=self.kernel_name)
         # sweep() 把最优块写回 kernel_op.py, 报告写 outputs/<op>/block_sweep/
 
         if result.get("skipped"):
@@ -1018,6 +1026,10 @@ class Scheduler:
                 #   仍失败则跳过本轮(沿用当前 kernel 进下一轮), 连续 3 次才停
                 coll_fail += 1
                 if coll_fail <= 1:
+                    # ★bug 修复: continue 会回到循环顶再 total_rounds += 1 → 重试多计一轮.
+                    #   先回退计数, 重试不消耗预算.
+                    total_rounds -= 1
+                    st["total_rounds"] = total_rounds
                     print(f"  ⚠ 采集失败(第{coll_fail}次), 重试同一轮 {round_dir}...")
                     continue
                 if coll_fail >= 3:
@@ -1080,6 +1092,11 @@ class Scheduler:
                         st["pytorch_baseline"] = pt_file
                     except Exception:
                         pass
+                else:
+                    # ★bug 修复: pytorch_*.json 需手动跑 bench_pytorch_*.py 才生成.
+                    #   缺时静默无 vs-PyTorch 参考 → 打警告 (不阻塞, 但用户该知道).
+                    print(f"  ⚠ 缺 PyTorch 基准 {pt_file} (trajectory 无 vs-PyTorch 参考线). "
+                          f"跑 python3 bench_910b3/bench_pytorch_*.py 生成")
                 # ★基准复测: 诊断 total_ns 是单次 msprof 采样(噪声大),
                 #   用 verify 机制 (warmup + VERIFY_RUNS 轮 msprof 平均) 重测源 kernel,
                 #   与后续轮完全同口径, 加速比才可信. 默认开, VERIFY_BASELINE=0 跳过.
@@ -1245,6 +1262,9 @@ class Scheduler:
                                 self._sanity_verify(round_kernel)
                         else:
                             print(f"  ↩ 回退: 本轮 {speedup:.3f}x < 上一轮 {prev_speedup:.3f}x×{floor} (噪声地板), 沿用上一轮 kernel")
+                        # ★bug 修复: 本轮成功 (即便前几次 coder 失败过) → 清空 prev_err,
+                        #   否则 hist["error"] 记的是之前 coder 失败的旧错误, planner 误以为成功轮有错
+                        prev_err = ""
                         self._save_traj()
                         break
                     prev_err = v.get("error", "unknown error")
@@ -1277,9 +1297,11 @@ class Scheduler:
 
             # ⑦ 记录 + 晋升决策 (hist 记"改了啥+结果"梗概, 让 planner 知道试过什么)
             ok = v.get("ok", False)
-            # NOOP 检测: 本轮写出的 kernel 和改之前的 pre_code 一模一样 (coder 没成功应用)
+            # NOOP 检测: 本轮写出的 kernel 和改之前的 pre_code 一模一样 (coder 没成功应用).
+            # ★bug 修复: promote 轮本来就原样拷贝 pre_code (晋升不改码) → 跳过 NOOP 判定,
+            #   否则 promote 轮被记成 "NOOP" 却 decision="KEEP", history 自相矛盾.
             noop = False
-            if round_kernel.exists() and pre_code:
+            if round_kernel.exists() and pre_code and not getattr(plan, "promote", False):
                 try:
                     noop = (round_kernel.read_text(encoding="utf-8") == pre_code)
                 except Exception:

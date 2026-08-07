@@ -62,7 +62,9 @@ def generate_matmul_candidates(M: int = 2048, N: int = 2048, K: int = 2048,
                                dtype_size: int = 4,
                                min_grid: int = DEFAULT_MIN_GRID,
                                max_grid: int = DEFAULT_MAX_GRID,
-                               verbose: bool = True) -> List[Tuple[int, int, int]]:
+                               verbose: bool = True,
+                               grid_mul: Optional[int] = None,
+                               bk_cap: Optional[int] = None) -> List[Tuple[int, int, int]]:
     """生成 fp32 matmul 型算子的所有 L0 合法 (BM, BN, BK) 候选.
 
     约束:
@@ -72,6 +74,10 @@ def generate_matmul_candidates(M: int = 2048, N: int = 2048, K: int = 2048,
       UB:  BM×BK + BN×BK + BM×BN ≤ 49152  (3 缓冲粗略估算)
       全部 16 倍数 (Cube MMA 基础粒度)
       grid = ceil(M/BM)×ceil(N/BN) ∈ [min_grid, max_grid]  (合理并行度)
+
+    ★grid_mul: 覆盖 grid 第二因子 (flash_attention 的 grid = ceil(seq/BM)×nheads,
+                不是 ceil(N/BN); 传 grid_mul=nheads 避免大 BM 被错误排除).
+    ★bk_cap: 覆盖 BK 上限 (flash_attention 的 K 循环是头维 dim, BK>dim 无意义).
     """
     L0A_MAX = L0A_BYTES // dtype_size  # 16384
     L0B_MAX = L0B_BYTES // dtype_size  # 16384
@@ -84,6 +90,8 @@ def generate_matmul_candidates(M: int = 2048, N: int = 2048, K: int = 2048,
     bn_max = min(1024, L0C_MAX // 16)
     # BK 扫描范围: [16, min(512, L0A_MAX//16, L0B_MAX//16)]
     bk_max = min(512, L0A_MAX // 16, L0B_MAX // 16)
+    if bk_cap:
+        bk_max = min(bk_max, ((bk_cap + 15) // 16) * 16)   # 封顶到 ≤bk_cap 的 16 倍数
 
     candidates = []
     total = 0
@@ -101,7 +109,8 @@ def generate_matmul_candidates(M: int = 2048, N: int = 2048, K: int = 2048,
                     continue
                 # Grid 约束 (与问题尺寸挂钩, 保证核利用率)
                 if M and N:
-                    grid = math.ceil(M / bm) * math.ceil(N / bn)
+                    g2 = grid_mul if grid_mul else math.ceil(N / bn)
+                    grid = math.ceil(M / bm) * g2
                     if grid < min_grid or grid > max_grid:
                         continue
                 candidates.append((bm, bn, bk))
@@ -128,13 +137,18 @@ def generate_conv2d_candidates(OH: int = 64, OW: int = 64, K_OUT: int = 32,
     约束:
       acc = tl.zeros((BLOCK_K, BLOCK_OW)) → BLOCK_K×BLOCK_OW×dtype ≤ 128KB (L0C)
       BLOCK_OW ≤ OW (超出无意义)
+      ★BLOCK_K ≥ K_OUT: kernel 无通道分块循环 (input/conv2d/kernel_op.py 直接 acc[BLOCK_K,BLOCK_OW]),
+        BLOCK_K<K_OUT 只算前 K_OUT 个输出通道 → 半吊子工作量, 计时失真且写回坏块.
       全部 16 倍数
     """
     L0C_MAX = L0C_BYTES // dtype_size  # 32768
 
+    # ★≥K_OUT 的最小 16 倍数 (conv2d 无通道分块, BLOCK_K 必须覆盖全部输出通道)
+    bk_min = max(16, ((K_OUT + 15) // 16) * 16)
+
     candidates = []
     total = 0
-    for bk in range(16, max(16, K_OUT) + 1, 16):
+    for bk in range(bk_min, bk_min + 32, 16):   # K_OUT 及相邻下一个 16 倍数 (mask 处理尾块)
         for bow in range(16, OW + 1, 16):
             total += 1
             if bk * bow > L0C_MAX:
@@ -172,8 +186,10 @@ def _read_op_params(code: str) -> dict:
 
 
 def _generate_matmul_runner(op_dir: Path, candidates: List[Tuple],
-                            op_meta: dict) -> str:
-    """生成 matmul 型算子的 sweep runner 脚本."""
+                            op_meta: dict, op_name: Optional[str] = None) -> str:
+    """生成 matmul 型算子的 sweep runner 脚本.
+    ★op_name: 显式算子名 (round>1 时 op_dir.name="roundN", 不能用来分支选 setup)."""
+    op = op_name or op_dir.name
     kernel_src = (op_dir / "kernel_op.py").read_text(encoding="utf-8")
     # 取 module-level 代码 (imports + config + kernel defs), 去掉 __main__ 块
     module_code = kernel_src.split('if __name__ == "__main__":')[0].rstrip()
@@ -187,26 +203,37 @@ def _generate_matmul_runner(op_dir: Path, candidates: List[Tuple],
 
     cands_json = json.dumps(candidates)
 
-    if op_dir.name == "matmul":
-        # ── 单 matmul: 一 kernel, 简单 setup ──
+    if op == "matmul":
+        # ── MLP 3 kernel: FC1 matmul → bias_gelu → FC2 matmul (★全链路计时, 不能只测 FC1) ──
+        H = params.get("HIDDEN", 2048)
         setup = textwrap.dedent(f"""\
-        # ── Tensor setup (matmul) ──
-        M, N, K = {M}, {N}, {K}
+        # ── Tensor setup (MLP 3 kernel) ──
+        M, K, N = {M}, {K}, {N}
+        HIDDEN = {H}
         DTYPE = torch.float32
         device = torch.device("npu")
-        x = (torch.rand(M, K, dtype=DTYPE, device=device) - 0.5) * 0.1
-        w = (torch.rand(K, N, dtype=DTYPE, device=device) - 0.5) * 0.1
-        z = torch.empty(M, N, dtype=DTYPE, device=device)
+        x  = (torch.rand(M, K, dtype=DTYPE, device=device) - 0.5) * 0.1
+        w1 = (torch.rand(K, HIDDEN, dtype=DTYPE, device=device) - 0.5) * 0.1
+        b1 = (torch.rand(HIDDEN, dtype=DTYPE, device=device) - 0.5) * 0.1
+        w2 = (torch.rand(HIDDEN, N, dtype=DTYPE, device=device) - 0.5) * 0.1
+        z = torch.empty(M, HIDDEN, dtype=DTYPE, device=device)
+        h = torch.empty(M, HIDDEN, dtype=DTYPE, device=device)
+        y = torch.empty(M, N, dtype=DTYPE, device=device)
 
         def run_one(bm, bn, bk):
-            grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
-            matmul_kernel[grid](x, w, z, M, N, K,
-                x.stride(0), x.stride(1), w.stride(0), w.stride(1),
-                z.stride(0), z.stride(1),
-                BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            grid1 = (triton.cdiv(M, bm) * triton.cdiv(HIDDEN, bn),)
+            grid2 = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+            grid_g = (triton.cdiv(M * HIDDEN, BLOCK_SIZE),)
+            matmul_kernel[grid1](x, w1, z, M, HIDDEN, K,
+                x.stride(0), x.stride(1), w1.stride(0), w1.stride(1),
+                z.stride(0), z.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            bias_gelu_kernel[grid_g](z, b1, h, M * HIDDEN, HIDDEN, BLOCK_SIZE=BLOCK_SIZE)
+            matmul_kernel2[grid2](h, w2, y, M, N, HIDDEN,
+                h.stride(0), h.stride(1), w2.stride(0), w2.stride(1),
+                y.stride(0), y.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
         """)
 
-    elif op_dir.name == "attention_mlp":
+    elif op == "attention_mlp":
         # ── 多 kernel 管线: 所有 matmul 相关 kernel 一起跑 ──
         seq = M; dim = N
         setup = textwrap.dedent(f"""\
@@ -225,6 +252,7 @@ def _generate_matmul_runner(op_dir: Path, candidates: List[Tuple],
         q = torch.empty(seq, dim, dtype=DTYPE, device=device)
         k = torch.empty(seq, dim, dtype=DTYPE, device=device)
         v = torch.empty(seq, dim, dtype=DTYPE, device=device)
+        k_t = torch.empty(dim, seq, dtype=DTYPE, device=device)   # ★预转置 K^T (与 kernel 布局一致)
         s = torch.empty(seq, seq, dtype=DTYPE, device=device)
         p = torch.empty(seq, seq, dtype=DTYPE, device=device)
         o = torch.empty(seq, dim, dtype=DTYPE, device=device)
@@ -247,8 +275,9 @@ def _generate_matmul_runner(op_dir: Path, candidates: List[Tuple],
             matmul_kernel[g_hidden](x, wv, v, seq, dim, dim,
                 x.stride(0), x.stride(1), wv.stride(0), wv.stride(1),
                 v.stride(0), v.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
-            # S = Q@K^T · scale
-            attention_scores_kernel[g_scores](q, k, s, seq, dim, scale,
+            # S = Q@K^T · scale  (★k_t 预转置, 与 kernel 布局一致)
+            k_t.copy_(k.T)
+            attention_scores_kernel[g_scores](q, k_t, s, seq, dim, scale,
                 BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
             # P = softmax(S)
             softmax_kernel[g_softmax](s, p, seq, seq, BLOCK=BLOCK_S)
@@ -268,29 +297,29 @@ def _generate_matmul_runner(op_dir: Path, candidates: List[Tuple],
             add_kernel[g_add](z, o, out, seq * dim, BLOCK=BLOCK_S)
         """)
 
-    elif op_dir.name == "flash_attention":
+    elif op == "flash_attention":
         seq = params.get("SEQ", 2048)
         nh = params.get("NHEADS", 8)
         dim = params.get("DIM", 64)
         setup = textwrap.dedent(f"""\
-        # ── Tensor setup (flash_attention) ──
+        # ── Tensor setup (flash_attention) — ★布局与 kernel 一致: Q/V[nh,seq,dim], K[nh,dim,seq] ──
         seq, nh, dim = {seq}, {nh}, {dim}
         scale = 1.0 / (dim ** 0.5)
         DTYPE = torch.float32
         device = torch.device("npu")
-        q = (torch.randn(seq, nh, dim, dtype=DTYPE, device=device)) * 0.1
-        k = (torch.randn(seq, nh, dim, dtype=DTYPE, device=device)) * 0.1
-        v = (torch.randn(seq, nh, dim, dtype=DTYPE, device=device)) * 0.1
-        o = torch.empty(seq, nh, dim, dtype=DTYPE, device=device)
+        q_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=device) * 0.1).permute(1, 0, 2).contiguous()
+        k_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=device) * 0.1).permute(1, 2, 0).contiguous()
+        v_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=device) * 0.1).permute(1, 0, 2).contiguous()
+        o = torch.empty(nh, seq, dim, dtype=DTYPE, device=device)
 
         def run_one(bm, bn, bk):
             grid = (triton.cdiv(seq, bm) * nh,)
-            flash_attn_mha_kernel[grid](q, k, v, o, seq, nh, dim, scale,
+            flash_attn_mha_kernel[grid](q_t, k_t, v_t, o, seq, nh, dim, scale,
                 BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
         """)
 
     else:
-        raise ValueError(f"未知 matmul 型算子: {op_dir.name}")
+        raise ValueError(f"未知 matmul 型算子: {op}")
 
     runner = textwrap.dedent(f"""\
     #!/usr/bin/env python3
@@ -359,8 +388,10 @@ def _generate_matmul_runner(op_dir: Path, candidates: List[Tuple],
 
 
 def _generate_conv2d_runner(op_dir: Path, candidates: List[Tuple],
-                            op_meta: dict) -> str:
-    """生成 conv2d 型算子的 sweep runner 脚本."""
+                            op_meta: dict, op_name: Optional[str] = None) -> str:
+    """生成 conv2d 型算子的 sweep runner 脚本.
+    ★op_name: 显式算子名 (round>1 时 op_dir.name="roundN", 不能用来分支选 setup)."""
+    op = op_name or op_dir.name
     kernel_src = (op_dir / "kernel_op.py").read_text(encoding="utf-8")
     module_code = kernel_src.split('if __name__ == "__main__":')[0].rstrip()
     params = _read_op_params(kernel_src)
@@ -368,7 +399,7 @@ def _generate_conv2d_runner(op_dir: Path, candidates: List[Tuple],
     cands_json = json.dumps(candidates)
     vars_ = op_meta["vars"]
 
-    if op_dir.name == "conv2d":
+    if op == "conv2d":
         setup = textwrap.dedent("""\
         # ── Tensor setup (conv2d) ──
         DTYPE = torch.float32
@@ -384,7 +415,7 @@ def _generate_conv2d_runner(op_dir: Path, candidates: List[Tuple],
                 C=C_IN, R=R, S=S, PAD=PAD)
         """)
 
-    elif op_dir.name == "conv_bias_relu":
+    elif op == "conv_bias_relu":
         setup = textwrap.dedent("""\
         # ── Tensor setup (conv_bias_relu) ──
         DTYPE = torch.float32
@@ -406,7 +437,7 @@ def _generate_conv2d_runner(op_dir: Path, candidates: List[Tuple],
             relu_kernel[grid_el](yb, y, n_el, BLOCK=BLOCK_EL)
         """)
     else:
-        raise ValueError(f"未知 conv2d 型算子: {op_dir.name}")
+        raise ValueError(f"未知 conv2d 型算子: {op}")
 
     runner = textwrap.dedent(f"""\
     #!/usr/bin/env python3
@@ -472,12 +503,13 @@ def _generate_conv2d_runner(op_dir: Path, candidates: List[Tuple],
 
 
 def _generate_runner(op_dir: Path, candidates: List[Tuple],
-                     op_meta: dict) -> str:
-    """根据算子类型生成对应的 sweep runner 脚本."""
+                     op_meta: dict, op_name: Optional[str] = None) -> str:
+    """根据算子类型生成对应的 sweep runner 脚本.
+    ★op_name 显式传入, 避免 round>1 (op_dir.name="roundN") 分支选错 setup."""
     if op_meta["type"] == "matmul":
-        return _generate_matmul_runner(op_dir, candidates, op_meta)
+        return _generate_matmul_runner(op_dir, candidates, op_meta, op_name)
     elif op_meta["type"] == "conv2d":
-        return _generate_conv2d_runner(op_dir, candidates, op_meta)
+        return _generate_conv2d_runner(op_dir, candidates, op_meta, op_name)
     raise ValueError(f"不支持候选生成: {op_meta['type']}")
 
 
@@ -522,7 +554,8 @@ def _apply_block(code: str, varnames: Tuple[str, ...], vals: tuple) -> str:
     return code
 
 
-def sweep(op_dir: Path, quick: bool = False, out_dir: Optional[Path] = None) -> dict:
+def sweep(op_dir: Path, quick: bool = False, out_dir: Optional[Path] = None,
+          op_name: Optional[str] = None) -> dict:
     """对 input/<op> 扫描最优 BLOCK → 返回 {{best_block, results:[...]}} 并写回。
 
     流程:
@@ -533,11 +566,14 @@ def sweep(op_dir: Path, quick: bool = False, out_dir: Optional[Path] = None) -> 
       5. 可选: 一次 msprof 包裹 runner 获取深度 profiling
 
     Args:
-      op_dir: kernel_op.py 所在目录
+      op_dir: kernel_op.py 所在目录 (★round>1 时可能是 outputs/<op>/TierX/roundN,
+              op 名不再用 op_dir.name 推导 — 那会是 "roundN", SWEEP_META 查不到 → 用 op_name)
       quick: True → 只测 ~48 候选 (均匀采样)
       out_dir: 产物目录 (默认 outputs/<op>/block_sweep/)
+      op_name: ★显式算子名 (matmul/attention_mlp/flash_attention/conv2d/conv_bias_relu),
+              匹配 SWEEP_META 用; 缺省时用 op_dir.name 兜底 (main.py 前置 sweep 场景).
     """
-    op = op_dir.name
+    op = op_name or op_dir.name
     meta = SWEEP_META.get(op)
     kernel = op_dir / "kernel_op.py"
 
@@ -561,7 +597,16 @@ def sweep(op_dir: Path, quick: bool = False, out_dir: Optional[Path] = None) -> 
         M = params.get("M", params.get("SEQ", 2048))
         N = params.get("N", params.get("DIM", 2048))
         K = params.get("K", 2048)
-        candidates = generate_matmul_candidates(M=M, N=N, K=K)
+        if op == "flash_attention":
+            # ★flash: grid = ceil(seq/BM)×nheads (不是 ceil(N/BN); BN 是 key 块, 循环不占 grid);
+            #   K 循环 = 头维 dim, BK>dim 无意义 → grid_mul=nheads, bk_cap=dim.
+            seq = params.get("SEQ", 2048)
+            nh = params.get("NHEADS", 8)
+            dim = params.get("DIM", 64)
+            candidates = generate_matmul_candidates(M=seq, N=seq, K=dim,
+                                                    grid_mul=nh, bk_cap=dim)
+        else:
+            candidates = generate_matmul_candidates(M=M, N=N, K=K)
     elif meta["type"] == "conv2d":
         OH = params.get("OH", 64)
         OW = params.get("OW", 64)
@@ -583,7 +628,7 @@ def sweep(op_dir: Path, quick: bool = False, out_dir: Optional[Path] = None) -> 
     out_root = (Path(out_dir) if out_dir
                 else _PROJECT / "outputs" / op / "block_sweep")
     out_root.mkdir(parents=True, exist_ok=True)
-    runner_code = _generate_runner(op_dir, candidates, meta)
+    runner_code = _generate_runner(op_dir, candidates, meta, op)
     runner_path = out_root / "sweep_runner.py"
     runner_path.write_text(runner_code, encoding="utf-8")
     result_path = out_root / "sweep_result.json"

@@ -304,9 +304,9 @@ class PlannerAgent:
                 plan_dict = extract_json(resp)
             except Exception as e:
                 print(f"  [Planner] LLM call failed: {e}, fallback stub")
-                plan_dict = self._stub_plan_v4(tier)
+                plan_dict = self._stub_plan_v4(tier, kernel_code)
         else:
-            plan_dict = self._stub_plan_v4(tier)
+            plan_dict = self._stub_plan_v4(tier, kernel_code)
 
         return RoundPlan(
             round_num=round_num, tier=tier,
@@ -325,165 +325,36 @@ class PlannerAgent:
                      if isinstance(plan_dict.get("handoff"), dict) else None),
         )
 
-    def _stub_plan_v4(self, tier: int) -> dict:
-        """stub 也输出 changes[] 格式 (old_code 用默认 matmul 配置, 便于本地测确定性替换)。"""
+    def _stub_plan_v4(self, tier: int, kernel_code: str = "") -> dict:
+        """stub 也输出 changes[] 格式.
+        ★bug 修复: old_code 硬编码 "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32" 只匹配 input/matmul,
+          其余 op (attention_mlp=64,64,64 / conv2d=BLOCK_K,BLOCK_OW / rms_norm 无 BLOCK 行) 全部
+          coder 匹配失败 → --stub 一轮都跑不通. 改为从当前 kernel config 提取真实 BLOCK 行."""
+        import re as _re
+        m = _re.search(r"BLOCK_M\s*,\s*BLOCK_N\s*,\s*BLOCK_K\s*=\s*[\d, ]+", kernel_code or "")
+        if m:
+            old = m.group(0).strip()
+            vals = [int(x) for x in _re.split(r"[\d,]+", old) if x.strip().isdigit()]
+            new = _re.sub(r"=\s*[\d, ]+", f"= {', '.join(str(v * 2) if v < 512 else v for v in vals)}", old)
+            change = {"old_code": old, "new_code": new,
+                      "reason": "STUB 增大分块", "section": "① config"}
+        else:
+            # conv2d 用分离行 (BLOCK_K = 32 独立一行, 非组合) → 逐行匹配
+            m2 = _re.search(r"^\s*BLOCK_K\s*=\s*\d+", kernel_code or "", _re.M)
+            if m2:
+                old = m2.group(0).strip()
+                val = int(_re.search(r"=\s*(\d+)", old).group(1))
+                new = _re.sub(r"=\s*\d+", f"= {val * 2 if val < 512 else val}", old)
+                change = {"old_code": old, "new_code": new,
+                          "reason": "STUB 增大 BLOCK_K", "section": "① config"}
+            else:
+                change = None
         strategies = {
-            1: ("[STUB] tune_algorithm",
-                [{"old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
-                  "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
-                  "reason": "增大 BLOCK_K 减 MTE1 次数", "section": "① config"}]),
-            2: ("[STUB] fuse_ops",
-                [{"old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
-                  "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
-                  "reason": "融合需要更大 block 减少 kernel 数", "section": "① config"}]),
-            3: ("[STUB] increase_tile",
-                [{"old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
-                  "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
-                  "reason": "Tier3: mte1_ratio 高 → 增大 BLOCK_K", "section": "① config"}]),
-            4: ("[STUB] improve_mem",
-                [{"old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
-                  "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
-                  "reason": "Tier4: 增大 tile 提高 L2 复用", "section": "① config"}]),
-            5: ("[STUB] reduce_conflict",
-                [{"old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
-                  "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
-                  "reason": "Tier5: 调整 block 减冲突", "section": "① config"}]),
-            6: ("[STUB] tune_arch",
-                [{"old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
-                  "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
-                  "reason": "Tier6: 调 block 均衡引擎占用", "section": "① config"}]),
+            1: "[STUB] tune_algorithm", 2: "[STUB] fuse_ops", 3: "[STUB] increase_tile",
+            4: "[STUB] improve_mem", 5: "[STUB] reduce_conflict", 6: "[STUB] tune_arch",
         }
-        s, changes = strategies.get(tier, ("analyze", []))
+        changes = [change] if change else []
+        s = strategies.get(tier, "[STUB] analyze")
         return {"strategy": s, "target_speedup": 1.05, "changes": changes,
                 "expected_impact": "~5%", "promote": False, "promote_reason": "",
                 "promote_evidence": "", "handoff": None}
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    #  LLM 调用
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def _call_llm(self, system_prompt: str, user_prompt: str) -> dict:
-        import os
-        deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if deepseek_key:
-            from openai import OpenAI
-            client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com")
-            resp = client.chat.completions.create(
-                model="deepseek-v4-pro", max_tokens=2048,
-                extra_body={"thinking": {"type": "disabled"}},
-                messages=[{"role": "system", "content": system_prompt},
-                          {"role": "user", "content": user_prompt}])
-            text = resp.choices[0].message.content or ""
-        elif anthropic_key:
-            import anthropic
-            client = anthropic.Anthropic(api_key=anthropic_key)
-            resp = client.messages.create(
-                model="claude-sonnet-4-20250514", max_tokens=2048,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}])
-            text = resp.content[0].text
-        else:
-            raise RuntimeError("No API key")
-
-        print(f"  [Planner] LLM response: {len(text)} chars")
-        if not text or not text.strip():
-            raise ValueError("Empty LLM response")
-        text = text.strip()
-        if "```" in text:
-            parts = text.split("```")
-            for p in parts:
-                p = p.strip()
-                if p.startswith("json"): p = p[4:].strip()
-                if p.startswith("{"): text = p; break
-        start = text.find("{"); end = text.rfind("}")
-        if start >= 0 and end > start: text = text[start:end+1]
-        import re, json
-        for attempt in range(3):
-            try: return json.loads(text)
-            except json.JSONDecodeError:
-                if attempt == 0: text = re.sub(r':\s*([^{}"\s,]+)(?=\s*[,}])', r': "\1"', text)
-                elif attempt == 1: text = re.sub(r'(?<=:)\s*([^"{}\[\],\s]+)(?=\s*[,}\]])', r' "\1"', text)
-        return json.loads(text)
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    #  Stub (本地测试)
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def _stub_plan(self, diagnosis, tier: int) -> dict:
-        """根据 Tier 返回合理的 stub 计划 (启发式, 不依赖 LLM)。"""
-        headroom = getattr(diagnosis, "optimization_headroom", "MEDIUM")
-        btype = getattr(diagnosis, "bottleneck_type", "unknown")
-        engine = getattr(diagnosis, "bottleneck_engine", "?")
-
-        strategies = {
-            1: ("evaluate_algorithm_choice",
-                "检查当前算法是否最优 — 对照 playbook 算子→算法表"),
-            2: ("identify_fusion_opportunities",
-                "分析 RAW 链上的连续 VecUnit op, 找融合机会"),
-            3: ("increase_tile_size" if headroom in ("HIGH", "MEDIUM") else "tune_block_config",
-                "增大 BLOCK_SIZE 使传输进入饱和区" if headroom in ("HIGH", "MEDIUM")
-                else "已饱和 — 检查 num_warps/num_stages"),
-            4: ("merge_small_transfers" if "latency" in btype else "double_buffering",
-                "合并小传输" if "latency" in btype
-                else f"{engine} 已饱和 → double buffer 或减少数据量"),
-            5: ("overlap_compute_transfer",
-                "用 double buffer 让计算和传输重叠"),
-            6: ("adjust_grid_count",
-                "检查 engine_utilization 是否均衡, 调整 grid 分配"),
-        }
-
-        strat, change = strategies.get(tier, ("analyze_deeper", "进一步分析"))
-        return {
-            "strategy": f"[STUB] {strat}",
-            "target_speedup": 1.05,
-            "specific_change": f"[STUB] {change}",
-            "expected_impact": f"[STUB] ~5% improvement on {engine}",
-            "verification_method": "CPU emulator multi-shape test + simulator --llm",
-        }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  自测
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _self_test():
-    from analyzers.bottleneck_diagnoser import diagnose_round
-
-    outputs = _PROJECT_DIR / "outputs"
-    rd = outputs / "vector_add_fp16_N65536" / "round0"
-
-    if not (rd / "merged" / "merged_report.json").exists():
-        print("[SKIP] merged_report.json not found")
-        return
-
-    planner = PlannerAgent()
-
-    for tier in range(1, 7):
-        diag = diagnose_round(rd, current_tier=tier)
-        from analyzers.data_extractor import extract
-        import json as _j
-        with open(rd / "merged" / "merged_report.json", encoding="utf-8") as f:
-            merged = _j.load(f)
-        extracted = extract(merged, {
-            "bottleneck": {"op_id": diag.bottleneck_op_id,
-                           "op_type": diag.bottleneck_op_type,
-                           "engine": diag.bottleneck_engine,
-                           "type": diag.bottleneck_type,
-                           "category": diag.bottleneck_category,
-                           "headroom": diag.optimization_headroom,
-                           "time_ratio": diag.bottleneck_time_ratio,
-                           "bw_utilization": diag.bottleneck_bw_utilization,
-                           "regime": diag.bottleneck_regime},
-            "strategies": diag.suggested_strategies,
-        }, tier=tier)
-
-        plan = planner.generate(diag, extracted, tier, [], "// kernel code", 1)
-        print(f"Tier {tier}: {plan.strategy}")
-        print(f"  change: {plan.specific_change[:80]}...")
-
-    print(f"\n[Planner] All 6 tiers OK (stub mode)")
-
-
-if __name__ == "__main__":
-    _self_test()

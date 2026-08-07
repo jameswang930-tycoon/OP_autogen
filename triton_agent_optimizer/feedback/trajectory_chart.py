@@ -144,13 +144,15 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
                        color=TIER_BG[(tier-1)%6], zorder=0)
 
     # ═══ PyTorch baseline (只有真实基准数据才画, 缺则不画误导虚线) ═══
+    # ★口径说明: torch 侧含 aclnn 框架 kernel (eager 全图), triton 侧只统计目标 kernel (非 aclnn).
+    #   两者不同口径 → 虚线仅作量级参考 (triton 会显得偏快), 不用于严格对比. 已在图上标注.
     if pytorch_tflops:
         pytorch_speedup = pytorch_tflops / initial_tflops
         ax.axhline(y=pytorch_speedup, color="gray", linestyle="--", linewidth=2.5,
                    alpha=0.8, zorder=1)
         ax.text(len(rounds)-1, pytorch_speedup + 0.03,
-                f"PyTorch eager ({pytorch_tflops:.1f} TFLOPS)",
-                fontsize=10, color="gray", ha="right", va="bottom",
+                f"PyTorch eager* ({pytorch_tflops:.1f} TFLOPS)\n*口径: torch 含框架 kernel, triton 不含 → 仅量级参考",
+                fontsize=9, color="gray", ha="right", va="bottom",
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
 
     # ═══ Running Best ═══

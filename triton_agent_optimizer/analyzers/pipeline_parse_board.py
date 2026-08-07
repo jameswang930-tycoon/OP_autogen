@@ -103,7 +103,7 @@ def parse(base):
 
     # kernel 级
     dur_us = _f(_first(obi, "Task", "Duration"))
-    num_cores = _f(_first(obi, "Block", "Dim"))
+    num_cores = _f(_first(obi, "Block", "Dim"))   # ★实际是 launch grid (Block Dim), 非物理核数
     kernel_name = _first(obi, "Op", "Name")
     freq = _f(_first(obi, "Current", "Freq"))
 
@@ -156,10 +156,13 @@ def parse(base):
         "l0c_read_gb_s": _bw(meml0, "l0c", "read", "bw"),
         "l0c_write_gb_s": _bw(meml0, "l0c", "write", "bw"),
     }
-    # 带宽单位换算: 官网值常为 MB/s, 统一转 GB/s (按量级推断)
+    # 带宽单位换算: Ascend Memory.csv 全为 MB/s, 统一转 GB/s.
+    # ★bug 修复: 原 `>= 1e4` 阈值漏掉 [1000,10000) MB/s (即 1~10 GB/s, 中小 kernel 常见) →
+    #   记成 1000× 高, mem_util 变 490%+, 误判 memory_bound. 改 `>= 1000`:
+    #   (本硬件原生 GB/s 值 <1000 的列不会被误除; ≥1000 MB/s 才是真实搬运带宽)
     for k in list(bandwidth):
         v = bandwidth[k]
-        if v is not None and v >= 1e4:
+        if v is not None and v >= 1000:
             bandwidth[k] = round(v / 1000.0, 3)  # MB/s → GB/s
 
     # 计算 (ArithmeticUtilization)

@@ -9,10 +9,10 @@ print(f"Rounds: {s['round']}, Best: {s['best_speedup']:.3f}x, Tier: {s['tier']}"
 print()
 print("History:")
 for h in t["history"]:
-    sp = h.get("actual_speedup", 1.0)
+    sp = h.get("speedup", 1.0)     # ★v4 键: speedup (非 actual_speedup)
     d = h.get("decision", "?")
     st = h.get("strategy", "?")[:60]
-    r = h.get("decision_reason", "")[:80]
+    r = h.get("error", "")[:80] or h.get("change", "")[:80]
     print(f"  R{h['round']:2d} T{h['tier']}: {st:60s} sp={sp:.3f} {d:8s} {r}")
 
 print()
@@ -24,19 +24,19 @@ for d in sorted(glob.glob(f"{base}/*/round*")):
         mr = json.load(open(mr_file))
         es = mr.get("execution_summary", {})
         ns = es.get("total_ns", "?")
-        ops = es.get("num_ops", "?")
-        print(f"  {rd:40s}: {ns:>8s} ns, {ops} ops")
+        ops = es.get("num_kernels", "?")
+        print(f"  {rd:40s}: {ns:>8s} ns, {ops} kernels")
     else:
         print(f"  {rd:40s}: no merged_report")
 
 print()
 print("Code diffs (Round 0 vs KEPT):")
 for h in t["history"]:
-    if h.get("decision") == "KEEP" or h.get("actual_speedup", 1) > 1.0:
+    if h.get("decision") == "KEEP" or h.get("speedup", 1) > 1.0:
         rn = h["round"]
-        tier_name = {2:"02_operator_fusion", 3:"03_tiling_block_config", 4:"04_memory_access", 5:"05_compute_occupancy", 6:"06_910b3_architecture"}.get(h["tier"], f"0{h['tier']}")
+        tier_name = {1:"01_algorithmic_structure", 2:"02_operator_fusion", 3:"03_tiling_block_config", 4:"04_memory_access", 5:"05_compute_occupancy", 6:"06_910b3_architecture"}.get(h["tier"], f"0{h['tier']}")
         rd_dir = os.path.join(base, tier_name, f"round{rn}")
-        kf = os.path.join(rd_dir, "kernel.py")
+        kf = os.path.join(rd_dir, "kernel_op.py")   # ★v4 文件名 kernel_op.py (非 kernel.py)
         if os.path.exists(kf):
             with open(kf) as f:
                 code = f.read()

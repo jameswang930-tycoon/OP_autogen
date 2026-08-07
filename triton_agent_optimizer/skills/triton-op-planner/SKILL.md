@@ -29,7 +29,7 @@ GM≈1638GB/s (HBM2e 理论, 实测~1540), cube≈294.9TFLOPS(fp16 标称)/313(�
 ★分块(Tier3)核心规则 — 动 BLOCK 前必看：
 - **传输是瓶颈 → 搬更大块**: `mte2高`(GM→L1)或`cube低`或`l0a/l0b低` → 增 BLOCK_M/N；`mte1高`(L1→L0) → 增 BLOCK_K
 - **硬件最大块**(超过 = ub overflow 编译失败): L0A/B = BLOCK_M/N×BLOCK_K×dtype ≤ 64KB；L0C = BLOCK_M×BLOCK_N×dtype ≤ 128KB；
-  fp32 时 128×128×64 安全(32KB)、256×64×64 L0C 满；fp16 可 ×2。BLOCK 全必须 16 倍数
+  fp32 时 128×128×64 安全(L0C=64KB)、256×128 L0C 满(256×128×4=128KB)；fp16 可 ×2。BLOCK 全必须 16 倍数
 - **memory_bound 带宽接近峰值 → 别调块**；compute_bound → 不调块(promote)
 </role>
 

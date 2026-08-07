@@ -168,10 +168,12 @@ class PlatformPaths:
         return self.repo_root / "docs"
 
     # ── Agent 优化器内部路径 ──────────────────────────────────────────────────
+    # ★bug 修复: 旧指到 "output"(单数), 而实际 pipeline (scheduler.py / main.py) 用 "outputs"(复数).
+    #   对齐到 outputs/, 避免 from config import output_dir 拿到错误路径 (phantom 目录).
     @property
     def output_dir(self) -> Path:
-        """输出根目录 (所有优化产出物)"""
-        d = self.triton_agent_root / "output"
+        """输出根目录 (所有优化产出物) — ★与 scheduler/main 的 outputs/ 对齐"""
+        d = self.triton_agent_root / "outputs"
         d.mkdir(parents=True, exist_ok=True)
         return d
 

@@ -353,6 +353,7 @@ def parse(base):
         "meta": {"source": "task", "generated_at": datetime.now().isoformat(),
                  "input_files": [str(prof_out)], "schema_version": "2.0"},
         "execution_summary": {"total_ns": total_ns,
+                              # ★num_cores 实际是 launch grid (Block Dim), 不是物理核数 (910B3 固定 20 核)
                               "num_cores": _max("block_dim"),
                               "kernel_name": kernel,
                               "num_kernels": n_kernels,

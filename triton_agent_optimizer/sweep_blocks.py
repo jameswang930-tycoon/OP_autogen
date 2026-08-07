@@ -48,9 +48,13 @@ SWEEP_META = {
     "matmul":          {"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": False},
     "attention_mlp":   {"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": True},
     "flash_attention": {"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": False},
+    "matmul_relu":     {"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": False},
+    "matmul_transpose":{"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": False},
     "conv2d":          {"vars": ("BLOCK_K", "BLOCK_OW"),           "type": "conv2d", "multi": False},
     "conv_bias_relu":  {"vars": ("BLOCK_K", "BLOCK_OW"),           "type": "conv2d", "multi": True},
     "rms_norm":        None,   # 行级 kernel, BLOCK_N 由 N 推导 (2 幂), 无自由分块参数
+    "layernorm":       None,   # 行级归约, BLOCK_N 由 N 推导 (2 幂), 无自由分块参数
+    "sigmoid":         None,   # 纯逐元素, 无 matmul 分块参数
 }
 
 
@@ -387,6 +391,45 @@ def _generate_matmul_runner(op_dir: Path, candidates: List[Tuple],
             grid = (triton.cdiv(seq, bm) * nh,)
             flash_attn_mha_kernel[grid](q_t, k_t, v_t, o, seq, nh, dim, scale,
                 BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+        """)
+
+    elif op == "matmul_relu":
+        # ── matmul + relu 2 kernel (全链路计时) ──
+        setup = textwrap.dedent(f"""\
+        # ── Tensor setup (matmul_relu) ──
+        M, K, N = {M}, {K}, {N}
+        DTYPE = torch.float32
+        device = torch.device("npu")
+        x = (torch.rand(M, K, dtype=DTYPE, device=device) - 0.5) * 0.1
+        w = (torch.rand(K, N, dtype=DTYPE, device=device) - 0.5) * 0.1
+        z = torch.empty(M, N, dtype=DTYPE, device=device)
+        y = torch.empty(M, N, dtype=DTYPE, device=device)
+
+        def run_one(bm, bn, bk):
+            grid_mm = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+            grid_el = (triton.cdiv(M * N, BLOCK_SIZE),)
+            matmul_kernel[grid_mm](x, w, z, M, N, K,
+                x.stride(0), x.stride(1), w.stride(0), w.stride(1),
+                z.stride(0), z.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            relu_kernel[grid_el](z, y, M * N, BLOCK=BLOCK_SIZE)
+        """)
+
+    elif op == "matmul_transpose":
+        # ── matmul B^T (转置访问, 全链路计时) ──
+        setup = textwrap.dedent(f"""\
+        # ── Tensor setup (matmul_transpose) ──
+        M, K, N = {M}, {K}, {N}
+        DTYPE = torch.float32
+        device = torch.device("npu")
+        a = (torch.rand(M, K, dtype=DTYPE, device=device) - 0.5) * 0.1
+        b = (torch.rand(N, K, dtype=DTYPE, device=device) - 0.5) * 0.1   # B 是 [N,K] row-major
+        c = torch.empty(M, N, dtype=DTYPE, device=device)
+
+        def run_one(bm, bn, bk):
+            grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+            matmul_btrans_kernel[grid](a, b, c, M, N, K,
+                a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+                c.stride(0), c.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
         """)
 
     else:

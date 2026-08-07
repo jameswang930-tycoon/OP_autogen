@@ -808,6 +808,14 @@ class Scheduler:
         if cur is None:
             return {"available": False, "error": "读不到 BLOCK 值"}
 
+        # ★Bug 修复: 防止 sweep 写回 input 源文件 (current_kernel 在 round1 = input/<op>/kernel_op.py).
+        #   sweep() 把最优块写回 op_dir/kernel_op.py → 若 op_dir 是 input 源目录会破坏基准.
+        #   先拷一份到 round_dir/kernel_op.py, 让 sweep 写回这个副本 (不碰源).
+        round_dir.mkdir(parents=True, exist_ok=True)
+        sweep_kernel = round_dir / "kernel_op.py"
+        sweep_kernel.write_text(code, encoding="utf-8")
+        sweep_kernel_dir = sweep_kernel.parent
+
         base = self.traj["state"].get("baseline_ns")
 
         # ★v2: 调用新 sweep — 程序化候选生成 + 单进程 runner + torch.npu.Event 计时
@@ -817,11 +825,11 @@ class Scheduler:
         print(f"  [Tier3] 分块实测 v2: 当前 BLOCK={cur}, "
               f"{'quick 采样' if _quick else '全量枚举'} L0 合法候选 → {sweep_out_dir}", flush=True)
 
-        # ★bug 修复: kernel.parent 在 round>1 是 outputs/<op>/TierX/roundN (name="roundN"),
-        #   sweep() 用 op_dir.name 查 SWEEP_META 会 miss → 静默跳过. 显式传 op_name=self.kernel_name.
-        result = sweep_blocks.sweep(kernel.parent, quick=_quick, out_dir=sweep_out_dir,
+        # ★bug 修复: 让 sweep 在 round_dir 副本上跑+写回 (不碰 current_kernel 源);
+        #   显式传 op_name (round 目录 name="roundN" 查不到 SWEEP_META).
+        result = sweep_blocks.sweep(sweep_kernel_dir, quick=_quick, out_dir=sweep_out_dir,
                                     op_name=self.kernel_name)
-        # sweep() 把最优块写回 kernel_op.py, 报告写 outputs/<op>/block_sweep/
+        # sweep() 把最优块写回 sweep_kernel (round_dir/kernel_op.py 副本), 不碰源
 
         if result.get("skipped"):
             return None

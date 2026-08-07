@@ -170,9 +170,9 @@ def _format_history(history: list) -> str:
         return "(no history)"
     by_tier = {}
     for r in history:
-        by_tier.setdefault(r.get("tier"), []).append(r)
+        by_tier.setdefault(r.get("tier") if r.get("tier") is not None else 0, []).append(r)
     lines = ["## 历史梗概 (★每层试过什么→结果, 判断该层还有没有空间/是否已探索完)"]
-    for t in sorted(by_tier):
+    for t in sorted(by_tier):   # ★tier=None 已归 0, sorted 不崩
         rs = by_tier[t]
         best = max((r.get("speedup") or 0) for r in rs)
         last = rs[-2:]   # 最近2轮
@@ -315,17 +315,34 @@ class PlannerAgent:
         else:
             plan_dict = self._stub_plan_v4(tier, kernel_code)
 
+        # ★防御性解析: LLM 可能返回 "1.1x"/"tier 2" 等带后缀/描述 → 提取数字, 失败用默认
+        def _safe_float(v, dflt):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                import re as _re
+                m = _re.search(r"[-+]?\d*\.?\d+", str(v or ""))
+                return float(m.group()) if m else dflt
+
+        def _safe_int(v, dflt):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                import re as _re
+                m = _re.search(r"\d+", str(v or ""))
+                return int(m.group()) if m else dflt
+
         return RoundPlan(
             round_num=round_num, tier=tier,
             tier_name=TIER_NAMES.get(tier, "?"),
             strategy=plan_dict.get("strategy", "unknown"),
-            target_speedup=float(plan_dict.get("target_speedup", 1.05)),
+            target_speedup=_safe_float(plan_dict.get("target_speedup", 1.05), 1.05),
             specific_change=str(plan_dict.get("specific_change", "")),
             expected_impact=str(plan_dict.get("expected_impact", "")),
             verification_method="msprof end-to-end",
             plan_text=json.dumps(plan_dict, ensure_ascii=False, indent=2),
             promote=bool(plan_dict.get("promote", False)),
-            promote_to=int(plan_dict.get("promote_to", 0) or 0),   # 目标层 (0=本层)
+            promote_to=_safe_int(plan_dict.get("promote_to", 0) or 0, 0),   # 目标层 (0=本层)
             promote_reason=str(plan_dict.get("promote_reason", "")),
             promote_evidence=str(plan_dict.get("promote_evidence", "")),
             handoff=(plan_dict.get("handoff")

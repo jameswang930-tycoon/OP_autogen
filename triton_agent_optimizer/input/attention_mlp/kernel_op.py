@@ -75,8 +75,8 @@ def attention_scores_kernel(q_ptr, k_ptr, s_ptr,
                             BLOCK_M: tl.constexpr,
                             BLOCK_N: tl.constexpr,
                             BLOCK_K: tl.constexpr):
-    # S = Q @ K^T · scale;  Q[seq,dim], K[seq,dim], S[seq,seq]
-    # K^T[k,n] = K[n,k] 用指针直接转置 (不依赖 tl.trans)
+    # S = Q @ K^T · scale;  Q[seq,dim], K_t[dim,seq]=k.T.contiguous(), S[seq,seq]
+    # ★K_t 预转置以保证 DMA 连续读取: K_t[k,n]=K[n,k], 行跨度=1 (非 dim=2048)
     pid = tl.program_id(axis=0)
     grid_n = (seq + BLOCK_N - 1) // BLOCK_N
     pid_m = pid // grid_n
@@ -84,15 +84,15 @@ def attention_scores_kernel(q_ptr, k_ptr, s_ptr,
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
-    q_ptrs = q_ptr + (offs_m[:, None] * dim + offs_k[None, :])      # Q[m,k]
-    k_ptrs = k_ptr + (offs_n[None, :] * dim + offs_k[:, None])      # K^T[k,n] = K[n,k]
+    q_ptrs = q_ptr + (offs_m[:, None] * dim + offs_k[None, :])      # Q[m,k] 连续 (stride=1)
+    k_ptrs = k_ptr + (offs_k[:, None] * seq + offs_n[None, :])      # K_t[k,n] 连续 (stride=1)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, dim, BLOCK_K):
         q = tl.load(q_ptrs, mask=offs_k[None, :] < (dim - k), other=0.0)
         kk = tl.load(k_ptrs, mask=offs_k[:, None] < (dim - k), other=0.0)
         acc = tl.dot(q, kk, acc)
         q_ptrs += BLOCK_K
-        k_ptrs += BLOCK_K
+        k_ptrs += BLOCK_K * seq
     s_ptrs = s_ptr + (offs_m[:, None] * seq + offs_n[None, :])
     s_mask = (offs_m[:, None] < seq) & (offs_n[None, :] < seq)
     tl.store(s_ptrs, acc * scale, mask=s_mask)
@@ -197,6 +197,8 @@ def main():
 
     # ★KERNEL_LOOP: verify/bench 用它 (一次 msprof 内循环 N 次, 求单次平均; 分配只做一次复用)
     LOOP = int(os.environ.get("KERNEL_LOOP", "1"))
+    # ★预转置 K: [seq, dim] → [dim, seq] 一次性分配, 保证 attention_scores 内 K^T 加载连续
+    k_t = torch.empty(dim, seq, dtype=DTYPE, device=npu)
     for _ in range(LOOP):
         # Q,K,V = X @ Wq/Wk/Wv
         matmul_kernel[g_hidden](x, wq, q, seq, dim, dim,
@@ -211,8 +213,9 @@ def main():
                                 x.stride(0), x.stride(1), wv.stride(0), wv.stride(1),
                                 v.stride(0), v.stride(1),
                                 BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K)
-        # S = Q@K^T · scale
-        attention_scores_kernel[g_scores](q, k, s, seq, dim, scale,
+        # S = Q@K^T · scale  (★k_t 预转置以保证 DMA 连续读)
+        k_t.copy_(k.T)  # k.T 返回 view, copy_ 写入预分配 buffer 避免每次分配
+        attention_scores_kernel[g_scores](q, k_t, s, seq, dim, scale,
                                           BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K)
         # P = softmax(S)
         softmax_kernel[g_softmax](s, p, seq, seq, BLOCK=BLOCK_S)

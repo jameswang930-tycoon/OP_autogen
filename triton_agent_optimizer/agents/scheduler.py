@@ -16,8 +16,10 @@ v4 流程 (见 README v4):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -121,7 +123,6 @@ def _keep_floor() -> float:
 
 def _extract_mnk(code: str):
     """从 kernel_op.py ①config 区提取 M/N/K (默认值) → (M,N,K) 或 None。"""
-    import re
     vals = {}
     for var, env in (("M", "MATMUL_M"), ("N", "MATMUL_N"), ("K", "MATMUL_K")):
         m = re.search(rf'os\.environ\.get\("{env}",\s*"?(\d+)"?\)', code)
@@ -347,6 +348,81 @@ def extract_tier_fields(diagnosis: dict, tier: int) -> str:
     return "\n".join(lines)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ★P2: 给 planner 的完整数据上下文 — 每 kernel 全量 task/deep + 占比 + Top耗时 + 轨迹 + 手递
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _sanitize_for_ctx(obj, depth=0):
+    """递归精简: 去 None/空容器, 截断超长字符串, 列表截前 N — 防 planner_context 膨胀. 保结构."""
+    if depth > 6 or obj is None:
+        return None
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            sv = _sanitize_for_ctx(v, depth + 1)
+            if sv is not None and sv != "" and sv != [] and sv != {}:
+                out[str(k)] = sv
+        return out
+    if isinstance(obj, list):
+        return [_sanitize_for_ctx(v, depth + 1) for v in obj[:20]]
+    if isinstance(obj, str):
+        return obj[:200] if len(obj) > 200 else obj
+    return obj
+
+
+def build_planner_context(diagnosis: dict, tier: int, state: dict, history: list,
+                          kernel_code: str, round_dir: Path,
+                          fusion_analysis: Optional[dict] = None,
+                          tier3_sweep: Optional[dict] = None,
+                          handoff: Optional[dict] = None) -> Path:
+    """★P2: 完整数据上下文 → 07_tier{N}_fields/planner_context.json (planner 直接读文件).
+
+    含: summary 全量 + 每 kernel 完整 task/deep + 耗时占比 + Top耗时 kernel + config 常量 +
+        轨迹 state + 全量 history + 跳转手递 handoff + 融合/分块实测 + api_overhead/multi_kernel.
+    只写一次紧凑 JSON (无重复), 不占 prompt; planner 按路径 cat 阅读分析瓶颈.
+    ★多 kernel 算子每个 kernel 的完整数据都列 (不是 _get 只取第一个), 优化打中占比最大的瓶颈 kernel."""
+    from agents.planner import _extract_config_constants
+    d7 = round_dir / f"07_tier{tier}_fields"
+    d7.mkdir(parents=True, exist_ok=True)
+    total_us = ((diagnosis.get("summary") or {}).get("total_ns") or 0) / 1000
+    kernels = []
+    for k in (diagnosis.get("kernels") or []):
+        dur = ((k.get("task") or {}).get("task_duration_us")) or 0
+        launch = k.get("launch_count") or 1
+        dtot = dur * launch
+        kernels.append({
+            "kernel_name": k.get("kernel_name", "?"),
+            "task_duration_us": round(dur, 1),
+            "launch_count": launch,
+            "time_us_total": round(dtot, 1),          # ★占比同口径: 单次耗时×launch (与 total_ns 同源)
+            "time_pct": round(dtot / total_us * 100, 1) if total_us else None,
+            "task": _sanitize_for_ctx(k.get("task") or {}),
+            "deep": _sanitize_for_ctx(k.get("deep") or {}),
+        })
+    top = sorted(kernels, key=lambda x: -(x["time_us_total"] or 0))
+    ctx = {
+        "tier": tier,
+        "config_constants": _extract_config_constants(kernel_code) or "(无)",
+        "summary": _sanitize_for_ctx(diagnosis.get("summary") or {}),
+        "kernels": kernels,
+        "top_time_kernels": [{"name": k["kernel_name"], "time_pct": k["time_pct"],
+                              "time_us_total": k["time_us_total"]} for k in top[:5]],
+        "trajectory_state": {kk: state.get(kk) for kk in
+                             ("tier", "round", "best_speedup", "current_speedup", "total_rounds", "num_kernels")},
+        "history": history[-40:],                     # ★P1: 全量最近40轮 (各层试过什么→结果)
+        "handoff": handoff or None,                    # ★P1: 跳转来的瓶颈分析+优化方向
+        "fusion_analysis": _sanitize_for_ctx(fusion_analysis) if fusion_analysis else None,
+        "tier3_sweep": ({"best": tier3_sweep.get("best"), "configs": tier3_sweep.get("configs")}
+                        if tier3_sweep and tier3_sweep.get("available") else None),
+    }
+    for _k in ("api_overhead", "multi_kernel", "framework_kernels"):
+        if diagnosis.get(_k) is not None:
+            ctx[_k] = _sanitize_for_ctx(diagnosis[_k])
+    path = d7 / "planner_context.json"
+    path.write_text(json.dumps(ctx, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    return path
+
+
 class Scheduler:
     """v4 状态机调度器。"""
 
@@ -379,7 +455,9 @@ class Scheduler:
                                        "baseline_ns": None, "num_kernels": None,
                                        "current_speedup": 1.0,   # 当前已接受 kernel 的加速比 (基线=1.0)
                                        "current_kernel": str(self.op_dir / "kernel_op.py"),
-                                       "total_rounds": 0},       # ★D7: 含 promote 轮的总执行数 (防 promote 白耗 max_rounds)
+                                       "total_rounds": 0,        # ★D7: 含 promote 轮的总执行数 (防 promote 白耗 max_rounds)
+                                       "handoff": None,          # ★P1: 跳转手递 (下个 tier 的 planner 读)
+                                       "tier_jumps": []},        # ★P1: 跳转路径记录 (防死循环)
                      "history": []}
         self.current_kernel = self.op_dir / "kernel_op.py"
         # ★D6: 保存原始 kernel 副本 → 环境漂移时重测 baseline 用它 (优化后 current_kernel 已不是原始版)
@@ -400,7 +478,8 @@ class Scheduler:
             print("  [Scheduler] 检测到旧版本 trajectory, 重置为 v4")
         return {"v": 4, "state": {"tier": 1, "round": 1, "best_speedup": 1.0,
                                   "baseline_ns": None, "num_kernels": None,
-                                  "current_speedup": 1.0},
+                                  "current_speedup": 1.0,
+                                  "handoff": None, "tier_jumps": []},
                 "history": []}
 
     def _save_traj(self):
@@ -548,13 +627,18 @@ class Scheduler:
         print("  [Scheduler] Tier2 融合: 编译 HIVM MLIR → nga run 分析依赖 → 08_fusion/")
         return run_fusion(self.current_kernel, round_dir, use_llm=self.use_llm)
 
-    # ── ④ Planner (只喂当前阶段筛好的字段 + 融合分析 + Tier3 分块实测数据) ──
+    # ── ④ Planner (07字段 + 完整数据上下文 + 轨迹 + 手递 + 融合 + Tier3 分块实测) ──
     def _plan(self, diagnosis: dict, extracted: str, tier: int, rn: int, round_dir: Path,
-              fusion_analysis: Optional[dict] = None, tier3_sweep: Optional[dict] = None):
+              fusion_analysis: Optional[dict] = None, tier3_sweep: Optional[dict] = None,
+              handoff: Optional[dict] = None):
         from agents.planner import PlannerAgent, _extract_config_constants
         kernel_code = self.current_kernel.read_text(encoding="utf-8") if self.current_kernel.exists() else ""
         skill = (_PROJECT / "skills" / "triton-op-planner" / "SKILL.md")
         cfg = _extract_config_constants(kernel_code)
+        # ★P2: 完整数据上下文 (每 kernel 全量 task/deep + 占比 + Top + 轨迹 + 手递) → planner 读文件
+        ctx_path = build_planner_context(
+            diagnosis, tier, self.traj["state"], self.traj.get("history", []),
+            kernel_code, round_dir, fusion_analysis, tier3_sweep, handoff)
         # ★D1-Tier3: 分块实测数据追加进喂给 planner 的字段 (精简, 只给决策要用的 key 结果)
         if tier3_sweep and tier3_sweep.get("available"):
             sw = tier3_sweep
@@ -583,10 +667,18 @@ class Scheduler:
             fusion_analysis=fusion_analysis,
             round_dir=round_dir,
             current_kernel=self.current_kernel,
+            context_path=ctx_path,                # ★P2: 完整数据上下文 JSON
+            trajectory_path=self.traj_path,        # ★P1: 全量轨迹 (每层试过什么)
+            handoff=handoff,                        # ★P1: 跳转来的瓶颈分析+方向
         )
         round_dir.mkdir(parents=True, exist_ok=True)
         plan_md = (f"# Tier{tier} Round{rn} Plan\n\n{plan.plan_text}\n\n"
                    f"## 提取字段\n{extracted}"
+                   + (f"\n\n## 完整数据上下文 → {ctx_path.name} ({ctx_path.stat().st_size}字节)"
+                      if ctx_path.exists() else "")
+                   + (f"\n\n## 跳转手递 (来自 Tier{handoff.get('from_tier')} planner, 作为部分参考)\n"
+                      f"{json.dumps(handoff, ensure_ascii=False, indent=1)}"
+                      if handoff else "")
                    + (f"\n\n## 融合分析\n{json.dumps(fusion_analysis, ensure_ascii=False, indent=1)}"
                       if fusion_analysis else ""))
         (round_dir / "plan.md").write_text(plan_md, encoding="utf-8")
@@ -681,91 +773,73 @@ class Scheduler:
             except Exception as e:
                 print(f"    ⚠ [Sanity] {label}尺寸异常: {str(e)[:120]}")
 
-    # ★D1-Tier3: 自动分块实测 — 到分块层时先跑一遍 L0 合法 BLOCK 候选, 收集各 config 实测数据
-    #   (含当前块对比), **喂给 planner 决策** (不是这里写死写回). 确定性 autotune 思想.
-    # 兜底: 任何异常/无可扫 → 返回 None 或 {"available": False}, 调用方继续正常走 LLM (不阻断迭代).
-    # 返回精简数据 (不含原始 msprof 输出/报错全文, 只给 planner 决策要用的关键结果).
+    # ★D1-Tier3: 自动分块实测 (v2) — 程序化枚举所有 L0 合法 BLOCK 候选,
+    #   单进程 torch.npu.Event 实测 (一次 msprof 可选), 每 config 5 次平均, 喂 planner 决策.
+    #   兜底: 任何异常/无可扫 → None 或 {"available": False}, 调用方正常走 LLM (不阻断迭代).
+    # ★v2 改进: 候选从 8→~300 (全面覆盖), 单进程 (无子进程 msprof 开销), 有方向分析.
     def _tier3_sweep_data(self, tier: int, rn: int, round_dir: Path) -> Optional[dict]:
         try:
-            from sweep_blocks import SWEEP, _read_current_block, _apply_block
+            import sweep_blocks
         except Exception as e:
             return {"available": False, "error": f"sweep_blocks 不可用: {str(e)[:80]}"}
-        cfg = SWEEP.get(self.kernel_name)
         kernel = self.current_kernel
-        if cfg is None or not kernel.exists():
+        meta = sweep_blocks.SWEEP_META.get(self.kernel_name)
+        if meta is None or not kernel.exists():
             return None                      # rms_norm 行级, 无自由分块参数 → 正常走 LLM
         code = kernel.read_text(encoding="utf-8")
-        cur = _read_current_block(code, cfg["vars"])
+        cur = sweep_blocks._read_current_block(code, meta["vars"])
         if cur is None:
             return {"available": False, "error": "读不到 BLOCK 值"}
-        # 候选 = 当前块(作对比) + L0 合法变体; TIER3_SWEEP_CANDS 限数(+1 含当前)
-        cands = [cur] + [c for c in cfg["cands"] if c != cur]
-        _lim = int(os.environ.get("TIER3_SWEEP_CANDS", "0"))
-        if _lim > 0:
-            cands = cands[:_lim + 1]
-        from agents.verifier import verify_end_to_end
+
         base = self.traj["state"].get("baseline_ns")
-        # ★时间控制: sweep 只求"相对排序", 每 config 轻量计时 (VERIFY_LOOP=TIER3_SWEEP_LOOP 默认5,
-        #   warmup=1) — 单 config ~1-2min, 8 config ~10-15min; 防 tiling 卡死拉长总运行.
-        #   (最终 block 正确性由主流程 verify 严格查, sweep 阶段从轻)
-        sweep_loop = int(os.environ.get("TIER3_SWEEP_LOOP", "5"))
-        _ovl, _ovw = os.environ.get("VERIFY_LOOP"), os.environ.get("VERIFY_WARMUP")
-        os.environ["VERIFY_LOOP"] = str(sweep_loop)
-        os.environ["VERIFY_WARMUP"] = "1"
-        # 产物目录: roundN/09_tier3_sweep/ (对齐 07_tier3_fields/08_fusion)
-        sweep_dir = round_dir / "09_tier3_sweep"
-        sweep_dir.mkdir(parents=True, exist_ok=True)
+
+        # ★v2: 调用新 sweep — 程序化候选生成 + 单进程 runner + torch.npu.Event 计时
+        sweep_out_dir = round_dir / "09_tier3_sweep"
+        sweep_out_dir.mkdir(parents=True, exist_ok=True)
+        _quick = os.environ.get("TIER3_SWEEP_QUICK", "0") == "1"
+        print(f"  [Tier3] 分块实测 v2: 当前 BLOCK={cur}, "
+              f"{'quick 采样' if _quick else '全量枚举'} L0 合法候选 → {sweep_out_dir}", flush=True)
+
+        result = sweep_blocks.sweep(kernel.parent, quick=_quick, out_dir=sweep_out_dir)
+        # sweep() 把最优块写回 kernel_op.py, 报告写 outputs/<op>/block_sweep/
+
+        if result.get("skipped"):
+            return None
+        if "error" in result:
+            return {"available": False, "error": result["error"]}
+
+        # 转换 v2 结果 → planner 期望格式
+        results = result.get("results", [])
+        best_block = result.get("best_block")
+        best_ns = None
+        cur_ns = None
         configs = []
-        print(f"  [Tier3] 分块实测: 测 {len(cands)} 个 config (含当前 {cur}, 每 config {sweep_loop} 轮) → {sweep_dir}", flush=True)
-        try:
-            for vals in cands:
-                try:
-                    cand_code = _apply_block(code, cfg["vars"], vals)
-                    cfg_rd = sweep_dir / ("config_" + "_".join(map(str, vals)))
-                    cfg_rd.mkdir(parents=True, exist_ok=True)
-                    (cfg_rd / "kernel_op.py").write_text(cand_code, encoding="utf-8")
-                    v = verify_end_to_end(cfg_rd / "kernel_op.py", cfg_rd, None, num_kernels=None)
-                    if v.get("ok") and v.get("ns"):
-                        configs.append({"block": list(vals), "ns": v["ns"],
-                                        "speedup": round(base / v["ns"], 3) if base else None,
-                                        "is_current": list(vals) == list(cur)})
-                        print(f"      {vals}: {v['ns']:.0f}ns", flush=True)
-                    else:
-                        configs.append({"block": list(vals), "ns": None, "is_current": list(vals) == list(cur),
-                                        "error": str(v.get("error", ""))[:80]})
-                        print(f"      {vals}: FAIL {str(v.get('error',''))[:80]}", flush=True)
-                except Exception as e:
-                    configs.append({"block": list(vals), "ns": None, "is_current": list(vals) == list(cur),
-                                    "error": str(e)[:80]})
-        finally:
-            if _ovl is None:
-                os.environ.pop("VERIFY_LOOP", None)
-            else:
-                os.environ["VERIFY_LOOP"] = _ovl
-            if _ovw is None:
-                os.environ.pop("VERIFY_WARMUP", None)
-            else:
-                os.environ["VERIFY_WARMUP"] = _ovw
-        valid = [c for c in configs if c.get("ns")]
+        for r in results:
+            blk = tuple(r["block"])
+            sc = {"block": list(r["block"]), "ns": r.get("ns"),
+                  "speedup": round(base / r["ns"], 3) if (base and r.get("ns")) else None,
+                  "is_current": blk == cur}
+            configs.append(sc)
+            if blk == best_block and r.get("ns"):
+                best_ns = r["ns"]
+        valid = sorted([c for c in configs if c.get("ns")], key=lambda c: c["ns"])
         if not valid:
-            (sweep_dir / "sweep_result.json").write_text(
-                json.dumps({"available": False, "error": "所有候选实测失败", "configs": configs},
-                           ensure_ascii=False, indent=1), encoding="utf-8")
-            return {"available": False, "error": "所有候选实测失败"}
-        valid_sorted = sorted(valid, key=lambda c: c["ns"])
-        # 写 09 报告 (planner 可读, 也留档)
-        (sweep_dir / "sweep_result.json").write_text(json.dumps(
-            {"available": True, "vars": list(cfg["vars"]), "configs": valid_sorted,
-             "best": valid_sorted[0]}, ensure_ascii=False, indent=1), encoding="utf-8")
-        with open(sweep_dir / "sweep_result.txt", "w", encoding="utf-8") as f:
-            f.write("══ Tier3 分块实测 (ns 越小越快; ★最优; [当前]) ══\n")
-            for c in valid_sorted:
-                mark = " ★最优" if c is valid_sorted[0] else (" [当前]" if c.get("is_current") else "")
+            return {"available": False, "error": "所有候选实测失败", "configs": configs}
+        best_cfg = valid[0]
+
+        # 写 09 报告
+        (sweep_out_dir / "sweep_result.json").write_text(json.dumps(
+            {"available": True, "vars": list(meta["vars"]), "configs": valid, "best": best_cfg,
+             "candidates_tested": result.get("candidates_tested", len(results))},
+            ensure_ascii=False, indent=1), encoding="utf-8")
+        with open(sweep_out_dir / "sweep_result.txt", "w", encoding="utf-8") as f:
+            f.write("══ Tier3 分块实测 v2 (ns 越小越快; ★最优; [当前]) ══\n")
+            for c in valid:
+                mark = " ★最优" if c is best_cfg else (" [当前]" if c.get("is_current") else "")
                 sp = f" ({c['speedup']}x)" if c.get("speedup") else ""
                 f.write(f"  {c['block']}: {c['ns']:.0f}ns{sp}{mark}\n")
-        print(f"  [Tier3] 实测报告 → {sweep_dir}")
-        return {"available": True, "configs": valid_sorted, "best": valid_sorted[0],
-                "vars": list(cfg["vars"])}
+        print(f"  [Tier3] 实测报告 → {sweep_out_dir}")
+        return {"available": True, "configs": valid, "best": best_cfg, "vars": list(meta["vars"])}
 
     # ★D6: 环境漂移防护 — 每 N 轮重测原始 baseline kernel + 当前 kernel,
     #   校正加速比基数 (长时运行跨时段温度/负载漂移会污染 baseline_ns).
@@ -806,6 +880,98 @@ class Scheduler:
             print(f"  [重基准] R{rn} 异常: {str(e)[:120]} (跳过)")
 
     # ── 主循环 (无 round0: 首轮采集即基准, 全部轮次直接进 outputs/<op>/<tier>/roundN) ──
+    # ── 晋升/回退决策 (★P1: 严格晋升 + 可回退 + 防死循环 + 跳转手递; 单测覆盖各场景) ──
+    def _decide_tier(self, st: dict, plan, tier: int, rn: int, round_dir: Path,
+                     speedup: float) -> tuple:
+        """晋升决策 → (new_tier, stop).
+        ★严格晋升: planner promote 必须有 promote_evidence/reason (数据依据), 否则视为本层再优化一轮.
+        ★可回退: 支持 planner 跳到前层 (target<当前), 不再因目标层轮数多而拒绝 (修复"想回退回不去").
+        ★防死循环: 同一跳转路径 (from->to) 重复≥3次 → 拒绝, 改前向晋升 (Tier6 则停止).
+        ★手递: 每次跳转写 round_dir/10_tier_handoff.json + st["handoff"] → 下个 tier 的 planner 读.
+        """
+        planner_promote = getattr(plan, "promote", False)
+        # ★无改进 = 本轮加速比没超过上一轮已接受×噪声地板; 数"本 tier 连续无改进"轮数 (跨 tier 即断)
+        no_improve = 0
+        floor = _keep_floor()
+        for h in reversed(self.traj["history"]):
+            if h.get("tier") != tier:
+                break
+            if h.get("speedup", 0) > h.get("prev_speedup", 0) * floor:
+                break
+            no_improve += 1
+        if self.target_speedup > 0 and speedup >= self.target_speedup:
+            # ★D3: 达标不硬停 — 继续探后续层确认无更大空间, 由 no_improve/max_rounds 收尾.
+            print(f"  🎯 已达标 {speedup:.3f}x ≥ target {self.target_speedup}x — 继续探后续层找更大空间")
+            self.target_speedup = -1
+        # ★P1 严格晋升: 必须给依据, 否则本层再优化
+        if planner_promote:
+            _prom_ev = (getattr(plan, "promote_evidence", "") or getattr(plan, "promote_reason", "")).strip()
+            if not _prom_ev:
+                print("  ⚠ planner promote 但无 promote_evidence/reason → 晋升需依据, 本层再优化一轮")
+                planner_promote = False
+        if planner_promote:
+            target = getattr(plan, "promote_to", 0) or 0
+            if target and 1 <= target <= 6 and target != tier:
+                direction = "回退" if target < tier else "晋升"
+                # ★P1 防死循环: 同一跳转路径重复≥3次 → 拒绝 (planner 有 trajectory+手递, 本不该反复跳)
+                _jumps = st.setdefault("tier_jumps", [])
+                _pair = f"{tier}->{target}"
+                if sum(1 for j in _jumps if j.get("pair") == _pair) >= 3:
+                    print(f"  ⛔ 拒绝跳转: 路径 {_pair} 已发生 ≥3 次 (防 T{target}↔T{tier} 死循环)")
+                    if tier >= 6:
+                        print("  ⛔ 且已到 Tier6, 停止")
+                        return tier, True
+                    print(f"  → 晋升 Tier{tier}→Tier{tier+1} (跳转被拒)")
+                    st["tier"] = tier + 1
+                    return tier + 1, False
+                # ★P1 手递: 瓶颈分析+优化方向 → 10_tier_handoff.json + st["handoff"] (下个 planner 读)
+                _hb = getattr(plan, "handoff", None) or {}
+                _hinfo = {
+                    "from_tier": tier, "to_tier": target, "from_round": rn,
+                    "bottleneck_analysis": (_hb.get("bottleneck")
+                                            or getattr(plan, "promote_reason", "") or ""),
+                    "optimization_direction": _hb.get("optimization_direction") or "",
+                    "promote_evidence": getattr(plan, "promote_evidence", "") or "",
+                }
+                (round_dir / "10_tier_handoff.json").write_text(
+                    json.dumps(_hinfo, ensure_ascii=False, indent=1), encoding="utf-8")
+                st["handoff"] = _hinfo
+                _jumps.append({"pair": _pair, "round": rn})
+                st["tier_jumps"] = _jumps
+                print(f"  [手递] 跳转手递 → {round_dir}/10_tier_handoff.json (下个 planner 读: 瓶颈+方向)")
+                print(f"  → {direction} Tier{tier}→Tier{target} (planner: {getattr(plan,'promote_reason','')})")
+                st["tier"] = target
+                return target, False
+            elif tier >= 6:
+                print(f"  ⛔ planner 判瓶颈已非本tier且到Tier6, 停止 ({getattr(plan,'promote_reason','')})")
+                return tier, True
+            else:
+                # ★P1: 前向晋升也写手递 (下个 tier 知道为什么从本层上来)
+                _hinfo = {
+                    "from_tier": tier, "to_tier": tier + 1, "from_round": rn,
+                    "bottleneck_analysis": getattr(plan, "promote_reason", "瓶颈不属本tier") or "瓶颈不属本tier",
+                    "optimization_direction": "", "promote_evidence": "",
+                }
+                (round_dir / "10_tier_handoff.json").write_text(
+                    json.dumps(_hinfo, ensure_ascii=False, indent=1), encoding="utf-8")
+                st["handoff"] = _hinfo
+                print(f"  [手递] 前向晋升手递 → {round_dir}/10_tier_handoff.json")
+                print(f"  → 晋升 Tier{tier}→Tier{tier+1} (planner: {getattr(plan,'promote_reason','瓶颈不属本tier')})")
+                st["tier"] = tier + 1
+                return tier + 1, False
+        elif no_improve >= 3 or tier >= 6:
+            if tier >= 6:
+                if no_improve >= 3:
+                    print("  ⛔ Tier6 连续3轮无改进, 停止")
+                    return tier, True
+                # ★B1修复: Tier6 有改进 → 继续 (README 写的"连续无改进才停"; 原来一轮即停是 bug)
+                print(f"  → Tier6 有改进(no_improve={no_improve}), 继续")
+                return tier, False
+            print(f"  → 晋升 Tier{tier}→Tier{tier+1} (本tier连续{no_improve}轮无改进)")
+            st["tier"] = tier + 1
+            return tier + 1, False
+        return tier, False   # 本层继续
+
     def run(self):
         st = self.traj["state"]
         tier, rn = st.get("tier", 1), st.get("round", 1)
@@ -979,15 +1145,28 @@ class Scheduler:
                 t_fusion = time.time() - _t0
                 print(f"  ⏱ ③融合分析: {t_fusion:.1f}s")
 
-            # ★D1-Tier3: 自动分块实测 — 进分块层先跑候选 BLOCK 收集各 config 实测数据,
-            #   喂给 planner 决策 (不是这里猜/写死). 报错/无可扫 → None, 正常走 LLM (兜底).
-            #   TIER3_SWEEP=1 默认; 每 op 首次进 Tier3 触发一次.
-            # ★计时: t_plan 从 sweep 前开始计 (sweep 是 planner 决策的数据准备, 计入 planner 阶段)
+            # ★D1-Tier3: 自动分块实测 v2 — 进分块层先跑全量 L0 合法 BLOCK 候选,
+            #   单进程 torch.npu.Event 实测, 喂 planner 决策. 报错/无可扫 → None, 走 LLM 兜底.
+            #   TIER3_SWEEP=1 默认.
+            # ★v2 重扫条件: kernel 代码结构(非 BLOCK 赋值) 的 hash 变化 → 重扫;
+            #    不再用永久 tier3_swept flag (T4/T5/T6 结构变更后重入 T3 也能触发).
+            # ★计时: t_plan 从 sweep 前开始计 (sweep 计入 planner 阶段).
             _t_plan0 = time.time()
             tier3_sweep = None
-            if tier == 3 and os.environ.get("TIER3_SWEEP", "1") == "1" and not st.get("tier3_swept"):
-                st["tier3_swept"] = True
-                tier3_sweep = self._tier3_sweep_data(tier, rn, round_dir)
+            if tier == 3 and os.environ.get("TIER3_SWEEP", "1") == "1":
+                import hashlib
+                _code_body = re.sub(r'(BLOCK_\w+)\s*[,=]\s*\d+', '',   # 去 BLOCK 赋值
+                                    self.current_kernel.read_text(encoding="utf-8")
+                                    if self.current_kernel.exists() else "")
+                _code_norm = re.sub(r'\s+', ' ', _code_body).strip()
+                _code_hash = hashlib.sha256(_code_norm.encode()).hexdigest()[:16]
+                _prev_hash = st.get("tier3_sweep_code_hash", "")
+                if _code_hash != _prev_hash or not st.get("tier3_swept"):
+                    st["tier3_swept"] = True
+                    st["tier3_sweep_code_hash"] = _code_hash
+                    tier3_sweep = self._tier3_sweep_data(tier, rn, round_dir)
+                else:
+                    print(f"  [Tier3] kernel 结构未变 (hash={_code_hash}), 跳过重扫, 复用历史最佳")
                 if tier3_sweep and tier3_sweep.get("available"):
                     print(f"  ⏱ Tier3 分块实测完成: {len(tier3_sweep['configs'])} config, "
                           f"最优 {tier3_sweep['best']['block']} {tier3_sweep['best']['ns']:.0f}ns "
@@ -996,8 +1175,15 @@ class Scheduler:
                     print(f"  [Tier3] 分块实测不可用 "
                           f"({(tier3_sweep or {}).get('error','行级/无候选')}) → 走 LLM (兜底)")
 
-            # ④ Planner → plan + 晋升决策 (只喂 07 筛好的字段 + 融合分析 + Tier3 分块实测数据)
-            plan = self._plan(diagnosis, extracted, tier, rn, round_dir, fusion_analysis, tier3_sweep)
+            # ④ Planner → plan + 晋升决策 (07字段 + 完整数据上下文 + 轨迹 + 手递 + 融合 + 分块实测)
+            incoming_handoff = st.get("handoff")   # ★P1: 上个 tier 跳转来的瓶颈分析+优化方向
+            if incoming_handoff:
+                print(f"  [手递] 收到 Tier{incoming_handoff.get('from_tier')}→本层 手递: "
+                      f"瓶颈={str(incoming_handoff.get('bottleneck_analysis'))[:80]}")
+            plan = self._plan(diagnosis, extracted, tier, rn, round_dir, fusion_analysis, tier3_sweep,
+                              handoff=incoming_handoff)
+            if incoming_handoff:
+                st["handoff"] = None   # ★已消费 (本层 planner 已读到), 防止后续轮重复引用
             t_plan = time.time() - _t_plan0
             print(f"  ⏱ ④Planner: {t_plan:.1f}s")
 
@@ -1121,69 +1307,12 @@ class Scheduler:
             self.traj["history"].append(hist)
 
             # 晋升决策: planner.promote (读瓶颈判断) + 连续3轮无改进兜底 + 达标/到Tier6停止
-            planner_promote = getattr(plan, "promote", False)
-            # ★无改进 = 本轮加速比没超过上一轮已接受×噪声地板 (speedup <= prev_speedup×floor);
-            #   数"本 tier 连续无改进"轮数 (跨 tier 边界即断) — 与 KEEP 地板同步
-            no_improve = 0
-            floor = _keep_floor()
-            for h in reversed(self.traj["history"]):
-                if h.get("tier") != tier:
-                    break
-                if h.get("speedup", 0) > h.get("prev_speedup", 0) * floor:
-                    break
-                no_improve += 1
-            if self.target_speedup > 0 and speedup >= self.target_speedup:
-                # ★D3: 达标不硬停 — 继续探后续层确认无更大空间, 由 no_improve/max_rounds 收尾.
-                #   (目标改成 -1 → 不再触发停; 否则一轮达标就过早停, 错过 Tier3+ 更大优化空间)
-                print(f"  🎯 已达标 {speedup:.3f}x ≥ target {self.target_speedup}x — 继续探后续层找更大空间")
-                self.target_speedup = -1
-            if planner_promote:
-                target = getattr(plan, "promote_to", 0) or 0
-                if target and 1 <= target <= 6 and target != tier:
-                    # ★尊重 planner 的目标层: 支持回退前层(算法/融合) 和 晋升后层
-                    direction = "回退" if target < tier else "晋升"
-                    # ★防死循环: 回退到已充分探索(≥3轮)的层 → 拒绝, 改晋升
-                    #   (planner 可能 T3 说"前面有空间"→回 T1 → T1 又跳回 T3 → 无限循环)
-                    _t_rounds = {}
-                    for _h in self.traj["history"]:
-                        _t_rounds[_h.get("tier")] = _t_rounds.get(_h.get("tier"), 0) + 1
-                    if target < tier and _t_rounds.get(target, 0) >= 3:
-                        print(f"  ⛔ 拒绝回退: Tier{target} 已探索 {_t_rounds[target]} 轮 (防 T{target}↔T{tier} 死循环), 改晋升")
-                        if tier >= 6:
-                            print(f"  ⛔ 且已到 Tier6, 停止")
-                            st["round"] = rn + 1
-                            self._save_traj()
-                            break
-                        print(f"  → 晋升 Tier{tier}→Tier{tier+1} (回退被拒)")
-                        tier += 1
-                        st["tier"] = tier
-                    else:
-                        print(f"  → {direction} Tier{tier}→Tier{target} "
-                              f"(planner: {getattr(plan,'promote_reason','')})")
-                        tier = target
-                        st["tier"] = tier
-                elif tier >= 6:
-                    print(f"  ⛔ planner 判瓶颈已非本tier且到Tier6, 停止 ({getattr(plan,'promote_reason','')})")
-                    st["round"] = rn + 1
-                    self._save_traj()
-                    break
-                else:
-                    print(f"  → 晋升 Tier{tier}→Tier{tier+1} (planner: {getattr(plan,'promote_reason','瓶颈不属本tier')})")
-                    tier += 1
-                    st["tier"] = tier
-            elif no_improve >= 3 or tier >= 6:
-                if tier >= 6:
-                    if no_improve >= 3:
-                        print("  ⛔ Tier6 连续3轮无改进, 停止")
-                        st["round"] = rn + 1
-                        self._save_traj()
-                        break
-                    # ★B1修复: Tier6 有改进 → 继续 (README 写的"连续无改进才停"; 原来一轮即停是 bug)
-                    print(f"  → Tier6 有改进(no_improve={no_improve}), 继续")
-                else:
-                    print(f"  → 晋升 Tier{tier}→Tier{tier+1} (本tier连续{no_improve}轮无改进)")
-                    tier += 1
-                    st["tier"] = tier
+            # ★P1: 严格晋升(需依据) + 可回退 + 防死循环 + 跳转手递 — 抽成 _decide_tier (可单测各场景)
+            tier, _stop = self._decide_tier(st, plan, tier, rn, round_dir, speedup)
+            if _stop:
+                st["round"] = rn + 1
+                self._save_traj()
+                break
             # ★D7: promote 轮免费 — 不消耗 max_rounds 配额 (用 promote_budget 扩总预算),
             #   但 rn 编号统一推进 (历史/目录编号一致, 不被 promote 打乱)
             if getattr(plan, "promote", False):

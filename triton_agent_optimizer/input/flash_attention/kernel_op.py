@@ -38,6 +38,8 @@ BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64          # 查询块/键块/头维块
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Multi-Head Flash Attention (因果): 每个 (头, 查询块) 一个 program, 边 loop key 块边 online softmax
+# ★K 输入预转置为 [nheads, dim, seq] (=每头 K^T): 保证 inner-loop K 加载 innermost stride=1
+#   (Q/V 用 [nheads, seq, dim], 原本就是连续加载; 只有 K 需要转置)
 @triton.jit
 def flash_attn_mha_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
                           seq, nheads, dim, scale,
@@ -54,8 +56,8 @@ def flash_attn_mha_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
     m_mask = offs_m < seq
     k_mask = offs_k < dim
 
-    # Q[m, head, k]: m*(NH*D) + head*D + k  (布局 [seq, nheads, dim])
-    q_ptrs = q_ptr + offs_m[:, None] * (nheads * dim) + head * dim + offs_k[None, :]
+    # Q[h, m, k]: h*(seq*dim) + m*dim + k  (布局 [nheads, seq, dim])
+    q_ptrs = q_ptr + head * (seq * dim) + offs_m[:, None] * dim + offs_k[None, :]
     q = tl.load(q_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
 
     acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
@@ -65,8 +67,9 @@ def flash_attn_mha_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
     for start in range(0, seq, BLOCK_N):
         offs_n = start + tl.arange(0, BLOCK_N)
         n_mask = offs_n < seq
-        # K^T[k, n] = K[n, head, k]  (指针直接转置)
-        k_ptrs = k_ptr + offs_n[None, :] * (nheads * dim) + head * dim + offs_k[:, None]
+        # K_t[h, k, n]: h*(dim*seq) + k*seq + n  → innermost(n) stride=1 连续✓
+        #   (K_t = 每头 K^T 预转置, 和 attention_mlp 的 attention_scores 同款修法)
+        k_ptrs = k_ptr + head * (dim * seq) + offs_k[:, None] * seq + offs_n[None, :]
         kk = tl.load(k_ptrs, mask=n_mask[None, :] & k_mask[:, None], other=0.0)
         s = tl.dot(q, kk) * scale                  # S = Q@K^T·scale [BLOCK_M, BLOCK_N]
 
@@ -79,13 +82,15 @@ def flash_attn_mha_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
         alpha = tl.exp(m_i - m_curr)                  # 旧块衰减 [BLOCK_M]
         l_i = alpha * l_i + tl.sum(p, axis=1)         # running sum [BLOCK_M]
 
-        v_ptrs = v_ptr + offs_n[:, None] * (nheads * dim) + head * dim + offs_k[None, :]
+        # V[h, n, d]: h*(seq*dim) + n*dim + d  → 行跨度=1 (连续✓)
+        v_ptrs = v_ptr + head * (seq * dim) + offs_n[:, None] * dim + offs_k[None, :]
         vv = tl.load(v_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
         acc = acc * alpha[:, None] + tl.dot(p, vv)    # O 累加 [BLOCK_M, BLOCK_K]
         m_i = m_curr
 
     o = acc / l_i[:, None]                            # 归一化
-    o_ptrs = o_ptr + offs_m[:, None] * (nheads * dim) + head * dim + offs_k[None, :]
+    # O[h, m, k]: h*(seq*dim) + m*dim + k
+    o_ptrs = o_ptr + head * (seq * dim) + offs_m[:, None] * dim + offs_k[None, :]
     tl.store(o_ptrs, o, mask=m_mask[:, None] & k_mask[None, :])
 
 
@@ -98,10 +103,12 @@ def main():
 
     npu = torch.device("npu")
     seq, nh, dim = SEQ, NHEADS, DIM
-    q = (torch.randn(seq, nh, dim, dtype=DTYPE, device=npu)) * 0.1
-    k = (torch.randn(seq, nh, dim, dtype=DTYPE, device=npu)) * 0.1
-    v = (torch.randn(seq, nh, dim, dtype=DTYPE, device=npu)) * 0.1
-    o = torch.empty(seq, nh, dim, dtype=DTYPE, device=npu)
+    # ★Q/V 用 [nheads, seq, dim] (原始连续); K 预转置成 [nheads, dim, seq] (=每头 K^T)
+    #   保证 kernel 内 K 加载 innermost stride=1 (DMA 连续突发)
+    q_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=npu) * 0.1).permute(1, 0, 2).contiguous()
+    k_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=npu) * 0.1).permute(1, 2, 0).contiguous()
+    v_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=npu) * 0.1).permute(1, 0, 2).contiguous()
+    o = torch.empty(nh, seq, dim, dtype=DTYPE, device=npu)  # ★[nheads, seq, dim]
 
     grid = (triton.cdiv(seq, BLOCK_M) * nh,)
     print(f"[info] flash_attn_mha seq={seq} heads={nh} dim={dim} causal=1 "
@@ -110,22 +117,27 @@ def main():
     # ★KERNEL_LOOP: verify/bench 用它 (一次 msprof 内循环 N 次, 求单次平均; 分配只做一次复用)
     LOOP = int(os.environ.get("KERNEL_LOOP", "1"))
     for _ in range(LOOP):
-        flash_attn_mha_kernel[grid](q, k, v, o, seq, nh, dim, SCALE,
+        flash_attn_mha_kernel[grid](q_t, k_t, v_t, o, seq, nh, dim, SCALE,
                                     BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K)
     torch.npu.synchronize()
     print("[info] flash_attn_mha launched & synced OK")
 
     # 正确性校验 (默认关, verify 设 MATMUL_VERIFY=1 自动跑; 对 torch 参考, 逐头算因果注意力)
     if os.environ.get("MATMUL_VERIFY", "0") == "1":
+        # o=[nheads,seq,dim] → back to [seq,nheads,dim] for comparison
         mask = torch.triu(torch.ones(seq, seq, dtype=torch.bool, device=npu), diagonal=1)  # 因果
-        ref = torch.empty_like(o)
+        q_ref = q_t.permute(1, 0, 2)   # [nh,seq,dim] → [seq,nh,dim]
+        k_ref = k_t.permute(2, 0, 1)   # [nh,dim,seq] → [seq,nh,dim]
+        v_ref = v_t.permute(1, 0, 2)   # [nh,seq,dim] → [seq,nh,dim]
+        o_ref = torch.empty_like(q_ref)
         for h in range(nh):
-            sh = (q[:, h, :] @ k[:, h, :].t()) * SCALE
+            sh = (q_ref[:, h, :] @ k_ref[:, h, :].t()) * SCALE
             sh = sh.masked_fill(mask, float("-inf"))
             ph = torch.softmax(sh, dim=-1)
-            ref[:, h, :] = ph @ v[:, h, :]
-        abs_diff = (o - ref).abs().max().item()
-        rel_diff = abs_diff / (ref.abs().max().item() + 1e-6)
+            o_ref[:, h, :] = ph @ v_ref[:, h, :]
+        o_cmp = o.permute(1, 0, 2)     # [nheads,seq,dim] → [seq,nheads,dim]
+        abs_diff = (o_cmp - o_ref).abs().max().item()
+        rel_diff = abs_diff / (o_ref.abs().max().item() + 1e-6)
         print(f"[info] result check: {'PASS' if rel_diff < 1e-2 else 'CHECK'}  "
               f"max|O-ref|={abs_diff:.6f} rel={rel_diff:.6f}")
 

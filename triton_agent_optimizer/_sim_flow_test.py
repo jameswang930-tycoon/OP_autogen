@@ -119,7 +119,8 @@ def fake_verify(kernel_op, round_dir, baseline_ns=None, num_kernels=None):
             "loop": 30, "rows": 90, "duration_us": round(base / sp / 1000, 1)}
 
 def fake_generate_v4(self, extracted, tier, history, kernel_code, round_num,
-                     op_dir=None, fusion_analysis=None, round_dir=None, current_kernel=None):
+                     op_dir=None, fusion_analysis=None, round_dir=None, current_kernel=None,
+                     context_path=None, trajectory_path=None, handoff=None):
     m = re.search(r"(BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, (\d+))", kernel_code)
     old = m.group(1) if m else "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32"
     val = m.group(2) if m else "32"

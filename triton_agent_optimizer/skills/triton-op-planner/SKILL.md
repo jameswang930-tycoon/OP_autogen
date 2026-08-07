@@ -11,8 +11,11 @@ argument-hint: >
     - 步骤2: 优化策略文档路径 = docx/playbook_tier{N}_*.md
     - 步骤3: 当前单文件路径
     - 步骤4: 诊断字段文件路径 + 内联字段
+    - 步骤5: 完整数据上下文 JSON（07/planner_context.json：每 kernel 全量 task/deep + 占比 + Top耗时 + 轨迹 + 历史 + 手递）
+    - 步骤6: 优化轨迹 optimization_trajectory.json（各层进度/结果）
+    - 步骤7: 跳转手递（上个 planner 的瓶颈分析+优化方向）
     - config 常量、history、fusion_analysis（Tier2）
-  输出：JSON {strategy, target_speedup, changes[], expected_impact, promote, promote_to, promote_reason}
+  输出：JSON {strategy, target_speedup, changes[], expected_impact, promote, promote_to, promote_reason, promote_evidence, handoff}
 ---
 
 # Triton Ascend 优化 Planner Skill
@@ -64,6 +67,9 @@ GM≈1638GB/s (HBM2e 理论, 实测~1540), cube≈294.9TFLOPS(fp16 标称)/313(�
 | 2 | 优化策略文档 | `cat <prompt步骤2给的playbook路径>` = `docx/playbook_tier{N}_*.md`（★按当前 tier） |
 | 3 | 当前单文件 | `cat <prompt步骤3给的kernel路径>`（★当前正在优化的版本） |
 | 4 | 诊断字段 | `cat <prompt步骤4给的07字段文件>` 或 用内联字段 |
+| 5 | ★完整数据上下文 JSON | `cat <prompt步骤5给的context路径>`（= 07/planner_context.json：**每 kernel 全量 task/deep + 耗时占比 + Top耗时 + 轨迹state + 历史 + 手递**，比 07 字段更全，分析瓶颈必读） |
+| 6 | ★优化轨迹 | `cat <prompt步骤6给的trajectory路径>`（= optimization_trajectory.json：**全部轮次的 tier/策略/加速比/结果** → 判断各层是否已榨干、防重复/防误跳/防死循环回退） |
+| 7 | ★跳转手递 | `cat <prompt步骤7给的handoff内容>`（若有：**上个 tier planner 分析出的瓶颈+优化方向**，作为部分参考，仍要结合其他数据独立判断） |
 
 「当前单文件」含义（调度器已给绝对路径，直接用；= 最新**被采纳**的 kernel）：
 | 轮次 | 路径 | 含义 |
@@ -89,10 +95,15 @@ GM≈1638GB/s (HBM2e 理论, 实测~1540), cube≈294.9TFLOPS(fp16 标称)/313(�
 | 当前 tier 字段显示"已无空间"（如 Tier3: block_dim≥40 且 mte1_ratio 已低） | 不是硬调本层，是信号 | 回前层查 或 晋升下一层 |
 | 「前层进度」显示某层只跑了几轮、加速比还很低 | 那层可能没榨干 | 回那层 `promote_to=<那层>` |
 
+**★必须读轨迹（步骤6）再定跳转**：从 `optimization_trajectory.json` 看**各层跑了几轮、做了啥、结果如何**。
+- 目标层已试过同类策略且无果 → **别反复回跳同一层**（防死循环；调度器对同一跳转路径≥3次会拒绝）
+- 目标层确实没榨干（轮数少 / 加速比低 / 有未试方向）→ 才回跳，并在手递里给**具体方向**（不是空泛"回去优化"）
+
 **规则**：
 - 前层有明显优化空间 → **NEVER 在本层硬调**，`promote=true, promote_to=<前层>`（**允许回退**，不只是前向晋升）
 - 前层无空间 → 才轮到本层优化（promote_to=0）
 - 本层也无空间 → `promote=true, promote_to=<下一层>`
+- **★严格晋升**：`promote=true` 时必须填 `promote_evidence`（用 context/trajectory 里的数据+历史证明当前层已无优化空间），否则调度器拒绝晋升
 
 ## 第一步：判断瓶颈是否属于本 tier（promote 决策）
 
@@ -138,9 +149,15 @@ GM≈1638GB/s (HBM2e 理论, 实测~1540), cube≈294.9TFLOPS(fp16 标称)/313(�
   "expected_impact": "MTE1 搬运次数减半, 端到端降 ~10%",
   "promote": false,
   "promote_to": 0,
-  "promote_reason": ""
+  "promote_reason": "",
+  "promote_evidence": "",
+  "handoff": {"to_tier": 0, "bottleneck": "", "optimization_direction": ""}
 }
 ```
+
+### promote / 跳转的额外要求（★P1）
+- **`promote=true` → 必须给 `promote_evidence`**：用完整数据上下文 + 轨迹里的数据/历史，说明"当前层已无优化空间"的证据（例：`Tier3 block_dim=40 全核已用, mte1_ratio<5%, sweep 最优=当前块 → 分块层无空间`）。没依据=不晋升，调度器会拒绝。
+- **跳转到别的 tier → 填 `handoff`**：`{"to_tier": 目标层, "bottleneck": "你分析出的瓶颈", "optimization_direction": "目标层应该做什么（具体到方向）"}`。调度器把它写进 `round_dir/10_tier_handoff.json` 并传给目标层 planner 作参考（共享信息+合作）。
 
 ### changes[].old_code 的铁律（★最关键）
 1. `old_code` **必须逐字符** 等于 kernel_op.py 里某一段（coder 会做精确字符串替换）。
@@ -156,7 +173,10 @@ GM≈1638GB/s (HBM2e 理论, 实测~1540), cube≈294.9TFLOPS(fp16 标称)/313(�
 ❌ **跨层改码**：Tier3 轮的 changes 里把 `DTYPE` 改成 fp16（那是 Tier1/5 的策略），或做了融合（Tier2）
 ❌ **硬调已无空间的本层**：当前 tier 字段已显示"无空间"，还继续换 BLOCK 值硬试 → 该回前层查或晋升
 ❌ **改完多轮无效果仍不回头**：本层连续几轮无改进 → 必须怀疑前层（算法/融合），不是无限硬调
-✅ **正确**：Tier3 轮，若发现算力利用率极低 → `promote=true, promote_to=1, promote_reason="cube 利用率过低, 算法可能非最优, 先回算法层"`
+❌ **无依据就 promote**：`promote=true` 但不给 `promote_evidence` → 调度器拒绝，白费一轮
+❌ **反复回跳同一层**：不读轨迹，T1↔T3 无限 ping-pong → 先看 trajectory 该层是否已试过，避免重复
+❌ **空泛手递**：回跳只写"回去优化"，不给 `handoff.optimization_direction` → 目标层 planner 没有可执行的参考
+✅ **正确**：Tier3 轮，若发现算力利用率极低 → `promote=true, promote_to=1, promote_reason="cube 利用率过低, 算法可能非最优, 先回算法层", promote_evidence="<数据: cube_util=0.12, 算法可能非最优>", handoff={"to_tier":1,"bottleneck":"cube 利用率极低, 算法层没榨干","optimization_direction":"检查 matmul 是否用了最优算法/split-k"}`
 
 ## 铁律（汇总）
 1. 只改单文件 `kernel_op.py`，绝不建议改其他文件。

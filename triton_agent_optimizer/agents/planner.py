@@ -61,6 +61,8 @@ class RoundPlan:
     promote: bool = False          # planner 决策: 是否换层 (晋升/回退)
     promote_to: int = 0            # ★目标层: 0=本层, <当前=回退前层, >当前=晋升后层
     promote_reason: str = ""
+    promote_evidence: str = ""     # ★P1: 晋升/回退的数据依据 (planner 必须给出, 调度器据此严格晋升)
+    handoff: Optional[dict] = None  # ★P1: 跳转手递 (给目标 tier 的瓶颈分析+优化方向)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -223,15 +225,22 @@ class PlannerAgent:
         fusion_analysis: Optional[dict] = None,
         round_dir: Optional[Path] = None,
         current_kernel: Optional[Path] = None,
+        context_path: Optional[Path] = None,      # ★P2: 完整数据上下文 JSON
+        trajectory_path: Optional[Path] = None,   # ★P1: 全量轨迹 (每层试过什么)
+        handoff: Optional[dict] = None,           # ★P1: 跳转来的瓶颈分析+方向
     ) -> RoundPlan:
         """v4 Planner: 输入 = 小指令 + 读文件路径 + 内联小字段 → plan + 晋升决策。
 
         ★不嵌入 playbook/kernel 全文, 让 nga run 自己读文件 (避免 prompt 超限/卡顿)。
-        额外输出 promote: bool + promote_reason (当前瓶颈是否属于本 tier, 决定晋升)。"""
+        ★P1: 每轮都读 optimization_trajectory.json (了解各层进度/晋升策略) + 完整数据上下文 JSON
+            (每 kernel 全量 task/deep + 占比 + Top耗时) + 跳转手递 (上个 planner 的瓶颈分析+方向)。
+        额外输出 promote/promote_to/promote_reason/promote_evidence/handoff。"""
         history_text = _format_history(history)
         config_text = _extract_config_constants(kernel_code)   # ★从单文件 config 区提取
         fusion_text = (json.dumps(fusion_analysis, ensure_ascii=False)[:600]
                        if fusion_analysis else "(无融合分析)")
+        handoff_text = (json.dumps(handoff, ensure_ascii=False)[:600]
+                        if handoff else "(无跳转手递)")
 
         # 读文件路径 (绝对路径, nga run 自己读)
         skill_path = self.playbook_dir.parent / "skills" / "triton-op-planner" / "SKILL.md"
@@ -247,7 +256,10 @@ class PlannerAgent:
             f"1. 调用 skill: {skill_path}\n"
             f"2. 读优化策略文档: {playbook_path}  (只看『优化内容』表 + 『决策依据』段)\n"
             f"3. 读当前单文件 (★当前正在优化的版本, 不是源文件): {current_kernel or (op_dir / 'kernel_op.py' if op_dir else '(未给)')}  (重点 ② kernel 区)\n"
-            f"4. 读诊断字段文件: {d7_path or '(未给, 用下面内联字段)'}\n\n"
+            f"4. 读诊断字段文件: {d7_path or '(未给, 用下面内联字段)'}\n"
+            f"5. ★读完整数据上下文 JSON (每 kernel 全量 task/deep + 耗时占比 + Top耗时 + 轨迹state + 历史 + 手递): {context_path or '(未给)'}  (分析瓶颈必读, 比 07 字段更全)\n"
+            f"6. ★读优化轨迹: {trajectory_path or '(未给)'}  (看全部轮次的 tier/策略/加速比/结果 → 判断各层是否已榨干, 防重复/防误跳/防死循环回退)\n"
+            f"7. (若有) ★读跳转手递: {handoff_text}  (上个 tier planner 分析出的瓶颈+优化方向, 作为部分参考; 仍要结合其他数据独立判断)\n\n"
             f"## 内联诊断字段 (当前 tier 筛好的, 若第4步文件读不到就用这些):\n{extracted[:1600]}\n\n"
             f"## config 常量:\n{config_text or '(无)'}\n"
             f"## 历史 (最近几轮):\n{history_text}\n"
@@ -257,6 +269,7 @@ class PlannerAgent:
             f"   - 算力利用率低/cube没吃满 → 算法可能非最优 (Tier1 有空间)\n"
             f"   - 多kernel串行+launch开销大 → 有融合空间 (Tier2 有空间)\n"
             f"   - 有 → promote=true, promote_to=<前层>, 允许回退; ★绝不在本层硬调\n"
+            f"   - 用 trajectory 查该前层是否已试过 → 若已充分探索且无果, 别反复回跳同一层\n"
             f"2. 然后判断: 当前瓶颈是否属于 Tier{tier}({TIER_NAMES.get(tier,'?')}) 的优化范畴?\n"
             f"   - 属于 → promote=false, promote_to=0, 给出 changes[]\n"
             f"   - 不属于且前层无空间 → promote=true, promote_to=<下一层>\n"
@@ -264,16 +277,20 @@ class PlannerAgent:
             f"4. changes[] 的 old_code 必须与【当前读到的 kernel_op.py(已含之前所有轮次 coder 的修改累积)】某段【逐字符】相同\n"
             f"   (★从读到的文件逐字复制, 绝不用示例/记忆里的旧值; 拿不准就不改, 宁缺勿错)\n"
             f"5. 只改单文件 kernel_op.py ①config/②kernel, 不碰其他文件; 不引入 num_warps/num_stages 到 @triton.jit()\n"
-            f"6. 目标加速比 1.05~1.5x\n\n"
+            f"6. 目标加速比 1.05~1.5x\n"
+            f"7. ★严格晋升: 若 promote=true, 必须填 promote_evidence (用完整数据上下文/trajectory 里的数据+历史证明当前层已无优化空间), 否则调度器会拒绝晋升\n"
+            f"8. ★跳转手递: 若 promote=true 且跳转到别的 tier, 填 handoff: {{\"to_tier\":N,\"bottleneck\":\"你分析出的瓶颈\",\"optimization_direction\":\"目标层应该做什么\"}} → 调度器写 10_tier_handoff.json 给目标层 planner 作参考\n\n"
             f"## 输出 JSON only (★先看真实示例再写):\n"
             f"例: 想把 BLOCK_K 增大 → ★old_code 必须逐字复制自【你读到的当前 kernel】, 不是示例里的数值\n"
             f'{{"strategy":"增大BLOCK_K减MTE1次数","target_speedup":1.1,\n'
             f'  "changes":[{{"old_code":"<从你读到的kernel里逐字复制要替换的那一行>","new_code":"<替换后的整行>","reason":"为什么","section":"① config/② kernel","tier":当前tier}}],\n'
-            f'  "expected_impact":"...","promote":false,"promote_to":0,"promote_reason":""}}\n'
+            f'  "expected_impact":"...","promote":false,"promote_to":0,"promote_reason":"","promote_evidence":"",\n'
+            f'  "handoff":{{"to_tier":0,"bottleneck":"","optimization_direction":""}}}}\n'
             f"格式 (★old_code 必须逐字符来自【当前读到的 kernel_op.py = 源 + 之前所有轮次修改累积】; 别用示例/记忆里的旧值; 拿不准就不改; tier 必须=当前层):\n"
             f'{{"strategy":"...","target_speedup":1.1,\n'
             f'  "changes":[{{"old_code":"被替换的整行(逐字复制自当前kernel)","new_code":"替换后的整行","reason":"为什么","section":"① config/② kernel","tier":N}}],\n'
-            f'  "expected_impact":"...","promote":false,"promote_to":0,"promote_reason":"..."}}'
+            f'  "expected_impact":"...","promote":false,"promote_to":0,"promote_reason":"...","promote_evidence":"...",\n'
+            f'  "handoff":{{"to_tier":N,"bottleneck":"...","optimization_direction":"..."}}}}'
         )
 
         # v4: 统一走 LLMClient (api / nga run CLI / stub), 并引用 planner skill
@@ -303,6 +320,9 @@ class PlannerAgent:
             promote=bool(plan_dict.get("promote", False)),
             promote_to=int(plan_dict.get("promote_to", 0) or 0),   # 目标层 (0=本层)
             promote_reason=str(plan_dict.get("promote_reason", "")),
+            promote_evidence=str(plan_dict.get("promote_evidence", "")),
+            handoff=(plan_dict.get("handoff")
+                     if isinstance(plan_dict.get("handoff"), dict) else None),
         )
 
     def _stub_plan_v4(self, tier: int) -> dict:
@@ -335,7 +355,8 @@ class PlannerAgent:
         }
         s, changes = strategies.get(tier, ("analyze", []))
         return {"strategy": s, "target_speedup": 1.05, "changes": changes,
-                "expected_impact": "~5%", "promote": False, "promote_reason": ""}
+                "expected_impact": "~5%", "promote": False, "promote_reason": "",
+                "promote_evidence": "", "handoff": None}
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  LLM 调用

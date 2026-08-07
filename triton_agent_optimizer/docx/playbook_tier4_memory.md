@@ -174,11 +174,109 @@ bias, scale, shift = params[0], params[1], params[2]
 
 ---
 
+## 实战案例（真实 910B3 排障）：跨步访问 → 88× 差距与修复
+
+> **来源**：attention_mlp / flash_attention / conv2d 优化后 vs PyTorch 出现几十倍差距。
+> **排查结论**：测量链路先核对无误（warmup×3 + 一次 msprof 内 KERNEL_LOOP=30 次 ÷30；PyTorch 侧 warmup×3 + Event 30 次 forward ÷30，两者对齐）→ 差距真实 → 根因全是 **DMA 跨步访问**（情况A 的真实实例）。
+>
+> **判断铁律**：`tl.load` 的 tile 若**最后一维（innermost）stride ≠ 1** → 必跨步，必慢。对照工作正常的 matmul：`b_ptrs = b_ptr + (offs_k[:,None]*stride_bk + offs_n[None,:]*stride_bn)`，`stride_bn=1`。
+
+### 案例1：Q@K^T 指针转置 → 88× 慢（attention_mlp.attention_scores_kernel）
+
+**触发**：`gm_to_ub` 带宽低到 ~1%，attention_scores_kernel 占端到端 99%。
+**现象**：attention_mlp 端到端 **158,823us** vs PyTorch **1,793us**（88×），其中 attention_scores 就 **156,218us**。
+**根因**：K^T 用指针直接转置，tile 最后一维 n 的 stride = `dim` = **2048 元素（8KB）** → DMA 搬 32B+ 整条 cache line 只用 1 个 float，其余"运空气"。
+
+### ❌ 问题示例代码
+```python
+# ❌ 指针直接转置: K^T[k,n] = K[n,k], tile 最后一维 n stride = dim = 2048 (8KB)
+k_ptrs = k_ptr + (offs_n[None, :] * dim + offs_k[:, None])   # 每行只取 1 个, 运空气
+```
+**出现的问题**：inner-loop 每次读 K 都是 8KB 跨步 → 带宽利用率 ~1%。数值正确但慢 88×，且看不见（matmul 长得一样却很快，因为 B 矩阵 `stride_bn=1`）。
+
+### ✅ 修改后正确代码（host 端预转置）
+```python
+# host (main): 预分配 k_t, 每轮 K 更新后转置 (真实部署 K 每轮变, 必须付)
+k_t = torch.empty(dim, seq, dtype=DTYPE, device=npu)   # 分配放 loop 外, 只一次
+for _ in range(LOOP):
+    ...
+    k_t.copy_(k.T)                                     # k.T 是 view, copy_ 写入预分配 buffer
+    attention_scores_kernel[g_scores](q, k_t, s, seq, dim, scale, BLOCK_*=...)
+
+# kernel: K_t[k,n] = k_ptr + k*seq + n, innermost(n) stride=1 → 连续突发 ✓
+k_ptrs = k_ptr + (offs_k[:, None] * seq + offs_n[None, :])
+for k in range(0, dim, BLOCK_K):
+    ...
+    k_ptrs += BLOCK_K * seq        # ★布局变了, 递增也要乘 seq (前进一个 k-block)
+```
+**约束/坑**：
+- 转置 kernel 每轮 ~100us（16MB fp32），是**诚实成本**；PyTorch/CANN matmul 原生支持 transB 不用转置 → 这是剩余差距
+- `k_t` 分配必须放 loop 外，否则每轮分配计入测量
+- 只转置被跨步访问的矩阵，其余保持原布局
+- 已用 torch CPU 模拟核对索引数学：`max_err=1.9e-6`（vs 参考 S=Q@K^T·scale）
+
+---
+
+### 案例2：Flash-Attention 每头 K^T 加载（flash_attn_mha_kernel，含"缩 stride ≠ 消除"教训）
+
+**触发**：`gm_to_ub` 低；flash_attention 端到端 **25,785us** vs PyTorch **1,012us**（25×）。
+**根因**：布局 `[seq, nh, dim]` 时，K 块 tile `(BLOCK_K, BLOCK_N)` 最后一维 n 的 stride = `nh*dim` = 512 元素（2KB）。
+
+### ❌ 问题示例代码（含第一版"不彻底修复"的坑）
+```python
+# ❌ 第一版: 只把布局换成 [nh, seq, dim], tile 最后一维 n 的 stride 缩到 dim=64 (256B)
+#    教训: 缩小 stride ≠ 消除 stride — innermost 仍非 1, DMA 依然不能突发
+k_ptrs = k_ptr + head * (seq * dim) + offs_n[None, :] * dim + offs_k[:, None]
+```
+
+### ✅ 修改后正确代码（K 预转置成每头 K^T）
+```python
+# host: 只转置 K;  Q/V 用 [nh,seq,dim] 天然连续, 不动
+q_t = q.permute(1, 0, 2).contiguous()   # [nh, seq, dim]
+k_t = k.permute(1, 2, 0).contiguous()   # [nh, dim, seq]  ← 每头 K^T
+v_t = v.permute(1, 0, 2).contiguous()   # [nh, seq, dim]
+
+# kernel: K_t[h,k,n] = head*(dim*seq) + k*seq + n, innermost(n) stride=1 ✓
+k_ptrs = k_ptr + head * (dim * seq) + offs_k[:, None] * seq + offs_n[None, :]
+```
+**约束/坑**：
+- 转置是 host 一次性（在测量 loop 外），不占每轮；只有 K 需要转置
+- verify 段 permute 必须跟着改：`k_ref = k_t.permute(2, 0, 1)` 还原 `[seq, nh, dim]`
+- 已核对索引数学：`rel=1.0e-7`（vs 逐头 torch 因果注意力参考）
+
+---
+
+### 案例3：Conv2D 权重跨步重读（conv2d / conv_bias_relu，已定位、待算法重构）
+
+**触发**：conv2d **484us** vs PyTorch **40.6us**（12×）；conv_bias_relu **306us** vs **89.2us**（3.4×）。
+**根因（两层）**：
+1. **权重跨步重读**：c/r/s 三重循环内 `offs_k * C*R*S`，stride=72 元素（288B），72 次重复 → 9KB 权重被 64 program × 72 次跨步读
+2. **没用 Cube**：`acc += wv[:,None] * xv[None,:]` 是向量外积（AIC 向量单元），没走 `tl.dot`（Cube 矩阵单元）→ 算力用不上
+
+### ❌ 问题示例代码
+```python
+for c in range(C):
+    for r in range(R):
+        for s in range(S):
+            xv = tl.load(x_ptr + n*C*H*W + c*H*W + ih*W + iw, mask=valid, other=0.0)  # [BLOCK_OW] 连续✓
+            wv = tl.load(w_ptr + offs_k*C*R*S + c*R*S + r*S + s, mask=k_mask, other=0.0)  # [BLOCK_K] stride=72 跨步✗
+            acc += wv[:, None] * xv[None, :]        # 向量外积, 无 tl.dot → 不上 Cube
+```
+
+### ✅ 修复方向（★未定稿，实现并验证后更新本节）
+- **im2col**：host 端把输入 patch 重排成 `[C*R*S, BLOCK_OW]` 连续块 + 权重 `[BLOCK_K, C*R*S]` 连续块，kernel 内 `acc = tl.dot(W, X_patch)` 走 Cube（对应 Tier1 算法层）
+- 或**权重预排**：host 把 W 排成 `[C*R*S, K]` 连续，让每个 `wv` 变连续 `[BLOCK_K]` 读（消除跨步，但仍是向量外积，治标不治本）
+**约束/坑**：**未验证的修复不写进"✅正确代码"** —— 本案例只记录诊断与方向；遇到同款先确认算子是否真的用上了 Cube（`tl.dot`），再看访存。
+
+---
+
 ## 常见错误与修复
 
 | 错误 | 现象 | 修复 |
 |---|---|---|
 | 跨步访问 | 带宽 ~10% | 连续化（最快维匹配布局） |
+| 转置 matmul 用指针直接转置（Q@K^T 等） | 带宽 ~1%，慢 88× | host 端预转置 K，kernel 内 innermost stride=1（见实战案例1/2） |
+| 只缩 stride 不消除（256B/512B 仍跨步） | 只改善几倍 | 预转置让 innermost=1，别停在"缩小" |
 | 非 16B 对齐 | 拆分事务/异常 | pad N 到 16B 倍数 |
 | row-major 无 L2 复用 | l2_hit_rate 低 | swizzle / 权重预排 |
 | load 与 compute 强耦合 | cube 空等 | 循环结构清晰让编译器流水线 |

@@ -5,7 +5,7 @@
 >
 > **★环境铁律（triton-ascend，违反必报错）**：
 > - `num_warps` / `num_stages` **禁止**传给 kernel（传了报 `please do not tune args`）
-> - 不用 `@triton.autotune`；只用裸 `@triton.jit`
+> - `@triton.autotune` 可用 `configs=[]` 触发后端自动分块生成，但当前 pipeline 使用自定义 sweep（sweep_blocks.py）做全面确定性扫描，**外部 tuner 不要传显式 configs list**
 > - **分块必须 16 倍数**（Cube MMA 16×16 基础粒度；非 16 倍数掉到 ~10% 算力）
 > - `BLOCK_*` 必须 `tl.constexpr`
 > - L0 上限：L0A/B=64KB、L0C=128KB；UB=192KB → **超过就 `ub overflow` 编译失败**

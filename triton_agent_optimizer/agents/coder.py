@@ -157,6 +157,25 @@ def _validate_python(code: str) -> tuple[bool, str]:
         return False, f"SyntaxError at line {e.lineno}: {e.msg}"
 
 
+# ★Unicode 脏字符 → ASCII 等价物 (LLM 常把 ASCII 写成 Unicode 等价物 → 语法错/运行错/HIVM编译错)
+#   em dash — / en dash – → - ; 智能引号 ' ' " " → ' " ; 省略号 … → ... ; 各种空格 → 普通空格
+_UNICODE_FIXES = {
+    "—": "-", "–": "-",            # em/en dash → -
+    "‘": "'", "’": "'",            # 单引号
+    "“": '"', "”": '"',            # 双引号
+    "…": "...",                          # 省略号
+    " ": " ", "　": " ",            # 不间断/全角空格
+    "​": "",                             # 零宽空格
+}
+
+
+def _sanitize_unicode(text: str) -> str:
+    """把 LLM 输出里的 Unicode 脏字符替换成 ASCII 等价物 (注释/字符串里的也清, compile 查不出但运行会错)."""
+    for bad, good in _UNICODE_FIXES.items():
+        text = text.replace(bad, good)
+    return text
+
+
 def _generate_diff(original: str, optimized: str) -> str:
     """生成 unified diff。"""
     orig_lines = original.splitlines(keepends=True)
@@ -209,6 +228,7 @@ def _apply_plan_changes(code: str, changes: list):
         new = (ch or {}).get("new_code", "")
         if not old:
             continue
+        new = _sanitize_unicode(new)   # ★清 new_code 的 Unicode 脏字符 (em dash 等, compile 查不出但运行错)
         n_hits = code.count(old)
         if n_hits > 1:
             print(f"    ⚠ D4: old_code 匹配 {n_hits} 处 '{old.strip()[:50]}...' "
@@ -411,7 +431,7 @@ class CoderAgent:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _clean_output(self, raw: str, original: str) -> str:
-        """清理 LLM 输出 — 去 BOM/行首垃圾/markdown 代码块包裹。"""
+        """清理 LLM 输出 — 去 BOM/行首垃圾/markdown 代码块包裹/★Unicode 脏字符。"""
         text = raw.lstrip('﻿').lstrip()   # 去 BOM + 行首空白
         # 去行首垃圾: 找到第一个有效起点 (#/import/from/"""/@triton/class/def), 前面有垃圾就切掉
         if text:
@@ -426,6 +446,13 @@ class CoderAgent:
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             text = "\n".join(lines)
+
+        # ★Unicode 脏字符清洗 (LLM 常把 ASCII 写成 Unicode 等价物 → 语法错/运行错):
+        #   em dash — (U+2014) / en dash – (U+2013) → ASCII - (减号/连字符)
+        #   智能引号 ' ' " " (U+2018/9/C/D) → ASCII ' "
+        #   省略号 … (U+2026) → ...
+        #   不间断空格 (U+00A0) / 全角空格 (U+3000) → 普通空格
+        text = _sanitize_unicode(text)
 
         # 如果输出为空或太短, 返回原始代码
         if len(text) < 10:

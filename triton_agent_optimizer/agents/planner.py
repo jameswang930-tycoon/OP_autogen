@@ -241,6 +241,12 @@ class PlannerAgent:
                        if fusion_analysis else "(无融合分析)")
         handoff_text = (json.dumps(handoff, ensure_ascii=False)[:600]
                         if handoff else "(无跳转手递)")
+        # ★优秀案例: 本 Tier 历史大加速比轮次, planner 作参考学习 (读不到/报错 → 空, 不阻断)
+        try:
+            from memory.excellent_cases import format_for_planner as _fmt_ec
+            ec_text = _fmt_ec(tier)
+        except Exception:
+            ec_text = "(本层优秀案例读取失败, 忽略)"
 
         # 读文件路径 (绝对路径, nga run 自己读)
         skill_path = self.playbook_dir.parent / "skills" / "triton-op-planner" / "SKILL.md"
@@ -259,7 +265,8 @@ class PlannerAgent:
             f"4. 读诊断字段文件: {d7_path or '(未给, 用下面内联字段)'}\n"
             f"5. ★读完整数据上下文 JSON (每 kernel 全量 task/deep + 耗时占比 + Top耗时 + 轨迹state + 历史 + 手递): {context_path or '(未给)'}  (分析瓶颈必读, 比 07 字段更全)\n"
             f"6. ★读优化轨迹: {trajectory_path or '(未给)'}  (看全部轮次的 tier/策略/加速比/结果 → 判断各层是否已榨干, 防重复/防误跳/防死循环回退)\n"
-            f"7. (若有) ★读跳转手递: {handoff_text}  (上个 tier planner 分析出的瓶颈+优化方向, 作为部分参考; 仍要结合其他数据独立判断)\n\n"
+            f"7. (若有) ★读跳转手递: {handoff_text}  (上个 tier planner 分析出的瓶颈+优化方向, 作为部分参考; 仍要结合其他数据独立判断)\n"
+            f"8. ★读本层优秀案例 (历史大加速比轮次, 参考学习, 别重复发明):\n{ec_text}\n\n"
             f"## 内联诊断字段 (当前 tier 筛好的, 若第4步文件读不到就用这些):\n{extracted[:1600]}\n\n"
             f"## config 常量:\n{config_text or '(无)'}\n"
             f"## 历史 (最近几轮):\n{history_text}\n"

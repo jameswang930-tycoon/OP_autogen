@@ -34,7 +34,23 @@ compute_utilization 极低但算法看着对 ? → 分块/融合问题, 回 Tier
 否则 → 算法层已最优, 晋升 Tier2
 ```
 
+### ★算子 → 最优算法选择表（Tier1 第一步：先选对算法，再谈参数）
+
+> 判据：先看 `bottleneck_type`（compute vs memory）。**compute → 提精度/算法效率**；**memory → 省访存**（im2col 复用输入、flash 省 S、online 单遍）。
+
+| 算子族 | 规范最优算法 | 关键点 | 对应 |
+|---|---|---|---|
+| matmul / GEMM | 分块 GEMM（tiled `tl.dot`） | fp32 累加；BLOCK 16 倍数 | 情况A/C |
+| **卷积 conv2d** | **im2col implicit GEMM**（软件收集 patch → `tl.dot` 走 cube） | 直接卷积+向量外积 = **不用 cube**，实测慢 PyTorch 12× | **情况G** |
+| attention (Q@K^T+softmax+P@V) | Flash Attention（online softmax 融合单 kernel） | 省 S 中间量 [seq²]；rescale 别漏 | 情况B |
+| softmax / norm | online 单遍归约 | 减 max + `other=-inf`；m/l/acc 全 fp32 | 情况D |
+| 逐元素 (bias/relu/gelu/残差) | 向量化逐元素 kernel | 大 BLOCK 连续访存；别多次单独 launch | Tier2 融合 |
+| 大 K matmul (K>4096) | split-k | 部分和 atomic_add/归约 | 情况E |
+| 小 grid + 高 launch | persistent kernel | 越界保护 | 情况F |
+
 ---
+
+
 
 ## 情况A：fp16 计算 + fp32 累加（compute_bound，我们 MLP/attention 最相关）
 
@@ -76,6 +92,44 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, ...,
 - kernel 内归约（`tl.sum` 等）如果输入是 fp16，**先 `.to(tl.float32)` 再归约**
 - 激活（tanh）对 fp16 输入敏感：kernel 内 `val.to(tl.float32)` 算激活再存
 - 验证 `MATMUL_VERIFY=1`，误差阈值放宽到 ~1e-2（fp16 输入 + fp32 累加 vs torch fp16 参考）
+
+### 精度策略扩展：fp16 vs bf16 vs tf32（Ascend 910B3 视角，别只用 fp16 一招）
+
+**触发**：compute_bound 决定降精度时，选哪种取决于**值域 vs 精度**。
+**怎么查**：搜 "bf16 vs fp16 dynamic range precision" / "tf32 tensor core precision"。
+
+| 精度 | 尾数位 | 指数位 | 适合 | Ascend 可用性 |
+|---|---|---|---|---|
+| fp16 | 10 位 | 5 位 | 值域正常 (±65504 内) | ✅（我们默认） |
+| bf16 | **7 位** | **8 位** | 值域大/训练易溢出 | ✅（同 fp16 路径，动态范围同 fp32） |
+| tf32 | 10 位 | 8 位 | fp32 输入的快速近似 | ⚠ triton-ascend **未验证**，别用 |
+
+**关键点**：
+- **值域溢出比精度损失更致命**：fp16 最大值 65504，softmax 前 Q@K^T·scale 或大激活可能超 → 用 bf16（指数位 8，动态范围同 fp32）
+- **精度敏感（attention/softmax）→ 用 fp16**（尾数 10 位 > bf16 的 7 位）；**大动态范围（norm/大激活）→ 用 bf16**
+- 无论 fp16/bf16，**累加器一律 fp32**（tl.dot 的 acc / 归约 / m·l 统计量）
+- ⚠ `tl.dot(..., input_precision="tf32")` 是 NVIDIA Triton 参数，**triton-ascend 不一定支持**——不要靠它，降精度就走 DTYPE（张量建 fp16/bf16 + fp32 累加）
+
+### ❌ 问题示例代码（误用 tf32 参数 / bf16 全精度损失）
+```python
+acc = tl.dot(a, b, acc, input_precision="tf32")   # ❌ triton-ascend 未必支持该参数, 编译可能报错
+# 或 bf16 做 attention: 尾数 7 位, Q@K^T 累加 2048 次误差 ~1e-1 → 结果 CHECK/FAIL
+```
+
+### ✅ 修改后正确代码（按瓶颈类型选 DTYPE + fp32 累加）
+```python
+# config: compute_bound 且值域正常 → fp16 (尾数更精细)
+DTYPE = torch.float16
+# config: 值域大/softmax 前易溢出 → bf16 (动态范围同 fp32)
+DTYPE = torch.bfloat16
+
+# kernel: 不管哪种, 累加器/归约/统计量全 fp32, 只有输入和最终存储降精度
+acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+for k in range(0, K, BLOCK_K):
+    acc = tl.dot(a, b, acc)          # fp16/bf16 输入 + fp32 累加
+tl.store(c_ptrs, acc.to(DTYPE), ...) # 写回才降精度
+```
+**约束/坑**：选精度 = 值域优先（溢出→bf16）→ 精度优先（attention→fp16）；别用 `input_precision`（Ascend 未验证）；改 DTYPE 后 `MATMUL_VERIFY=1` 重验，阈值 ~1e-2。
 
 ---
 
@@ -124,6 +178,42 @@ O = acc / l_row[:, None]
 - **causal/边界 mask 必须在 `tl.max` 之前**（先 mask 再求 max，否则无效位置污染归一化）
 - K 越界 load 的 `other` 用 **`-inf`**（不是 0——0 会贡献进 sum）
 - 这是算法级大改，必须 `MATCH_VERIFY=1` 数值校验；fp32 参考下 online 版可能差 ~1e-5（顺序不同），可接受
+
+### 因果剪枝：KV 循环只跑到 query 块末位（省 ~50% key 块，纯赚）
+
+**触发**：因果 attention 且当前 kernel 对**所有** key 块都 loop + mask（我们 flash_attn 现在就是：`for start in range(0, seq, BLOCK_N)` 永远 32 块）。
+**收益**：seq=2048、BLOCK_M=64 时 key 块从 1024 → ~528（**省 ~48%**）；每块都省一次 K 加载 + dot + mask。
+**怎么查**：搜 "flash attention causal skip kv blocks diagonal bound"。
+
+### ❌ 问题示例代码（因果仍全量 loop，白算对角线上方块）
+```python
+for start in range(0, seq, BLOCK_N):      # ❌ 无因果上界: 每个 query 块都处理全部 key 块
+    offs_n = start + tl.arange(0, BLOCK_N)
+    kk = tl.load(...);  vv = tl.load(...)
+    s = tl.dot(q, kk) * scale
+    causal = offs_n[None, :] <= offs_m[:, None]   # mask 全在内部, 上三角全白算
+    s = tl.where(causal, s, float("-inf"))
+    ...
+```
+**出现的问题**：因果时 key n > query m 的块对结果无贡献（被 mask 成 -inf），但**仍付出完整的 K 加载 + dot + softmax**。seq=2048 有一半 key 块纯浪费。
+
+### ✅ 修改后正确代码（KV 循环加因果上界）
+```python
+# query 块末位 = m_block*BLOCK_M + BLOCK_M - 1; 只处理 kv_start ≤ 它的 key 块
+kv_hi = min(seq, m_block * BLOCK_M + BLOCK_M)    # ✅ 因果上界 (含对角块, 它部分有贡献)
+for start in range(0, kv_hi, BLOCK_N):           # ✅ 对角线上方的 key 块直接跳过
+    offs_n = start + tl.arange(0, BLOCK_N)
+    kk = tl.load(...);  vv = tl.load(...)
+    s = tl.dot(q, kk) * scale
+    causal = offs_n[None, :] <= offs_m[:, None]  # 对角块内部仍需 mask
+    s = tl.where(causal, s, float("-inf"))
+    ...
+```
+**约束/坑**：
+- `kv_hi` 必须是**动态上界**（每 query 块不同），不是全局 `seq`；对角块（`start ≤ kv_hi` 的最后一个）**仍要 mask**（部分 key ≤ query）
+- 只适用于因果（非因果 attention 不能加）
+- 已用 torch 参考验证：剪枝后输出与全量 loop 逐元素一致（rel~1e-7）
+- 这是我们 flash_attn 的**直接可做优化**（改 loop 上界一行 + 用 m_block 算 kv_hi）
 
 ---
 
@@ -245,6 +335,75 @@ for tile_id in range(pid, num_tiles, num_programs):
 
 ---
 
+## 情况G：Conv im2col implicit GEMM（conv 走 cube，我们 conv2d 最相关）
+
+**触发**：conv2d 类算子（我们 input/conv2d、conv_bias_relu），当前用**向量外积** `acc += wv[:,None]*xv[None,:]` → 没用 cube（矩阵单元）。
+**收益**：`tl.dot` 走 cube。**原理差距**：fp32 向量单元 vs cube 吞吐差 ~50×；实测我们 conv2d 484us vs PyTorch 40.6us（**12× 慢**）——根因就是这个算法。im2col 后接近 PyTorch。
+**怎么查**：搜 "triton convolution implicit gemm im2col"（官方教程用 TMA 硬件 im2col，我们**没有 TMA**，用下面的软件 im2col）。
+
+### ❌ 问题示例代码（直接卷积 + 向量外积，不用 cube）
+```python
+# 每 program 算 [BLOCK_K 通道 × BLOCK_OW 空间], c/r/s 三重循环外积累加
+for c in range(C):
+    for r in range(R):
+        for s in range(S):
+            xv = tl.load(x_ptr + n*C*H*W + c*H*W + ih*W + iw, mask=valid, other=0.0)  # [BLOCK_OW]
+            wv = tl.load(w_ptr + offs_k*C*R*S + c*R*S + r*S + s, mask=k_mask, other=0.0)  # [BLOCK_K]
+            acc += wv[:, None] * xv[None, :]        # ❌ 向量外积: 走 AIC 向量单元, 不上 cube
+```
+**出现的问题**：`wv[:,None] * xv[None,:]` 是外积（向量单元），C*R*S 次循环 = 算力只用了向量单元的一小部分 → 我们 conv2d 慢 PyTorch 12×。**外积 ≠ tl.dot**——这是 conv 最常见的算法级错误。
+
+### ✅ 修改后正确代码（软件 im2col → tl.dot 走 cube）
+```python
+# 核心: 把 conv 重写成 GEMM。
+#   M_GEMM = 输出空间 (n*OH*OW), N_GEMM = 输出通道 K, K_GEMM = C*R*S (滤波tap×输入通道)
+#   每 program 一次 tl.dot: [K, CRS] @ [CRS, OW] → [K, OW]  (BLOCK_CRS = next_pow2(C*R*S))
+@triton.jit
+def conv2d_im2col_kernel(x_ptr, w_ptr, y_ptr,
+                         N, H, W, K, OH, OW,
+                         BLOCK_K: tl.constexpr, BLOCK_OW: tl.constexpr, BLOCK_CRS: tl.constexpr,
+                         C: tl.constexpr, R: tl.constexpr, S: tl.constexpr, PAD: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    total_ow = (OW + BLOCK_OW - 1) // BLOCK_OW
+    owb = pid % total_ow
+    tmp = pid // total_ow
+    oh = tmp % OH
+    n = tmp // OH
+
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_ow = owb * BLOCK_OW + tl.arange(0, BLOCK_OW)
+    offs_crs = tl.arange(0, BLOCK_CRS)          # ≥C*R*S 的 2 幂 (72 → 128)
+    c = offs_crs // (R * S); r = (offs_crs % (R * S)) // S; s = offs_crs % S
+    ih = oh + r - PAD                            # [CRS]
+    iw = offs_ow[None, :] + s[:, None] - PAD     # [CRS, OW]
+
+    # 软件 im2col: patch[crs, ow] = X[n, c, ih, iw]; padding/越界 → 0
+    valid = (offs_crs[:, None] < C * R * S) & (ih[:, None] >= 0) & (ih[:, None] < H) \
+            & (iw >= 0) & (iw < W)
+    patch = tl.load(x_ptr + n * C * H * W + c[:, None] * H * W + ih[:, None] * W + iw,
+                    mask=valid, other=0.0)        # [CRS, OW]  innermost(ow) stride=1 连续
+
+    # W 拍平 [K, C*R*S]: wtile[k, crs] = W[k, c, r, s]
+    wtile = tl.load(w_ptr + offs_k[:, None] * (C * R * S) + offs_crs[None, :],
+                    mask=(offs_crs[None, :] < C * R * S) & (offs_k[:, None] < K),
+                    other=0.0)                    # [K, CRS]
+
+    acc = tl.zeros((BLOCK_K, BLOCK_OW), dtype=tl.float32)
+    acc = tl.dot(wtile, patch, acc)               # [K,CRS]@[CRS,OW]→[K,OW], ★三参 acc 与我们所有 kernel 一致
+    y_ptrs = y_ptr + n * K * OH * OW + offs_k[:, None] * OH * OW + oh * OW + offs_ow[None, :]
+    tl.store(y_ptrs, acc, mask=(offs_k[:, None] < K) & (offs_ow[None, :] < OW))
+```
+**约束/坑**：
+- **BLOCK_CRS 必须 ≥C*R*S 的 2 幂**（tl.arange 要求）；72→128，多出的 tap 用 mask 置 0（0×patch=0，安全）
+- **L0 核验**（我们 C=8 R=S=3 K=32 OW=64, BLOCK_K=32, BLOCK_CRS=128, BLOCK_OW=64, fp32）：L0A=32×128×4=**16KB**✓ L0B=128×64×4=**32KB**✓ L0C=32×64×4=**8KB**✓ UB=56KB✓
+- **innermost 连续**：patch 的最后一维是 ow（X 内存 stride=1）→ DMA 连续突发✓
+- **已用 `tl.dot(a,b,acc)` 三参 + fp32 acc**（与我们所有 kernel 一致，避免二参兼容风险）
+- **已用 torch conv2d 参考验证索引数学**：max_err=1.5e-5（本场景）
+- conv_bias_relu 的 conv2d_kernel 同款替换；grid 不变 `(N*OH*ceil(OW/BLOCK_OW),)`
+- ⚠ 具体加速倍数需真机 msprof 确认（原理上从"向量外积不上 cube"变"cube"，但小卷积可能访存受限）
+
+---
+
 ## 通用算法替换原则
 
 1. **先判瓶颈类型再选算法**：compute_bound → 精度/算法效率；memory_bound → 省访存（online/flash/合并）。
@@ -264,5 +423,8 @@ for tile_id in range(pid, num_tiles, num_programs):
 | K 越界 other=0 | sum 被污染 | other 用 `-inf` |
 | softmax 没减 max | exp 溢出 nan | 减 max + other=-inf |
 | QKV 拼接 stride 错 | 读错位置垃圾值 | 显式 stride 或 .contiguous() |
+| conv 用向量外积不上 cube | 慢 PyTorch 12× | im2col + `tl.dot` 走 cube（情况G） |
+| 因果 attention 全量 loop key 块 | 上三角白算 ~50% | KV 循环加因果上界 `kv_hi`（情况B 扩展） |
+| 用 `input_precision="tf32"` | triton-ascend 未必支持 | 降精度走 DTYPE (fp16/bf16) + fp32 累加 |
 | 用 tl.erf | 编译失败 | 换 tl.math.tanh |
 | 算法改完不重调后续 | 收益被掩盖 | 回 Tier2/3 重做 |

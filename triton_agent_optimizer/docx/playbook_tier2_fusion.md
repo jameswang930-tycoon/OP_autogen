@@ -36,6 +36,31 @@ memory_bound 但算力利用率低 ?
 无可融合 → 晋升 Tier3
 ```
 
+### ★怎么读我们的 HIVM 融合分析（`08_fusion/fusion_analysis.json`）
+
+> Tier2 每轮框架会编译 kernel → HIVM MLIR → LLM 分析依赖，产出这份文件。**这是融合决策的直接依据，先读它再动手。**
+
+```json
+{
+  "op_count": 12,                    // HIVM 里的算子数 (含各 kernel 内步骤)
+  "raw_deps":  [{"from": "matmul", "to": "bias", "type": "RAW"}, ...],
+  "war_deps":  [...],                // 写后读 (buffer 复用冲突)
+  "waw_deps":  [...],                // 写后写 (同一输出写两次)
+  "fusion_candidates": [{"ops": ["fc1", "bias_gelu"], "reason": "RAW 链上连续逐元素"}]
+}
+```
+
+| 键 | 含义 | 融合决策 |
+|---|---|---|
+| `raw_deps` | **读后写**：op2 读 op1 的输出 → 天然可融合 | **RAW 链上的连续逐元素 op → 并进前一 kernel epilogue**（情况A/B） |
+| `war_deps` | 写后读：缓冲被复用 → 读写顺序冲突 | 融合时**换新 buffer**（不要复用被 WAR 的缓冲） |
+| `waw_deps` | 写后写：同一输出写两次 | 合并成一次写 或 重命名输出 |
+| `fusion_candidates` | LLM 建议的融合候选列表 | 挑**占比最大的中间 kernel** 先融（收益最大） |
+
+**判断标准**：看 `raw_deps` 里 `from` 是 matmul/cube、`to` 是逐元素（vector）的链 → 融合进 epilogue 几乎必赚；`to` 是另一个 cube/matmul → 用上面的**成本模型**评估再融。
+
+**注意**：`fusion_candidates` 是 LLM 的初步建议，**还要自己核一遍**（LLM 可能建议跨 store/跨迭代的非法融合）——对照下面的"不可融合边界"过滤。
+
 ---
 
 ## 情况A：激活/偏置并入 matmul epilogue（★省中间 Z 的 GM 往返，我们 MLP/attention 最相关）
@@ -75,7 +100,42 @@ def fc1_gelu_kernel(a_ptr, w_ptr, b_ptr, c_ptr, M, N, K, ...,
 **约束/坑**：
 - **N 维 32B 对齐**（web 实测：epilogue 融合时 N 不满足 32B 对齐 → UB 越界写）。fp16 时 `BLOCK_N×2` 是 32 倍数；fp32 时 `BLOCK_N×4`
 - 融合后单块 = acc(L0C) + bias + val + y（UB/L0 压力↑）→ 监控 UB，超了减小 BLOCK 或拆
-- 我们的 `mlp_gelu_kernel` 已是这个模式（正确样例）
+- ★内部一致性提醒：`attention_mlp` 的 `mlp_gelu_kernel` 已是融合模式（正确样例）；但 **`input/matmul` 这个算子本身没融合**（`matmul_kernel(FC1) → 独立 bias_gelu_kernel → matmul_kernel2(FC2)` 3 个分离 kernel）——它是本层**最直接的融合目标**，别被"已是正确样例"误导而跳过
+
+### 完整重构示例：input/matmul 的 FC1 + bias_gelu 融合（★按我们的真实代码改）
+
+**改前**（input/matmul/kernel_op.py，3 个分离 kernel）：
+```python
+# ① FC1: Z = X@W1
+matmul_kernel[grid1](x, w1, z, M, HIDDEN, K, ..., BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK)
+# ② bias_gelu: H = GELU(Z + b1)  ← 独立 kernel, Z 落 GM 又读回
+bias_gelu_kernel[grid_g](z, b1, h, M * HIDDEN, HIDDEN, BLOCK_SIZE=BLOCK_SIZE)
+# ③ FC2: Y = H@W2
+matmul_kernel2[grid2](h, w2, y, M, N, HIDDEN, ..., BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK)
+```
+**改后**（FC1 的 epilogue 直接算 bias+GELU，删掉 bias_gelu_kernel）：
+```python
+@triton.jit
+def fc1_gelu_kernel(a_ptr, w_ptr, b_ptr, c_ptr, M, N, K, ...,
+                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    ...  # 与 matmul_kernel 完全相同的 K 循环, acc fp32
+    bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+    val = acc + bias[None, :]                                # ✅ bias 在 epilogue
+    cdf = 0.5 * (1.0 + tl.math.tanh(0.7978845608028654 * (val + 0.044715 * val * val * val)))
+    y = val * cdf                                            # ✅ GELU 在 epilogue (tanh 近似)
+    tl.store(c_ptrs, y, mask=c_mask)                         # 直接写 H, Z 不进 GM
+```
+**配套改动**（融合不只是改 kernel）：
+- **删** `bias_gelu_kernel` 定义 + main() 里的 launch
+- **grid**：`grid1` 不变（FC1 的 tile 网格）；**删 `grid_g`**；`h` 张量保留（FC2 输入）
+- **main()**：`fc1_gelu_kernel[grid1](x, w1, b1, h, ...)` 替代 ①②
+- **verify**：`MATMUL_VERIFY=1` 里参考 `h_ref = F.gelu(torch.matmul(x,w1)+b1, approximate="tanh")`（已有，无需改）
+
+**约束/坑**：
+- **tanh-GELU 公式已 CPU 验证** = torch `F.gelu(approximate="tanh")`（max_err=1.5e-07）
+- 融合后 BLOCK 不变也合法：FC1 单块 = acc(L0C) + bias + val + y（UB 压力↑，2048³ BLOCK 64³ 实测安全；超了就减 BLOCK）
+- `bias` 是 [BLOCK_N] 向量 load（offs_n），`val = acc + bias[None,:]` 广播
+- 结果 kernel 数 3→2，中间 Z 不再写/读 GM（省 32MB 无谓流量）
 
 ---
 
@@ -230,6 +290,32 @@ P_tile = tl.exp(S_tile - m_new)
 
 ---
 
+## 融合收益/成本模型（★先算值不值得，再决定融不融）
+
+> 不是所有相邻算子都值得融合。先估成本再动手，避免**过度融合**（情况E）和**无效融合**（白融还没收益）。
+
+**Ascend 量级**：kernel launch 开销 ~5-20us；HBM 读写 ~快一个数量级于片上。判断公式：
+```
+中间 kernel 耗时 > 2 × launch 开销（~10-40us）  → 融合值得（省 GM 往返 + launch）
+中间 kernel 是纯逐元素（<10us）                 → 融合几乎必然值得（launch 占大头）
+两个大 matmul 之间夹小逐元素                     → 值得（epilogue 吸收"几乎免费"）
+两个都 compute_bound 的大 kernel 硬融            → 可能倒挂（占用崩，性能反降）
+```
+
+| 场景 | 是否融合 | 依据 |
+|---|---|---|
+| matmul 后跟 bias/激活/残差（逐元素） | ✅ 几乎必融 | epilogue 吸收"几乎免费"；GEMM+Bias+ReLU 实测 **28~39%** 提速 |
+| 小/中算子叠小逐元素 | ✅ 强烈建议 | launch 开销占比高，实测 1.5~3.13× |
+| 中间 kernel 耗时 < 2×launch | ⚠ 评估 | 收益可能 < 噪声地板 |
+| 两个都 compute_bound 的大 matmul | ⚠ 别硬融 | 资源压力崩占用，收益倒挂 |
+| 中间张量 > UB（无法留在片上） | ❌ 不融 | 必须落 GM 再读 |
+| 融合后寄存器/L0C 溢出 | ❌ 拆 | 溢出 → spill 到 GM → 更慢 |
+| 依赖全量输出（softmax 行归约） | ❌ 除非 online | 需要整行 sum 才能算 → 只有 flash 的 online 才可融 |
+
+**★实测警示**：有案例 GELU 并进 GEMM epilogue 端到端只 **1.03×**（< 噪声地板 1.05×）——因为 erf 计算成本没消失，只是从独立 kernel 搬进 epilogue。**融合前先算**：省的是 GM 流量 + launch，**算的不是算术量**；若中间 kernel 本来就不碰 GM（寄存器里就有），融合收益≈0。
+
+---
+
 ## 不可融合边界（必须遵守）
 
 1. **中间有 GM store**（数据跨内存生命周期）→ 不跨 store 融合
@@ -250,5 +336,8 @@ P_tile = tl.exp(S_tile - m_new)
 | epilogue N 未 32B 对齐 | UB 越界写/垃圾 | 对齐 BLOCK_N（fp16×2/fp32×4 是 32 倍数） |
 | 融合改浮点顺序 | 精度差 >1e-6 | 严格保序，只合并表达式 |
 | 过度融合 | 寄存器溢出/更慢 | 融合深度 2~3 级，监控 L0C |
+| 无效融合（中间不碰 GM） | 收益≈0（如 GELU 只 1.03×） | 先算成本模型：省的是 GM+launch，不是算术量 |
+| 两个 compute_bound 大 kernel 硬融 | 占用崩，性能倒挂 | 只融 compute+memory 组合 |
+| 不读 fusion_analysis 就动手 | 融错/漏融 | 先读 raw_deps/fusion_candidates（见上） |
 | 用 tl.erf | 编译失败 | 换 tl.math.tanh |
 | 跨迭代/跨 store 融合 | 结果错 | 遵守不可融合边界 |

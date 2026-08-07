@@ -167,10 +167,112 @@ shift = tl.load(params_ptr + 2)
 
 ### ✅ 修改后正确代码（一次大 load，寄存器切片）
 ```python
-params = tl.load(params_ptr + tl.arange(0, 3))   # ✅ 一次连续 load
-bias, scale, shift = params[0], params[1], params[2]
+# ✅ 一次连续 load; ★tl.arange 两端必须 2 幂 → 用 4 宽 + mask 取前 3 个
+offs = tl.arange(0, 4)                                  # (0,3) 会编译失败: arange 要求 2 幂
+params = tl.load(params_ptr + offs, mask=offs < 3, other=0.0)   # 一次总线请求搬 16B
+bias, scale, shift = params[0], params[1], params[2]    # 标量切片
 ```
-**约束/坑**：仅当地址连续、mask 一致才合并；合并不连续地址会读到错数据。
+**约束/坑**：仅当地址连续、mask 一致才合并；合并不连续地址会读到错数据。`tl.arange(0, 3)` **非法**（arange 要求 start/end 是 2 幂）→ 用 4 宽 + mask；4×fp32=16B 是单事务且 16B 对齐，3×fp32=12B 反而不对齐。
+
+---
+
+## 情况F：512B 行宽对齐（带宽主前提，16B 只是底线）
+
+**触发**：`main_mem_read/write` 带宽只有峰值 ~70% 上不去（无跨步、无 L2 问题）；或 CV(cube+vector) 算子 innermost 行宽不是 512B 倍数。
+**收益**：昇腾 cache line = **512B**；实测 32B 对齐场景只有 512B 对齐场景的 **~70% 带宽**。行宽 512B 对齐是带宽封顶的前提。
+**怎么查**：搜 "ascend 512B row width alignment bandwidth" / "GM地址尽量512B对齐"。
+
+### ❌ 问题示例代码（行宽非 512B 倍数 → 带宽 ~70% 封顶）
+```python
+# ❌ fp16 下 BLOCK_N=96: 行宽 96×2=192B, 非 512B 倍数
+#    CV 算子尾部轴(innermost)必须 512B 整除, 否则编译器自动 pad → 性能差
+BLOCK_M, BLOCK_N, BLOCK_K = 64, 96, 64      # fp16: BLOCK_N=96 → 行宽 192B ✗
+```
+**出现的问题**：昇腾 cache line = 512B。innermost 连续元素数 × dtype 字节不是 512B 倍数时，DMA 仍按 512B 整条搬、只用其中一部分 → 带宽利用率上不去（32B 对齐只有 512B 对齐的 ~70%）。
+
+### ✅ 修改后正确代码（行宽对齐到 512B 整数倍）
+```python
+# ✅ 行宽 = BLOCK_N × dtype字节, 取 512B 的整数倍:
+#   fp16/bf16: BLOCK_N = 256 (256×2=512B) 或 512
+#   fp32:      BLOCK_N = 128 (128×4=512B) 或 256
+BLOCK_M, BLOCK_N, BLOCK_K = 64, 128, 64    # fp32: 行宽 128×4=512B ✓
+#   L0A=64×64×4=16KB ✓  L0B=128×64×4=32KB ✓  L0C=64×128×4=32KB ✓  (均 ≤ 上限)
+#   fp16 想要 512B 行宽 → BLOCK_N=256 (行宽 256×2=512B; L0B=256×64×2=32KB ✓)
+```
+**约束/坑**：行宽 = 每行 innermost 连续元素数（matmul 的 BLOCK_N）；512B 是**带宽前提**，还要配合 tier3 的 L0A/B≤64KB、L0C≤128KB、16 倍数、饱和曲线一起选；GM 地址尽量 512B 对齐（torch 分配一般满足）；单次搬运 ≥16KB 带宽最好。**对齐算术与 padded-store mask 索引已 CPU 验证；加速倍数需真机 msprof 确认**（1.0×~1.4×，随算子不同）。
+
+---
+
+## 情况G：Store 侧合并 — 输出要转置时先在 UB 里转置再连续 store
+
+**触发**：`ub_to_gm`/`mte3_time` 高；输出 tile 的 innermost 维 stride ≠ 1（跨步写）。
+**收益**：MTE3 跨步写 = 拆事务 + 非 32B 对齐分散写触发读改写(RMW)，写带宽可能减半；转成连续写恢复满载。
+**怎么查**：搜 "triton coalesced store transpose in shared memory" / "ascend MTE3 store alignment"。
+
+### ❌ 问题示例代码（自然累加形状 → 跨步 store）
+```python
+# ❌ 累加 tile 形状是 [BLOCK_K, BLOCK_M] (B 行主序 B@A 的自然形状),
+#    输出却是 row-major [M, K] → 直接 store 时末维是 m, stride=K → 跨步写
+acc = tl.dot(b, a)                            # [BLOCK_K, BLOCK_M] (k 行, m 列)
+out_ptrs = out_ptr + offs_m[None, :] * K + offs_k[:, None]     # 末维 m, stride=K ✗
+tl.store(out_ptrs, acc, mask=mask)
+```
+**出现的问题**：store 的 innermost（末维）stride ≠ 1 → MTE3 跨步写：每次只写一点、拆成多个事务；非 32B 对齐的分散写还会触发读-改-写（RMW），写带宽掉一半以上。**和 load 侧一样，store 也要 innermost stride=1**。
+
+### ✅ 修改后正确代码（UB 里 tl.trans 后连续 store）
+```python
+# ✅ 先在 UB/寄存器里 tl.trans 把末维换成连续维, 再连续 store
+acc_t = tl.trans(acc)                         # [BLOCK_M, BLOCK_K] (m 行, k 列)
+out_ptrs = out_ptr + offs_m[:, None] * K + offs_k[None, :]     # 末维 k, stride=1 ✓
+tl.store(out_ptrs, acc_t, mask=mask)
+```
+**约束/坑**：
+- `tl.trans` 在 triton-ascend 支持 fp32/fp16/bf16 的 **2D** 转置（**3D 非相邻轴转置不支持**，勿用）；int64/bool 不支持
+- 若编译器把 trans 落到 L1/L0 中转（数据搬运）可能不划算 → 替代方案是 host 端预转置输入（见实战案例1/2），二选一
+- UB 手算（fp32, BLOCK_M=BLOCK_K=64）：acc=64×64×4=**16KB**，trans 后在 UB/寄存器内重排，远小于 192KB；L0A/L0B/L0C 由外层 matmul 的 (BM,BN,BK) 决定（见 tier3 表）
+- **索引数学已 CPU 验证（两种写法输出逐元素相同，trans 后 innermost stride=1）；转置实现效率与加速倍数需真机 msprof 确认**
+
+---
+
+## 情况H：消除中间张量 GM 往返（S/P 不进 GM，UB 内直接消费）
+
+**触发**：`main_mem_read/write` 高且 `l2_hit_rate` 高（复用没问题但带宽仍满）；或 kernel 里先 `tl.store` 中间结果、再 `tl.load` 回来算下一步。
+**收益**：标准 attention 的 S、P 各进出 GM 一次 = O(seq²) 4 趟；融合成 online softmax 后 S/P 只在 UB/寄存器，GM 流量 O(N)。这是 flash_attention 提速的一部分（案例2）。
+**怎么查**：搜 "flash attention online softmax no intermediate HBM roundtrip" / "triton fused attention"。
+
+### ❌ 问题示例代码（物化中间 → 多次 GM 往返）
+```python
+# ❌ S 写 GM → 读回 softmax → P 写 GM → 读回乘 V: seq² 矩阵 4 趟 GM
+tl.store(s_ptr, s)                    # S[seq,seq] 进 GM (MTE3)
+p = tl.load(s_ptr)                    # 再读回 (MTE2)
+tl.store(p_ptr, p)                    # P[seq,seq] 进 GM (MTE3)
+o = tl.dot(p, v)                      # 再读 P
+```
+**出现的问题**：softmax 每元素只做几个 flops，却把整块 seq² 矩阵搬了 4 趟 → `main_mem_read/write` 打满，cube/vector 闲着。
+
+### ✅ 修改后正确代码（online softmax 融合，S/P 只在寄存器）
+```python
+# ✅ Q 只 load 一次; loop K/V 块; S/P 只在寄存器; 只写 O 一次
+q = tl.load(q_ptrs, mask=...)                    # [BLOCK_M, BLOCK_K] load 一次
+m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+for start in range(0, N, BLOCK_N):
+    k = tl.load(k_ptrs, mask=...)                # [BLOCK_K, BLOCK_N]
+    v = tl.load(v_ptrs, mask=...)                # [BLOCK_N, BLOCK_K]
+    s = tl.dot(q, k) * scale                     # S 在寄存器, 不进 GM
+    m_new = tl.maximum(tl.max(s, axis=1), m_i)
+    alpha = tl.exp(m_i - m_new)
+    p = tl.exp(s - m_new[:, None])               # P 在寄存器, 不进 GM
+    l_i = l_i * alpha + tl.sum(p, axis=1)
+    acc = acc * alpha[:, None] + tl.dot(p, v)
+    m_i = m_new
+tl.store(o_ptrs, acc / l_i[:, None], mask=...)   # 只写 O 一次
+```
+**约束/坑**：
+- UB 估算（fp32, BM=BN=BK=64）：Q=16KB + K块=16KB + V块=16KB + acc=16KB + S/P 各 16KB ≈ **96KB ≤ 192KB** ✓；若 K/V 双缓冲，峰值 ≈ Q + 2×(K+V) + acc + S/P ≈ 128KB，仍 ≤192KB 但留余量
+- online softmax 本身是 Tier1 算法层成果；本层记住的**内存原则**是"中间张量不进 GM、UB 内直接消费"
+- **已 CPU 验证与 torch softmax 逐元素一致（rel=4.1e-7）；单点加速倍数需真机 msprof 确认**
 
 ---
 
@@ -281,4 +383,8 @@ for c in range(C):
 | row-major 无 L2 复用 | l2_hit_rate 低 | swizzle / 权重预排 |
 | load 与 compute 强耦合 | cube 空等 | 循环结构清晰让编译器流水线 |
 | 合并不连续小传输 | 读错数据 | 仅连续地址才合并 |
+| `tl.arange(0,3)` 非法 | 编译失败 | arange 要求 2 幂 → 4 宽 + mask |
+| 行宽非 512B 倍数 | 带宽 ~70% 封顶 | 行宽对齐 512B（fp32:128, fp16:256）（情况F） |
+| store 跨步 / 输出要转置 | MTE3 拆事务/RMW | UB 内 `tl.trans` 后连续 store（情况G） |
+| 中间张量进出 GM | main_mem 打满 | online softmax 融合，S/P 不进 GM（情况H） |
 | UB 塞满 | 双缓冲没空间 | UB ≤ 192KB/n_bufs |

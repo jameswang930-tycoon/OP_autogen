@@ -40,13 +40,15 @@ TIER_FG   = ["#2e7d32","#e65100","#1565c0","#c62828","#6a1b9a","#00695c"]
 TIER_NAME = ["Algorithm","Fusion","Tiling","Memory","Compute","Architecture"]
 
 
-def _load_pytorch_tflops(kernel_dir: Path, state: dict):
-    """PyTorch 基准线 TFLOPS: 优先 state (scheduler 存好的), 缺则按算子自动读 bench json.
-    ★不再回退到误导的默认 9.2 — 没有真实基准就返回 None, 图上不画虚线.
+def _load_pytorch_bench(kernel_dir: Path, state: dict) -> Optional[dict]:
+    """PyTorch 基准 (tflops + time_us): 优先 state (scheduler 存好的), 缺则按算子自动读 bench json.
+    ★不再回退到误导的默认 — 没有真实基准就返回 None, 图上不画虚线.
+    ★时间 time_us 是直接可比口径 (同算子同形状); tflops 仅兜底展示.
     按算子选基准: attention → pytorch_attention; 多matmul/MLP → pytorch_mlp; 单 matmul → pytorch."""
-    st_val = state.get("pytorch_tflops")
-    if st_val:
-        return st_val
+    st_tf = state.get("pytorch_tflops")
+    st_tu = state.get("pytorch_time_us")
+    if st_tf or st_tu:
+        return {"tflops": st_tf, "time_us": st_tu}
     bench_dir = _PROJECT_DIR / "bench_910b3"
     op = kernel_dir.name.lower()
     # ★显式算子映射优先 (bench_910b3/bench_config.PT_BENCH_MAP); 旧启发式兜底
@@ -55,7 +57,7 @@ def _load_pytorch_tflops(kernel_dir: Path, state: dict):
         f = PT_BENCH_MAP.get(op)
         if f and (bench_dir / f).exists():
             try:
-                return json.loads((bench_dir / f).read_text(encoding="utf-8"))["tflops"]
+                return json.loads((bench_dir / f).read_text(encoding="utf-8"))
             except Exception:
                 pass
     except Exception:
@@ -67,7 +69,7 @@ def _load_pytorch_tflops(kernel_dir: Path, state: dict):
         p = bench_dir / f
         if p.exists():
             try:
-                return json.loads(p.read_text(encoding="utf-8"))["tflops"]
+                return json.loads(p.read_text(encoding="utf-8"))
             except Exception:
                 continue
     return None
@@ -101,7 +103,10 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     # TFLOPS: 从 state.baseline_ns 算 (需 M/N/K, 存在 state 里) 或默认
     initial_tflops = state.get("initial_tflops") or 6.4
     # ★PyTorch 基准: 优先 state (scheduler 存的), 缺则自动按算子读 bench json; None = 无真实数据 → 不画误导虚线
-    pytorch_tflops = _load_pytorch_tflops(kernel_dir, state)
+    # ★对比用时间 (time_us, 同算子同形状直接可比); tflops 仅兜底展示
+    pt_bench = _load_pytorch_bench(kernel_dir, state) or {}
+    pytorch_tflops = pt_bench.get("tflops")
+    pytorch_time_us = pt_bench.get("time_us")
     # ★F3: hist 若存了每轮真实 tflops (kernel 结构变化后 FLOPs 变) 就逐轮用, 否则 initial×speedup 兜底
     hist_tflops = [r.get("tflops") for r in history]
     per_round_tf = [
@@ -145,15 +150,26 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
 
     # ═══ PyTorch baseline (只有真实基准数据才画, 缺则不画误导虚线) ═══
     # ★口径说明: torch 侧含 aclnn 框架 kernel (eager 全图), triton 侧只统计目标 kernel (非 aclnn).
-    #   两者不同口径 → 虚线仅作量级参考 (triton 会显得偏快), 不用于严格对比. 已在图上标注.
-    if pytorch_tflops:
-        pytorch_speedup = pytorch_tflops / initial_tflops
-        ax.axhline(y=pytorch_speedup, color="gray", linestyle="--", linewidth=2.5,
-                   alpha=0.8, zorder=1)
-        ax.text(len(rounds)-1, pytorch_speedup + 0.03,
-                f"PyTorch eager* ({pytorch_tflops:.1f} TFLOPS)\n*口径: torch 含框架 kernel, triton 不含 → 仅量级参考",
-                fontsize=9, color="gray", ha="right", va="bottom",
-                bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
+    #   ★对比用时间: pytorch_speedup = 我们 baseline_ns / pytorch_ns (同算子同形状, 时间直接可比).
+    #     y 轴是"相对我们 baseline 的加速比" → 虚线位置直接 = "PyTorch 用时是 baseline 的几分之几".
+    #     若 pytorch 快于我们的 baseline → 虚线 >1; 慢 → <1.
+    if pt_bench:
+        _pt_ns = (pytorch_time_us or 0) * 1000.0
+        _base_ns = state.get("baseline_ns")
+        if _pt_ns and _base_ns:
+            pytorch_speedup = _base_ns / _pt_ns            # ★时间口径 (首选)
+        elif pytorch_tflops and initial_tflops:
+            pytorch_speedup = pytorch_tflops / initial_tflops   # 兜底 (无时间数据时)
+        else:
+            pytorch_speedup = None
+        if pytorch_speedup:
+            ax.axhline(y=pytorch_speedup, color="gray", linestyle="--", linewidth=2.5,
+                       alpha=0.8, zorder=1)
+            _lbl_t = f"{pytorch_time_us:.0f}us" if pytorch_time_us else f"{pytorch_tflops:.1f} TFLOPS"
+            ax.text(len(rounds)-1, pytorch_speedup + 0.03,
+                    f"PyTorch eager* ({_lbl_t})\n*口径: torch 含框架 kernel, triton 不含 → 仅参考",
+                    fontsize=9, color="gray", ha="right", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
 
     # ═══ Running Best ═══
     running_best = np.maximum.accumulate(np.array(cum_speeds))
@@ -216,8 +232,17 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     total_rounds = len(rounds) - 1
     final_s = running_best[-1]
     final_t = tflops_arr[-1]
-    _vs_pt = (f"  |  vs PyTorch({pytorch_tflops:.1f} TFLOPS): {final_t/pytorch_tflops*100:.0f}%"
-              if pytorch_tflops else "")
+    # ★vs PyTorch 用时间对比 (直接可比): 我们最优用时 vs pytorch 用时
+    _vs_pt = ""
+    if pt_bench:
+        _cur_ns = state.get("baseline_ns")
+        _final_us = (_cur_ns / final_s / 1000.0) if (_cur_ns and final_s) else None
+        if pytorch_time_us and _final_us:
+            _vs_pt = (f"  |  vs PyTorch({pytorch_time_us:.0f}us): "
+                      f"我们最优 {_final_us:.0f}us = {_final_us/pytorch_time_us*100:.0f}%")
+        elif pytorch_tflops:
+            _vs_pt = (f"  |  vs PyTorch({pytorch_tflops:.1f} TFLOPS): "
+                      f"{final_t/pytorch_tflops*100:.0f}%")
     title = (
         f"Optimization Trajectory: {kernel_dir.name}     "
         f"Rounds: {total_rounds}  |  "

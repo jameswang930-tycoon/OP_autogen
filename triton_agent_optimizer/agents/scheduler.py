@@ -156,6 +156,18 @@ def _clip(s: str, n: int) -> str:
     return cut + "..."
 
 
+# ★PyTorch 基准 json → bench 脚本 映射 (自动跑用; 缺 json 时自动调对应脚本生成)
+PT_SCRIPT_MAP = {
+    "pytorch_tflops.json": "bench_pytorch.py",
+    "pytorch_mlp_tflops.json": "bench_pytorch_mlp.py",
+    "pytorch_attention_tflops.json": "bench_pytorch_attention.py",
+    "pytorch_flash_attention_tflops.json": "bench_pytorch_flash_attention.py",
+    "pytorch_conv2d_tflops.json": "bench_pytorch_conv2d.py",
+    "pytorch_conv_bias_relu_tflops.json": "bench_pytorch_conv_bias_relu.py",
+    "pytorch_rms_norm_tflops.json": "bench_pytorch_rms_norm.py",
+}
+
+
 def _summarize_changes(plan) -> str:
     """把 plan 的 changes[] 压成一句梗概 (hist 记录用, 让 planner 知道试过什么)。
     用 '=' 提取 LHS(变量名)=RHS(新值), 截断时括号保持成对 (不再出现半截表达式)."""
@@ -1088,15 +1100,41 @@ class Scheduler:
                 pt = _PROJECT / "bench_910b3" / pt_file
                 if pt.exists():
                     try:
-                        st["pytorch_tflops"] = json.loads(pt.read_text(encoding="utf-8"))["tflops"]
+                        _pt = json.loads(pt.read_text(encoding="utf-8"))
+                        st["pytorch_tflops"] = _pt.get("tflops")
+                        # ★pytorch 时间(us) — 同算子同形状, 时间才是直接可比 (apples-to-apples);
+                        #   TFLOPS 口径不同 (我们 cube_fops vs bench 公式) 不可比 → 对比用时间
+                        st["pytorch_time_us"] = _pt.get("time_us")
                         st["pytorch_baseline"] = pt_file
                     except Exception:
                         pass
                 else:
-                    # ★bug 修复: pytorch_*.json 需手动跑 bench_pytorch_*.py 才生成.
-                    #   缺时静默无 vs-PyTorch 参考 → 打警告 (不阻塞, 但用户该知道).
-                    print(f"  ⚠ 缺 PyTorch 基准 {pt_file} (trajectory 无 vs-PyTorch 参考线). "
-                          f"跑 python3 bench_910b3/bench_pytorch_*.py 生成")
+                    # ★自动跑对应的 PyTorch bench 生成基准 (需 NPU; 失败不阻断). env AUTO_RUN_PT_BENCH=0 关闭.
+                    _script = PT_SCRIPT_MAP.get(pt_file)
+                    if os.environ.get("AUTO_RUN_PT_BENCH", "1") == "1" and _script:
+                        print(f"  [PyTorch] 缺 {pt_file} → 自动跑 python3 bench_910b3/{_script} "
+                              f"(AUTO_RUN_PT_BENCH=1)")
+                        try:
+                            _r = subprocess.run(
+                                ["python3", str(_PROJECT / "bench_910b3" / _script)],
+                                capture_output=True, text=True, timeout=3600,
+                                encoding="utf-8", errors="backslashreplace")
+                            if pt.exists():
+                                _pt = json.loads(pt.read_text(encoding="utf-8"))
+                                st["pytorch_tflops"] = _pt.get("tflops")
+                                st["pytorch_time_us"] = _pt.get("time_us")
+                                st["pytorch_baseline"] = pt_file
+                                print(f"  [PyTorch] ✅ 自动生成 {pt_file}: "
+                                      f"time_us={st.get('pytorch_time_us')}")
+                            else:
+                                print(f"  ⚠ PyTorch bench 未产出 {pt_file}: "
+                                      f"{(getattr(_r, 'stderr', '') or '')[-200:]}")
+                        except Exception as e:
+                            print(f"  ⚠ 自动跑 PyTorch bench 失败: {str(e)[:120]}")
+                    else:
+                        # ★缺 json 且不自动跑 → 警告 (不阻塞, 但用户该知道).
+                        print(f"  ⚠ 缺 PyTorch 基准 {pt_file} (trajectory 无 vs-PyTorch 参考线). "
+                              f"跑 python3 bench_910b3/{_script or 'bench_pytorch_*.py'} 生成")
                 # ★基准复测: 诊断 total_ns 是单次 msprof 采样(噪声大),
                 #   用 verify 机制 (warmup + VERIFY_RUNS 轮 msprof 平均) 重测源 kernel,
                 #   与后续轮完全同口径, 加速比才可信. 默认开, VERIFY_BASELINE=0 跳过.
@@ -1324,6 +1362,37 @@ class Scheduler:
                       for k in (diagnosis.get("kernels") or []))
             if _cf and ns:
                 hist["tflops"] = round(_cf / (ns / 1e9) / 1e12, 2)
+            # ★优秀案例自动记录: 本轮(相对上一最优, 非基准)加速比 > 阈值 → 记为该 Tier 优秀案例
+            #   (planner 优化前读 memory/tier{N}_cases.json 作参考学习; 永不抛异常)
+            _best_before = st.get("best_speedup")
+            try:
+                from memory.excellent_cases import EXCELLENT_THRESHOLD, is_excellent, record as _rec_excellent
+                if (kept and v.get("ok") and _best_before is not None
+                        and is_excellent(_best_before, speedup)):
+                    _bn = "?"
+                    try:
+                        _bn = ((diagnosis.get("kernels") or [{}])[0]
+                               .get("deep", {}).get("roofline", {}).get("bottleneck_type") or "?")
+                    except Exception:
+                        pass
+                    _rec_excellent(tier, {
+                        "tier": tier, "op": self.kernel_name, "round": rn,
+                        "strategy": getattr(plan, "strategy", ""),
+                        "bottleneck": _bn,
+                        "solution": (getattr(plan, "expected_impact", "")
+                                     or getattr(plan, "strategy", "")),
+                        "changes": _extract_changes_from_plan(plan.plan_text) or [],
+                        "speedup_before": round(float(_best_before), 4),
+                        "speedup_after": round(float(speedup), 4),
+                        "improvement_x": round(float(speedup) / float(_best_before), 3),
+                        "ns": ns,
+                        "recorded_at": datetime.now().isoformat(),
+                    })
+                    print(f"  [优秀案例] Tier{tier} R{rn}: {speedup:.3f}x / 上最优 "
+                          f"{_best_before:.3f}x = {speedup/_best_before:.2f}x "
+                          f"(>{EXCELLENT_THRESHOLD:.2f}) → memory/tier{tier}_cases.json")
+            except Exception as _ec:
+                print(f"  ⚠ [优秀案例] 记录跳过: {str(_ec)[:120]}")
             if st.get("best_speedup") is None or speedup > st["best_speedup"]:
                 st["best_speedup"] = speedup
             self.traj["history"].append(hist)
@@ -1357,6 +1426,16 @@ class Scheduler:
         print(f"  [产出] 最终 kernel 累计加速比 {st.get('current_speedup')}x "
               f"(baseline {_bs}ns → 当前 {_cur_ns}ns); best {st.get('best_speedup')}x")
         print(f"  [产出] 最终 kernel 文件 → {st.get('current_kernel')}")
+
+        # ★自动生成轨迹图 (优化结束后; 失败/无 matplotlib 不阻断). env AUTO_CHART=0 关闭.
+        if os.environ.get("AUTO_CHART", "1") == "1":
+            try:
+                from feedback.trajectory_chart import generate as _gen_chart
+                _chart_out = self.kernel_dir / "final_output" / "trajectory_chart.png"
+                _gen_chart(self.kernel_dir, _chart_out)
+                print(f"  [图表] 轨迹图 → {_chart_out}")
+            except Exception as e:
+                print(f"  ⚠ 轨迹图生成失败: {str(e)[:120]}")
         return 0
 
 

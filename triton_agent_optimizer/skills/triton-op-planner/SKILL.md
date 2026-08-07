@@ -27,9 +27,11 @@ argument-hint: >
 GM≈1638GB/s (HBM2e 理论, 实测~1540), cube≈294.9TFLOPS(fp16 标称)/313(官方), fp32≈73.7TFLOPS。
 
 ★分块(Tier3)核心规则 — 动 BLOCK 前必看：
+- **★本层优先用 sweep 实测数据**（playbook_tier3 §八）：框架已枚举全部 L0 合法候选实测，`09_tier3_sweep/sweep_result.json` 的 `best` 就是答案——**别手工猜新 BLOCK 覆盖 sweep 结果**；sweep 不可用（rms_norm/报错）才用下面手工判断兜底
 - **传输是瓶颈 → 搬更大块**: `mte2高`(GM→L1)或`cube低`或`l0a/l0b低` → 增 BLOCK_M/N；`mte1高`(L1→L0) → 增 BLOCK_K
 - **硬件最大块**(超过 = ub overflow 编译失败): L0A/B = BLOCK_M/N×BLOCK_K×dtype ≤ 64KB；L0C = BLOCK_M×BLOCK_N×dtype ≤ 128KB；
   fp32 时 128×128×64 安全(L0C=64KB)、256×128 L0C 满(256×128×4=128KB)；fp16 可 ×2。BLOCK 全必须 16 倍数
+- **tile 过大越过饱和拐点 → 寄存器 spill 性能断崖**（别跳最大合法块，用 sweep 找实测拐点）；Ascend 行宽 512B 对齐（fp32:BLOCK_N=128）
 - **memory_bound 带宽接近峰值 → 别调块**；compute_bound → 不调块(promote)
 </role>
 
@@ -46,7 +48,7 @@ GM≈1638GB/s (HBM2e 理论, 实测~1540), cube≈294.9TFLOPS(fp16 标称)/313(�
 
 | Tier | 策略 | 允许改 | 禁止改 |
 |---|---|---|---|
-| 1 算法结构 | 算法/精度 | 算法结构、kernel 重组、DTYPE(如 fp16计算+fp32累加)、split-k/flash | 禁止"只调 BLOCK_* 当算法优化" |
+| 1 算法结构 | 算法/精度 | 算法结构、kernel 重组、DTYPE(如 fp16计算+fp32累加)、split-k/flash、**conv im2col implicit GEMM**(见 playbook_tier1 情况G)、**因果 attention KV 剪枝** | 禁止"只调 BLOCK_* 当算法优化" |
 | 2 算子融合 | 融合 | 合并 kernel、消除中间 GM 往返、激活/残差并入 epilogue | 禁止改算法选择 |
 | 3 分块配置 | 分块 | **只改** BLOCK_M/N/K、BLOCK_SIZE、grid | **NEVER** 改 DTYPE / 融合 / 算法 |
 | 4 访存 | 访存 | 访问模式、对齐、双缓冲、L2 复用 | 禁止改 BLOCK_* / DTYPE |

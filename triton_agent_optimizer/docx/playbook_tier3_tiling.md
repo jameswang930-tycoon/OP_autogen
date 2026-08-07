@@ -76,6 +76,39 @@ BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
 ```
 **约束/坑**：分块 vs 带宽是**饱和曲线**——小分块程序开销主导（带宽≈分块翻倍），大分块记忆体带宽封顶（变平）。还在翻倍 = 没到平台可继续增；变平 = 到平台，再增无用。**BLOCK 必须 16 倍数**。
 
+### 寄存器溢出悬崖（tile 过大性能崩塌，★为什么数据驱动是唯一可靠手段）
+
+**触发**：只想着"越大越好"，BLOCK_M/N 过大 → 累加器 `BLOCK_M×BLOCK_N` 个 fp32 寄存器超出硬件可容纳 → **spill 到慢速内存，性能断崖**。
+**怎么查**：搜 "triton register spilling matmul large block"。
+
+### ❌ 问题示例代码（tile 过大 → 崩塌）
+```python
+BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 32   # fp32: acc=128×128=16384 个寄存器
+# 某 GPU 实测: 32×32×32=2.77 TFLOPS → 128×128×32=0.238 TFLOPS (崩 10×+)
+# 原因: 累加器寄存器超限 → spill; 且 grid 缩到 16×16=256, 占用下降
+```
+**出现的问题**：L0C 没超（128×128×4=64KB < 128KB），但**寄存器/L0C 压力 + 占用下降**双重打击 → 性能比小 tile 差一个数量级。**约束表只保证"编译能过"，不保证"性能好"**——这就是必须实测（sweep）而非手工推算的原因。
+
+### ✅ 修改后正确代码（饱和曲线的实测段选块）
+```python
+# 实测饱和点: 从小块起, 每轮 sweep 记录 ns, 找到"还在降"→"变平"的拐点
+#   拐点前: 带宽≈分块×2 (程序开销主导); 拐点后: 带宽封顶 (变平, 再增无用)
+# 不要一次性跳到最大合法块 (可能跨过拐点掉进寄存器悬崖)
+```
+**约束/坑**：①**先算 L0/UB 上限**（编译能过）②再**实测找拐点**（性能好）；③Ascend 额外注意 **行宽 512B 对齐**（见下）；④别用 `BLOCK_M=BLOCK_N` 对称假设——实测常是非对称更好。
+
+### ★Ascend 512B 行宽对齐（带宽利用率）
+
+**触发**：算子 innermost 行宽不是 512B 整数倍 → 带宽利用率上不去。
+**怎么查**：搜 "ascend operator row width 512B alignment bandwidth"。
+
+| 精度 | 512B = 元素数 | 推荐 BLOCK_N 行宽 |
+|---|---|---|
+| fp32 | 128 元素 | BLOCK_N ∈ {128, 256}（128×4=512B✓） |
+| fp16/bf16 | 256 元素 | BLOCK_N ∈ {256, 512}（256×2=512B✓） |
+
+**约束/坑**：行宽 = 每行 innermost 连续元素数（matmul 的 BLOCK_N）。**配合** §二-A 的 L0C 约束 + 饱和曲线实测一起选；512B 对齐是带宽前提，不是唯一因素。
+
 ---
 
 ## §二-B：block_dim < 40 → 缩小 BLOCK 增并行
@@ -175,6 +208,15 @@ BLOCK_SIZE = 8192     # 8192×4×3 = 96KB < 192KB (安全)
 ```
 **完整改动清单**：① config 加 `GROUP_M=8`；② kernel 签名加 `GROUP_SIZE_M: tl.constexpr`；③ 调用传 `GROUP_SIZE_M=GROUP_M`；④ pid 解码换 swizzle。
 **约束/坑**：GROUP_SIZE_M=1 退化为 row-major（安全兜底）；`GROUP_SIZE_M` 是 constexpr。
+
+### swizzle 的 Ascend 注意（★收益需真机实测）
+
+- **原理跨架构有效**（L2 复用是通用层次结构），但 **1.17~1.98× 是 vLLM 在 GPU 上实测**，Ascend 910B3 的具体收益**未在我们框架内实测**——改动后用 msprof 对比，收益 < 噪声地板（1.05×）就回退
+- **triton-ascend 有 Swizzle2D 变体**（比通用 GROUP_SIZE_M 更适配昇腾的 L2/UB 结构）——若 `GROUP_SIZE_M` 收益不明显，搜 "triton-ascend-case-matmul-swizzle2d" 换 Swizzle2D
+- **依赖程序 id 按序 launch**（Triton 调度实现细节，非硬件保证）——实测确认生效再保留
+- **配合 §二-A 饱和曲线**：swizzle 只在搬运是瓶颈时有用；compute_bound 下别加（徒增指令）
+
+---
 
 ---
 
@@ -288,6 +330,38 @@ tl.store(out_ptr + offs, x * 2.0, mask=mask)               # store 也 mask → 
 
 ---
 
+## §八：★分块实测 sweep（本层优先手段，数据驱动不是猜）
+
+> **本层第一动作是跑 sweep，不是手工推 BLOCK。** §二-A 到 §七 的手工判断只在 sweep 不可用时兜底。
+> 框架在 Tier3 每轮自动跑 `sweep_blocks.sweep()`：**程序化枚举全部 L0 合法 (BM,BN,BK) 候选 → 单进程 torch.npu.Event 实测每 config 5 次平均 → 最优写回 kernel_op.py**。
+
+**sweep 跑什么**：
+- matmul 族（matmul/attention_mlp/flash_attention）：枚举 `(BM,BN,BK)`，约束 = L0A/B≤64KB、L0C≤128KB、UB≤192KB、16 倍数、grid∈[16,3000]
+- conv 族（conv2d/conv_bias_relu）：枚举 `(BLOCK_K,BLOCK_OW)`，**BLOCK_K ≥ K_OUT**（否则只算一半通道，见 tier4 案例3）
+- **flash_attention 特殊**：BK 上限 = 头维 dim（BK>64 无意义，K 循环就 64 长）；grid = ceil(seq/BM)×nheads
+- rms_norm：**无自由分块参数**（行级，BLOCK_N 由 N 推导 2 幂）→ sweep 跳过，走 LLM
+
+**怎么读 `round_dir/09_tier3_sweep/sweep_result.json`**：
+```json
+{"available": true, "vars": ["BLOCK_M","BLOCK_N","BLOCK_K"],
+ "configs": [{"block":[64,64,64], "ns": 123456, "speedup": 1.2, "is_current": true}, ...],
+ "best": {"block":[128,128,64], "ns": 100000, ...}}
+```
+- `configs[]` 按 ns 升序，`[0]` = 最优；`is_current` 标当前块；`speedup` = **整体 baseline_ns ÷ 该候选 ns**（相对 round1 基线的加速比，**不是相对当前块**）——比大小看 ns，别拿 speedup 当"相对当前块"判断
+- **决策**：最优明显快于当前 → `changes[]` 直接采用最优块（数据就是答案，别猜新值）；当前已接近最优/无增益 → 分块已到位，promote 下一层
+
+**★多 kernel 共享一个 BLOCK 的协调**（attention_mlp 9 kernel / MLP 3 kernel）：
+- 多个 kernel 共用 `BLOCK_M/N/K`，**单 kernel 最优 ≠ 全链路最优**（matmul 爱大 tile、softmax 爱小 tile）
+- **sweep 测的是全链路**（runner 一次跑完所有 kernel 计时）——它已经帮你协调了多 kernel 的取舍，**信任 sweep 的全链路结果，别手工改成单 kernel 最优**
+- 手工调 BLOCK 时同理：改动后必须**整算子 verify**（不是只看一个 kernel 的 ns）
+
+**约束/坑**：
+- sweep 写回最优块到当前 kernel，planner 决策基于实测数据；**coder 不要手工改一个新 BLOCK 覆盖掉 sweep 结果**（除非有明确理由，比如 sweep 报错）
+- sweep 用 torch.npu.Event 计时（非 msprof）——相对排序可靠，绝对 ns 别用于跨轮对比
+- sweep 报错/无候选 → 回退 LLM + §二-A/B 手工兜底（不是崩）
+
+---
+
 ## 八、禁忌 + 收益 + 常见错误
 
 **禁忌**：禁 num_warps/autotune/非 16 倍数/超 L0·UB/计算瓶颈乱调/算法·融合·精度（越层）。
@@ -296,8 +370,13 @@ tl.store(out_ptr + offs, x * 2.0, mask=mask)               # store 也 mask → 
 | 错误 | 现象 | 修复 |
 |---|---|---|
 | BLOCK 超 L0/UB | `ub overflow` 编译失败 | 先算 L0A/B≤64KB、L0C≤128KB、UB≤192KB |
+| tile 过大越过饱和拐点 | 寄存器 spill，性能断崖（实测 10×+） | sweep 找实测拐点，别跳最大合法块 |
 | 非 16 倍数 | cube 利用率 ~10% | BLOCK 改 16 倍数 |
+| 行宽非 512B 倍数 | 带宽利用率低 | BLOCK_N 对齐（fp32:128, fp16/bf16:256） |
+| 绕过 sweep 手工改 BLOCK | 覆盖实测最优 / 猜错 | 优先 sweep 数据；手工只在 sweep 不可用时 |
+| 多 kernel 改成单 kernel 最优块 | 全链路变慢 | 信任 sweep 全链路结果；改后整算子 verify |
 | swizzle 漏 min | 越界/错 tile | `group_size_m = min(grid_m-first_pid_m, GROUP_SIZE_M)` |
+| swizzle 收益未实测就保留 | 白加指令 | msprof 对比，<1.05× 就回退；可试 Swizzle2D |
 | EVEN_K 非 constexpr | mask 没省掉 | 调用处算好传 constexpr |
 | SUB_BLOCK 整数除 | 尾部漏处理 | `tl.cdiv` + 尾部 mask |
 | care_padding 误用 | 垃圾值 | 仅未填充值不影响结果时用 |

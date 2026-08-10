@@ -436,12 +436,14 @@ def build_planner_context(diagnosis: dict, tier: int, state: dict, history: list
         "history": history[-40:],                     # ★P1: 全量最近40轮 (各层试过什么→结果)
         "handoff": handoff or None,                    # ★P1: 跳转来的瓶颈分析+优化方向
         "fusion_analysis": _sanitize_for_ctx(fusion_analysis) if fusion_analysis else None,
-        "tier3_sweep": ({"best": tier3_sweep.get("best"), "configs": tier3_sweep.get("configs")}
+        "tier3_sweep": ({"best": tier3_sweep.get("best"), "status": "available"}
                         if tier3_sweep and tier3_sweep.get("available") else None),
     }
-    for _k in ("api_overhead", "multi_kernel", "framework_kernels"):
-        if diagnosis.get(_k) is not None:
-            ctx[_k] = _sanitize_for_ctx(diagnosis[_k])
+    # ★只给 tier2 带 framework_kernels/api_overhead (其余 tier 不需要, 减小 context)
+    if tier == 2:
+        for _k in ("api_overhead", "multi_kernel", "framework_kernels"):
+            if diagnosis.get(_k) is not None:
+                ctx[_k] = _sanitize_for_ctx(diagnosis[_k])
     path = d7 / "planner_context.json"
     path.write_text(json.dumps(ctx, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
     return path
@@ -669,31 +671,18 @@ class Scheduler:
         ctx_path = build_planner_context(
             diagnosis, tier, self.traj["state"], self.traj.get("history", []),
             kernel_code, round_dir, fusion_analysis, tier3_sweep, handoff)
-        # ★D1: 分块实测数据追加进喂给 planner 的字段
-        #   sweep 数据持久化在 state["last_sweep_result"], 每轮都传给 planner
+        # ★D1: 只把 sweep 结论 (最优 BLOCK + 状态) 追加进 prompt, 完整数据在 09/sweep_result.json
         if tier3_sweep and tier3_sweep.get("available"):
             sw = tier3_sweep
-            lines = ["", f"# ══ 分块实测 sweep 数据 (★状态: {sweep_status}) ══",
-                     "各 config 实测 (ns 越小越快; 标★=实测最优; 标[当前]=sweep 前的原始块):"]
-            for c in sw["configs"]:
-                mark = " ★最优" if c is sw["best"] else (" [当前]" if c.get("is_current") else "")
-                sp = f" ({c['speedup']}x)" if c.get("speedup") else ""
-                lines.append(f"- {c['block']}: {c['ns']:.0f}ns{sp}{mark}")
+            best = sw.get("best", {})
+            lines = ["", f"# ══ sweep 分块结论 (状态: {sweep_status}) ══",
+                     f"最优 BLOCK: {best.get('block', '?')} = {best.get('ns', '?')}ns"
+                     + (f" (vs 当前 {best.get('speedup', '?')}x)" if best.get("speedup") else ""),
+                     f"已自动写入 kernel_op.py. 完整 {len(sw.get('configs', []))} 候选数据 → 09_tier3_sweep/sweep_result.json"]
             if tier == 3:
-                lines.append(f"★分块层决策 (sweep状态={sweep_status}): ")
-                if sweep_status == "ran_this_round":
-                    lines.append("  sweep 本轮重新实测 (kernel结构变了) → 数据是最新最准的. "
-                                 "当前 BLOCK 已由 sweep 自动写入 kernel_op.py. "
-                                 "已穷举全部 L0 合法候选, 禁止再猜新 BLOCK 值. "
-                                 "若最优就是当前块 → 分块已到极限, promote.")
-                elif sweep_status in ("skipped_structure_unchanged", "reused_from_cache"):
-                    lines.append("  sweep 本轮未重跑 (kernel 结构未变, 上次 sweep 数据仍有效). "
-                                 "当前 BLOCK 仍是上次 sweep 的最优. "
-                                 "若你想改 BLOCK → 不需要 (全部已实测过, 当前已是最优). promote 到下一层.")
+                lines.append("★分块层: 已穷举全部 L0 合法 2幂候选, 当前已是最优. 禁止猜新 BLOCK. promote 到下一层.")
             else:
-                lines.append(f"★当前 BLOCK 由 sweep 实测优化 (状态={sweep_status}, 见 kernel_op.py). "
-                             "聚焦本层策略 (算法/融合/访存/计算等). "
-                             "sweep 在 kernel 结构变化时自动重扫 (hash 检测).")
+                lines.append(f"BLOCK 已优化 (sweep状态={sweep_status}), 聚焦本层策略.")
             extracted = extracted + "\n" + "\n".join(lines)
         elif sweep_status.startswith("failed") or sweep_status == "not_triggered":
             extracted = extracted + f"\n# ══ 分块 sweep: {sweep_status} (无实测数据, BLOCK 未由 sweep 优化, 可自由调整) ══"
@@ -1279,10 +1268,16 @@ class Scheduler:
                     print(f"  [Tier3] kernel 结构未变 (hash={_code_hash}), 跳过重扫, 复用历史最佳")
                     _sweep_status = "skipped_structure_unchanged"
                 if tier3_sweep and tier3_sweep.get("available"):
-                    print(f"  ⏱ 分块实测完成: {len(tier3_sweep['configs'])} config, "
+                    print(f"  ⏱ 分块实测完成: {len(tier3_sweep.get('configs', []))} config, "
                           f"最优 {tier3_sweep['best']['block']} {tier3_sweep['best']['ns']:.0f}ns "
-                          f"({time.time()-_t_plan0:.0f}s) → 数据喂 planner 决策")
-                    st["last_sweep_result"] = tier3_sweep          # ★持久化: 后续轮复用
+                          f"({time.time()-_t_plan0:.0f}s) → 最优已写入 kernel")
+                    # ★只存结论 (best + status), 不存全部 configs → 防 trajectory 膨胀
+                    st["last_sweep_result"] = {
+                        "available": True,
+                        "best": tier3_sweep["best"],
+                        "vars": tier3_sweep.get("vars", []),
+                        "n_configs": len(tier3_sweep.get("configs", [])),
+                    }
                     _sweep_status = "ran_this_round"
                 elif tier3_sweep and tier3_sweep.get("available") is False:
                     print(f"  [Tier3] 分块实测不可用 "

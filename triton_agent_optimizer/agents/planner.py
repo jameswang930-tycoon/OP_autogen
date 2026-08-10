@@ -352,7 +352,7 @@ class PlannerAgent:
         if m:
             old = m.group(0).strip()
             vals = [int(x) for x in _re.findall(r"\d+", old)]
-            new = _re.sub(r"=\s*[\d, ]+", f"= {', '.join(str(v * 2) if v < 512 else v for v in vals)}", old)
+            new = _re.sub(r"=\s*[\d, ]+", f"= {', '.join(str(v * 2) if v < 512 else str(v) for v in vals)}", old)
             change = {"old_code": old, "new_code": new,
                       "reason": "STUB 增大分块", "section": "① config"}
         else:
@@ -361,7 +361,7 @@ class PlannerAgent:
             if m2:
                 old = m2.group(0).strip()
                 val = int(_re.search(r"=\s*(\d+)", old).group(1))
-                new = _re.sub(r"=\s*\d+", f"= {val * 2 if val < 512 else val}", old)
+                new = _re.sub(r"=\s*\d+", f"= {str(val * 2) if val < 512 else str(val)}", old)
                 change = {"old_code": old, "new_code": new,
                           "reason": "STUB 增大 BLOCK_K", "section": "① config"}
             else:

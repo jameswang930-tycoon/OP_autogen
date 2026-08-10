@@ -341,6 +341,9 @@ def main():
 
     if os.environ.get("_INDUSTRIAL_IN_MSPROF") != "1":
         # ── 外层: 一次 msprof 包内层 → 同时算 端到端/纯kernel → 写 json ──
+        # ★必须先设标记再调 measure_pytorch_msprof: 它用 dict(os.environ,...) 传给 msprof,
+        #   msprof 重启本脚本时才能拿到 _INDUSTRIAL_IN_MSPROF=1 走"内层"路径 (否则无限套娃 msprof).
+        os.environ["_INDUSTRIAL_IN_MSPROF"] = "1"
         from bench_910b3.bench_common import measure_pytorch_msprof
         import subprocess
         app_cmd = (f"python3 {Path(__file__).resolve()} {args.op} --mode {args.mode} "

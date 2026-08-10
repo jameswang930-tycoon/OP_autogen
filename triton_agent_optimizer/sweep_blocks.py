@@ -42,8 +42,8 @@ L0C_BYTES = 128 * 1024  # 128KB
 UB_BYTES  = 192 * 1024  # 192KB
 
 # ── Sweep 参数 ──
-DEFAULT_WARMUP = 2       # 每 config 预热次数
-DEFAULT_LOOP    = 5       # 每 config 计时次数
+DEFAULT_WARMUP = 3       # 每 config 预热次数 (JIT 编译/cache 预热)
+DEFAULT_LOOP    = 10      # 每 config 计时次数 (torch.npu.Event, 取平均; SWEEP_LOOP env 可调)
 DEFAULT_MIN_GRID = 16     # 最小 grid (至少覆盖 20 核的大部分)
 DEFAULT_MAX_GRID = 3000   # 最大 grid (防调度开销淹没收益)
 
@@ -81,37 +81,53 @@ def generate_matmul_candidates(M: int = 2048, N: int = 2048, K: int = 2048,
       L0B: BN×BK×4 ≤ 64KB  →  BN×BK ≤ 16384
       L0C: BM×BN×4 ≤ 128KB →  BM×BN ≤ 32768
       UB:  BM×BK + BN×BK + BM×BN ≤ 49152  (3 缓冲粗略估算)
-      全部 16 倍数 (Cube MMA 基础粒度)
+      ★全部 2 的幂 (tl.dot + tl.arange 要求; 非 2 幂会报错/降级)
       grid = ceil(M/BM)×ceil(N/BN) ∈ [min_grid, max_grid]  (合理并行度)
 
     ★grid_mul: 覆盖 grid 第二因子 (flash_attention 的 grid = ceil(seq/BM)×nheads,
                 不是 ceil(N/BN); 传 grid_mul=nheads 避免大 BM 被错误排除).
     ★bk_cap: 覆盖 BK 上限 (flash_attention 的 K 循环是头维 dim, BK>dim 无意义).
     """
+    def _pow2_range(lo, hi):
+        """[lo, hi] 内的 2 幂序列: 16, 32, 64, 128, 256, 512, 1024..."""
+        result = []
+        v = 16
+        while v <= hi:
+            if v >= lo:
+                result.append(v)
+            v *= 2
+        return result
+
     L0A_MAX = L0A_BYTES // dtype_size  # 16384
     L0B_MAX = L0B_BYTES // dtype_size  # 16384
     L0C_MAX = L0C_BYTES // dtype_size  # 32768
     UB_MAX  = UB_BYTES  // dtype_size  # 49152
 
-    # BM 扫描范围: [16, min(1024, L0C_MAX//16)]
-    bm_max = min(1024, L0C_MAX // 16)
-    # BN 扫描范围: [16, min(1024, L0C_MAX//16)]
-    bn_max = min(1024, L0C_MAX // 16)
-    # BK 扫描范围: [16, min(512, L0A_MAX//16, L0B_MAX//16)]
-    bk_max = min(512, L0A_MAX // 16, L0B_MAX // 16)
+    # ★只扫 2 的幂 (tl.dot/tl.arange 要求): 16, 32, 64, 128, 256, 512, 1024
+    bm_range = _pow2_range(16, min(1024, L0C_MAX // 16))
+    bn_range = _pow2_range(16, min(1024, L0C_MAX // 16))
+    bk_max_val = min(512, L0A_MAX // 16, L0B_MAX // 16)
     if bk_cap:
-        bk_max = min(bk_max, ((bk_cap + 15) // 16) * 16)   # 封顶到 ≤bk_cap 的 16 倍数
+        bk_max_val = min(bk_max_val, 1 << (bk_cap).bit_length() - 1 if bk_cap >= 16 else 16)
+        # 封顶到 ≤bk_cap 的最大 2 幂
+        v = 16
+        while v * 2 <= bk_cap:
+            v *= 2
+        bk_max_val = min(bk_max_val, v)
+    bk_range = _pow2_range(16, bk_max_val)
 
     candidates = []
     total = 0
-    for bm in range(16, bm_max + 1, 16):
+    for bm in bm_range:
         # BN 上限受 L0C 约束: bm×bn ≤ L0C_MAX
-        bn_limit = min(bn_max, L0C_MAX // bm)
-        for bn in range(16, bn_limit + 1, 16):
+        for bn in bn_range:
+            if bm * bn > L0C_MAX:
+                continue
             bm_bn = bm * bn
             # BK 上限受 L0A 和 L0B 约束
-            bk_limit = min(bk_max, L0A_MAX // bm, L0B_MAX // bn)
-            for bk in range(16, bk_limit + 1, 16):
+            for bk in bk_range:
+                if bm * bk > L0A_MAX or bn * bk > L0B_MAX:
+                    continue
                 total += 1
                 # UB 约束 (3 缓冲: A tile + B tile + C tile)
                 if bm * bk + bn * bk + bm_bn > UB_MAX:
@@ -127,7 +143,7 @@ def generate_matmul_candidates(M: int = 2048, N: int = 2048, K: int = 2048,
     if verbose:
         print(f"  [候选生成] 检查 {total} 组合 → {len(candidates)} 有效 "
               f"(L0A≤{L0A_MAX}, L0B≤{L0B_MAX}, L0C≤{L0C_MAX}, "
-              f"UB≤{UB_MAX}, grid∈[{min_grid},{max_grid}], 步长16)")
+              f"UB≤{UB_MAX}, grid∈[{min_grid},{max_grid}], 2的幂)")
         # 统计各维度覆盖
         bms = sorted(set(c[0] for c in candidates))
         bns = sorted(set(c[1] for c in candidates))
@@ -148,17 +164,31 @@ def generate_conv2d_candidates(OH: int = 64, OW: int = 64, K_OUT: int = 32,
       BLOCK_OW ≤ OW (超出无意义)
       ★BLOCK_K ≥ K_OUT: kernel 无通道分块循环 (input/conv2d/kernel_op.py 直接 acc[BLOCK_K,BLOCK_OW]),
         BLOCK_K<K_OUT 只算前 K_OUT 个输出通道 → 半吊子工作量, 计时失真且写回坏块.
-      全部 16 倍数
+      ★全部 2 的幂 (tl.dot/tl.arange 要求)
     """
     L0C_MAX = L0C_BYTES // dtype_size  # 32768
 
-    # ★≥K_OUT 的最小 16 倍数 (conv2d 无通道分块, BLOCK_K 必须覆盖全部输出通道)
-    bk_min = max(16, ((K_OUT + 15) // 16) * 16)
+    # ★≥K_OUT 的最小 2 幂 (conv2d 无通道分块, BLOCK_K 必须覆盖全部输出通道)
+    bk_min = 16
+    while bk_min < K_OUT:
+        bk_min *= 2
+
+    # 2 幂范围
+    def _pow2(lo, hi):
+        r = []
+        v = lo
+        while v <= hi:
+            r.append(v)
+            v *= 2
+        return r
+
+    bk_range = [bk_min, bk_min * 2]  # K_OUT 的 2 幂 + 下一个 2 幂 (mask 处理尾块)
+    bow_range = _pow2(16, OW)
 
     candidates = []
     total = 0
-    for bk in range(bk_min, bk_min + 32, 16):   # K_OUT 及相邻下一个 16 倍数 (mask 处理尾块)
-        for bow in range(16, OW + 1, 16):
+    for bk in bk_range:
+        for bow in bow_range:
             total += 1
             if bk * bow > L0C_MAX:
                 continue
@@ -226,7 +256,7 @@ def _build_runner_body(module_code: str, setup: str, cands_json: str,
     print(f"[sweep] {{n_total}} candidates, warmup={{WARMUP}}, loop={{LOOP}}", flush=True)
 
     for idx, cfg in enumerate(CANDIDATES):
-        {', '.join(f'{v}=cfg[{i}]' for i, v in enumerate(vars_))}
+        {', '.join(vars_)} = cfg
         try:
             for _ in range(WARMUP):
                 run_one({', '.join(vars_)})

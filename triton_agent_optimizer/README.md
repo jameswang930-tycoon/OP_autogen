@@ -55,7 +55,19 @@ main.py input/matmul [--fresh] [--resume] [--max-rounds N] [--target X]
 
 ---
 
-## 2. 完整数据流（每轮）
+## 1.5 三种测量方法对照
+
+| 场景 | 工具 | 方式 | 为什么 |
+|---|---|---|---|
+| **sweep 分块扫描** | `torch.npu.Event` | 单进程, 每候选预热3次+计时10次取平均 | 快速筛选77个候选(几分钟); 只需相对排序, 不需绝对精度 |
+| **PyTorch bench** | `torch.npu.Event` | 一次窗口30次forward÷30 | 与sweep同口径, 保证bench和sweep可比 |
+| **verifier 每轮验证** | **msprof** | 一次msprof内KERNEL_LOOP=30遍, op_summary求和÷30 | 精确绝对值 + 深度profiling(带宽/引擎/冲突); 最终加速比以此为准 |
+
+**为什么sweep不用msprof?** msprof按kernel名合并, 77个候选用同一个kernel函数名 → 无法区分不同BLOCK的耗时。torch.npu.Event在runner内部逐候选计时, 不受此限制。两种方法都是设备级计时(非CPU侧), 相对排序一致。sweep选出最优BLOCK后, verifier用msprof重新测——最终加速比以verifier为准。
+
+**sweep和bench口径一致**(都用Event), **verifier用msprof**(更精确)。sweep只需"哪个BLOCK最快"的相对排序, 不需匹配verifier的绝对ns。
+
+---
 
 ```
 ┌─ kernel 链 (采纳/回退) ──────────────────────────────────────────────┐

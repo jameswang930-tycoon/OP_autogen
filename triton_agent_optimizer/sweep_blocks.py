@@ -738,31 +738,57 @@ def sweep(op_dir: Path, quick: bool = False, out_dir: Optional[Path] = None,
         cmd = [py, str(runner_path)]
         print(f"  [sweep] 直接运行 (torch.npu.Event 计时, 无 msprof 开销)")
 
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                          encoding="utf-8", errors="backslashreplace",
-                          timeout=7200, env=env, cwd=str(out_root))
-    except subprocess.TimeoutExpired:
-        print(f"  [sweep] ❌ 超时 (2h)")
-        return {"error": "sweep timeout"}
-    except Exception as e:
-        print(f"  [sweep] ❌ 运行失败: {e}")
-        return {"error": str(e)[:200]}
-
-    print(r.stdout[-2000:] if len(r.stdout) > 2000 else r.stdout)
-    if r.stderr and "Error" in r.stderr:
-        print(f"  [sweep] stderr: {r.stderr[-500:]}")
-
+    # ★崩溃续跑: 设备级 fatal 会杀进程/污染设备 — 父进程读增量结果, 用**新进程**跑"剩余"候选
+    #   (新进程=干净设备). 反复崩的候选标 error 跳过; 从成功的里挑最快.
+    all_results = {}        # blk_tuple -> result
+    remaining = list(candidates)
+    for attempt in range(1, 8):   # 最多 7 轮 (每轮崩溃只留更少候选)
+        if not remaining:
+            break
+        runner_code = _generate_runner(op_dir, remaining, meta, op)   # 只生成剩余候选的 runner
+        runner_path.write_text(runner_code, encoding="utf-8")
+        try:
+            subprocess.run(cmd, text=True, encoding="utf-8", errors="backslashreplace",
+                           timeout=7200, env=env, cwd=str(out_root))
+        except subprocess.TimeoutExpired:
+            print(f"  [sweep] ❌ 超时 (2h), 用已测结果")
+            break
+        except Exception as e:
+            print(f"  [sweep] ❌ 运行失败: {e}")
+            break
+        # 读增量结果 (每候选保存, 崩溃前已测的都在)
+        if result_path.exists():
+            try:
+                _data = json.loads(result_path.read_text(encoding="utf-8"))
+                for _res in _data.get("results", []):
+                    all_results[tuple(_res["block"])] = _res
+            except Exception:
+                pass
+        _done = set(all_results)
+        _new_remaining = [c for c in remaining if tuple(c) not in _done]
+        if not _new_remaining:
+            break
+        if len(_new_remaining) == len(remaining):
+            # 没进展 → 第一个候选反复崩 → 标 error 跳过 (别卡死)
+            _skip = _new_remaining[0]
+            all_results[tuple(_skip)] = {"block": list(_skip), "ns": None,
+                                         "error": "设备致命错误, 跳过"}
+            print(f"  [sweep] 候选 {_skip} 反复崩溃 → 标 error 跳过")
+            _new_remaining = _new_remaining[1:]
+        print(f"  [sweep] 第{attempt}轮: 完成 {len(_done)}/{len(candidates)}, "
+              f"剩余 {len(_new_remaining)} → 新进程续跑 (干净设备)", flush=True)
+        remaining = _new_remaining
     elapsed = time.time() - t0
     print(f"  [sweep] 运行 {elapsed:.0f}s")
 
-    # 4. 解析结果
-    if not result_path.exists():
-        print(f"  [sweep] ❌ 无结果文件 {result_path}")
-        return {"error": "no result file"}
-
-    data = json.loads(result_path.read_text(encoding="utf-8"))
-    results = data.get("results", [])
+    # 4. 合并结果 (来自各轮累积, 不依赖最后一轮 result_path)
+    if not all_results:
+        print(f"  [sweep] ❌ 无任何候选结果 (全崩/超时)")
+        return {"error": "no result"}
+    for c in candidates:
+        if tuple(c) not in all_results:
+            all_results[tuple(c)] = {"block": list(c), "ns": None, "error": "未完成"}
+    results = [all_results[tuple(c)] for c in candidates]
     valid = [r for r in results if r.get("ns")]
     if not valid:
         print(f"[sweep] 无有效候选, 当前 {cur} 保留")

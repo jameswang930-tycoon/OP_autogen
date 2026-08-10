@@ -182,7 +182,7 @@ def generate_conv2d_candidates(OH: int = 64, OW: int = 64, K_OUT: int = 32,
             v *= 2
         return r
 
-    bk_range = [bk_min, bk_min * 2]  # K_OUT 的 2 幂 + 下一个 2 幂 (mask 处理尾块)
+    bk_range = _pow2(bk_min, L0C_MAX // 16)   # BLOCK_K 从 K_OUT 的 2 幂 到 L0C 上限 (配合最小 OW=16)
     bow_range = _pow2(16, OW)
 
     candidates = []
@@ -261,16 +261,15 @@ def _build_runner_body(module_code: str, setup: str, cands_json: str,
             for _ in range(WARMUP):
                 run_one({', '.join(vars_)})
             torch.npu.synchronize()
-            times = []
+            # ★一次窗口包 LOOP 次, 只 sync 一次 (和 bench 同款, 10× 少 sync)
+            ev_s = torch.npu.Event(enable_timing=True)
+            ev_e = torch.npu.Event(enable_timing=True)
+            ev_s.record()
             for _ in range(LOOP):
-                ev_s = torch.npu.Event(enable_timing=True)
-                ev_e = torch.npu.Event(enable_timing=True)
-                ev_s.record()
                 run_one({', '.join(vars_)})
-                ev_e.record()
-                torch.npu.synchronize()
-                times.append(ev_s.elapsed_time(ev_e))
-            avg_ns = sum(times) / len(times) * 1e6
+            ev_e.record()
+            torch.npu.synchronize()
+            avg_ns = ev_s.elapsed_time(ev_e) / LOOP * 1e6  # ms→ns, ÷LOOP = 单次平均
             results.append({{"block": list(cfg), "ns": round(avg_ns, 1)}})
             print(f"  [{{idx+1}}/{{n_total}}] {{cfg}}: {{avg_ns:.0f}}ns", flush=True)
         except Exception as e:

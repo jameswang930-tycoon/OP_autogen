@@ -675,10 +675,16 @@ class Scheduler:
         if tier3_sweep and tier3_sweep.get("available"):
             sw = tier3_sweep
             best = sw.get("best", {})
+            # ★B1/B4 防御: best.ns 可能为 None (当前块保留且未实测成功); 候选数用 n_configs 兜底 (缓存丢了 configs)
+            _bns = best.get("ns")
+            _ns_s = f"{_bns:.0f}ns" if isinstance(_bns, (int, float)) else "?"
+            _n_cfg = len(sw.get("configs") or []) or sw.get("n_configs") or 0
+            _rp = sw.get("result_path") or str(round_dir / "09_tier3_sweep" / "sweep_result.json")
+            _wrote_s = "最优已自动写入 kernel_op.py" if sw.get("written", True) else "当前块保留 (sweep 未改动)"
             lines = ["", f"# ══ sweep 分块结论 (状态: {sweep_status}) ══",
-                     f"最优 BLOCK: {best.get('block', '?')} = {best.get('ns', '?')}ns"
+                     f"最优 BLOCK: {best.get('block', '?')} = {_ns_s}"
                      + (f" (vs 当前 {best.get('speedup', '?')}x)" if best.get("speedup") else ""),
-                     f"已自动写入 kernel_op.py. 完整 {len(sw.get('configs', []))} 候选数据 → 09_tier3_sweep/sweep_result.json"]
+                     f"{_wrote_s}. 完整 {_n_cfg} 候选数据 → {_rp}"]
             if tier == 3:
                 lines.append("★分块层: 已穷举全部 L0 合法 2幂候选, 当前已是最优. 禁止猜新 BLOCK. promote 到下一层.")
             else:
@@ -838,8 +844,6 @@ class Scheduler:
         sweep_kernel.write_text(code, encoding="utf-8")
         sweep_kernel_dir = sweep_kernel.parent
 
-        base = self.traj["state"].get("baseline_ns")
-
         # ★v2: 调用新 sweep — 程序化候选生成 + 单进程 runner + torch.npu.Event 计时
         sweep_out_dir = round_dir / "09_tier3_sweep"
         sweep_out_dir.mkdir(parents=True, exist_ok=True)
@@ -859,27 +863,34 @@ class Scheduler:
             return {"available": False, "error": result["error"]}
 
         # 转换 v2 结果 → planner 期望格式
+        # ★B3: 加速比相对"当前块"算 (sweep() 已算 speedup_vs_cur) — 不用 round1 baseline,
+        #   跨结构轮次 (tier3 重扫) 时 baseline 是旧 kernel, 比值会失真误导 planner.
         results = result.get("results", [])
-        best_block = result.get("best_block")
-        best_ns = None
-        cur_ns = None
+        written = not bool(result.get("unchanged"))   # ★B1: sweep 是否真写回了新块
+        cur_result = next((r for r in results if tuple(r.get("block", [])) == cur), None)
+        cur_ns = cur_result.get("ns") if cur_result else None
         configs = []
         for r in results:
             blk = tuple(r["block"])
             sc = {"block": list(r["block"]), "ns": r.get("ns"),
-                  "speedup": round(base / r["ns"], 3) if (base and r.get("ns")) else None,
+                  "speedup": round(cur_ns / r["ns"], 3) if (cur_ns and r.get("ns")) else None,
                   "is_current": blk == cur}
             configs.append(sc)
-            if blk == best_block and r.get("ns"):
-                best_ns = r["ns"]
         valid = sorted([c for c in configs if c.get("ns")], key=lambda c: c["ns"])
         if not valid:
             return {"available": False, "error": "所有候选实测失败", "configs": configs}
-        best_cfg = valid[0]
+        # ★B1: best 必须是 kernel 里真实存在的块 —
+        #   sweep 写回新块 → 用实测最快; 未写回(unchanged, 当前块保留) → 用当前块,
+        #   否则当前块实测失败 (ns=None) 时 planner 会拿到一个"实际没写进去"的假最优.
+        if written:
+            best_cfg = valid[0]
+        else:
+            best_cfg = next((c for c in configs if c.get("is_current")), None) or valid[0]
 
         # 写 09 报告
         (sweep_out_dir / "sweep_result.json").write_text(json.dumps(
             {"available": True, "vars": list(meta["vars"]), "configs": valid, "best": best_cfg,
+             "written": written,
              "candidates_tested": result.get("candidates_tested", len(results))},
             ensure_ascii=False, indent=1), encoding="utf-8")
         with open(sweep_out_dir / "sweep_result.txt", "w", encoding="utf-8") as f:
@@ -898,7 +909,8 @@ class Scheduler:
             self.traj["state"]["current_kernel"] = str(sweep_kernel)
             print(f"  [Tier3] ★current_kernel → {sweep_kernel} (sweep 优化后的 BLOCK 已生效)")
 
-        return {"available": True, "configs": valid, "best": best_cfg, "vars": list(meta["vars"])}
+        return {"available": True, "configs": valid, "best": best_cfg, "vars": list(meta["vars"]),
+                "written": written, "result_path": str(sweep_out_dir / "sweep_result.json")}
 
     # ★D6: 环境漂移防护 — 每 N 轮重测原始 baseline kernel + 当前 kernel,
     #   校正加速比基数 (长时运行跨时段温度/负载漂移会污染 baseline_ns).
@@ -1260,35 +1272,48 @@ class Scheduler:
                 _code_hash = hashlib.sha256(_code_norm.encode()).hexdigest()[:16]
                 _prev_hash = st.get("tier3_sweep_code_hash", "")
                 if _code_hash != _prev_hash or not st.get("tier3_swept"):
-                    st["tier3_swept"] = True
-                    st["tier3_sweep_code_hash"] = _code_hash
+                    # ★B2: 成功才标记已扫 — 失败不写 hash/tier3_swept,
+                    #   下次结构未变也会重试 (瞬时失败不永久禁用自动分块扫描).
                     tier3_sweep = self._tier3_sweep_data(tier, rn, round_dir)
-                    _sweep_status = "ran_this_round"
+                    if tier3_sweep and tier3_sweep.get("available"):
+                        st["tier3_swept"] = True
+                        st["tier3_sweep_code_hash"] = _code_hash
+                        _best = tier3_sweep.get("best") or {}
+                        _bns = _best.get("ns")
+                        _bns_s = f"{_bns:.0f}ns" if isinstance(_bns, (int, float)) else "?"
+                        _w_s = ("最优已写入 kernel" if tier3_sweep.get("written", True)
+                                else "当前块保留 (未改动)")
+                        print(f"  ⏱ 分块实测完成: {len(tier3_sweep.get('configs', []))} config, "
+                              f"最优 {_best.get('block')} {_bns_s} "
+                              f"({time.time()-_t_plan0:.0f}s) → {_w_s}")
+                        # ★只存结论 (best + status + 报告路径), 不存全部 configs → 防 trajectory 膨胀
+                        st["last_sweep_result"] = {
+                            "available": True,
+                            "best": tier3_sweep["best"],
+                            "vars": tier3_sweep.get("vars", []),
+                            "n_configs": len(tier3_sweep.get("configs", [])),
+                            "result_path": tier3_sweep.get("result_path") or "",
+                            "written": tier3_sweep.get("written", True),
+                        }
+                        _sweep_status = "ran_this_round"
+                    elif tier3_sweep and tier3_sweep.get("available") is False:
+                        print(f"  [Tier3] 分块实测不可用 "
+                              f"({tier3_sweep.get('error','行级/无候选')}) → 走 LLM (兜底)")
+                        _sweep_status = f"failed: {tier3_sweep.get('error', '?')[:60]}"
+                        tier3_sweep = None   # 失败 → 不传坏数据给 planner
+                    else:
+                        # ★B5: _tier3_sweep_data 返回 None (行级 op/无可扫) → 不声称本轮实测
+                        _sweep_status = "skipped_no_free_params"
                 else:
                     print(f"  [Tier3] kernel 结构未变 (hash={_code_hash}), 跳过重扫, 复用历史最佳")
                     _sweep_status = "skipped_structure_unchanged"
-                if tier3_sweep and tier3_sweep.get("available"):
-                    print(f"  ⏱ 分块实测完成: {len(tier3_sweep.get('configs', []))} config, "
-                          f"最优 {tier3_sweep['best']['block']} {tier3_sweep['best']['ns']:.0f}ns "
-                          f"({time.time()-_t_plan0:.0f}s) → 最优已写入 kernel")
-                    # ★只存结论 (best + status), 不存全部 configs → 防 trajectory 膨胀
-                    st["last_sweep_result"] = {
-                        "available": True,
-                        "best": tier3_sweep["best"],
-                        "vars": tier3_sweep.get("vars", []),
-                        "n_configs": len(tier3_sweep.get("configs", [])),
-                    }
-                    _sweep_status = "ran_this_round"
-                elif tier3_sweep and tier3_sweep.get("available") is False:
-                    print(f"  [Tier3] 分块实测不可用 "
-                          f"({tier3_sweep.get('error','行级/无候选')}) → 走 LLM (兜底)")
-                    _sweep_status = f"failed: {tier3_sweep.get('error', '?')[:60]}"
-                    tier3_sweep = None   # 失败 → 不传坏数据给 planner
 
             # ★关键: 即使本轮 sweep 没跑, 也把上次成功的 sweep 结果传给 planner (tier3 尤其需要)
-            if not tier3_sweep and st.get("last_sweep_result"):
+            #   ★B2: 本轮尝试过但失败 → 不喂过期缓存 (防"已穷举=最优"假象, 让 planner 走 LLM 兜底)
+            if (not tier3_sweep and st.get("last_sweep_result")
+                    and not _sweep_status.startswith("failed")):
                 tier3_sweep = st["last_sweep_result"]
-                if _sweep_status == "not_triggered":
+                if _sweep_status in ("not_triggered", "skipped_no_free_params"):
                     _sweep_status = "reused_from_cache"   # ★本轮没跑, 用的是上次缓存
 
             # ④ Planner → plan + 晋升决策 (07字段 + 完整数据上下文 + 轨迹 + 手递 + 融合 + 分块实测)
@@ -1498,6 +1523,45 @@ class Scheduler:
                 print(f"  [图表] 轨迹图 → {_chart_out}")
             except Exception as e:
                 print(f"  ⚠ 轨迹图生成失败: {str(e)[:120]}")
+
+        # ★最终产物: 把找到的最优 kernel 写进 final_output/ — 不只留图表, 代码也要可直取.
+        #   写: ①最终 kernel_op.py (当前被采纳链上的最优) ②baseline 副本 ③final_summary.json 摘要.
+        try:
+            import shutil as _sh
+            _final_dir = self.kernel_dir / "final_output"
+            _final_dir.mkdir(parents=True, exist_ok=True)
+            _src = self.current_kernel if (self.current_kernel and self.current_kernel.exists()) else None
+            if _src is None and st.get("current_kernel"):
+                _p = Path(st["current_kernel"])
+                if _p.exists():
+                    _src = _p
+            if _src is not None:
+                _sh.copy2(_src, _final_dir / "kernel_op.py")
+                _bl = self.kernel_dir / "baseline_kernel.py"
+                if _bl.exists():
+                    _sh.copy2(_bl, _final_dir / "baseline_kernel.py")
+                (_final_dir / "final_summary.json").write_text(json.dumps({
+                    "op": self.kernel_name,
+                    "final_tier": st.get("tier"),
+                    "total_rounds": st.get("total_rounds", 0),
+                    "promote_rounds": _prom,
+                    "effective_rounds": _n_eff,
+                    "baseline_ns": _bs,
+                    "final_ns": _cur_ns,
+                    "current_speedup": st.get("current_speedup"),
+                    "best_speedup": st.get("best_speedup"),
+                    "final_kernel_source": str(_src),
+                    "generated_at": datetime.now().isoformat(),
+                }, ensure_ascii=False, indent=1), encoding="utf-8")
+                print(f"  [最终产物] 优化 kernel → {_final_dir / 'kernel_op.py'} "
+                      f"(累计加速比 {st.get('current_speedup')}x, 源 {_src})")
+                if _bl.exists():
+                    print(f"  [最终产物] baseline 副本 → {_final_dir / 'baseline_kernel.py'}")
+                print(f"  [最终产物] 摘要 → {_final_dir / 'final_summary.json'}")
+            else:
+                print(f"  ⚠ [最终产物] 无可用最终 kernel (current_kernel 缺失), 跳过写 final_output")
+        except Exception as e:
+            print(f"  ⚠ [最终产物] 写 final_output 失败: {str(e)[:150]}")
         return 0
 
 

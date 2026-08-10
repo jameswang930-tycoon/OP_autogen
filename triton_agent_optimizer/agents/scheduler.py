@@ -165,6 +165,10 @@ PT_SCRIPT_MAP = {
     "pytorch_conv2d_tflops.json": "bench_pytorch_conv2d.py",
     "pytorch_conv_bias_relu_tflops.json": "bench_pytorch_conv_bias_relu.py",
     "pytorch_rms_norm_tflops.json": "bench_pytorch_rms_norm.py",
+    "pytorch_matmul_relu_tflops.json": "bench_pytorch_matmul_relu.py",
+    "pytorch_matmul_transpose_tflops.json": "bench_pytorch_matmul_transpose.py",
+    "pytorch_layernorm_tflops.json": "bench_pytorch_layernorm.py",
+    "pytorch_sigmoid_tflops.json": "bench_pytorch_sigmoid.py",
 }
 
 
@@ -1217,15 +1221,14 @@ class Scheduler:
                 t_fusion = time.time() - _t0
                 print(f"  ⏱ ③融合分析: {t_fusion:.1f}s")
 
-            # ★D1-Tier3: 自动分块实测 v2 — 进分块层先跑全量 L0 合法 BLOCK 候选,
-            #   单进程 torch.npu.Event 实测, 喂 planner 决策. 报错/无可扫 → None, 走 LLM 兜底.
-            #   TIER3_SWEEP=1 默认.
-            # ★v2 重扫条件: kernel 代码结构(非 BLOCK 赋值) 的 hash 变化 → 重扫;
-            #    不再用永久 tier3_swept flag (T4/T5/T6 结构变更后重入 T3 也能触发).
+            # ★D1: 自动分块实测 v2 — 全量 L0 合法 BLOCK 候选, 单进程 torch.npu.Event 实测, 喂 planner.
+            #   ★触发: round1 (不管 tier, 分块是地基, 先固定好起点) 或 tier==3 (结构变更后重扫).
+            #   报错/无可扫 → None, 走 LLM 兜底. TIER3_SWEEP=1 默认.
+            # ★v2 重扫条件: kernel 代码结构(非 BLOCK 赋值) 的 hash 变化 → 重扫.
             # ★计时: t_plan 从 sweep 前开始计 (sweep 计入 planner 阶段).
             _t_plan0 = time.time()
             tier3_sweep = None
-            if tier == 3 and os.environ.get("TIER3_SWEEP", "1") == "1":
+            if (rn == 1 or tier == 3) and os.environ.get("TIER3_SWEEP", "1") == "1":
                 import hashlib
                 _code_body = re.sub(r'(BLOCK_\w+)\s*[,=]\s*\d+', '',   # 去 BLOCK 赋值
                                     self.current_kernel.read_text(encoding="utf-8")

@@ -145,4 +145,8 @@ PT_BENCH_MAP = {
     "flash_attention": "pytorch_flash_attention_tflops.json",
     "conv2d": "pytorch_conv2d_tflops.json",
     "conv_bias_relu": "pytorch_conv_bias_relu_tflops.json",
+    "matmul_relu": "pytorch_matmul_relu_tflops.json",
+    "matmul_transpose": "pytorch_matmul_transpose_tflops.json",
+    "layernorm": "pytorch_layernorm_tflops.json",
+    "sigmoid": "pytorch_sigmoid_tflops.json",
 }

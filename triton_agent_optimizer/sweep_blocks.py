@@ -145,7 +145,8 @@ def generate_matmul_candidates(M: int = 2048, N: int = 2048, K: int = 2048,
                     continue
                 total += 1
                 # UB 约束 (3 缓冲: A tile + B tile + C tile)
-                if bm * bk + bn * bk + bm_bn > UB_MAX:
+                # ★安全余量 ×0.9: 正好 192KB 的 3 缓冲 + 中间产物会 OOM 打崩设备 (报 "575:NPU function error")
+                if bm * bk + bn * bk + bm_bn > int(UB_MAX * 0.9):
                     continue
                 # Grid 约束 (与问题尺寸挂钩, 保证核利用率)
                 if M and N:
@@ -205,7 +206,8 @@ def generate_conv2d_candidates(OH: int = 64, OW: int = 64, K_OUT: int = 32,
     for bk in bk_range:
         for bow in bow_range:
             total += 1
-            if bk * bow > L0C_MAX:
+            # ★安全余量 ×0.9: acc 正好 128KB (L0C 上限) + xv/wv buffer → OOM 打崩设备 (575)
+            if bk * bow > int(L0C_MAX * 0.9):
                 continue
             candidates.append((bk, bow))
 
@@ -270,6 +272,11 @@ def _build_runner_body(module_code: str, setup: str, cands_json: str,
 
     print(f"[sweep] {{n_total}} candidates, warmup={{WARMUP}}, loop={{LOOP}}", flush=True)
 
+    # ★复用单个 Event 对: 每候选新建会累积 ACL Event 资源 → 数百候选后 aclrtCreateEvent 失败
+    #   (报 "575:NPU function error: Aclrt"). 设备级错误后重建 Event 对 + sync 恢复.
+    ev_s = torch.npu.Event(enable_timing=True)
+    ev_e = torch.npu.Event(enable_timing=True)
+    consecutive_err = 0
     for idx, cfg in enumerate(CANDIDATES):
         {', '.join(vars_)} = cfg
         try:
@@ -277,8 +284,6 @@ def _build_runner_body(module_code: str, setup: str, cands_json: str,
                 run_one({', '.join(vars_)})
             torch.npu.synchronize()
             # ★一次窗口包 LOOP 次, 只 sync 一次 (和 bench 同款, 10× 少 sync)
-            ev_s = torch.npu.Event(enable_timing=True)
-            ev_e = torch.npu.Event(enable_timing=True)
             ev_s.record()
             for _ in range(LOOP):
                 run_one({', '.join(vars_)})
@@ -287,9 +292,21 @@ def _build_runner_body(module_code: str, setup: str, cands_json: str,
             avg_ns = ev_s.elapsed_time(ev_e) / LOOP * 1e6  # ms→ns, ÷LOOP = 单次平均
             results.append({{"block": list(cfg), "ns": round(avg_ns, 1)}})
             print(f"  [{{idx+1}}/{{n_total}}] {{cfg}}: {{avg_ns:.0f}}ns", flush=True)
+            consecutive_err = 0
         except Exception as e:
+            consecutive_err += 1
             results.append({{"block": list(cfg), "ns": None, "error": str(e)[:120]}})
             print(f"  [{{idx+1}}/{{n_total}}] {{cfg}}: ERROR {{str(e)[:100]}}", flush=True)
+            # ★设备级错误恢复: sync + 重建 Event 对 (Event 可能被设备错误污染)
+            try:
+                torch.npu.synchronize()
+                ev_s = torch.npu.Event(enable_timing=True)
+                ev_e = torch.npu.Event(enable_timing=True)
+            except Exception:
+                pass
+            if consecutive_err >= 5:
+                print("  [sweep] ⛔ 连续 5 个候选设备错误 (某 BLOCK 可能打崩设备) → 提前停止", flush=True)
+                break
 
     valid = [r for r in results if r.get("ns")]
     errs  = [r for r in results if not r.get("ns")]

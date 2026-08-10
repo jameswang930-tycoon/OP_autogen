@@ -240,6 +240,18 @@ def _make_cann_fused_forward(op, sh):
             fused_mm = fused_mm or _f
         if "fused" in _low and "conv" in _low:
             fused_conv = fused_conv or _f
+    if op == "matmul" and fused_mm:
+        # 两层 MLP: fc1 = aclnnFusedMatmul(gelu_tanh) 融合 (y=gelu_tanh(x@w1+b1), 1 kernel),
+        #           fc2 = 普通 matmul. ★签名需服务器确认 (fused_mm 的激活参数版本可能不同)
+        M, K, N, H = sh["M"], sh["K"], sh["N"], sh["H"]
+        x = (torch.rand(M, K, device=npu, dtype=DT) - 0.5) * 0.1
+        w1 = (torch.rand(K, H, device=npu, dtype=DT) - 0.5) * 0.1
+        b1 = (torch.rand(H, device=npu, dtype=DT) - 0.5) * 0.1
+        w2 = (torch.rand(H, N, device=npu, dtype=DT) - 0.5) * 0.1
+        def fwd():
+            h = fused_mm(x, w1, b1)      # fc1+bias+gelu_tanh 融合 (1 kernel)
+            return h @ w2                # fc2 普通 matmul
+        return fwd
     if op == "matmul_relu" and fused_mm:
         M, K, N = sh["M"], sh["K"], sh["N"]
         x = (torch.rand(M, K, device=npu, dtype=DT) - 0.5) * 0.1
@@ -356,7 +368,16 @@ def main():
             print(f"[industrial] {args.op}/{args.mode} → {out_json.name}: "
                   f"e2e={result['time_us']}us kernel={result.get('kernel_time_us')}us")
             return
-        # msprof 失败 → 兜底: 内层直接跑 + Event 计时写 json
+        # msprof 失败 → 兜底 Event 计时; ★若已有旧 msprof 好结果则保留, 不覆盖 (否则好数据被差数据顶掉)
+        old = None
+        if out_json.exists():
+            try:
+                old = json.loads(out_json.read_text(encoding="utf-8"))
+            except Exception:
+                old = None
+        if old and old.get("time_us") and old.get("method") == "msprof":
+            print(f"  ⚠ msprof 不可用, 但 {out_json.name} 已有 msprof 结果 ({old['time_us']}us) → 保留, 不覆盖")
+            return
         print("  ⚠ msprof 不可用 → 兜底 Event 计时")
         import torch
         _run_loop(args.op, args.mode, sh, args.warmup, args.measure)

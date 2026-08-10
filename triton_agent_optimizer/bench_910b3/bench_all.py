@@ -104,11 +104,11 @@ def main():
         best_mode = best_file = None
         for mode in OP_MODES[op]:
             j = _read_json(op, mode)
-            if j is None or not args.skip_existing:
-                if j is None or not j.get("time_us"):
-                    j = _run_one(op, mode, args.measure)
-                elif args.skip_existing:
-                    print(f"  ⏭ {op}[{mode}] 已有 json, 跳过 (--skip-existing)")
+            # ★默认重跑(覆盖旧结果); --skip-existing 才对已有有效 json 跳过(只补缺的)
+            if args.skip_existing and j and j.get("time_us"):
+                print(f"  ⏭ {op}[{mode}] 已有 json, 跳过 (--skip-existing)")
+            else:
+                j = _run_one(op, mode, args.measure)
             if j and j.get("time_us"):
                 t = j["time_us"]
                 if best_t is None or t < best_t:

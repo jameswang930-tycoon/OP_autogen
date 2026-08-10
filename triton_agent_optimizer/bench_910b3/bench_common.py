@@ -117,11 +117,11 @@ def measure_msprof_op(app_cmd: str, kernel_name: str,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  PyTorch 统一 msprof 测量 (pt_msprof.py 用) — 一次 msprof 同时算 端到端 + 纯kernel
-#  口径与 agents/verifier._read_durations 一致 → 两端(我们/PyTorch)可比:
-#    端到端   = Σ全部 kernel 行 (含 aclnn 框架) ÷ N
-#    纯kernel = Σ非 aclnn 行              ÷ N
-#  ⚠ 热身行要跳过 (app 内部 warmup+measure 次 launch; 每遍 kernel 数 = 总行数/(warmup+measure))
+#  PyTorch 统一 msprof 测量 (pt_msprof.py / bench_industrial.py 用)
+#  一次 msprof 同时算 端到端 + 纯kernel:
+#    端到端   = Σ全部 kernel 行 (跳过热身) ÷ N      ← 与 triton 侧 verify 同口径 (可比)
+#    纯kernel = 同一实测设备时间 (torch 的计算 kernel 全是 aclnn 前缀, 与端到端不可分)
+#  ⚠ 热身行要跳过 (app 内部 warmup+measure 次 launch; 每遍 kernel 数 ≈ 总行数/(warmup+measure))
 # ═══════════════════════════════════════════════════════════════════════
 
 def _read_op_summary_rows(prof_out: Path) -> list:
@@ -172,9 +172,11 @@ def measure_pytorch_msprof(app_cmd: str, out_json: Path, flops: float,
         if not measured:
             return None
         all_us = sum(d for _, d in measured)
-        target_us = sum(d for op, d in measured if not op.lower().startswith("aclnn"))
+        # ★torch 侧修复: 计算 kernel 全是 aclnn 前缀 (aclnnMatmul 等), "非 aclnn"过滤会得 0.
+        #   torch 的"纯 kernel"与端到端不可分 (计算=框架都走 aclnn 下发) → kernel_time_us = 实测设备时间.
+        #   (triton 侧 verifier 才用"非 aclnn=目标 kernel"过滤, 两者口径本就不同)
         e2e_us = all_us / measure
-        kernel_us = target_us / measure
+        kernel_us = e2e_us
         e2e_s = e2e_us / 1e6
         tflops = (flops / 1e12 / e2e_s) if e2e_s else None
         data = {"tflops": round(tflops, 2) if tflops else None,

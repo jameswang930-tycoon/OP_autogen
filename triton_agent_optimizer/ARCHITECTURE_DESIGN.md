@@ -557,3 +557,247 @@ cat outputs/<op>/optimization.log
 | HIVM | 每轮全流程 | 仅 **Tier2 融合** |
 | 记忆 | 经验库检索 | 基本弃用 (仅 coder 错修参考) |
 ```
+
+---
+
+## 10. 六层优化策略：读取字段详解
+
+> 每轮 `run_optimize.sh` 产出 `diagnosis.json` 后，scheduler 按当前 tier 用 `TIER_FIELDS` + `TIER_PER_KERNEL` 筛字段 → `07_tier<N>_fields/` 喂 Planner。
+> 字段来源: `summary.*`(通用 msprof 骨架) / `kernels[i].task.*`(骨架 per-kernel) / `kernels[i].deep.*`(msprof op 深层画像)。
+> **全局摘要(前层信号)** 任何 tier 都喂: `num_kernels`(多→融合空间) / `num_kernels_total`(含框架) / `api_overhead_total_us`(launch 开销) —— 让 planner 先做"前层优先检查"，不能只闷头调本层参数。
+
+### 10.1 Tier1 算法结构
+
+**优化什么**: 算法选择 / 精度(fp16/int8) / 算术强度 → 决定 kernel 走什么算法规格。
+**读的字段**:
+
+| 字段路径 | 含义 | 为什么读 / 看什么 |
+|---|---|---|
+| `summary.num_kernels` | 目标 kernel 数 | 多 kernel = 复合算子/融合空间; 判断该走单算子还是算法拆分 |
+| `summary.total_ns` | 端到端耗时 | 总预算, 各 kernel 占比的分母 |
+| `kernels[].deep.compute.cube_fops` | cube 浮点运算数 | 真实计算量; 算 TFLOPS/算术强度 (FLOPs 来源) |
+| `kernels[].deep.compute.vector_fops` | 向量运算数 | 非 matmul (softmax/rms_norm/逐元素) 的真实计算量 |
+| `kernels[].deep.compute.cube_ratio` | cube 指令占比 | 低 = 算法没走 cube (如 conv 该 im2col 上 cube); 高 = 计算密集 |
+| `kernels[].deep.compute.cube_fp16_ratio` | cube fp16 占比 | 精度选择: 该不该降 fp16 提算力 |
+| `kernels[].deep.compute.cube_int8_ratio` | cube int8 占比 | 能否走 int8 量化 |
+| `kernels[].deep.engine_utilization.vec` | 向量指令占比 | 向量型算子瓶颈 (归约/逐元素 kernel 命门) |
+| `kernels[].deep.roofline.compute_utilization` | 算力利用率 | 是否计算瓶颈、离峰值多远 (naive<30% → 有空间) |
+| `kernels[].deep.roofline.arithmetic_intensity` | 算术强度(计算/访存) | 计算型 vs 访存型 → 决定走算法优化还是访存优化 |
+| `kernels[].deep.roofline.bottleneck_type` | 瓶颈类型 | 一针见血: compute/memory/latency/balanced → 本层是否瓶颈 |
+| `kernels[].task.pipes_us.aiv_vec_time_us` | 向量耗时 (per-kernel) | 向量 kernel (rms_norm/softmax/bias_gelu) 的实际耗时占比 |
+
+### 10.2 Tier2 算子融合
+
+**优化什么**: 多 kernel → 单 kernel (逐元素并入 matmul epilogue / 残差 / 冗余 load)。
+**读的字段**:
+
+| 字段路径 | 含义 | 为什么读 / 看什么 |
+|---|---|---|
+| `summary.num_kernels` | 目标 kernel 数 | 有几个 kernel 可融合; 3 个分离 kernel 是融合目标 |
+| `summary.num_kernels_total` | 总 kernel 数(含框架) | aclnn 框架准备 kernel 是否多 → 能否避免 |
+| `summary.api_overhead_total_us` | launch 开销 | 大 = 每次 launch 固定开销高 → 融合收益大 |
+| `kernels[].task.task_type` | 每 kernel 引擎 | 逐元素 Vec kernel 可并入 matmul epilogue; Cube/Vec 混合找融合点 |
+| `kernels[].launch_count` | 每 kernel launch 次数 | 复用 kernel (QKV 复用 matmul) 的融合/拆分候选 |
+| `api_overhead` | API 开销明细 | 具体哪个 launch 贵 (换 tensor 不换 launch) |
+| `multi_kernel` | 算子类型分解 | 整条计算链 → 找相邻可融合 op (bias→gelu→残差) |
+| `framework_kernels` | 框架 kernel(非目标) | 哪些是 aclnn 数据准备, 是否本可避免 |
+| `kernels[].deep.roofline.compute_utilization` | 算力利用率 (per-kernel) | 低利用率的独立小 kernel = 最该并入的候选 |
+| `kernels[].launch_count` | launch 次数 (per-kernel) | 每 kernel 被 launch 几次, 占比口径 |
+
+### 10.3 Tier3 分块配置
+
+**优化什么**: BLOCK_M/N/K (L0A/L0B/L0C/UB 约束, 2 幂) — round1/tier3 自动 sweep 实测最优块。
+**读的字段**:
+
+| 字段路径 | 含义 | 为什么读 / 看什么 |
+|---|---|---|
+| `kernels[].task.block_dim` | 核数 | 当前分块用多少核; 太少 = 并行度不足 |
+| `kernels[].deep.engine_utilization.mte1` | MTE1(L1→L0A/B)占比 | 内层搬运是否瓶颈 (BK 太大 → L0A/B 搬运占比高) |
+| `kernels[].deep.engine_utilization.mte2` | MTE2(GM→L1)占比 | GM 搬运是否瓶颈 (BLOCK 小 → GM 搬运频繁) |
+| `kernels[].deep.engine_utilization.cube` | cube 占比 | 计算占比; 太低 = 被搬运拖住 |
+| `kernels[].deep.bandwidth_gb_s.l0a_read_gb_s` | L0A 读带宽 | BLOCK_M×BK 与 L0A(64KB) 的贴合度 |
+| `kernels[].deep.bandwidth_gb_s.l0a_write_gb_s` | L0A 写带宽 | 同上 |
+| `kernels[].deep.bandwidth_gb_s.l0b_read_gb_s` | L0B 读带宽 | BLOCK_N×BK 与 L0B(64KB) 的贴合度 |
+| `kernels[].deep.bandwidth_gb_s.l0b_write_gb_s` | L0B 写带宽 | 同上 |
+| `kernels[].task.pipes_us.aic_mte1_time_us` | MTE1(L1→L0A/B)耗时 (per-kernel) | 搬运实际耗时 → BLOCK 该调大/调小 |
+| `kernels[].deep.conflict.bank_cflt_ratio` | bank 冲突 (per-kernel) | 大块时 UB bank 冲突 |
+
+### 10.4 Tier4 访存
+
+**优化什么**: GM 带宽 / L2 复用 / 连续化 / 128-bit 对齐 / 流水线。
+**读的字段**:
+
+| 字段路径 | 含义 | 为什么读 / 看什么 |
+|---|---|---|
+| `kernels[].deep.bandwidth_gb_s.main_mem_read_gb_s` | GM 读带宽 | 是否接近 HBM 峰值 (访存瓶颈) |
+| `kernels[].deep.bandwidth_gb_s.main_mem_write_gb_s` | GM 写带宽 | 是否访存写瓶颈 |
+| `kernels[].deep.bandwidth_gb_s.gm_to_ub_gb_s` | GM→UB 带宽 | 搬运通路效率 |
+| `kernels[].deep.bandwidth_gb_s.ub_to_gm_gb_s` | UB→GM 带宽 | 搬运通路效率 |
+| `kernels[].deep.l2_hit_rate` | L2 命中率 | 低 = L2 复用差 → 增大块/调访问序复用 |
+| `kernels[].task.pipes_us.aic_mte2_time_us` | MTE2(GM读)耗时 | GM 读时间占比 |
+| `kernels[].task.pipes_us.aic_mte3_time_us` | MTE3(GM写)耗时 | GM 写时间占比 |
+| `kernels[].deep.roofline.memory_utilization` | 访存利用率 | 是否访存瓶颈 + 提升空间 |
+| `kernels[].deep.roofline.arithmetic_intensity` | 算术强度 | 确认访存型 → 本层优化优先 |
+| `kernels[].task.est_bytes_in/out` | 绝对搬运量 (per-kernel) | 冗余搬运判断: 中间 tensor 写 GM 又读回 → L2 复用/降搬运 |
+
+### 10.5 Tier5 计算占用
+
+**优化什么**: 向量化 / rsqrt / FMA / ILP / bank 冲突。
+**读的字段**:
+
+| 字段路径 | 含义 | 为什么读 / 看什么 |
+|---|---|---|
+| `kernels[].task.pipes_us.aic_cube_time_us` | cube 耗时 | 计算核心时间; cube 满 = 算力瓶颈 |
+| `kernels[].task.pipes_us.aic_scalar_time_us` | 标量耗时 | 标量瓶颈 (地址计算/循环/索引开销) |
+| `kernels[].deep.engine_utilization.scalar` | scalar 占比 | 标量是否卡住流水 |
+| `kernels[].deep.engine_utilization.fixpipe` | fixpipe 占比 | 定标指令是否卡 |
+| `kernels[].deep.compute.cube_ratio` | cube 指令占比 | 是否计算为主 |
+| `kernels[].deep.conflict.bank_cflt_ratio` | bank 冲突 | 向量 bank 冲突 (128-bit 对齐可解) |
+| `kernels[].deep.conflict.bankgroup_cflt_ratio` | bankgroup 冲突 | bankgroup 冲突 |
+| `kernels[].deep.conflict.total_cflt_ratio` | vec 总冲突 | 向量总冲突占比 |
+| `kernels[].deep.conflict.wait_ratio` | vec 被阻塞占比 (per-kernel) | 等待/流水气泡 → ILP 提升 |
+
+### 10.6 Tier6 架构专属
+
+**优化什么**: 引擎失衡 / wait_ratio / mte 冲突 / 代码风格。
+**读的字段**:
+
+| 字段路径 | 含义 | 为什么读 / 看什么 |
+|---|---|---|
+| `kernels[].deep.engine_utilization` | 各引擎利用率 | cube/vec/mte2/mte3 是否均衡; 引擎失衡 = 硬件没吃满 |
+| `kernels[].deep.conflict.mte_cflt_ratio` | mte 冲突 | 搬运冲突 |
+| `kernels[].deep.conflict.wait_ratio` | vec 被阻塞占比 | 向量等搬运/等计算 → 流水线气泡 |
+| `kernels[].task.task_type` | 每 kernel 引擎 | 引擎类型分布 |
+| `kernels[].task.block_dim` | 核数 | 并行度 |
+| `kernels[].deep.roofline.bottleneck_type` | 瓶颈类型 | 最终确认瓶颈是否属本层 |
+| `kernels[].deep.engine_utilization.cube/vec/mte2/mte3` | 各引擎占比 (per-kernel) | 逐 kernel 引擎分布 → 调访问/代码结构喂平衡 |
+
+---
+
+## 11. diagnosis.json 完整结构与字段来源
+
+### 11.1 数据流：msprof 产物 → diagnosis.json
+
+```
+通用 msprof (任务级)                     msprof op (逐 kernel, 每 kernel 一次)
+  05_task/task_prof/                      04_board/op_<i>/OPPROF_*/
+  ├─ op_summary*.csv  (每 kernel 一行)     ├─ OpBasicInfo.csv
+  ├─ op_statistic*.csv (算子统计)          ├─ PipeUtilization.csv
+  ├─ api_statistic*.csv (API 开销)         ├─ ArithmeticUtilization.csv
+  └─ l2_cache*.csv     (L2 命中)           ├─ Memory.csv
+      │                                    ├─ MemoryL0.csv
+      ▼                                    ├─ MemoryUB.csv
+  pipeline_parse_task.py                   ├─ L2Cache.csv
+      ▼                                    └─ ResourceConflictRatio.csv
+  05_task/task.json  (骨架)                    │
+      │                                        ▼
+      │                            pipeline_parse_board.py
+      │                                        ▼
+      │                            04_board/board_<i>.json (deep)
+      └───────────────┬────────────────────────┘
+                      ▼
+              integrate.py (按 kernel 名合并 + roofline 计算)
+                      ▼
+              06_diagnosis/diagnosis.json
+```
+
+### 11.2 diagnosis.json 顶层结构
+
+```json
+{
+  "meta":        {"source": "msprof (generic) + msprof op per-kernel", "num_kernels": N, "filled_kernels": M},
+  "summary":     {"num_kernels", "num_kernels_total", "total_ns", "num_cores",
+                  "api_overhead_total_us", "l2_hit_rate", "filled_kernels"},
+  "kernels": [   {  // 每优化目标 kernel 一个 (= kernel_slot + deep)
+      "kernel_name", "framework", "launch_count",
+      "task":  { "task_type", "task_duration_us", "block_dim", "input/output_shapes|dtypes",
+                 "aicore_time_us", "aiv_time_us", "total_cycles",
+                 "pipes_us": {"aic_cube/mac/scalar/mte1/mte2/mte3/fixpipe_time_us",
+                              "aiv_vec/scalar/mte2/mte3_time_us"},
+                 "est_bytes_in", "est_bytes_out", "transfers": [...] },
+      "deep":  { "freq_mhz", "bandwidth_gb_s": {...}, "engine_utilization": {...},
+                 "compute": {...}, "conflict": {...}, "l2_hit_rate",
+                 "roofline": {"achieved_memory_bw_gb_s", "peak_memory_bw_gb_s", "memory_utilization",
+                              "achieved_compute_tflops", "peak_compute_tflops", "compute_utilization",
+                              "arithmetic_intensity", "bottleneck_type"} },
+      "filled_by": "msprof op"
+  }],
+  "framework_kernels": [...],   // aclnn* 框架 kernel (非优化目标, 仅观察)
+  "api_overhead":    [...],     // 来自 api_statistic.csv
+  "multi_kernel":    [...],     // 来自 op_statistic.csv
+  "notes": [...]
+}
+```
+
+### 11.3 字段来源明细（每个字段 ← 哪个文件哪个列 / 怎么算）
+
+#### summary.*（integrate.py 从 task.json 汇总）
+
+| 字段 | 来源文件 → 列 | 怎么解析 |
+|---|---|---|
+| `num_kernels` | op_summary*.csv `Op Name` 列 | 去重非 aclnn 的 op 名数 = 优化目标 kernel 数 |
+| `num_kernels_total` | op_summary*.csv `Op Name` 列 | 去重含 aclnn 的全部 op 名数 |
+| `total_ns` | op_summary*.csv `Task Duration(us)` | Σ 非 aclnn 行的耗时 ×1000（与 verify 端到端口径一致） |
+| `num_cores` | op_summary*.csv `Block Dim` 列 | 最大值（★实际是 launch grid，910B3 固定 20 核） |
+| `api_overhead_total_us` | api_statistic*.csv `Time` 列 | Σ 各行 total_us |
+| `l2_hit_rate` | l2_cache*.csv `Hit Rate` 列 | 百分数 >1 归一化到 0~1 |
+| `filled_kernels` | — | integrate 统计 deep 被 msprof op 填满的 kernel 数 |
+
+#### kernels[i].task.*（骨架，来自 05_task/task_prof/op_summary*.csv，pipeline_parse_task.py）
+
+| 字段 | 来源列 | 说明 |
+|---|---|---|
+| `kernel_name` / `framework` | `Op Name` | 是否为 aclnn 前缀（框架 kernel 不进 kernels[]，进 framework_kernels[]） |
+| `task_type` | `Task Type` | 引擎类型（Cube/Vec…） |
+| `task_duration_us` | `Task Duration(us)` | 单次 launch 耗时 |
+| `block_dim` | `Block Dim` | launch grid |
+| `input/output_shapes|dtypes` | `Input/Output Shape`、`Input/Output Data Type` | 形状/类型 |
+| `aicore_time_us` / `aiv_time_us` / `total_cycles` | `aicore time`/`aiv time`/`total cycles` | cube/向量核时间、周期 |
+| `pipes_us.*` | `aic_*_time(us)` / `aiv_*_time(us)` 列 | per-pipe 耗时；兼容列名（cube↔mac、fixpipe↔fixp；cube 缺 mte3 用 aiv_mte3） |
+| `est_bytes_in/out` | `Input/Output Shape`×dtype 字节 | 计算估值（每元素搬一次） |
+| `transfers[]` | shape+dtype → 字节, pipe 耗时 → 带宽 | 计算：GM读(MTE2)/L1→L0A/B(MTE1)/写回(MTE3)/Cube MAC 每通路 |
+| `launch_count` | `Op Name` 同名行数 | 每 kernel 被 launch 几次（占比口径） |
+
+#### kernels[i].deep.*（深层，来自 04_board/op_<i>/OPPROF_*/，pipeline_parse_board.py）
+
+| 字段 | 来源 CSV → 列 | 说明 |
+|---|---|---|
+| `freq_mhz` | OpBasicInfo `Current Freq` | 运行频率 |
+| `bandwidth_gb_s.main_mem_read/write_gb_s` | Memory `main_mem_read/write_bw`（aic 前缀兼容） | GM 读/写带宽 |
+| `bandwidth_gb_s.l1_read/write_gb_s` | Memory `l1_read/write_bw` | L1 带宽 |
+| `bandwidth_gb_s.l2_read/write_gb_s` | Memory `l2_read/write_bw` | L2 带宽 |
+| `bandwidth_gb_s.gm_to_ub/ub_to_gm_gb_s` | Memory `aiv_gm_to_ub_bw` / `aiv_ub_to_gm_bw` | UB↔GM 真实搬运带宽 |
+| `bandwidth_gb_s.ub_vector/scalar/mte_read/write_gb_s` | MemoryUB `aiv_ub_*_bw_vector/scalar`、`ub_*_bw_mte` | UB 读写带宽 |
+| `bandwidth_gb_s.l0a/l0b/l0c_read/write_gb_s` | MemoryL0 `aic_l0a/l0b/l0c_read/write_bw` | L0 各缓冲带宽 |
+| `engine_utilization.cube/vec/mte1/mte2/mte3/scalar/fixpipe` | PipeUtilization `*_ratio`（或 time/总时长） | 各引擎占比 |
+| `compute.cube_fops` / `vector_fops` | ArithmeticUtilization `cube_fops` / `aiv_vec_fops` | 真实浮点运算数（FLOPs 来源） |
+| `compute.cube_ratio` / `cube_fp16_ratio` / `cube_int8_ratio` | ArithmeticUtilization `cube_ratio` / `cube_fp16_ratio` / `cube_int8_ratio` | 精度分布 |
+| `compute.vec_ratio` / `vec_fp32_ratio` / `*_instr_number` | ArithmeticUtilization | 向量占比/指令数 |
+| `conflict.*` | ResourceConflictRatio **全列**（bank_cflt_ratio / bankgroup_cflt_ratio / mte_cflt_ratio / wait_ratio / total_cflt_ratio） | 冲突/等待占比 |
+| `l2_hit_rate` | L2Cache `Hit Rate`（归一化 0~1） | L2 命中率 |
+
+★带宽统一换算：Ascend Memory*.csv 列是 MB/s，`>=1000` 就 ÷1000 转 GB/s（小带宽列不动，避免误除）。
+
+#### kernels[i].deep.roofline.*（★ integrate.py 计算，不是 CSV 直读）
+
+| 字段 | 计算式 | 用途 |
+|---|---|---|
+| `achieved_memory_bw_gb_s` | `main_mem_read + main_mem_write` | 实际访存带宽（读+写之和） |
+| `peak_memory_bw_gb_s` | hardware_peak.json `gm_bw_gb_s`，无则理论 1638.4 GB/s | 峰值参照 |
+| `memory_utilization` | achieved/peak | 访存利用率 |
+| `achieved_compute_tflops` | `(cube_fops + vector_fops)/1e12` | 实际算力 |
+| `peak_compute_tflops` | hardware_peak.json / 理论 294.9 (fp16) | fp16 峰值 |
+| `peak_compute_fp32_tflops` | 73.7 (fp16/4) | fp32 峰值 |
+| `compute_utilization` | achieved / max(fp16峰, fp32峰) | 算力利用率（用 max 防 fp32 kernel 被 fp16 峰值低估） |
+| `arithmetic_intensity` | `achieved_compute×1e12 / achieved_mem / 1e9` | 算术强度（计算/访存） |
+| `bottleneck_type` | `_classify(mem_util, comp_util)` | mem≥0.8&comp<0.5→memory；comp≥0.8&mem<0.5→compute；都<0.3→latency；否则 balanced |
+
+#### framework_kernels[] / api_overhead[] / multi_kernel[]
+
+| 字段 | 来源 CSV → 列 | 说明 |
+|---|---|---|
+| `framework_kernels[]` | op_summary*.csv（aclnn* 行） | torch_npu 框架 kernel（数据准备/参考），非优化目标，仅观察 |
+| `api_overhead[]` | api_statistic*.csv `Level`/`API Name`/`Time`/`Count` | launch/API 开销明细（判断融合收益） |
+| `multi_kernel[]` | op_statistic*.csv `OP Type`/`Count`/`Total Time`/`Avg`/`Ratio` | 每类算子次数/耗时（判断是否值得融合） |
+
+> **raw**：task.json 和每个 board_<i>.json 里都保留 `raw` = 对应 CSV 的**全部列+全部行**（不遗漏），diagnosis.json 里只留 normalized 关键字段（Planner 只看筛后的 07 字段）。

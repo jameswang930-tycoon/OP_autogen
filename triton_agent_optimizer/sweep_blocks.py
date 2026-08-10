@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""前置 BLOCK 扫描 (v2) — 全面覆盖: 生成**所有** L0 合法候选, 单进程 torch.npu.Event 实测, 每 config 5 次取平均.
+"""BLOCK 分块扫描 (v2) — 程序化枚举全部 L0 合法候选, 单进程 torch.npu.Event 实测.
 
-★v2 改进:
-  ① 候选: 程序化枚举所有 L0 合法 (BM,BN,BK) 组合 (非手写 8 个), 全面覆盖
-  ② 单进程: 利用 triton JIT 同进程不同 constexpr 自动编译, 像 @triton.autotune 一样运行
-  ③ 一次 msprof(可选): msprof 包裹整个 runner → 一次分析捕获所有 config 的 kernel 执行
-  ④ 每 config: 预热 2 次 + 计时 5 次 (torch.npu.Event 设备时间), 取平均
-  ⑤ 精简输出: 只保留 ns/speedup 排序结果 → 喂 planner 决策
+支持算子 (SWEEP_META):
+  matmul族: matmul(MLP 3-kernel全链) / attention_mlp(9-kernel+k_t转置) / flash_attention(K预转置[nh,dim,seq])
+            matmul_relu(2-kernel) / matmul_transpose(转置B)
+  conv族:   conv2d(BLOCK_K≥K_OUT) / conv_bias_relu(3-kernel)
+  行级/逐元素: rms_norm / layernorm / sigmoid → None (无自由分块参数, 跳过)
 
-用法 (910B3):
-  python3 sweep_blocks.py input/matmul            # 全量扫 matmul 的 BLOCK
+触发: scheduler round1 (分块地基) + tier3 (kernel 结构 hash 变化时重扫)
+结果: 持久化 st["last_sweep_result"], 每轮传给 planner (含真实状态 ran/skipped/reused/failed)
+op_name: 显式传入 (round>1 目录名="roundN", 不能用来查 SWEEP_META)
+
+用法:
+  python3 sweep_blocks.py input/matmul                          # 全量扫 (main.py --sweep-blocks)
+  python3 sweep_blocks.py input/matmul --quick                  # 采样 ~48 个候选
+  TIER3_SWEEP_QUICK=1 python3 main.py input/matmul              # 主循环里 quick 模式
   python3 sweep_blocks.py input/matmul --quick    # 只扫 top-48 候选
   python3 main.py input/matmul --sweep-blocks     # main 内置
 

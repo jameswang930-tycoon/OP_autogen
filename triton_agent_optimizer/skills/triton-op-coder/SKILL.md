@@ -76,8 +76,24 @@ argument-hint: >
 | `please do not tune args ['num_warps','num_stages']` | 传了这两个参数 | 去掉，triton-ascend 自动管理 tiling/流水 |
 | `int has no len()` | grid 用了 int | grid 必须是 tuple |
 | SyntaxError | 括号/缩进 | 检查改动处语法 |
+| `invalid character` (U+XXXX) | ★代码里混入了 Unicode 特殊字符 | 见下方铁律 |
 | ImportError: no module named 'triton_kernel' | 残留旧 import | kernel_op.py 是单文件，不许 import 兄弟文件 |
 | 数值错（结果 check 不过） | mask/other 改错 | 检查边界 mask 和 other 填充值 |
+
+### ★★ 禁止 Unicode 特殊字符（最高频报错源！每次输出前自查）
+代码里**绝对不能**出现以下字符（LLM 常犯，导致 SyntaxError/运行报错）：
+- **中文标点**: `。` `，` `；` `：` `（` `）` `【` `】` `？` `！` → 用 ASCII `. , ; : ( ) [ ] ? !`
+- **箭头**: `→` `←` `⇒` `⇐` → 用 ASCII `->` `<-` `=>` `<=`
+- **dash**: `—` `–` `―` → 用 ASCII `-`（减号/连字符）
+- **智能引号**: `''` `""` → 用 ASCII `'` `"`
+- **数学符号**: `×` `÷` `∙` `·` → 用 ASCII `* / * *`
+- **省略号**: `…` → 用 ASCII `...`
+- **全角/不间断空格**: `　` ` ` → 用 ASCII 普通空格
+- **其他**: `•` `★` `☆` `²` `³` `°` `±` `≈` `∞` 等所有非 ASCII 字符
+
+**自查规则**：输出代码前，扫描一遍你写的每一行代码（非注释行），确保**只有 ASCII 字符**。
+注释行可以用中文，但代码行（import/赋值/运算/指针/load/store/dot）**只能用 ASCII**。
+如果你写了 `→` 或 `×` 或 `。`，立即改成 `->` 或 `*` 或 `.`。
 
 ## 输出
 输出**完整**的修改后 `kernel_op.py` 源码。**不要** markdown 代码块包裹，**不要**解释文字。

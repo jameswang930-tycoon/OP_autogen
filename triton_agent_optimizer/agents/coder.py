@@ -1,47 +1,18 @@
 #!/usr/bin/env python3
 """
-Coder Agent — Prompt 编排器 + LLM 调用。
+Coder Agent — 读 Plan + 当前代码 → 做最小化代码改动。
 
-═══════════════════════════════════════════════════════════════════════════════
-  职责: 读 Plan + 当前代码 → 调用 LLM 做最小化代码改动
+两步策略:
+  Step 0 (首选, 确定性): 从 plan 的 changes[] 做 old_code→new_code 精确替换
+    → _sanitize_unicode 清洗 new_code 的 Unicode 脏字符 → _validate_python 语法校验
+  Step 1 (兜底, LLM): Step 0 失败/有 previous_error 时调 LLM 改码
+    → _clean_output (去 BOM/前导垃圾/markdown/Unicode 脏字符) → _validate_python
 
-  输入 (从 Orchestrator):
-    - plan: RoundPlan (Planner 产出)
-    - kernel_code: str (当前 kernel 源码)
-    - previous_error: str (Verifier 回传的错误, 用于重试)
-    - round_dir: Path (本轮输出目录, 用于保存 diff)
+Unicode 脏字符清洗 (_sanitize_unicode):
+  - 15+ 类替换: 中文标点/箭头/dash/引号/数学符号/省略号/空格 → ASCII 等价
+  - 兜底: compile 失败时逐行清非注释行的非 ASCII
 
-  输出:
-    - CoderResult (optimized_code, diff, lines_changed)
-
-═══════════════════════════════════════════════════════════════════════════════
-  约束
-═══════════════════════════════════════════════════════════════════════════════
-
-  可以读:
-    ✅ kernel.py (当前代码)
-    ✅ plan.md (优化计划)
-    ✅ Playbook (参考知识)
-
-  只能写:
-    ✅ optimized kernel.py (修改后代码)
-    ✅ diff.patch (变更记录)
-
-  绝对不能碰:
-    ❌ 任何 msprof/ hivmir/ merged 数据
-    ❌ optimization_trajectory.json
-    ❌ 其他 round 目录的文件
-
-═══════════════════════════════════════════════════════════════════════════════
-  回退机制
-═══════════════════════════════════════════════════════════════════════════════
-
-  Coder 不负责回退。回退由 Orchestrator 实现:
-    - Coder 把优化代码写入 round_N/kernel.py
-    - Verifier 验证 → 如果 REVERT:
-      Orchestrator.current_kernel 保持不变 (还是上一轮的代码)
-      round_N/kernel.py 保留在目录中作为记录 (不删除)
-    → 下一轮从上一轮代码开始, 自然实现了 "回退"
+防截断: 检查所有 def 仍在; 防 no-op: 检查输出 ≠ 原码。
 """
 
 from __future__ import annotations
@@ -157,23 +128,74 @@ def _validate_python(code: str) -> tuple[bool, str]:
         return False, f"SyntaxError at line {e.lineno}: {e.msg}"
 
 
-# ★Unicode 脏字符 → ASCII 等价物 (LLM 常把 ASCII 写成 Unicode 等价物 → 语法错/运行错/HIVM编译错)
-#   em dash — / en dash – → - ; 智能引号 ' ' " " → ' " ; 省略号 … → ... ; 各种空格 → 普通空格
+# ★Unicode 脏字符 → ASCII 等价物 (LLM 常把 ASCII 写成 Unicode → 语法错/运行错/HIVM编译错)
+#   覆盖: 各种 dash/引号/空格/数学符号/中文标点/箭头/省略号
 _UNICODE_FIXES = {
-    "—": "-", "–": "-",            # em/en dash → -
-    "‘": "'", "’": "'",            # 单引号
-    "“": '"', "”": '"',            # 双引号
-    "…": "...",                          # 省略号
-    " ": " ", "　": " ",            # 不间断/全角空格
-    "​": "",                             # 零宽空格
+    # ── dash/连字符 ──
+    "—": "-", "–": "-", "―": "-", "‒": "-", "‑": "-",   # em/en/horizontal/figure/non-breaking hyphen
+    # ── 引号 ──
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",              # 单引号变体
+    "“": '"', "”": '"', "„": '"', "‟": '"',              # 双引号变体
+    "«": "<", "»": ">", "‹": "<", "›": ">",              # 角引号
+    # ── 空格 ──
+    " ": " ", "　": " ", " ": " ", " ": " ",             # 不间断/全角/数字/窄不间断
+    "⁠": "", "​": "",                                     # 零宽 (连接符/空格)
+    # ── 省略号 ──
+    "…": "...",
+    # ── 数学符号 (LLM 常替代运算符) ──
+    "×": "*", "÷": "/", "∙": "*", "·": "*",              # 乘除号 → */ /
+    "−": "-",                                             # U+2212 minus sign → -
+    "±": "+/-", "∓": "-/+",
+    "≈": "~=", "≠": "!=", "≤": "<=", "≥": ">=",          # 比较运算符
+    "∞": "float('inf')",
+    "°": " deg",
+    "²": "**2", "³": "**3",                              # 上标
+    # ── 箭头 (注释里常见, 不影响运行但统一清) ──
+    "→": "->", "←": "<-", "↑": "^", "↓": "v", "↔": "<->",
+    "⇒": "=>", "⇐": "<=", "⇑": "^^", "⇓": "vv",
+    # ── 中文标点 (LLM 中文上下文泄漏到代码) ──
+    "。": ".", "，": ",", "；": ";", "：": ":",
+    "（": "(", "）": ")", "【": "[", "】": "]",
+    "「": "'", "」": "'", "『": '"', "』": '"',
+    "？": "?", "！": "!", "、": ",",
+    # ── 其他 ──
+    "•": "*", "◦": "*", "▪": "*", "‣": "*",
+    "©": "(c)", "®": "(r)", "™": "(tm)",
+    "№": "No.", "§": "S.", "¶": "P.",
 }
 
 
 def _sanitize_unicode(text: str) -> str:
-    """把 LLM 输出里的 Unicode 脏字符替换成 ASCII 等价物 (注释/字符串里的也清, compile 查不出但运行会错)."""
+    """把 LLM 输出里的 Unicode 脏字符替换成 ASCII 等价物."""
     for bad, good in _UNICODE_FIXES.items():
         text = text.replace(bad, good)
+    # ★兜底: 如果替换后仍有非 ASCII 且 compile 失败, 暴力清掉所有非 ASCII (注释外)
+    try:
+        compile(text, "<check>", "exec")
+    except SyntaxError:
+        # 还有非 ASCII 导致语法错 → 逐行处理: 非 comment/string 行去掉非 ASCII
+        lines = text.split("\n")
+        cleaned = []
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                cleaned.append(line)   # 注释行保留 Unicode (不影响运行)
+            else:
+                # 非注释行: 替换剩余非 ASCII 为 ASCII 最近邻 (保守: 只清确实非法的)
+                cleaned.append("".join(ch if ord(ch) < 128 else _closest_ascii(ch) for ch in line))
+        text = "\n".join(cleaned)
     return text
+
+
+def _closest_ascii(ch: str) -> str:
+    """非 ASCII 字符 → 最近 ASCII 替代 (保守兜底)."""
+    # 常见 Unicode → ASCII (补充 _UNICODE_FIXES 没覆盖的)
+    _map = {"²": "2", "³": "3", "¹": "1", "⁰": "0", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+            "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4", "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+            "ɑ": "a", "ɛ": "e", "ɔ": "o", "ν": "v", "β": "B", "γ": "g", "δ": "d", "θ": "th", "λ": "l", "μ": "u",
+            "π": "pi", "ρ": "r", "σ": "s", "τ": "t", "φ": "phi", "ω": "w", "Δ": "D", "Σ": "S", "Ω": "O",
+            "√": "sqrt", "∑": "sum", "∏": "prod", "∫": "int", "∂": "d", "∇": "grad"}
+    return _map.get(ch, "")  # 未知 → 删除 (比留非法字符安全)
 
 
 def _generate_diff(original: str, optimized: str) -> str:

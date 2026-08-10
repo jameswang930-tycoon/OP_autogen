@@ -9,11 +9,12 @@
   - 测 torch 跑原算子的耗时 → 与我们优化后的 Triton MLP 对比:
       speedup vs PyTorch = torch_mlp_time / triton_mlp_time
   - 输出 pytorch_mlp_tflops.json (供轨迹图 vs-PyTorch 参考)
+  - ★env 名与 kernel_op.py 一致 (MATMUL_M/N/K, MLP_HIDDEN), 改尺寸两边同步
 
 用法 (910B3):
   conda activate triton-npu && source /usr/local/Ascend/ascend-toolkit/set_env.sh
-  python3 bench_910b3/bench_pytorch_mlp.py             # 2048³ fp32, warmup2 + 5 轮
-  M=1024 K=1024 HIDDEN=1024 N=1024 python3 bench_910b3/bench_pytorch_mlp.py   # 改尺寸
+  python3 bench_910b3/bench_pytorch_mlp.py                          # 2048³ fp32, warmup3 + 30 次窗口
+  MATMUL_M=1024 MATMUL_K=1024 MLP_HIDDEN=1024 MATMUL_N=1024 python3 bench_910b3/bench_pytorch_mlp.py
   python3 bench_910b3/bench_pytorch_mlp.py --dtype float16
 """
 import argparse
@@ -34,10 +35,10 @@ OUT = Path(__file__).resolve().parent / "pytorch_mlp_tflops.json"
 
 def main():
     p = argparse.ArgumentParser(description="PyTorch MLP 基准线 (与 Triton kernel_op.py 同形状)")
-    p.add_argument("--m", type=int, default=int(os.environ.get("M", "2048")))
-    p.add_argument("--k", type=int, default=int(os.environ.get("K", "2048")))
-    p.add_argument("--n", type=int, default=int(os.environ.get("N", "2048")))
-    p.add_argument("--hidden", type=int, default=int(os.environ.get("HIDDEN", "2048")))
+    p.add_argument("--m", type=int, default=int(os.environ.get("MATMUL_M", os.environ.get("M", "2048"))))
+    p.add_argument("--k", type=int, default=int(os.environ.get("MATMUL_K", os.environ.get("K", "2048"))))
+    p.add_argument("--n", type=int, default=int(os.environ.get("MATMUL_N", os.environ.get("N", "2048"))))
+    p.add_argument("--hidden", type=int, default=int(os.environ.get("MLP_HIDDEN", os.environ.get("HIDDEN", "2048"))))
     p.add_argument("--dtype", type=str, default=os.environ.get("DTYPE", "float32"))
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--measure", type=int, default=int(os.environ.get("BENCH_PT_MEASURE", "30")),

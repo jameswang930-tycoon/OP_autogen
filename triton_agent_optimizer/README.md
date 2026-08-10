@@ -1,4 +1,4 @@
-# Triton Agent Optimizer — 完整架构设计 (v4.1)
+# Triton Agent Optimizer — 完整架构设计 (v4.2)
 
 > **核心差异化优势**：不靠盲试（AutoKernel 300~400 轮），用 **真机 msprof + msprof op** 精确诊断瓶颈（真实带宽/L2/算力/冲突），6 层策略按「结构影响从大到小」逐轮优化，每轮只看**当前策略需要的字段**，Planner（笨 LLM）定方向、Coder **确定性改码**、**只用 msprof 端到端验证加速比**。
 >
@@ -6,7 +6,7 @@
 >
 > **环境**：Ascend 910B3（保密服务器，只能 paste-in）+ CANN 8.5.1 / triton-ascend 3.2.0 / torch_npu 2.9.0。
 > **LLM 调用**：服务器无 Claude API，用本地 codeagent：`echo "<prompt>" | nga run`（`LLM_CLI_COMMAND="nga run"`）。
-> **更新**：2026-08-05 — v4 完整落地（单文件 + kernel 链 + 确定性改码 + 硬件基准套件 + 轨迹图）。
+> **更新**：2026-08-10 — v4.2：sweep 每轮传 planner + 严格晋升/回退/手递 + 优秀案例 + Unicode 清洗 + 10 算子 + 自动 bench/chart。
 
 ---
 
@@ -18,10 +18,13 @@
 | **单文件驱动** | 算子 + config + 测试合成 `kernel_op.py`（①config ②kernel ③main），coder 只改它 |
 | **kernel 链** | round1 读源文件，roundN 读上一轮成功输出；**源文件永不修改**；失败不提交 |
 | **每轮只看该策略字段** | 6 层策略各有自己的数据段（50 字段），Planner 只喂当前层要的 |
-| **确定性改码** | Planner 输出 `changes[]`（old_code→new_code 逐字符匹配），Coder 精确替换，找不到就报告不猜 |
-| **验证只跑 msprof** | warmup + 3 轮 msprof 取平均 → 加速比（时间比）；报错就地回传 Coder |
-| **Planner 定晋升** | 读当前瓶颈判断是否属本 tier → 停留/晋升/降级/停止 |
-| **历史梗概** | 每轮记「改了啥 → 加速比 [KEEP/REVERT/FAIL]」，REVERT(变慢回退) 明确标记，Planner 知道试过什么不重复踩坑 |
+| **确定性改码** | Planner 输出 `changes[]`（old_code→new_code 逐字符匹配），Coder 精确替换 + Unicode 清洗，找不到就报告不猜 |
+| **sweep 分块地基** | round1 自动枚举全部 L0 合法 BLOCK 候选, 真机实测选最优 → 每轮传给 planner (含真实状态) |
+| **验证 = 正确性 + msprof** | 先 MATMUL_VERIFY 正确性校验 (对 torch 参考), 再 msprof 端到端测时 → 加速比 |
+| **严格晋升 + 可回退** | planner promote 必须给数据依据 (promote_evidence); 支持回退前层; 防死循环 (同路径≥3次拒绝) |
+| **跳转手递** | 跨 tier 跳转时, 当前 planner 写 10_tier_handoff.json (瓶颈+方向) → 目标 tier planner 读 |
+| **优秀案例** | 单轮相对上一最优 >1.3× 加速 → 自动记 memory/tier{N}_cases.json, 后续 planner 参考 |
+| **自动 bench + 图表** | 缺 PyTorch 基准时自动跑 bench; 优化结束自动生成轨迹图 (vs-PyTorch 时间对比) |
 
 ---
 
@@ -36,11 +39,18 @@ main.py input/matmul [--fresh] [--resume] [--max-rounds N] [--target X]
              ├─ 逐 kernel msprof op → board_<i>.json (深层)
              └─ integrate → diagnosis.json (roofline)
         ② _diagnose → 写 roundN/07_tier{N}_fields/ (当前 tier 筛字段)
-        ③ (Tier2) _run_fusion → roundN/08_fusion/ (HIVM MLIR + nga 融合分析)
-        ④ _plan (planner via nga run) → roundN/plan.md (含 changes[])
-        ⑤ _code (coder 确定性替换 changes[]) → roundN/kernel_op.py + diff.patch
-        ⑥ verify (msprof warmup + 3轮平均) → 加速比 vs 初始基准
-        ⑦ 记录 hist (change/speedup/result/error) → 晋升/降级/停止
+        ③ (tier2) _run_fusion → roundN/08_fusion/ (HIVM MLIR + nga 融合分析)
+        ④ sweep (round1 或 tier3+hash变):
+             ├─ 程序化枚举全部 L0 合法 BLOCK → 09_tier3_sweep/
+             ├─ 单进程 torch.npu.Event 实测 → 最优写入 round_dir/kernel_op.py
+             └─ 结果持久化 st["last_sweep_result"] → 每轮传 planner (含状态)
+        ⑤ _plan (planner) → roundN/plan.md
+             读: 07字段 + planner_context.json + 轨迹 + 手递 + sweep数据 + 优秀案例
+             出: changes[] + promote(需evidence) + handoff(跳转给目标tier)
+        ⑥ _code (coder 确定性替换 + Unicode 清洗) → roundN/kernel_op.py + diff.patch
+        ⑦ verify (正确性校验 + msprof 端到端) → 加速比 vs 初始基准
+        ⑧ 记录 + 决策: 严格晋升/回退(防死循环)/停止 + 优秀案例 + 手递
+      结束: 自动跑 PyTorch bench (AUTO_RUN_PT_BENCH) + 自动生成轨迹图 (AUTO_CHART)
 ```
 
 ---

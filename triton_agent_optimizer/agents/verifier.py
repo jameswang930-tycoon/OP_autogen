@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Verifier Agent (v4) — 端到端验证: 只跑 msprof 整文件 → 端到端耗时 → 加速比.
+"""Verifier Agent (v4) — 端到端验证: 正确性校验 + msprof 耗时 → 加速比.
 
-★v4 只用 verify_end_to_end (warmup + 一次 msprof 内循环 KERNEL_LOOP 次取平均).
-  v3 的 VerifierAgent 类 / CPU emulator / 两阶段验证 (execution/) 已清理.
-
-  正确性: 每轮单独跑 MATMUL_VERIFY=1, 结果必须 "result check: PASS" → 防"优化把结果改错还通过".
-  ★H1: 从源码检测 KERNEL_LOOP 循环是否还在, 防 coder 弄丢循环导致 ÷loop 虚高.
+流程:
+  ① warmup × VERIFY_WARMUP (默认3): 裸跑 kernel 预热 JIT/cache
+  ② 正确性校验: MATMUL_VERIFY=1 → kernel 对 torch 参考算 diff → 必须 "result check: PASS"
+     (不 PASS → 本轮 FAIL, 回传 coder 修; 在 msprof 之前, 防"改错结果还通过")
+  ③ msprof 测时: 一次 msprof 内 KERNEL_LOOP=30 遍 → op_summary 求和 ÷ loop = 单次端到端 ns
+  ④ H1 循环检测: 源码找 `for _ in range(LOOP):` → 找不到则用实测遍数 (防 coder 弄丢循环)
+  ⑤ msprof_0 目录每次先 rmtree (防重试残留旧 CSV)
 """
 from __future__ import annotations
 

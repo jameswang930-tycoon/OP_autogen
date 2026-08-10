@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Triton Agent Optimizer v4 — 主入口（单文件驱动 + 真机双源 + 6 层轮次化）
+Triton Agent Optimizer v4.2 — 主入口（单文件驱动 + 真机双源 + 6 层轮次化 + sweep + 手递 + 优秀案例）
 
 v4 流程:
   1. 单文件 kernel_op.py（①config + ②kernel + ③test 一体, coder 只改它）

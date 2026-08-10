@@ -15,7 +15,7 @@
 用法 (910B3):
   conda activate triton-npu && source /usr/local/Ascend/ascend-toolkit/set_env.sh
   python3 bench_910b3/bench_pytorch_attention.py              # 2048² fp32, warmup3+30次窗口
-  SEQ=1024 DIM=1024 python3 bench_910b3/bench_pytorch_attention.py   # 改尺寸
+  MATMUL_M=1024 MATMUL_N=1024 python3 bench_910b3/bench_pytorch_attention.py   # 改尺寸
   python3 bench_910b3/bench_pytorch_attention.py --dtype float16
 """
 import argparse
@@ -37,8 +37,8 @@ OUT = Path(__file__).resolve().parent / "pytorch_attention_tflops.json"
 def main():
     p = argparse.ArgumentParser(description="PyTorch 自注意力+MLP 基准线 (同 attention_mlp 场景)")
     # ★默认对齐 input/attention_mlp/kernel_op.py: seq=dim=2048, fp32
-    p.add_argument("--seq", type=int, default=int(os.environ.get("SEQ", "2048")))
-    p.add_argument("--dim", type=int, default=int(os.environ.get("DIM", "2048")))
+    p.add_argument("--seq", type=int, default=int(os.environ.get("MATMUL_M", os.environ.get("SEQ", "2048"))))
+    p.add_argument("--dim", type=int, default=int(os.environ.get("MATMUL_N", os.environ.get("DIM", "2048"))))
     p.add_argument("--dtype", type=str, default=os.environ.get("DTYPE", "float32"))
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--measure", type=int, default=int(os.environ.get("BENCH_PT_MEASURE", "30")),

@@ -2,30 +2,23 @@
 """
 Planner Agent — Prompt 编排器 + LLM 调用。
 
-═══════════════════════════════════════════════════════════════════════════════
-  职责: 读诊断 + Playbook + 历史 → 调用 LLM 生成本轮优化计划
+职责: 读诊断数据 + Playbook + 历史 + sweep + 手递 + 优秀案例 → 调用 LLM 生成本轮优化计划。
 
-  输入 (从 Orchestrator):
-    - diagnosis: BottleneckDiagnosis (瓶颈是谁, 什么类型, 优化空间)
-    - extracted_data: str (data_extractor 的精简文本, ~2KB)
-    - tier: int (当前优化层级 1~6)
-    - history: list (最近 N 轮记录, 从 trajectory.json 读)
-    - kernel_code: str (当前 kernel 源码)
-    - playbook_dir: Path (docx/ 目录)
+generate_v4 输入 (scheduler 传入):
+  - extracted: 当前 tier 筛好的字段文本 (07_tier{N}_fields)
+  - tier: 当前优化层级 1~6
+  - history: trajectory.json 的全部历史 (每层试过什么→结果)
+  - kernel_code: 当前 kernel 源码 (含 sweep 优化后的 BLOCK)
+  - context_path: planner_context.json (每 kernel 全量 task/deep + 占比 + Top耗时 + sweep)
+  - trajectory_path: optimization_trajectory.json (各层进度/结果)
+  - handoff: 跳转手递 (上个 tier planner 的瓶颈分析+优化方向)
+  - fusion_analysis: Tier2 HIVM 依赖分析 (仅 tier2)
 
-  输出:
-    - RoundPlan (strategy, target_speedup, specific_change, ...)
-    - plan.md 写入本轮目录
+输出:
+  - RoundPlan: strategy, changes[], promote, promote_to, promote_evidence, handoff
+  - 每轮读本 tier 优秀案例 (memory/tier{N}_cases.json) 作参考学习
 
-═══════════════════════════════════════════════════════════════════════════════
-  LLM 调用方式
-═══════════════════════════════════════════════════════════════════════════════
-
-  支持两种模式:
-    - stub: 返回占位计划 (本地测试用)
-    - anthropic: 调用 Claude API (生产环境)
-
-  切换: 设置环境变量 ANTHROPIC_API_KEY 即启用真实模式
+LLM 调用: LLMClient (api / nga run CLI / stub 三模式)
 """
 
 from __future__ import annotations
@@ -358,7 +351,7 @@ class PlannerAgent:
         m = _re.search(r"BLOCK_M\s*,\s*BLOCK_N\s*,\s*BLOCK_K\s*=\s*[\d, ]+", kernel_code or "")
         if m:
             old = m.group(0).strip()
-            vals = [int(x) for x in _re.split(r"[\d,]+", old) if x.strip().isdigit()]
+            vals = [int(x) for x in _re.findall(r"\d+", old)]
             new = _re.sub(r"=\s*[\d, ]+", f"= {', '.join(str(v * 2) if v < 512 else v for v in vals)}", old)
             change = {"old_code": old, "new_code": new,
                       "reason": "STUB 增大分块", "section": "① config"}

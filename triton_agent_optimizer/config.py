@@ -915,7 +915,7 @@ class Config:
         print(f"Environment:       {info['environment']}")
         print(f"Python:            {info['python']}")
         print(f"Repo root:         {info['repo_root']}")
-        print(f"Simulator:         {'[OK]' if info['simulator_available'] else '[MISSING]'}")
+        print(f"Simulator:         {'[OK]' if info.get('simulator_available') else '[MISSING]'}")
         print(f"Emulator:          {'[OK]' if info['emulator_available'] else '[MISSING]'}")
         print(f"Hardware params:   {'[OK]' if info['hardware_params_loaded'] else '[FAIL]'}")
 

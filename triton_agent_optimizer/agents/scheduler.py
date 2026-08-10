@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """Scheduler — v4 状态机: 读 diagnosis.json → 提取当前 tier 字段 → 驱动 Planner→Coder→验证→晋升。
 
-v4 流程 (见 README v4):
-  每轮:
-    ① run_optimize.sh <input_dir> <round_dir>  → 采集+解析 → diagnosis.json
-    ② 读 diagnosis.json → summary.num_kernels
-    ③ 按当前 tier 提取该策略要看的字段段 (extract_tier_fields)
-    ④ Planner: 字段段 + 策略文档 + 单文件 + config → plan.md + 晋升决策
-    ⑤ Coder: plan + 教程 + 纠错文档 → 改 kernel_op.py (单文件)
-    ⑥ 验证: 只跑 msprof 端到端 → 加速比; 失败报错回传 Coder 同轮重改
-    ⑦ 记录 + 晋升/降级/停止 → 下一轮/下一 tier
+v4 流程 (每轮):
+  ① run_optimize.sh <input_dir> <round_dir> [M N K]  → 采集+解析 → diagnosis.json
+  ② _diagnose: 按当前 tier 筛字段 → 07_tier{N}_fields/
+  ③ (tier2) _run_fusion: 编译 HIVM MLIR → 08_fusion/ (仅多 kernel 算子)
+  ④ sweep (round1 或 tier3+hash 变): 程序化枚举 BLOCK 候选, 真机实测 → 09_tier3_sweep/
+     → 最优 BLOCK 写入 round_dir/kernel_op.py → current_kernel 指向它
+     → 结果持久化 st["last_sweep_result"], 每轮传给 planner (含 sweep_status)
+  ⑤ Planner: 07字段 + planner_context.json + 轨迹 + 手递 + sweep数据 + 优秀案例 → plan.md
+  ⑥ Coder: 读 plan changes[] → 确定性替换 (Step0) 或 LLM (Step1) → round_dir/kernel_op.py
+     → Unicode 脏字符自动清洗 (_sanitize_unicode) + Python 语法校验
+  ⑦ Verify: 正确性校验 (MATMUL_VERIFY) → msprof 端到端 → 加速比
+  ⑧ 记录 + 晋升/回退/停止:
+     - 严格晋升 (需 promote_evidence)
+     - 可回退 (防死循环: 同路径≥3次拒绝)
+     - 跳转手递 (10_tier_handoff.json)
+     - 优秀案例自动记录 (memory/tier{N}_cases.json, 阈值1.3×)
+     - 自动跑 PyTorch bench (AUTO_RUN_PT_BENCH) + 自动生成轨迹图 (AUTO_CHART)
 
 用法:
   python -m agents.scheduler <op_dir> [--max-rounds N] [--stub]
@@ -478,7 +486,8 @@ class Scheduler:
                                        "current_kernel": str(self.op_dir / "kernel_op.py"),
                                        "total_rounds": 0,        # ★D7: 含 promote 轮的总执行数 (防 promote 白耗 max_rounds)
                                        "handoff": None,          # ★P1: 跳转手递 (下个 tier 的 planner 读)
-                                       "tier_jumps": []},        # ★P1: 跳转路径记录 (防死循环)
+                                       "tier_jumps": [],         # ★P1: 跳转路径记录 (防死循环)
+                                       "last_sweep_result": None},  # ★sweep 结果持久化 (每轮传给 planner)
                      "history": []}
         self.current_kernel = self.op_dir / "kernel_op.py"
         # ★D6: 保存原始 kernel 副本 → 环境漂移时重测 baseline 用它 (优化后 current_kernel 已不是原始版)
@@ -651,7 +660,7 @@ class Scheduler:
     # ── ④ Planner (07字段 + 完整数据上下文 + 轨迹 + 手递 + 融合 + Tier3 分块实测) ──
     def _plan(self, diagnosis: dict, extracted: str, tier: int, rn: int, round_dir: Path,
               fusion_analysis: Optional[dict] = None, tier3_sweep: Optional[dict] = None,
-              handoff: Optional[dict] = None):
+              handoff: Optional[dict] = None, sweep_status: str = "not_triggered"):
         from agents.planner import PlannerAgent, _extract_config_constants
         kernel_code = self.current_kernel.read_text(encoding="utf-8") if self.current_kernel.exists() else ""
         skill = (_PROJECT / "skills" / "triton-op-planner" / "SKILL.md")
@@ -660,19 +669,34 @@ class Scheduler:
         ctx_path = build_planner_context(
             diagnosis, tier, self.traj["state"], self.traj.get("history", []),
             kernel_code, round_dir, fusion_analysis, tier3_sweep, handoff)
-        # ★D1-Tier3: 分块实测数据追加进喂给 planner 的字段 (精简, 只给决策要用的 key 结果)
+        # ★D1: 分块实测数据追加进喂给 planner 的字段
+        #   sweep 数据持久化在 state["last_sweep_result"], 每轮都传给 planner
         if tier3_sweep and tier3_sweep.get("available"):
             sw = tier3_sweep
-            lines = ["", "# ══ Tier3 分块实测 (sweep, ★决策依据 — 用数据不是猜) ══",
-                     "各 config 实测 (ns 越小越快; 标★=实测最优; 标[当前]=当前块):"]
+            lines = ["", f"# ══ 分块实测 sweep 数据 (★状态: {sweep_status}) ══",
+                     "各 config 实测 (ns 越小越快; 标★=实测最优; 标[当前]=sweep 前的原始块):"]
             for c in sw["configs"]:
                 mark = " ★最优" if c is sw["best"] else (" [当前]" if c.get("is_current") else "")
                 sp = f" ({c['speedup']}x)" if c.get("speedup") else ""
                 lines.append(f"- {c['block']}: {c['ns']:.0f}ns{sp}{mark}")
-            lines.append("★分块层决策指引: 若最优比当前明显快 → changes[] 直接采用实测最优块; "
-                         "若当前已接近最优/无增益 → 分块已到位, promote 到下一层. "
-                         "禁止再猜一个新的 BLOCK 值 (实测数据就是答案).")
+            if tier == 3:
+                lines.append(f"★分块层决策 (sweep状态={sweep_status}): ")
+                if sweep_status == "ran_this_round":
+                    lines.append("  sweep 本轮重新实测 (kernel结构变了) → 数据是最新最准的. "
+                                 "当前 BLOCK 已由 sweep 自动写入 kernel_op.py. "
+                                 "已穷举全部 L0 合法候选, 禁止再猜新 BLOCK 值. "
+                                 "若最优就是当前块 → 分块已到极限, promote.")
+                elif sweep_status in ("skipped_structure_unchanged", "reused_from_cache"):
+                    lines.append("  sweep 本轮未重跑 (kernel 结构未变, 上次 sweep 数据仍有效). "
+                                 "当前 BLOCK 仍是上次 sweep 的最优. "
+                                 "若你想改 BLOCK → 不需要 (全部已实测过, 当前已是最优). promote 到下一层.")
+            else:
+                lines.append(f"★当前 BLOCK 由 sweep 实测优化 (状态={sweep_status}, 见 kernel_op.py). "
+                             "聚焦本层策略 (算法/融合/访存/计算等). "
+                             "sweep 在 kernel 结构变化时自动重扫 (hash 检测).")
             extracted = extracted + "\n" + "\n".join(lines)
+        elif sweep_status.startswith("failed") or sweep_status == "not_triggered":
+            extracted = extracted + f"\n# ══ 分块 sweep: {sweep_status} (无实测数据, BLOCK 未由 sweep 优化, 可自由调整) ══"
         print(f"  [Planner] 输入: 07字段({len(extracted.splitlines())}行) + playbook_tier{tier} "
               f"+ {self.current_kernel}({len(kernel_code)}字符) + config[{cfg.splitlines()[0] if cfg else '?'}] "
               f"+ 历史{len(self.traj.get('history', []))}轮"
@@ -876,6 +900,15 @@ class Scheduler:
                 sp = f" ({c['speedup']}x)" if c.get("speedup") else ""
                 f.write(f"  {c['block']}: {c['ns']:.0f}ns{sp}{mark}\n")
         print(f"  [Tier3] 实测报告 → {sweep_out_dir}")
+
+        # ★关键修复: sweep 已把最优 BLOCK 写到 sweep_kernel (round_dir/kernel_op.py).
+        #   把 current_kernel 指向它 → planner/coder 读到 sweep 优化后的 BLOCK (否则读到旧源).
+        #   coder ⑤ 会往 round_dir/kernel_op.py 写 → 但它读的 pre_code/current_kernel 已是好的 BLOCK.
+        if sweep_kernel.exists():
+            self.current_kernel = sweep_kernel
+            self.traj["state"]["current_kernel"] = str(sweep_kernel)
+            print(f"  [Tier3] ★current_kernel → {sweep_kernel} (sweep 优化后的 BLOCK 已生效)")
+
         return {"available": True, "configs": valid, "best": best_cfg, "vars": list(meta["vars"])}
 
     # ★D6: 环境漂移防护 — 每 N 轮重测原始 baseline kernel + 当前 kernel,
@@ -1228,6 +1261,7 @@ class Scheduler:
             # ★计时: t_plan 从 sweep 前开始计 (sweep 计入 planner 阶段).
             _t_plan0 = time.time()
             tier3_sweep = None
+            _sweep_status = "not_triggered"   # ★告诉 planner sweep 真实状态
             if (rn == 1 or tier == 3) and os.environ.get("TIER3_SWEEP", "1") == "1":
                 import hashlib
                 _code_body = re.sub(r'(BLOCK_\w+)\s*[,=]\s*\d+', '',   # 去 BLOCK 赋值
@@ -1240,15 +1274,27 @@ class Scheduler:
                     st["tier3_swept"] = True
                     st["tier3_sweep_code_hash"] = _code_hash
                     tier3_sweep = self._tier3_sweep_data(tier, rn, round_dir)
+                    _sweep_status = "ran_this_round"
                 else:
                     print(f"  [Tier3] kernel 结构未变 (hash={_code_hash}), 跳过重扫, 复用历史最佳")
+                    _sweep_status = "skipped_structure_unchanged"
                 if tier3_sweep and tier3_sweep.get("available"):
-                    print(f"  ⏱ Tier3 分块实测完成: {len(tier3_sweep['configs'])} config, "
+                    print(f"  ⏱ 分块实测完成: {len(tier3_sweep['configs'])} config, "
                           f"最优 {tier3_sweep['best']['block']} {tier3_sweep['best']['ns']:.0f}ns "
                           f"({time.time()-_t_plan0:.0f}s) → 数据喂 planner 决策")
-                else:
+                    st["last_sweep_result"] = tier3_sweep          # ★持久化: 后续轮复用
+                    _sweep_status = "ran_this_round"
+                elif tier3_sweep and tier3_sweep.get("available") is False:
                     print(f"  [Tier3] 分块实测不可用 "
-                          f"({(tier3_sweep or {}).get('error','行级/无候选')}) → 走 LLM (兜底)")
+                          f"({tier3_sweep.get('error','行级/无候选')}) → 走 LLM (兜底)")
+                    _sweep_status = f"failed: {tier3_sweep.get('error', '?')[:60]}"
+                    tier3_sweep = None   # 失败 → 不传坏数据给 planner
+
+            # ★关键: 即使本轮 sweep 没跑, 也把上次成功的 sweep 结果传给 planner (tier3 尤其需要)
+            if not tier3_sweep and st.get("last_sweep_result"):
+                tier3_sweep = st["last_sweep_result"]
+                if _sweep_status == "not_triggered":
+                    _sweep_status = "reused_from_cache"   # ★本轮没跑, 用的是上次缓存
 
             # ④ Planner → plan + 晋升决策 (07字段 + 完整数据上下文 + 轨迹 + 手递 + 融合 + 分块实测)
             incoming_handoff = st.get("handoff")   # ★P1: 上个 tier 跳转来的瓶颈分析+优化方向
@@ -1256,7 +1302,7 @@ class Scheduler:
                 print(f"  [手递] 收到 Tier{incoming_handoff.get('from_tier')}→本层 手递: "
                       f"瓶颈={str(incoming_handoff.get('bottleneck_analysis'))[:80]}")
             plan = self._plan(diagnosis, extracted, tier, rn, round_dir, fusion_analysis, tier3_sweep,
-                              handoff=incoming_handoff)
+                              handoff=incoming_handoff, sweep_status=_sweep_status)
             if incoming_handoff:
                 st["handoff"] = None   # ★已消费 (本层 planner 已读到), 防止后续轮重复引用
             t_plan = time.time() - _t_plan0

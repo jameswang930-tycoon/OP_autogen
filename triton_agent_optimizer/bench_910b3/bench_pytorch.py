@@ -8,7 +8,7 @@ scheduler (main.py) 启动时会读它存进 trajectory state。
   conda activate triton-npu
   source /usr/local/Ascend/ascend-toolkit/set_env.sh
   python3 bench_pytorch.py                  # M=N=K=2048 fp32 (对齐优化算子), warmup 3 + 30 次窗口
-  M=1024 python3 bench_pytorch.py           # 改尺寸
+  MATMUL_M=1024 python3 bench_pytorch.py           # 改尺寸
   python3 bench_pytorch.py --dtype float32  # 测 fp32
   python3 bench_pytorch.py --rounds 10      # 调轮数
   输出: pytorch_tflops.json (轨迹图/scheduler 读)
@@ -41,9 +41,9 @@ OUT = Path(__file__).resolve().parent / "pytorch_tflops.json"
 def main():
     p = argparse.ArgumentParser(description="torch.matmul PyTorch 基准线")
     # ★H5/E4: 默认对齐优化算子 (input/matmul/kernel_op.py = 2048³ fp32), 避免跨尺寸/跨精度比较失真
-    p.add_argument("--m", type=int, default=int(os.environ.get("M", "2048")))
-    p.add_argument("--n", type=int, default=int(os.environ.get("N", "2048")))
-    p.add_argument("--k", type=int, default=int(os.environ.get("K", "2048")))
+    p.add_argument("--m", type=int, default=int(os.environ.get("MATMUL_M", os.environ.get("M", "2048"))))
+    p.add_argument("--n", type=int, default=int(os.environ.get("MATMUL_N", os.environ.get("N", "2048"))))
+    p.add_argument("--k", type=int, default=int(os.environ.get("MATMUL_K", os.environ.get("K", "2048"))))
     p.add_argument("--dtype", type=str, default=os.environ.get("DTYPE", "float32"))
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--measure", type=int, default=int(os.environ.get("BENCH_PT_MEASURE", "30")),

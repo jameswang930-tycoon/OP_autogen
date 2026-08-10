@@ -183,9 +183,14 @@ def extract_json(text: str) -> dict:
             return json.loads(text)
         except json.JSONDecodeError:
             if attempt == 0:
-                text = re.sub(r':\s*([^{}"\s,]+)(?=\s*[,}])', r': "\1"', text)
+                # ★修复: 只给"字母开头的裸值"加引号, 跳过 true/false/null/数字/负数/浮点
+                text = re.sub(r':\s*([a-zA-Z_][a-zA-Z_0-9]*)(?=\s*[,}])',
+                              lambda m: f': "{m.group(1)}"' if m.group(1) not in ('true', 'false', 'null')
+                              else f': {m.group(1)}', text)
             elif attempt == 1:
-                text = re.sub(r'(?<=:)\s*([^"{}\[\],\s]+)(?=\s*[,}\]])', r' "\1"', text)
+                text = re.sub(r'(?<=:)\s*([a-zA-Z_][a-zA-Z_0-9]*)(?=\s*[,}\]])',
+                              lambda m: f' "{m.group(1)}"' if m.group(1) not in ('true', 'false', 'null')
+                              else f' {m.group(1)}', text)
 
     return json.loads(text)
 

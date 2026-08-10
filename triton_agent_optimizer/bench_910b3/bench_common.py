@@ -124,6 +124,24 @@ def measure_msprof_op(app_cmd: str, kernel_name: str,
 #  ⚠ 热身行要跳过 (app 内部 warmup+measure 次 launch; 每遍 kernel 数 ≈ 总行数/(warmup+measure))
 # ═══════════════════════════════════════════════════════════════════════
 
+def _detect_kernels_per_iter(rows: list, tail_n: int = 60) -> int:
+    """★从 op_summary 行序列检测每遍 kernel 数 (真实 launch 序列是周期性的, 每遍 kernel 名相同).
+    取末尾 tail_n 行 (loop 部分, 60 行≈15 遍, 通常不含开头 setup 行), 找最小重复周期 k.
+    返回整数 k; 检测不到返回 None (调用方兜底取整)."""
+    tail = rows[-tail_n:]
+    if len(tail) < 4:
+        return None
+    names = [op for op, _ in tail]
+    n = len(names)
+    for k in range(1, n // 2 + 1):
+        m = (n // k) * k                       # 只检查完整周期部分
+        if m < k * 2:
+            continue
+        if all(names[i] == names[i - k] for i in range(k, m)):
+            return k
+    return None
+
+
 def _read_op_summary_rows(prof_out: Path) -> list:
     """读全部 op_summary*.csv 合并 → [(op_name, dur_us), ...] 按行序.
     ★msprof 可能按 {device}_{model}_{iter} 拆多份文件 — 只读 summaries[0] 会漏掉大部分 kernel
@@ -168,10 +186,15 @@ def measure_pytorch_msprof(app_cmd: str, out_json: Path, flops: float,
         if total < measure:
             print(f"  ⚠ [PT-msprof] 仅 {total} 行 < measure({measure}) → 回退 Event", flush=True)
             return None
-        k_per_iter = total / (warmup + measure)          # 每遍 kernel 数 (含框架)
-        skip = int(warmup * k_per_iter)
-        take = int(measure * k_per_iter)
-        measured = rows[skip:skip + take] if take else rows[skip:]
+        # ★每遍 kernel 数: 从行序列检测重复周期 (真实 launch 序列周期性, 每遍 kernel 名相同) —
+        #   比 total/(warmup+measure) 取整更可靠 (后者会被 setup 行/非均匀撑偏). 检测不到才兜底取整.
+        k_per_iter = _detect_kernels_per_iter(rows)
+        if not k_per_iter:
+            k_per_iter = max(1, int(round(total / (warmup + measure))))
+        # ★从末尾取最后 measure 遍: 前面是 setup+warmup, 天然排除 setup 行膨胀.
+        #   (app 结构 = setup → warmup 循环 → measure 循环; measure 循环在末尾)
+        take = measure * k_per_iter
+        measured = rows[-take:] if take else rows
         if not measured:
             return None
         all_us = sum(d for _, d in measured)
@@ -187,8 +210,8 @@ def measure_pytorch_msprof(app_cmd: str, out_json: Path, flops: float,
                 "kernel_time_us": round(kernel_us, 1) if kernel_us else None,
                 "method": "msprof", "warmup": warmup, "measure": measure,
                 "rows_total": total, "rows_measured": len(measured),
-                # ★每遍 kernel 数: ≈1.0 = 已融合成单 kernel (工业级融合成功标志)
-                "kernels_per_iter": round(len(measured) / measure, 1) if measured else None}
+                # ★每遍 kernel 数 (整数): 1 = 已融合成单 kernel (工业级融合成功标志)
+                "kernels_per_iter": k_per_iter}
         if extras:
             data.update(extras)
         out_json.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")

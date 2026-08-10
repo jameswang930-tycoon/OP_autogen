@@ -294,6 +294,11 @@ def _build_runner_body(module_code: str, setup: str, cands_json: str,
     ev_s = torch.npu.Event(enable_timing=True)
     ev_e = torch.npu.Event(enable_timing=True)
     consecutive_err = 0
+    consecutive_dev = 0   # ★连续"设备级错误"计数: ≥2 说明设备被污染 → 停本轮交父进程新进程续跑
+    def _is_device_error(s):
+        s = (s or "").lower()
+        return any(k in s for k in ("aclrt", "aclerror", "npu function", "npu.synchronize",
+                                    "synchronizedevice", "aicore", "acl error", "device error"))
     for idx, cfg in enumerate(CANDIDATES):
         {', '.join(vars_)} = cfg
         try:
@@ -310,21 +315,34 @@ def _build_runner_body(module_code: str, setup: str, cands_json: str,
             results.append({{"block": list(cfg), "ns": round(avg_ns, 1)}})
             print(f"  [{{idx+1}}/{{n_total}}] {{cfg}}: {{avg_ns:.0f}}ns", flush=True)
             consecutive_err = 0
+            consecutive_dev = 0
         except Exception as e:
-            consecutive_err += 1
-            results.append({{"block": list(cfg), "ns": None, "error": str(e)[:120]}})
-            print(f"  [{{idx+1}}/{{n_total}}] {{cfg}}: ERROR {{str(e)[:100]}}", flush=True)
-            # ★设备级错误恢复: sync + 重建 Event 对 (Event 可能被设备错误污染)
-            try:
-                torch.npu.synchronize()
-                ev_s = torch.npu.Event(enable_timing=True)
-                ev_e = torch.npu.Event(enable_timing=True)
-            except Exception:
-                pass
-            if consecutive_err >= 5:
-                print("  [sweep] ⛔ 连续 5 个候选设备错误 (某 BLOCK 可能打崩设备) → 提前停止", flush=True)
-                _save_partial()   # 停之前保存已测结果
-                break
+            _err = str(e)[:200]
+            if _is_device_error(_err):
+                # ★设备级错误 (aclrt/NPU/sync): 不把当前候选标 error — 设备可能被污染,
+                #   交父进程用新进程 (干净设备) 续跑它和剩下的. 连续 2 个就停本轮.
+                consecutive_dev += 1
+                print(f"  [{{idx+1}}/{{n_total}}] {{cfg}}: DEVICE-ERROR {{_err[:100]}}", flush=True)
+                try:
+                    torch.npu.synchronize()
+                    ev_s = torch.npu.Event(enable_timing=True)
+                    ev_e = torch.npu.Event(enable_timing=True)
+                except Exception:
+                    pass
+                if consecutive_dev >= 2:
+                    print("  [sweep] ⛔ 连续 2 个设备错误 (设备被污染) → 停本轮, 交父进程新进程续跑", flush=True)
+                    _save_partial()
+                    break
+            else:
+                # ★普通错误 (容量太大/编译等): 标 error 跳过继续, 连续 5 个才停
+                consecutive_err += 1
+                consecutive_dev = 0
+                results.append({{"block": list(cfg), "ns": None, "error": _err[:120]}})
+                print(f"  [{{idx+1}}/{{n_total}}] {{cfg}}: ERROR {{_err[:100]}}", flush=True)
+                if consecutive_err >= 5:
+                    print("  [sweep] ⛔ 连续 5 个候选错误 → 提前停止", flush=True)
+                    _save_partial()
+                    break
         _save_partial()   # ★每候选保存一次 (即使 fatal 杀进程, 已测的也在文件里)
 
     valid = [r for r in results if r.get("ns")]
@@ -742,6 +760,7 @@ def sweep(op_dir: Path, quick: bool = False, out_dir: Optional[Path] = None,
     #   (新进程=干净设备). 反复崩的候选标 error 跳过; 从成功的里挑最快.
     all_results = {}        # blk_tuple -> result
     remaining = list(candidates)
+    _timeout = False
     for attempt in range(1, 8):   # 最多 7 轮 (每轮崩溃只留更少候选)
         if not remaining:
             break
@@ -751,6 +770,7 @@ def sweep(op_dir: Path, quick: bool = False, out_dir: Optional[Path] = None,
             subprocess.run(cmd, text=True, encoding="utf-8", errors="backslashreplace",
                            timeout=7200, env=env, cwd=str(out_root))
         except subprocess.TimeoutExpired:
+            _timeout = True
             print(f"  [sweep] ❌ 超时 (2h), 用已测结果")
             break
         except Exception as e:
@@ -784,7 +804,7 @@ def sweep(op_dir: Path, quick: bool = False, out_dir: Optional[Path] = None,
     # 4. 合并结果 (来自各轮累积, 不依赖最后一轮 result_path)
     if not all_results:
         print(f"  [sweep] ❌ 无任何候选结果 (全崩/超时)")
-        return {"error": "no result"}
+        return {"error": "sweep timeout" if _timeout else "no result"}
     for c in candidates:
         if tuple(c) not in all_results:
             all_results[tuple(c)] = {"block": list(c), "ns": None, "error": "未完成"}

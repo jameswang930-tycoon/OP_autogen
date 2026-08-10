@@ -160,7 +160,7 @@ def parse(base):
     prof_out = find_prof_dir(base)
     if prof_out is None:
         raise SystemExit(f"[task] 找不到 {base} 下 op_summary*.csv\n"
-                         f"  需先跑: msprof --output=<dir> --application='python3 test_matmul.py' --ai-core=on")
+                         f"  需先跑: msprof --output=<dir> --application='python3 kernel_op.py' --ai-core=on")
 
     # ── raw: 全部文件全字段 (文件名带时间戳, 按前缀匹配) ──
     def _find(prefix):

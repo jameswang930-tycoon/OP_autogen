@@ -69,6 +69,11 @@ argument-hint: >
 4. 禁止新增 import（不引 torch/numpy 等新库）。
 5. 禁止让 kernel 退化成 PyTorch 计算（tl.dot/tl.load/tl.store 等 tl 原语必须在 kernel 内）。
 6. 禁止改数学公式的语义（只优化实现方式）。
+7. 禁止产生 HIVM 无法分析的 load（triton-ascend 后端限制，会 SIGABRT 崩）:
+   - load 地址必须是**连续仿射**: `base_ptr + tl.arange(0,N)*stride` 这种
+   - 禁止**数据依赖寻址**: 用 load 出来的值算 offset 再 load（即 gather/离散访问）
+   - 禁止地址里夹 `tl.where` / 条件表达式（会 lower 成 `vsel`, HIVM 分配器不认）
+   - mask 必须**静态简单**（`offs < N` 这种, 由 arange 推导）; 禁止 mask 依赖另一个 load 的结果
 
 ### 常见报错应对（previous_error 出现时）
 | 报错类型 | 典型原因 | 应对 |
@@ -79,6 +84,7 @@ argument-hint: >
 | `invalid character` (U+XXXX) | ★代码里混入了 Unicode 特殊字符 | 见下方铁律 |
 | ImportError: no module named 'triton_kernel' | 残留旧 import | kernel_op.py 是单文件，不许 import 兄弟文件 |
 | 数值错（结果 check 不过） | mask/other 改错 | 检查边界 mask 和 other 填充值 |
+| `unsupported op for finding the root alloc` / `hivm.hir.load` + `vsel` | ★HIVM 内存分配分析失败: load 地址/取值链里夹了向量选择, 不是连续仿射寻址 | 改 load: 地址必须是 `base + arange×stride` 连续仿射; 禁止数据依赖寻址/条件地址/离散访问 (见下方铁律 7) |
 
 ### ★★ 禁止 Unicode 特殊字符（最高频报错源！每次输出前自查）
 代码里**绝对不能**出现以下字符（LLM 常犯，导致 SyntaxError/运行报错）：

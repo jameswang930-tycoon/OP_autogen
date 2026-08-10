@@ -11,7 +11,7 @@ try:
     import torch_npu
 except ImportError:
     pass
-OUT = Path(__file__).resolve().parent / "pytorch_matmul_relu_tflops.json"
+OUT = Path(__file__).resolve().parent / "outputs" / "pytorch_matmul_relu_tflops.json"
 
 
 def main():

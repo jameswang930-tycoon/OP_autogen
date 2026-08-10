@@ -28,6 +28,8 @@ except Exception:
 
 _BENCH_DIR = Path(__file__).resolve().parent
 _PROJ = _BENCH_DIR.parent
+if str(_PROJ) not in sys.path:
+    sys.path.insert(0, str(_PROJ))   # ★供 from bench_910b3.bench_common import ...
 
 # 与 input/ 算子对齐; flash_attention 只跑 fa (CANN FA);
 # matmul/matmul_relu/conv_bias_relu 有 CANN 融合算子 (aclnnFusedMatmul/FusedConvBiasRelu) → 加 cann-fused
@@ -51,7 +53,7 @@ OP_MODES = {
 
 
 def _read_json(op, mode):
-    p = _BENCH_DIR / f"industrial_{op}_{mode}_tflops.json"
+    p = _BENCH_DIR / "outputs" / f"industrial_{op}_{mode}_tflops.json"
     if not p.exists():
         return None
     try:
@@ -84,7 +86,19 @@ def main():
                    help="已有 json 的模式不重跑 (缺的才跑)")
     p.add_argument("--measure", type=int, default=30)
     p.add_argument("--list", action="store_true", help="只列出算子×模式, 不跑")
+    p.add_argument("--clean", action="store_true",
+                   help="清理 bench_910b3/outputs/ 全部产物 (json/txt/msprof临时) 后退出")
     args = p.parse_args()
+
+    # ★清理产物 (bench_910b3/outputs/): 干不干净, 不用手动删垃圾
+    if args.clean:
+        try:
+            from bench_910b3.bench_common import clean_bench_out
+            n = clean_bench_out()
+            print(f"  ✅ 已清理 bench_910b3/outputs/ 共 {n} 个文件/目录")
+        except Exception as e:
+            print(f"  ⚠ 清理失败: {e}")
+        return
 
     ops = [args.op] if args.op else list(OP_MODES)
     for op in ops:
@@ -166,9 +180,11 @@ def main():
         print(f"  ⚠ 缺: {miss} (看上面的 stderr / 确认 TorchAir/CANN-FA 可用)")
 
     # 写汇总 json
-    (_BENCH_DIR / "industrial_summary.json").write_text(
+    _out_dir = _BENCH_DIR / "outputs"
+    _out_dir.mkdir(parents=True, exist_ok=True)
+    (_out_dir / "industrial_summary.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"  汇总 → {_BENCH_DIR}/industrial_summary.json")
+    print(f"  汇总 → {_out_dir}/industrial_summary.json")
 
 
 if __name__ == "__main__":

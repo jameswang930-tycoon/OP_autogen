@@ -31,7 +31,7 @@ try:
 except ImportError:
     pass
 
-OUT = Path(__file__).resolve().parent / "pytorch_conv_bias_relu_tflops.json"
+OUT = Path(__file__).resolve().parent / "outputs" / "pytorch_conv_bias_relu_tflops.json"
 
 
 def main():

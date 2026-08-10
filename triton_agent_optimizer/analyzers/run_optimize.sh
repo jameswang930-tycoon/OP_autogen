@@ -36,14 +36,11 @@
 #      # 预期: run=kernel_op.py; ✅ op_summary; ✅ msprof op [matmul_kernel] 8 CSV;
 #      #        ✅ diagnosis.json ✓; 字段校验: 列名不匹配 0 个
 #   4. 看诊断:
-#      python3 input/matmul/real_report.py input/matmul/e2e_run/06_diagnosis/diagnosis.json
-#      # 预期: summary(num_kernels/filled) + kernel task/deep + roofline(一针见血)
+#      cat input/matmul/e2e_run/06_diagnosis/diagnosis.json   # summary + kernel task/deep + roofline
 #   5. 完整优化循环 (一键, 每轮: 采集→提取当前tier字段→planner→coder→msprof端到端→加速比):
 #      LLM_CLI_COMMAND="nga run" python3 main.py input/matmul
 #      # 本地无 LLM 先试流程: python3 main.py input/matmul --max-rounds 3 --stub
-#   6. 核对当前策略筛字段 (解析完 07 已自动产出, 再手动核对一遍规则):
-#      python3 analyzers/test_tier_extract.py input/matmul/e2e_run/06_diagnosis/diagnosis.json
-#      # 预期: 每 tier 只显示自己策略的字段; X/Y 有数据 越大越好
+#   6. 核对当前策略筛字段 (解析完 07 已自动产出): 看 <out_dir>/07_tier<N>_fields/tier<N>_fields.txt
 #   ★ 07 产物: 解析完自动产出 <out_dir>/07_tier<N>_fields/{tier<N>_fields.txt,.json}
 #      = 当前优化阶段筛选后的字段 (planner 只读这个; TIER 环境变量指定阶段, 默认 1)
 #
@@ -290,4 +287,4 @@ fi
 echo ""; echo "══════════ 完成 (PASS=$PASS FAIL=$FAIL) ══════════"
 echo "  diagnosis.json     : $D/diagnosis.json  (单算子优化用)"
 echo "  hivm_fusion_view   : $OUT/08_fusion/hivm_fusion_view.txt  (多算子融合用, 若生成)"
-echo "  看诊断报告: python3 input/matmul/real_report.py"
+echo "  看诊断: cat $D/diagnosis.json"

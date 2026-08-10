@@ -479,10 +479,10 @@
 
 ```bash
 # msprof op（★主源，默认全量 8 CSV，别指定 --aic-metrics）
-msprof op --kernel-name=matmul_kernel --warm-up=10 --output=./board_prof python3 test_matmul.py
+msprof op --kernel-name=matmul_kernel --warm-up=10 --output=./board_prof python3 kernel_op.py
 
 # 通用 msprof（8.5.1 用 --ai-core=on）
-msprof --output=./task_prof --application="python3 test_matmul.py" --ai-core=on
+msprof --output=./task_prof --application="python3 kernel_op.py" --ai-core=on
 
 # 字段校验（区分"列名不匹配 BUG" vs "源无此字段 合法缺"）
 python3 analyzers/check_fields.py board.json task.json diagnosis.json

@@ -34,7 +34,7 @@ try:
 except ImportError:
     pass
 
-OUT = Path(__file__).resolve().parent / "pytorch_flash_attention_tflops.json"
+OUT = Path(__file__).resolve().parent / "outputs" / "pytorch_flash_attention_tflops.json"
 
 
 def main():

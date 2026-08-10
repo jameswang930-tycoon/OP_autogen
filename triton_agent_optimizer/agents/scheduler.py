@@ -841,7 +841,7 @@ class Scheduler:
     # ★v2 改进: 候选从 8→~300 (全面覆盖), 单进程 (无子进程 msprof 开销), 有方向分析.
     def _tier3_sweep_data(self, tier: int, rn: int, round_dir: Path) -> Optional[dict]:
         try:
-            import sweep_blocks
+            from analyzers import sweep_blocks
         except Exception as e:
             return {"available": False, "error": f"sweep_blocks 不可用: {str(e)[:80]}"}
         kernel = self.current_kernel
@@ -1193,7 +1193,7 @@ class Scheduler:
                     print(f"  ⚠ 无 PyTorch 基准映射 ({self.kernel_dir.name}) → 跳过 vs-PyTorch 参考线 "
                           f"(避免用 matmul 基准对比非 matmul 算子)")
                     pt_file = None
-                pt = (_PROJECT / "bench_910b3" / pt_file) if pt_file else None
+                pt = (_PROJECT / "bench_910b3" / "outputs" / pt_file) if pt_file else None
                 if pt and pt.exists():
                     try:
                         _pt = json.loads(pt.read_text(encoding="utf-8"))
@@ -1250,7 +1250,7 @@ class Scheduler:
                 _best_file = None
                 for _m in _ind_modes:
                     _f = f"industrial_{self.kernel_name}_{_m}_tflops.json"
-                    _p = _PROJECT / "bench_910b3" / _f
+                    _p = _PROJECT / "bench_910b3" / "outputs" / _f
                     if not _p.exists():
                         continue
                     try:

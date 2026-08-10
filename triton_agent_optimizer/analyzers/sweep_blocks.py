@@ -12,11 +12,11 @@
 op_name: 显式传入 (round>1 目录名="roundN", 不能用来查 SWEEP_META)
 
 用法:
-  python3 sweep_blocks.py input/matmul                          # 全量扫 (main.py --sweep-blocks)
-  python3 sweep_blocks.py input/matmul --quick                  # 采样 ~48 个候选
+  python3 analyzers/sweep_blocks.py input/matmul                # 全量扫 (main.py --sweep-blocks)
+  python3 analyzers/sweep_blocks.py input/matmul --quick        # 采样 ~48 个候选
   TIER3_SWEEP_QUICK=1 python3 main.py input/matmul              # 主循环里 quick 模式
-  python3 sweep_blocks.py input/matmul --quick    # 只扫 top-48 候选
-  python3 main.py input/matmul --sweep-blocks     # main 内置
+  python3 analyzers/sweep_blocks.py input/matmul --quick        # 只扫 top-48 候选
+  python3 main.py input/matmul --sweep-blocks                   # main 内置
 
 候选规模 (M=N=K=2048, fp32):
   L0 约束后 ~300-500 候选, 总 kernel call ~3500 次, 单进程 ~5-10min (含编译)
@@ -31,7 +31,7 @@ try:
 except Exception:
     pass
 
-_PROJECT = Path(__file__).resolve().parent
+_PROJECT = Path(__file__).resolve().parent.parent   # analyzers/ 上一级 = 项目根
 if str(_PROJECT) not in sys.path:
     sys.path.insert(0, str(_PROJECT))
 

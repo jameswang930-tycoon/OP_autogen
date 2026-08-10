@@ -102,8 +102,7 @@ diagnosis.json
 
 查看：
 ```bash
-python3 input/matmul/real_report.py input/matmul/e2e_run/06_diagnosis/diagnosis.json
-# 或 cat 原始 JSON
+cat input/matmul/e2e_run/06_diagnosis/diagnosis.json   # 或 jq '.' 格式化
 ```
 
 ---

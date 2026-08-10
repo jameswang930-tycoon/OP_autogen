@@ -370,7 +370,7 @@ def main():
         #   msprof 重启本脚本时才能拿到 _INDUSTRIAL_IN_MSPROF=1 走"内层"路径 (否则无限套娃 msprof).
         os.environ["_INDUSTRIAL_IN_MSPROF"] = "1"
         # ★actual 文件: 内层进程写实际执行模式 (compile 是否回退 eager), 外层读回写进 json
-        _am_file = _BENCH_DIR / f".actual_{args.op}_{args.mode}.txt"
+        _am_file = _BENCH_DIR / "outputs" / f".actual_{args.op}_{args.mode}.txt"
         try:
             _am_file.unlink(missing_ok=True)
         except Exception:
@@ -380,7 +380,7 @@ def main():
         import subprocess
         app_cmd = (f"python3 {Path(__file__).resolve()} {args.op} --mode {args.mode} "
                    f"--measure {args.measure} --warmup {args.warmup}")
-        out_json = _BENCH_DIR / f"industrial_{args.op}_{args.mode}_tflops.json"
+        out_json = _BENCH_DIR / "outputs" / f"industrial_{args.op}_{args.mode}_tflops.json"
         result = measure_pytorch_msprof(app_cmd, out_json, flops,
                                         measure=args.measure, warmup=args.warmup,
                                         extras={"op": args.op, "mode": args.mode})

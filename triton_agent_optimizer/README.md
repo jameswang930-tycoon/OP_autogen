@@ -228,7 +228,7 @@ echo "你是 Triton 优化 Planner。先调用 skill: skills/triton-op-planner/S
 | `pipeline_parse_board.py` | msprof op → board_<i>.json（8 CSV 全字段） |
 | `integrate.py` | 按 kernel 名合并骨架+deep → diagnosis.json |
 | `check_fields.py` | 缺字段精准指路（工具/文件/列名），区分「列名不匹配/合法缺」 |
-| `test_tier_extract.py` | 逐 tier 筛字段核对 |
+| `sweep_blocks.py` | Tier3 分块扫描：程序化枚举 L0 合法 BLOCK + 真机实测 |
 | `run_hivm_fusion.py` | Tier2：HIVM MLIR + nga 融合分析 |
 | `merge_single_file.py` | 旧式三文件→单文件兜底 |
 
@@ -265,17 +265,18 @@ python3 input/attention_mlp/kernel_op.py && MATMUL_VERIFY=1 python3 input/attent
 # ② 只采集+解析
 bash analyzers/run_optimize.sh input/matmul input/matmul/e2e_run
 
-# ③ 逐 tier 筛字段核对
-python3 analyzers/test_tier_extract.py input/matmul/e2e_run/06_diagnosis/diagnosis.json
+# ③ 逐 tier 筛字段核对 (解析完 07 自动产出)
+cat input/matmul/e2e_run/07_tier1_fields/tier1_fields.txt
 
-# ④ 硬件基准 (填占位参数 + PyTorch 基准线)
-cd bench_910b3 && python3 run_bench.py && python3 bench_pytorch.py
+# ④ 工业级基准 (各 mode 真机测 → 取每算子 min 作为对比天花板)
+cd bench_910b3 && python3 bench_all.py
+python3 bench_all.py --clean      # 清理 bench_910b3/outputs/ 全部产物
 
-# ⑤ 轨迹图 (含 PyTorch 虚线)
-cd .. && python3 feedback/trajectory_chart.py outputs/matmul
+# ⑤ 硬件基准 (roofline 峰值) + 轨迹图
+python3 run_bench.py && cd .. && python3 feedback/trajectory_chart.py outputs/matmul
 
 # ⑥ 看诊断报告
-python3 input/matmul/real_report.py <round_dir>/06_diagnosis/diagnosis.json
+cat <round_dir>/06_diagnosis/diagnosis.json
 ```
 
 ---

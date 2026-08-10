@@ -18,7 +18,7 @@ from pathlib import Path
 
 
 def _find_test_file(op_dir: Path) -> Path:
-    """找测试驱动: 优先 test*.py (避免误选 real_report.py 等工具脚本)。"""
+    """找测试驱动: 优先 test*.py (避免误选工具脚本)。"""
     candidates = [p for p in op_dir.glob("*.py")
                   if p.name not in ("triton_kernel.py", "kernel_op.py")
                   and "__pycache__" not in p.parts]

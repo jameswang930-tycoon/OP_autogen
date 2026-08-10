@@ -29,6 +29,26 @@ _PROJ = Path(__file__).resolve().parent.parent
 if str(_PROJ) not in sys.path:
     sys.path.insert(0, str(_PROJ))
 
+# ★所有基准产物统一放 bench_910b3/outputs/ (工业级/PT基准 json、actual 标记、msprof 临时)
+BENCH_OUT = Path(__file__).resolve().parent / "outputs"
+
+
+def clean_bench_out():
+    """清理 bench_910b3/outputs/ 全部产物 (json/txt/msprof 临时). 返回删除的文件数."""
+    import shutil as _sh
+    n = 0
+    if BENCH_OUT.exists():
+        for p in BENCH_OUT.iterdir():
+            try:
+                if p.is_dir():
+                    _sh.rmtree(p)
+                else:
+                    p.unlink()
+                n += 1
+            except Exception:
+                pass
+    return n
+
 
 def _read_kernel_durations(prof_out: Path, kernel_name: str) -> list:
     """读 op_summary, 返回目标 kernel 的**逐次** Task Duration(us) 列表 (按行序 = launch 顺序).

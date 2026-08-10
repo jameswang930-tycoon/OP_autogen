@@ -45,12 +45,12 @@ LLM 调用（服务器无 Claude API, 用本地 codeagent）:
      # 轮数 30 = 每个算子跑满 30 轮看最优 (默认 max_rounds=200, 这里用 30 省时间)
   3. 只采集+解析 (不跑优化):
      bash analyzers/run_optimize.sh input/matmul input/matmul/e2e_run
-  4. 只看各 tier 筛字段:
-     python3 analyzers/test_tier_extract.py input/matmul/e2e_run/06_diagnosis/diagnosis.json
+  4. 只看各 tier 筛字段 (解析完 07 自动产出):
+     cat input/matmul/e2e_run/07_tier1_fields/tier1_fields.txt
   5. 只测 Tier2 融合分析:
      python3 analyzers/run_hivm_fusion.py input/matmul/kernel_op.py /tmp/fusion_test
   6. 看诊断报告:
-     python3 input/matmul/real_report.py <round_dir>/06_diagnosis/diagnosis.json
+     cat <round_dir>/06_diagnosis/diagnosis.json
   ══════════════════════════════════════════════════════════
 
 Usage:
@@ -202,7 +202,7 @@ def main():
     # ★D1: 前置 BLOCK 扫描 — 先固定好块再进主循环 (分块是乘性地基, 块差会让后面所有层诊断失真)
     if args.sweep_blocks:
         try:
-            from sweep_blocks import sweep
+            from analyzers.sweep_blocks import sweep
             print("\n[main] ══ 前置 BLOCK 扫描 (D1) ══")
             r = sweep(op_dir, quick=args.sweep_quick)
             if r.get("error"):

@@ -40,7 +40,7 @@ def _script_json(script_name: str) -> Path:
     """bench_pytorch_X.py → pytorch_X_tflops.json (脚本固定写出的 json)."""
     stem = Path(script_name).stem
     rest = stem[len("bench_pytorch"):] if stem.startswith("bench_pytorch") else ""
-    return _BENCH_DIR / f"pytorch{rest}_tflops.json"
+    return _BENCH_DIR / "outputs" / f"pytorch{rest}_tflops.json"
 
 
 def main():
@@ -60,7 +60,7 @@ def main():
     # 1. 一次 msprof 跑脚本 (脚本自己 Event 计时 + 写 json)
     try:
         import shutil as _sh
-        msprof_out = _BENCH_DIR / "_pt_msprof_tmp"
+        msprof_out = _BENCH_DIR / "outputs" / "_pt_msprof_tmp"
         _sh.rmtree(msprof_out, ignore_errors=True)
         msprof_out.mkdir(parents=True, exist_ok=True)
         cmd = ["msprof", f"--output={msprof_out}", f"--application={app_cmd}", "--ai-core=on"]

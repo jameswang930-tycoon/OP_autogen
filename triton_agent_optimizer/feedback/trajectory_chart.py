@@ -49,7 +49,7 @@ def _load_pytorch_bench(kernel_dir: Path, state: dict) -> Optional[dict]:
     st_tu = state.get("pytorch_time_us")
     if st_tf or st_tu:
         return {"tflops": st_tf, "time_us": st_tu}
-    bench_dir = _PROJECT_DIR / "bench_910b3"
+    bench_dir = _PROJECT_DIR / "bench_910b3" / "outputs"   # ★产物统一在 bench_910b3/outputs/
     op = kernel_dir.name.lower()
     # ★显式算子映射优先 (bench_910b3/bench_config.PT_BENCH_MAP); 旧启发式兜底
     try:

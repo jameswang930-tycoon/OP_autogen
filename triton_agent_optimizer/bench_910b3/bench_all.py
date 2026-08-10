@@ -97,11 +97,12 @@ def main():
             print(f"  {op:20s} → {', '.join(OP_MODES[op])}")
         return
 
-    # ── 跑 / 收集 ──
+    # ── 跑 / 收集 (每候选记录 kernels_per_iter + actual_mode, 供融合判定) ──
     results = []
     for op in ops:
         best_t = best_k = None
         best_mode = best_file = None
+        cands = []
         for mode in OP_MODES[op]:
             j = _read_json(op, mode)
             # ★默认重跑(覆盖旧结果); --skip-existing 才对已有有效 json 跳过(只补缺的)
@@ -110,25 +111,54 @@ def main():
             else:
                 j = _run_one(op, mode, args.measure)
             if j and j.get("time_us"):
+                _actual = j.get("actual_mode", mode)   # 实际执行模式 (compile 是否回退)
+                cands.append({"mode": mode, "time_us": j["time_us"],
+                              "kernel_us": j.get("kernel_time_us"),
+                              "kpi": j.get("kernels_per_iter"),          # 每遍 kernel 数 (≈1=融合)
+                              "actual": _actual})
                 t = j["time_us"]
-                if best_t is None or t < best_t:
+                # ★最优只从"真正执行"的方法里选 (回退的是别的方法的重复测量, 不该顶替成最优)
+                if _actual == mode and (best_t is None or t < best_t):
                     best_t, best_k = t, j.get("kernel_time_us")
                     best_mode, best_file = mode, f"industrial_{op}_{mode}_tflops.json"
         results.append({"op": op, "mode": best_mode, "e2e_us": best_t,
-                        "kernel_us": best_k, "source": best_file})
+                        "kernel_us": best_k, "source": best_file, "cands": cands})
 
-    # ── 终端汇总表 ──
-    print("\n" + "═" * 78)
-    print("  工业级基准汇总 (每算子取最优 = 端到端最小者)   [单位: us]")
-    print("═" * 78)
-    print(f"  {'算子':<20}{'最优模式':<12}{'端到端us':>12}{'纯kernelus':>14}   来源")
-    print("  " + "-" * 76)
+    # ── 终端明细表 (含"是否真正执行" + 融合判定) ──
+    def _exec_status(mode, actual):
+        """判断该候选是否真正执行了对应方法, 还是回退成了别的."""
+        if actual == mode:
+            return "✅ 真正执行"
+        _fb = actual.split("→")[-1]
+        return f"⚠ 未真正执行 (回退 {_fb})"
+    print("\n" + "═" * 96)
+    print("  工业级基准明细 (kernels/遍: ≈1=已融合; 执行状态: 是否真正跑了该方法)   [单位: us]")
+    print("═" * 96)
+    print(f"  {'算子':<18}{'模式':<13}{'端到端':>10}{'纯kernel':>12}{'kernels/遍':>11}   {'执行状态':<18}   来源")
+    print("  " + "-" * 94)
     for r in results:
-        e = f"{r['e2e_us']:.1f}" if r["e2e_us"] is not None else "—"
-        k = f"{r['kernel_us']:.1f}" if r["kernel_us"] is not None else "—"
-        src = r["source"] or "(无)"
-        print(f"  {r['op']:<20}{r['mode'] or '—':<12}{e:>12}{k:>14}   {src}")
-    print("═" * 78)
+        n_real = n_fb = 0
+        for c in r["cands"]:
+            e = f"{c['time_us']:.1f}" if c["time_us"] is not None else "—"
+            k = f"{c['kernel_us']:.1f}" if c["kernel_us"] is not None else "—"
+            kpi = f"{c['kpi']}" if c["kpi"] is not None else "—"
+            st = _exec_status(c["mode"], c["actual"])
+            n_real += 1 if st.startswith("✅") else 0
+            n_fb += 1 if st.startswith("⚠") else 0
+            src = f"industrial_{r['op']}_{c['mode']}_tflops.json"
+            print(f"  {r['op']:<18}{c['mode']:<13}{e:>10}{k:>12}{kpi:>11}   {st:<18}   {src}")
+        # ★融合判定: eager 的 kernels/遍 vs compile/cann-fused 的 → 是否变小
+        _e = next((c for c in r["cands"] if c["mode"] == "eager"), None)
+        _cf = next((c for c in r["cands"] if c["mode"] in ("compile", "cann-fused")), None)
+        if _cf and _cf.get("actual", _cf["mode"]) == "eager":
+            print(f"  {'':<3}└─ ⚠ {_cf['mode']} 未真正执行 (回退 eager, torchair 不可用) → 无融合")
+        elif _e and _cf and _e.get("kpi") and _cf.get("kpi") and _cf["kpi"] < _e["kpi"]:
+            print(f"  {'':<3}└─ 融合判定: eager {_e['kpi']} → {_cf['mode']} {_cf['kpi']} → 融合✓")
+        elif _e and _cf and _e.get("kpi") and _cf.get("kpi"):
+            print(f"  {'':<3}└─ 融合判定: eager {_e['kpi']} = {_cf['mode']} {_cf['kpi']} → 未融合✗ (GE 未融合该模式)")
+        if n_fb:
+            print(f"  {'':<3}└─ 方法执行: {n_real} 个真正执行, {n_fb} 个回退 → 回退的方法结果不可信, 别当最优")
+        print("  " + "-" * 94)
     ok = [r for r in results if r["e2e_us"] is not None]
     print(f"  成功 {len(ok)}/{len(results)} 个算子有工业级最优端到端.")
     if len(ok) != len(results):

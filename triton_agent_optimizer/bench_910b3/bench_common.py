@@ -125,24 +125,27 @@ def measure_msprof_op(app_cmd: str, kernel_name: str,
 # ═══════════════════════════════════════════════════════════════════════
 
 def _read_op_summary_rows(prof_out: Path) -> list:
-    """读 op_summary → [(op_name, dur_us), ...] 按行序 (launch 顺序)."""
+    """读全部 op_summary*.csv 合并 → [(op_name, dur_us), ...] 按行序.
+    ★msprof 可能按 {device}_{model}_{iter} 拆多份文件 — 只读 summaries[0] 会漏掉大部分 kernel
+      (表现为"仅 13 行 < measure(30) → 回退"). 必须合并所有文件."""
     summaries = sorted(prof_out.rglob("op_summary*.csv"))
     if not summaries:
         return []
-    try:
-        with open(summaries[0], encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-    except Exception:
-        return []
     out = []
-    for row in rows:
-        dur = row.get("Task Duration(us)") or row.get("TaskDuration")
-        op = row.get("Op Name") or row.get("OpName") or ""
+    for p in summaries:
         try:
-            d = float(dur)
-        except (TypeError, ValueError):
+            with open(p, encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        except Exception:
             continue
-        out.append((op, d))
+        for row in rows:
+            dur = row.get("Task Duration(us)") or row.get("TaskDuration")
+            op = row.get("Op Name") or row.get("OpName") or ""
+            try:
+                d = float(dur)
+            except (TypeError, ValueError):
+                continue
+            out.append((op, d))
     return out
 
 

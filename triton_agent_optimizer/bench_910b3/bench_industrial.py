@@ -310,27 +310,39 @@ def _compile_torchair(fn, op, mode):
         cfg = torchair.CompilerConfig()
         cfg.mode = os.environ.get("TORCHAIR_MODE", "max-autotune")
         backend = torchair.get_npu_backend(compiler_config=cfg)
-        return torch.compile(fn, backend=backend)
+        return torch.compile(fn, backend=backend), "compile"
     except Exception as e:
         print(f"  ⚠ [industrial] {op}/{mode}: torchair 不可用 ({str(e)[:100]}) → eager 兜底", flush=True)
-        return fn
+        return fn, "eager"
+
+
+def _set_actual(mode_str: str):
+    """把"实际执行模式"写进文件 (内层进程写, 外层读回 → json 记录, 让用户分辨 compile 是否真编译了)."""
+    try:
+        f = os.environ.get("_INDUSTRIAL_ACTUAL_FILE")
+        if f:
+            Path(f).write_text(mode_str, encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _run_loop(op, mode, sh, warmup, measure):
     """内层 (msprof 下): warmup + measure 次 forward.
     compile 用 TorchAir (GE 图融合 → CANN 融合 kernel); cann-fused 直接调 CANN 融合算子 (失败回退 compile)."""
     import torch
+    actual = mode
     fn = _make_forward(op, sh)
     if mode == "compile":
-        fn = _compile_torchair(fn, op, mode)
+        fn, actual = _compile_torchair(fn, op, mode)
     elif mode == "cann-fused":
         cf = _make_cann_fused_forward(op, sh)
         if cf is not None:
-            fn = cf
+            fn, actual = cf, "cann-fused"
         else:
-            fn = _compile_torchair(fn, op, mode)   # 回退 GE 图融合 (同批 CANN 融合 kernel)
+            fn, actual = _compile_torchair(fn, op, mode)   # 回退 GE 图融合 (同批 CANN 融合 kernel)
+            actual = "cann-fused→" + actual               # 记录实际 (cann-fused→compile / →eager)
     elif mode == "fa":
-        pass   # flash_attention 的 forward 已是 CANN FA
+        actual = "fa"   # flash_attention 的 forward 已是 CANN FA
     # warmup + measure
     for _ in range(warmup):
         fn()
@@ -338,6 +350,7 @@ def _run_loop(op, mode, sh, warmup, measure):
     for _ in range(measure):
         fn()
     torch.npu.synchronize()
+    _set_actual(actual)   # ★记录实际执行模式 (外层读回 → json) — 让"compile 没融合"可分辨
 
 
 def main():
@@ -356,6 +369,13 @@ def main():
         # ★必须先设标记再调 measure_pytorch_msprof: 它用 dict(os.environ,...) 传给 msprof,
         #   msprof 重启本脚本时才能拿到 _INDUSTRIAL_IN_MSPROF=1 走"内层"路径 (否则无限套娃 msprof).
         os.environ["_INDUSTRIAL_IN_MSPROF"] = "1"
+        # ★actual 文件: 内层进程写实际执行模式 (compile 是否回退 eager), 外层读回写进 json
+        _am_file = _BENCH_DIR / f".actual_{args.op}_{args.mode}.txt"
+        try:
+            _am_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        os.environ["_INDUSTRIAL_ACTUAL_FILE"] = str(_am_file)
         from bench_910b3.bench_common import measure_pytorch_msprof
         import subprocess
         app_cmd = (f"python3 {Path(__file__).resolve()} {args.op} --mode {args.mode} "
@@ -364,9 +384,17 @@ def main():
         result = measure_pytorch_msprof(app_cmd, out_json, flops,
                                         measure=args.measure, warmup=args.warmup,
                                         extras={"op": args.op, "mode": args.mode})
+        # 读回实际模式 → 追加进 json (让"compile 没融合"可分辨: actual_mode=eager 说明 torchair 回退)
         if result is not None:
+            try:
+                if _am_file.exists():
+                    result["actual_mode"] = _am_file.read_text(encoding="utf-8").strip()
+                    out_json.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
+            except Exception:
+                pass
             print(f"[industrial] {args.op}/{args.mode} → {out_json.name}: "
-                  f"e2e={result['time_us']}us kernel={result.get('kernel_time_us')}us")
+                  f"e2e={result['time_us']}us kernel={result.get('kernel_time_us')}us "
+                  f"actual={result.get('actual_mode', args.mode)}")
             return
         # msprof 失败 → 兜底 Event 计时; ★若已有旧 msprof 好结果则保留, 不覆盖 (否则好数据被差数据顶掉)
         old = None

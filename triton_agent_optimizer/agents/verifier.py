@@ -34,13 +34,19 @@ def _read_durations(prof_out: Path) -> tuple:
       注: 端到端是 device 端到端 (所有 kernel 执行时间之和), 不含 host 侧 launch/gap;
           两端同法, 故可比."""
     import csv as _csv
+    # ★读全部 op_summary*.csv 合并: msprof 可能按 {device}_{model}_{iter} 拆多份文件,
+    #   只读 summaries[0] 会漏掉大部分 kernel (表现为行数 < loop, 加速比失真)
     summaries = sorted(prof_out.rglob("op_summary*.csv"))
     if not summaries:
         return None, None, 0, 0
-    try:
-        with open(summaries[0], encoding="utf-8") as f:
-            rows = list(_csv.DictReader(f))
-    except Exception:
+    rows = []
+    for _s in summaries:
+        try:
+            with open(_s, encoding="utf-8") as f:
+                rows.extend(list(_csv.DictReader(f)))
+        except Exception:
+            continue
+    if not rows:
         return None, None, 0, 0
     target_us, all_us = None, None
     target_n = all_n = 0

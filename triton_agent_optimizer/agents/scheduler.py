@@ -484,7 +484,10 @@ class Scheduler:
         """初始化: 从头开始 (round1/tier1 读源文件)。"""
         self.traj = {"v": 4, "state": {"tier": 1, "round": 1, "best_speedup": 1.0,
                                        "baseline_ns": None, "num_kernels": None,
-                                       "current_speedup": 1.0,   # 当前已接受 kernel 的加速比 (基线=1.0)
+                                       "current_speedup": 1.0,   # 当前已接受 kernel 的加速比 (★主=端到端口径)
+                                       # ★端到端口径 (优化效果主指标, 含框架 kernel):
+                                       #   baseline_ns = 纯 kernel 基线; baseline_e2e_ns = 端到端基线
+                                       "baseline_e2e_ns": None,
                                        "current_kernel": str(self.op_dir / "kernel_op.py"),
                                        "total_rounds": 0,        # ★D7: 含 promote 轮的总执行数 (防 promote 白耗 max_rounds)
                                        "handoff": None,          # ★P1: 跳转手递 (下个 tier 的 planner 读)
@@ -511,6 +514,7 @@ class Scheduler:
         return {"v": 4, "state": {"tier": 1, "round": 1, "best_speedup": 1.0,
                                   "baseline_ns": None, "num_kernels": None,
                                   "current_speedup": 1.0,
+                                  "baseline_e2e_ns": None,
                                   "handoff": None, "tier_jumps": []},
                 "history": []}
 
@@ -599,11 +603,22 @@ class Scheduler:
             return None
         dgn = round_dir / "06_diagnosis" / "diagnosis.json"
         if dgn.exists():
-            return json.loads(dgn.read_text(encoding="utf-8"))
+            _d = json.loads(dgn.read_text(encoding="utf-8"))
+            # ★修复: diagnosis 无目标 kernel (kernel 未启动/崩溃, 如 coder 改崩) → 视为采集失败,
+            #   不再带着空分析数据往下跑 (否则 planner 拿到全空字段, "所有分析流程失败"假象化).
+            #   run_optimize.sh 此时已把崩溃 trace 打到 warmup.txt/task_run.txt.
+            if not (_d.get("kernels") or []):
+                print("  [Scheduler] ⚠ diagnosis 无目标 kernel (kernel 未启动? coder 改崩?) → 视为采集失败")
+                return None
+            return _d
         # 兜底: 产物也可能直接在 round_dir 下
         alt = round_dir / "diagnosis.json"
         if alt.exists():
-            return json.loads(alt.read_text(encoding="utf-8"))
+            _d = json.loads(alt.read_text(encoding="utf-8"))
+            if not (_d.get("kernels") or []):
+                print("  [Scheduler] ⚠ diagnosis 无目标 kernel (kernel 未启动?) → 视为采集失败")
+                return None
+            return _d
         print("  [Scheduler] ❌ diagnosis.json 未生成")
         return None
 
@@ -764,7 +779,9 @@ class Scheduler:
         try:
             from agents.verifier import verify_end_to_end
             nk = self.traj.get("state", {}).get("num_kernels")
-            return verify_end_to_end(kernel, round_dir, baseline_ns, num_kernels=nk)
+            nla = self.traj.get("state", {}).get("num_launches")
+            return verify_end_to_end(kernel, round_dir, baseline_ns,
+                                     num_kernels=nk, num_launches=nla)
         except Exception as e:
             # ★bug 修复: stub 假 PASS 只允许在 stub 模式 (use_llm=False).
             #   生产环境 (use_llm=True) 验证异常必须返回 FAIL → 调度器记 FAIL + 回传 coder 修.
@@ -926,21 +943,30 @@ class Scheduler:
             rb_dir = self.kernel_dir / "rebaseline"
             rb_dir.mkdir(parents=True, exist_ok=True)
             vb = verify_end_to_end(base_kernel, rb_dir / "base", None,
-                                   num_kernels=st.get("num_kernels"))
+                                   num_kernels=st.get("num_kernels"),
+                                   num_launches=st.get("num_launches"))
             if not (vb.get("ok") and vb.get("ns")):
                 print(f"  [重基准] R{rn} 重测原始 kernel 失败: {str(vb.get('error',''))[:120]} (跳过)")
                 return
             new_base = vb["ns"]
             # 重测当前已接受 kernel → 新累计加速比
             cur = verify_end_to_end(self.current_kernel, rb_dir / "cur", None,
-                                    num_kernels=st.get("num_kernels"))
+                                    num_kernels=st.get("num_kernels"),
+                                    num_launches=st.get("num_launches"))
             if not (cur.get("ok") and cur.get("ns")):
                 print(f"  [重基准] R{rn} 重测当前 kernel 失败 (跳过, 沿用旧 baseline)")
                 return
             new_speedup = new_base / cur["ns"] if cur["ns"] else None
+            # ★端到端基线/当前加速比 (主口径) — 两端 verify 都返回 e2e_ns
+            _eb = vb.get("e2e_ns") or st.get("baseline_e2e_ns")
+            _ec = cur.get("e2e_ns")
+            _new_e2e_speedup = (_eb / _ec) if (_eb and _ec) else None
             drift = new_base / st["baseline_ns"] if st.get("baseline_ns") else 1.0
             st["baseline_ns"] = new_base
-            st["current_speedup"] = round(new_speedup, 4) if new_speedup else st.get("current_speedup", 1.0)
+            st["current_speedup"] = (round(_new_e2e_speedup, 4) if _new_e2e_speedup
+                                     else (round(new_speedup, 4) if new_speedup else st.get("current_speedup", 1.0)))
+            if _eb:
+                st["baseline_e2e_ns"] = _eb
             st["last_rebase_round"] = rn
             # ★不进 history (避免与正常轮同 round 号, trajectory 图点重叠):
             #   REBASELINE 是测量事件不是优化轮, 只更新 state; 换基后后续轮 speedup 用新基准.
@@ -1127,21 +1153,32 @@ class Scheduler:
             if st.get("baseline_ns") is None:
                 st["baseline_ns"] = ks0.get("total_ns")
                 st["num_kernels"] = ks0.get("num_kernels")
+                # ★verifier H1 兜底除数用: 每遍实际 launch 总数 (Σ launch_count).
+                #   去重 kernel 数在多 launch 算子(attention_mlp 9次/遍)下会高估遍数 → 加速比虚高.
+                st["num_launches"] = sum((k.get("launch_count") or 1)
+                                         for k in (diagnosis.get("kernels") or []))
                 mnk = _extract_mnk(self.current_kernel.read_text(encoding="utf-8")
                                    if self.current_kernel.exists() else "")
                 if mnk:
                     st["baseline_mnk"] = list(mnk)   # 记 baseline 尺寸, 防后续轮跨尺寸失真
                 # initial_tflops (供轨迹图):
                 #   ★优先用诊断的真实 cube_fops 之和 (多 matmul/多 kernel 正确, MLP=2×2MNK)
-                #   兜底用 config 的 2MNK (单 matmul)
+                #   兜底 (deep 未填时) 用 config 的 2MNK × cube 类 kernel 数 —
+                #   ★修复: 原来只算单 matmul (2MNK), 对 MLP 2 个 matmul/attention 多 matmul
+                #   会低估 2×/更多; 按 task_type=Cube 的 kernel 数乘 (bias_gelu 等 Vec 不计数).
+                #   (cube_fops 若来自 msprof 的 MAC 计数, 数值为 FLOPs 的一半 → 显示偏低 ~2×, 时间口径不受影响)
                 cube_fops = sum((k.get("deep") or {}).get("compute", {}).get("cube_fops") or 0
                                 for k in (diagnosis.get("kernels") or []))
                 if cube_fops and st["baseline_ns"]:
                     st["initial_tflops"] = round(
                         cube_fops / (st["baseline_ns"] / 1e9) / 1e12, 2)
                 elif mnk and st["baseline_ns"]:
+                    _n_mm = sum(1 for k in (diagnosis.get("kernels") or [])
+                                if str(((k.get("task") or {}).get("task_type") or "")).lower()
+                                in ("cube", "aic", "mac"))
                     st["initial_tflops"] = round(
-                        2 * mnk[0] * mnk[1] * mnk[2] / (st["baseline_ns"] / 1e9) / 1e12, 2)
+                        2 * mnk[0] * mnk[1] * mnk[2] * max(1, _n_mm)
+                        / (st["baseline_ns"] / 1e9) / 1e12, 2)
                 # ★F4: PyTorch 基准 — 按算子显式映射 (bench_910b3/bench_pytorch_*.py 输出),
                 #   显式映射缺时回退旧启发式 (多 kernel→MLP, 单→单 matmul); 必须与 op 同尺寸同 dtype (见 H5/E4).
                 try:
@@ -1150,37 +1187,45 @@ class Scheduler:
                     PT_BENCH_MAP = {}
                 pt_file = PT_BENCH_MAP.get(self.kernel_dir.name)
                 if not pt_file:
-                    nk = st.get("num_kernels") or 0
-                    pt_file = "pytorch_mlp_tflops.json" if nk > 1 else "pytorch_tflops.json"
-                pt = _PROJECT / "bench_910b3" / pt_file
-                if pt.exists():
+                    # ★修复: 不再回退到 matmul json — 非 matmul 算子 (softmax/vector_add/旧算子)
+                    #   会得到 apples-to-oranges 的 "vs PyTorch" 误导参考线 (matmul 的 tflops/时间
+                    #   和向量/归约算子完全不可比). 无映射 → 跳过 PyTorch 基准, 轨迹图不画误导虚线.
+                    print(f"  ⚠ 无 PyTorch 基准映射 ({self.kernel_dir.name}) → 跳过 vs-PyTorch 参考线 "
+                          f"(避免用 matmul 基准对比非 matmul 算子)")
+                    pt_file = None
+                pt = (_PROJECT / "bench_910b3" / pt_file) if pt_file else None
+                if pt and pt.exists():
                     try:
                         _pt = json.loads(pt.read_text(encoding="utf-8"))
                         st["pytorch_tflops"] = _pt.get("tflops")
-                        # ★pytorch 时间(us) — 同算子同形状, 时间才是直接可比 (apples-to-apples);
-                        #   TFLOPS 口径不同 (我们 cube_fops vs bench 公式) 不可比 → 对比用时间
+                        # ★pytorch 时间(us) — ★统一 msprof 口径 (pt_msprof.py 生成):
+                        #   time_us = 端到端 (Σ全部含框架), kernel_time_us = 纯kernel (Σ非aclnn).
+                        #   与我们 verify 同口径 → 两端可比.
                         st["pytorch_time_us"] = _pt.get("time_us")
+                        st["pytorch_kernel_time_us"] = _pt.get("kernel_time_us")
                         st["pytorch_baseline"] = pt_file
                     except Exception:
                         pass
-                else:
+                elif pt_file:
                     # ★自动跑对应的 PyTorch bench 生成基准 (需 NPU; 失败不阻断). env AUTO_RUN_PT_BENCH=0 关闭.
                     _script = PT_SCRIPT_MAP.get(pt_file)
                     if os.environ.get("AUTO_RUN_PT_BENCH", "1") == "1" and _script:
-                        print(f"  [PyTorch] 缺 {pt_file} → 自动跑 python3 bench_910b3/{_script} "
-                              f"(AUTO_RUN_PT_BENCH=1)")
+                        print(f"  [PyTorch] 缺 {pt_file} → 自动跑 msprof 包裹的 bench_910b3/{_script} "
+                              f"(AUTO_RUN_PT_BENCH=1, 一次 msprof 出 端到端+纯kernel)")
                         try:
                             _r = subprocess.run(
-                                ["python3", str(_PROJECT / "bench_910b3" / _script)],
-                                capture_output=True, text=True, timeout=3600,
+                                ["python3", str(_PROJECT / "bench_910b3" / "pt_msprof.py"), _script],
+                                capture_output=True, text=True, timeout=7200,
                                 encoding="utf-8", errors="backslashreplace")
                             if pt.exists():
                                 _pt = json.loads(pt.read_text(encoding="utf-8"))
                                 st["pytorch_tflops"] = _pt.get("tflops")
                                 st["pytorch_time_us"] = _pt.get("time_us")
+                                st["pytorch_kernel_time_us"] = _pt.get("kernel_time_us")
                                 st["pytorch_baseline"] = pt_file
                                 print(f"  [PyTorch] ✅ 自动生成 {pt_file}: "
-                                      f"time_us={st.get('pytorch_time_us')}")
+                                      f"e2e_time_us={st.get('pytorch_time_us')} "
+                                      f"kernel_time_us={st.get('pytorch_kernel_time_us')}")
                             else:
                                 print(f"  ⚠ PyTorch bench 未产出 {pt_file}: "
                                       f"{(getattr(_r, 'stderr', '') or '')[-200:]}")
@@ -1190,6 +1235,41 @@ class Scheduler:
                         # ★缺 json 且不自动跑 → 警告 (不阻塞, 但用户该知道).
                         print(f"  ⚠ 缺 PyTorch 基准 {pt_file} (trajectory 无 vs-PyTorch 参考线). "
                               f"跑 python3 bench_910b3/{_script or 'bench_pytorch_*.py'} 生成")
+                # ★工业级基准 (工业级天花板): 对每个算子跑过全部候选 mode 后**取 time_us 最小者**.
+                #   - 有 CANN 融合算子的 (matmul/matmul_relu/conv_bias_relu): eager + compile + cann-fused
+                #   - 其余: eager(CANN vendor) + compile(TorchAir 图融合)
+                #   - flash_attention: 只取 fa (CANN FlashAttention 专用)
+                #   我们最终 kernel 的端到端 vs 这个"工业级最优" — 这才是看优化效果的对比.
+                if self.kernel_name == "flash_attention":
+                    _ind_modes = ["fa"]
+                elif self.kernel_name in ("matmul", "matmul_relu", "conv_bias_relu"):
+                    _ind_modes = ["eager", "compile", "cann-fused"]
+                else:
+                    _ind_modes = ["eager", "compile"]
+                _best_t = _best_k = None
+                _best_file = None
+                for _m in _ind_modes:
+                    _f = f"industrial_{self.kernel_name}_{_m}_tflops.json"
+                    _p = _PROJECT / "bench_910b3" / _f
+                    if not _p.exists():
+                        continue
+                    try:
+                        _d = json.loads(_p.read_text(encoding="utf-8"))
+                        _t = _d.get("time_us")
+                        if _t and (_best_t is None or _t < _best_t):
+                            _best_t, _best_k, _best_file = _t, _d.get("kernel_time_us"), _f
+                    except Exception:
+                        pass
+                if _best_t:
+                    st["industrial_time_us"] = _best_t
+                    st["industrial_kernel_time_us"] = _best_k
+                    st["industrial_baseline"] = _best_file
+                    print(f"  [工业级] 基准 {_best_file} ({'/'.join(_ind_modes)} 取 min): "
+                          f"e2e={_best_t}us kernel={_best_k}us")
+                else:
+                    print(f"  ⚠ 缺工业级基准 (跑 python3 bench_910b3/bench_industrial.py {self.kernel_name} "
+                          f"--mode {'fa' if self.kernel_name == 'flash_attention' else 'eager / compile'} "
+                          f"生成后才有 vs-工业级 对比线)")
                 # ★基准复测: 诊断 total_ns 是单次 msprof 采样(噪声大),
                 #   用 verify 机制 (warmup + VERIFY_RUNS 轮 msprof 平均) 重测源 kernel,
                 #   与后续轮完全同口径, 加速比才可信. 默认开, VERIFY_BASELINE=0 跳过.
@@ -1202,13 +1282,18 @@ class Scheduler:
                             _sh.rmtree(base_rd)   # ★P1: 每次重测基准前清干净 (防跨 run 累积)
                         base_rd.mkdir(parents=True, exist_ok=True)
                         vb = verify_end_to_end(self.current_kernel, base_rd, None,
-                                               num_kernels=st.get("num_kernels"))
+                                               num_kernels=st.get("num_kernels"),
+                                               num_launches=st.get("num_launches"))
                         if vb.get("ok") and vb.get("ns"):
                             st["baseline_ns"] = vb["ns"]
+                            # ★端到端基线 (同一次 msprof 的 Σ全部kernel 口径)
+                            if vb.get("e2e_ns"):
+                                st["baseline_e2e_ns"] = vb["e2e_ns"]
                             if cube_fops:
                                 st["initial_tflops"] = round(
                                     cube_fops / (vb["ns"] / 1e9) / 1e12, 2)
-                            print(f"  [基准] 复测平均 baseline_ns={vb['ns']}ns "
+                            _e2e_s = f" e2e={vb.get('e2e_ns')}ns" if vb.get("e2e_ns") else ""
+                            print(f"  [基准] 复测平均 baseline_ns={vb['ns']}ns{_e2e_s} "
                                   f"(warmup+msprof 平均, 与后续轮同口径)")
                         else:
                             berr = vb.get("error", "")
@@ -1346,8 +1431,10 @@ class Scheduler:
                 (round_dir / "diff.patch").write_text("(promote, 无代码改动)", encoding="utf-8")
                 speedup = prev_speedup                        # 未改码 → 加速比与上一轮相同
                 _bns = st.get("baseline_ns")
+                _be2e = st.get("baseline_e2e_ns")
                 v = {"ok": True,                             # ★F1: ns 反推, 不再留 None 脏字段
                      "ns": round(_bns / speedup, 1) if _bns and speedup else None,
+                     "e2e_ns": round(_be2e / speedup, 1) if _be2e and speedup else None,
                      "speedup": speedup, "note": "promote轮(无改动)"}
                 self.current_kernel = round_kernel
                 st["current_kernel"] = str(round_kernel)
@@ -1372,9 +1459,14 @@ class Scheduler:
                     v = self._verify(round_dir, st.get("baseline_ns"))
                     t_verify += time.time() - _tv
                     if v.get("ok"):
-                        # ★保留判定: speedup 始终 = 初始基线/本轮 (累计, 输出的就是这个);
-                        #   但"是否采纳进 kernel 链"对比上一轮已接受的加速比 (prev_speedup)
-                        speedup = v.get("speedup", 1.0) or 1.0   # None→1.0 防御 (baseline 缺失时 verify 返回 None)
+                        # ★主加速比 = 端到端 (优化效果口径, 含框架 kernel); 纯 kernel 作参考.
+                        #   baseline_e2e_ns 缺失 (VERIFY_BASELINE=0 等) → 兜底纯 kernel 口径.
+                        _e2e = v.get("e2e_ns")
+                        _be2e = st.get("baseline_e2e_ns")
+                        if _e2e and _be2e:
+                            speedup = _be2e / _e2e
+                        else:
+                            speedup = v.get("speedup", 1.0) or 1.0   # None→1.0 防御 (纯 kernel 兜底)
                         floor = _keep_floor()
                         if speedup >= prev_speedup * floor:
                             self.current_kernel = round_kernel
@@ -1403,9 +1495,14 @@ class Scheduler:
             if not round_kernel.exists():
                 round_kernel.write_text(pre_code or "", encoding="utf-8")
 
-            speedup = v.get("speedup", 1.0) or 1.0   # None→1.0 防御 (round1 已保证 baseline 存在, 正常到不了)
+            # ★主加速比统一 = 端到端 (与 keep 块同口径); 兜底纯 kernel
+            _e2e = v.get("e2e_ns")
+            _be2e = st.get("baseline_e2e_ns")
+            speedup = (_be2e / _e2e) if (_e2e and _be2e) else (v.get("speedup", 1.0) or 1.0)
             ns = v.get("ns")
-            print(f"  加速比: {speedup:.3f}x (vs 初始基线 {st.get('baseline_ns')}ns; 上一轮 {prev_speedup:.3f}x)"
+            _be = st.get("baseline_ns")
+            print(f"  加速比: {speedup:.3f}x (端到端口径; 纯kernel基线 {_be}ns / 端到端基线 {_be2e}ns; "
+                  f"本轮 纯kernel={ns}ns e2e={_e2e}ns; 上一轮 {prev_speedup:.3f}x)"
                   + ("  ✅采纳" if kept else "  ↩未采纳"))
             t_round = time.time() - round_start
             print(f"  ⏱ ⑤Coder: {t_code:.1f}s")
@@ -1440,9 +1537,10 @@ class Scheduler:
                     "change": _summarize_changes(plan),       # 例: "BLOCK_M,BLOCK_N,BLOCK_K=64,64,64"
                     # ★changes_full = 完整 changes[] 数组 (old_code/new_code 全文, 审计/复盘不丢信息)
                     "changes_full": _extract_changes_from_plan(plan.plan_text) or [],
-                    "speedup": round(speedup, 4),             # 加速比 = 初始基线/本轮 (累计)
+                    "speedup": round(speedup, 4),             # ★主加速比 = 端到端口径 (初始端到端基线/本轮)
+                    "kernel_speedup": round(_be / ns, 4) if (_be and ns) else None,  # 纯 kernel 口径参考
                     "prev_speedup": round(prev_speedup, 4),   # 上一轮已接受 kernel 的加速比 (保留判定用)
-                    "ns": ns, "decision": decision, "result": result,
+                    "ns": ns, "e2e_ns": _e2e, "decision": decision, "result": result,
                     "error": (prev_err[:120] if prev_err else "")}
             # ★F3: 每轮真实 tflops (kernel 结构变化后 FLOPs 变, 轨迹图用 hist 值, 不再 initial×speedup 失真)
             _cf = sum((k.get("deep") or {}).get("compute", {}).get("cube_fops") or 0
@@ -1502,16 +1600,22 @@ class Scheduler:
             self._save_traj()
 
         self._write_timing_stats()   # ★各阶段耗时统计 (项目自身瓶颈)
-        # ★最后产出汇总: 总轮次/总耗时/平均每轮/最终 kernel 的 ns 与 speedup
-        _bs = st.get("baseline_ns")
-        _cur_ns = round(_bs / st.get("current_speedup", 1.0), 1) if (_bs and st.get("current_speedup")) else None
+        # ★最后产出汇总: 总轮次/总耗时/两种口径 (端到端主 + 纯kernel参考)
+        _bs = st.get("baseline_ns")                    # 纯 kernel 基线 (ns)
+        _be2e = st.get("baseline_e2e_ns")              # 端到端基线 (ns)
+        _cs = st.get("current_speedup") or 1.0         # ★主加速比 (端到端口径)
+        _cur_e2e = round(_be2e / _cs, 1) if _be2e else None
+        # 纯 kernel 当前耗时: 从最近 hist 的 kernel_speedup 反推 (pure baseline / kernel_speedup)
+        _last_ks = next((h.get("kernel_speedup") for h in reversed(self.traj.get("history", []))
+                         if h.get("kernel_speedup")), None)
+        _cur_ns = round(_bs / _last_ks, 1) if (_bs and _last_ks) else None
         _prom = st.get("promote_budget", 0)
         _n_eff = st.get("total_rounds", 0) - _prom
-        print(f"\n══ 完成: best_speedup={st.get('best_speedup')}x ══")
+        print(f"\n══ 完成: best_speedup={st.get('best_speedup')}x (端到端口径) ══")
         print(f"  [产出] 总执行 {st.get('total_rounds', 0)} 轮 (含 {_prom} 次 promote, 有效优化 {_n_eff} 轮), "
               f"总耗时 {time.time()-total_start:.0f}s")
-        print(f"  [产出] 最终 kernel 累计加速比 {st.get('current_speedup')}x "
-              f"(baseline {_bs}ns → 当前 {_cur_ns}ns); best {st.get('best_speedup')}x")
+        print(f"  [产出] ★端到端: baseline {_be2e}ns → 当前 {_cur_e2e}ns, 加速比 {_cs}x (best {st.get('best_speedup')}x)")
+        print(f"  [产出] 纯kernel: baseline {_bs}ns → 当前 {_cur_ns}ns, 加速比 {_last_ks if _last_ks is not None else '?'}x")
         print(f"  [产出] 最终 kernel 文件 → {st.get('current_kernel')}")
 
         # ★自动生成轨迹图 (优化结束后; 失败/无 matplotlib 不阻断). env AUTO_CHART=0 关闭.
@@ -1546,10 +1650,11 @@ class Scheduler:
                     "total_rounds": st.get("total_rounds", 0),
                     "promote_rounds": _prom,
                     "effective_rounds": _n_eff,
-                    "baseline_ns": _bs,
-                    "final_ns": _cur_ns,
-                    "current_speedup": st.get("current_speedup"),
-                    "best_speedup": st.get("best_speedup"),
+                    # ★两种口径: 端到端(主) + 纯kernel(参考)
+                    "baseline_ns": _bs, "final_ns": _cur_ns,            # 纯 kernel
+                    "baseline_e2e_ns": _be2e, "final_e2e_ns": _cur_e2e, # 端到端
+                    "industrial_time_us": st.get("industrial_time_us"), # 工业级基准 (torch.compile/CANN-FA)
+                    "current_speedup": _cs, "best_speedup": st.get("best_speedup"),
                     "final_kernel_source": str(_src),
                     "generated_at": datetime.now().isoformat(),
                 }, ensure_ascii=False, indent=1), encoding="utf-8")

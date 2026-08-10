@@ -100,20 +100,23 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     decisions = ["BASELINE"] + decisions
     strategies = ["Baseline"] + strategies
 
-    # TFLOPS: 从 state.baseline_ns 算 (需 M/N/K, 存在 state 里) 或默认
-    initial_tflops = state.get("initial_tflops") or 6.4
+    # TFLOPS: state.initial_tflops (scheduler 算的) — 非 cube 算子可能没有 → None, 不画误导轴
+    #   (★修复: 原来 `or 6.4` 给访存型算子硬画假数, 已移除 — 访存型算子该看 GB/s, 不是 TFLOPS)
+    initial_tflops = state.get("initial_tflops")
     # ★PyTorch 基准: 优先 state (scheduler 存的), 缺则自动按算子读 bench json; None = 无真实数据 → 不画误导虚线
     # ★对比用时间 (time_us, 同算子同形状直接可比); tflops 仅兜底展示
     pt_bench = _load_pytorch_bench(kernel_dir, state) or {}
-    pytorch_tflops = pt_bench.get("tflops")
+    # (pytorch_tflops 只用于 _load_pytorch_bench 内部/state 读取; 本函数只用时间口径对比)
     pytorch_time_us = pt_bench.get("time_us")
     # ★F3: hist 若存了每轮真实 tflops (kernel 结构变化后 FLOPs 变) 就逐轮用, 否则 initial×speedup 兜底
     hist_tflops = [r.get("tflops") for r in history]
-    per_round_tf = [
-        (h if isinstance(h, (int, float)) else initial_tflops * cs)
-        for h, cs in zip(hist_tflops, cum_speeds[1:])
-    ]
-    tflops_arr = np.array([initial_tflops] + per_round_tf)
+    tflops_arr = None
+    if initial_tflops:
+        per_round_tf = [
+            (h if isinstance(h, (int, float)) else initial_tflops * cs)
+            for h, cs in zip(hist_tflops, cum_speeds[1:])
+        ]
+        tflops_arr = np.array([initial_tflops] + per_round_tf)
 
     # ── Tier ranges ──
     tier_ranges = []
@@ -155,20 +158,37 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     #     若 pytorch 快于我们的 baseline → 虚线 >1; 慢 → <1.
     if pt_bench:
         _pt_ns = (pytorch_time_us or 0) * 1000.0
-        _base_ns = state.get("baseline_ns")
+        # ★统一端到端口径: 我们 baseline_e2e_ns (msprof Σ全部) vs torch time_us (pt_msprof Σ全部)
+        _base_ns = state.get("baseline_e2e_ns") or state.get("baseline_ns")
+        # ★只认时间口径 (同算子同形状直接可比). 无时间数据 → 不画虚线.
+        #   (★修复: 原 tflops 兜底 pytorch_tflops/initial_tflops 已移除 — 跨算子类型用 TFLOPS
+        #   比是 apples-to-oranges, 访存型算子 tflops 天然 0.x 会让虚线位置完全失真)
         if _pt_ns and _base_ns:
-            pytorch_speedup = _base_ns / _pt_ns            # ★时间口径 (首选)
-        elif pytorch_tflops and initial_tflops:
-            pytorch_speedup = pytorch_tflops / initial_tflops   # 兜底 (无时间数据时)
+            pytorch_speedup = _base_ns / _pt_ns
         else:
             pytorch_speedup = None
         if pytorch_speedup:
             ax.axhline(y=pytorch_speedup, color="gray", linestyle="--", linewidth=2.5,
                        alpha=0.8, zorder=1)
-            _lbl_t = f"{pytorch_time_us:.0f}us" if pytorch_time_us else f"{pytorch_tflops:.1f} TFLOPS"
             ax.text(len(rounds)-1, pytorch_speedup + 0.03,
-                    f"PyTorch eager* ({_lbl_t})\n*口径: torch 含框架 kernel, triton 不含 → 仅参考",
+                    f"PyTorch eager* ({pytorch_time_us:.0f}us)\n*口径: torch 含框架 kernel, triton 不含 → 仅参考",
                     fontsize=9, color="gray", ha="right", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
+
+    # ═══ Industrial baseline (工业级天花板: torch.compile/TorchAir 或 CANN-FA) — 第二条虚线 ═══
+    #   口径与 PyTorch 线同: 我们端到端基线 vs 工业级端到端 (都是 msprof Σ全部).
+    #   ★这才是"看优化效果"的对比 — 我们最终 kernel vs 工业级实现.
+    industrial_time_us = state.get("industrial_time_us")
+    if industrial_time_us:
+        _ind_ns = industrial_time_us * 1000.0
+        _base_ns = state.get("baseline_e2e_ns") or state.get("baseline_ns")
+        if _ind_ns and _base_ns:
+            ind_speedup = _base_ns / _ind_ns
+            ax.axhline(y=ind_speedup, color="#d32f2f", linestyle="--", linewidth=2.0,
+                       alpha=0.8, zorder=1)
+            ax.text(len(rounds)-1, ind_speedup + 0.03,
+                    f"Industrial (torch.compile/CANN-FA) ({industrial_time_us:.0f}us)",
+                    fontsize=9, color="#d32f2f", ha="right", va="bottom",
                     bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
 
     # ═══ Running Best ═══
@@ -220,33 +240,37 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
                               alpha=0.85, ec=TIER_FG[(tier-1)%6], lw=1.2),
                     zorder=20)
 
-    # ═══ Right Y: TFLOPS ═══
-    ax2 = ax.twinx()
-    ymin, ymax = ax.get_ylim()
-    ax2.set_ylim(ymin * initial_tflops, ymax * initial_tflops)
-    ax2.set_ylabel("Throughput (TFLOPS)", fontsize=12, color="#7b1fa2")
-    ax2.tick_params(axis="y", labelcolor="#7b1fa2")
-    ax2.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.1f"))
+    # ═══ Right Y: TFLOPS (只有有意义的 initial_tflops 才画 — 访存型算子无 → 不画误导轴) ═══
+    if tflops_arr is not None:
+        ax2 = ax.twinx()
+        ymin, ymax = ax.get_ylim()
+        ax2.set_ylim(ymin * initial_tflops, ymax * initial_tflops)
+        ax2.set_ylabel("Throughput (TFLOPS)", fontsize=12, color="#7b1fa2")
+        ax2.tick_params(axis="y", labelcolor="#7b1fa2")
+        ax2.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.1f"))
 
     # ═══ Title ═══
     total_rounds = len(rounds) - 1
     final_s = running_best[-1]
-    final_t = tflops_arr[-1]
-    # ★vs PyTorch 用时间对比 (直接可比): 我们最优用时 vs pytorch 用时
+    final_t = tflops_arr[-1] if tflops_arr is not None else None
+    _tf_s = f"{initial_tflops:.1f} -> {final_t:.2f}" if final_t is not None else "—"
+    # ★vs PyTorch 用端到端口径对比 (直接可比, 两端都 msprof Σ全部): 我们最优用时 vs pytorch 用时
+    #   (★修复: 原 tflops 兜底对比已移除 — 跨算子类型用 TFLOPS 比失真)
     _vs_pt = ""
-    if pt_bench:
-        _cur_ns = state.get("baseline_ns")
+    if pt_bench or state.get("industrial_time_us"):
+        _cur_ns = state.get("baseline_e2e_ns") or state.get("baseline_ns")
         _final_us = (_cur_ns / final_s / 1000.0) if (_cur_ns and final_s) else None
         if pytorch_time_us and _final_us:
             _vs_pt = (f"  |  vs PyTorch({pytorch_time_us:.0f}us): "
                       f"我们最优 {_final_us:.0f}us = {_final_us/pytorch_time_us*100:.0f}%")
-        elif pytorch_tflops:
-            _vs_pt = (f"  |  vs PyTorch({pytorch_tflops:.1f} TFLOPS): "
-                      f"{final_t/pytorch_tflops*100:.0f}%")
+        _ind_us = state.get("industrial_time_us")
+        if _ind_us and _final_us:
+            _vs_pt += (f"  |  vs Industrial({_ind_us:.0f}us): "
+                       f"{_final_us/_ind_us*100:.0f}%")
     title = (
         f"Optimization Trajectory: {kernel_dir.name}     "
         f"Rounds: {total_rounds}  |  "
-        f"TFLOPS: {initial_tflops:.1f} -> {final_t:.2f}  |  "
+        f"TFLOPS: {_tf_s}  |  "
         f"Speedup: {final_s:.2f}x{_vs_pt}"
     )
     ax.set_title(title, fontsize=13, fontweight="bold", pad=22)
@@ -267,7 +291,8 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     plt.close(fig)
 
     print(f"[chart] {out} ({total_rounds} rounds, "
-          f"{initial_tflops:.1f}->{final_t:.2f} TFLOPS, {final_s:.2f}x)")
+          f"{initial_tflops if initial_tflops is not None else 'N/A'}->"
+          f"{final_t if final_t is not None else 'N/A'} TFLOPS, {final_s:.2f}x)")
     return out
 
 

@@ -60,6 +60,10 @@ SWEEP_META = {
     "rms_norm":        None,   # 行级 kernel, BLOCK_N 由 N 推导 (2 幂), 无自由分块参数
     "layernorm":       None,   # 行级归约, BLOCK_N 由 N 推导 (2 幂), 无自由分块参数
     "sigmoid":         None,   # 纯逐元素, 无 matmul 分块参数
+    "vector_add":      None,   # 逐元素, 无自由分块参数
+    "fused_add_mul":   None,   # 逐元素, 无自由分块参数
+    "softmax":         None,   # 行级归约, BLOCK_N 由 N 推导 (2 幂), 无自由分块参数
+    "rms_norm_residual": None, # 行级归约, 无自由分块参数
 }
 
 
@@ -67,13 +71,22 @@ SWEEP_META = {
 # 候选生成
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _ceil_pow2(x: int) -> int:
+    """≥x 的最小 2 幂 (≥16): 16,32,64,128... — 供 bk_min 保底 (flash BK 须覆盖整个头维)."""
+    v = 16
+    while v < x:
+        v *= 2
+    return v
+
+
 def generate_matmul_candidates(M: int = 2048, N: int = 2048, K: int = 2048,
                                dtype_size: int = 4,
                                min_grid: int = DEFAULT_MIN_GRID,
                                max_grid: int = DEFAULT_MAX_GRID,
                                verbose: bool = True,
                                grid_mul: Optional[int] = None,
-                               bk_cap: Optional[int] = None) -> List[Tuple[int, int, int]]:
+                               bk_cap: Optional[int] = None,
+                               bk_min: int = 16) -> List[Tuple[int, int, int]]:
     """生成 fp32 matmul 型算子的所有 L0 合法 (BM, BN, BK) 候选.
 
     约束:
@@ -114,7 +127,9 @@ def generate_matmul_candidates(M: int = 2048, N: int = 2048, K: int = 2048,
         while v * 2 <= bk_cap:
             v *= 2
         bk_max_val = min(bk_max_val, v)
-    bk_range = _pow2_range(16, bk_max_val)
+    # ★bk_min 保底 (flash_attention 用): BLOCK_K 是头维分块, BK<dim 只算部分头维 →
+    #   分数/输出数值错且计时偏快可能被误选. 传 bk_min=ceil_pow2(dim) 保证覆盖整个头维.
+    bk_range = _pow2_range(max(16, bk_min), bk_max_val)
 
     candidates = []
     total = 0
@@ -629,11 +644,14 @@ def sweep(op_dir: Path, quick: bool = False, out_dir: Optional[Path] = None,
         if op == "flash_attention":
             # ★flash: grid = ceil(seq/BM)×nheads (不是 ceil(N/BN); BN 是 key 块, 循环不占 grid);
             #   K 循环 = 头维 dim, BK>dim 无意义 → grid_mul=nheads, bk_cap=dim.
+            #   ★bk_min=ceil_pow2(dim): BK<dim 只算部分头维 → softmax 分数/输出错且计时偏快
+            #     (可能被误选为最优). 与 conv2d 的 "BLOCK_K ≥ K_OUT" 保底同理.
             seq = params.get("SEQ", 2048)
             nh = params.get("NHEADS", 8)
             dim = params.get("DIM", 64)
             candidates = generate_matmul_candidates(M=seq, N=seq, K=dim,
-                                                    grid_mul=nh, bk_cap=dim)
+                                                    grid_mul=nh, bk_cap=dim,
+                                                    bk_min=_ceil_pow2(dim))
         else:
             candidates = generate_matmul_candidates(M=M, N=N, K=K)
     elif meta["type"] == "conv2d":

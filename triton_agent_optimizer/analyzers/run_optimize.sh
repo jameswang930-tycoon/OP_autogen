@@ -71,7 +71,9 @@ if [ -n "$M" ] && [ -n "$N" ] && [ -n "$K" ]; then
 else
     echo "  [尺寸] 未指定 M/N/K → 用 kernel 源码 config 默认尺寸 (与 verify 同口径)"
 fi
-TIER=${TIER:-1}    # 当前优化阶段 1~6 (调度器传; 决定 07 筛哪层字段)
+TIER=${TIER:-2}    # 当前优化阶段 1~6 (调度器传; 决定 07 筛哪层字段)
+# ★修复: 旧默认 1 让 L222 的 "${TIER:-2}" 成为死代码 — 手工跑(不设 TIER)永远不会进 Tier2 融合.
+#   默认 2 才匹配 H3 注释"TIER 未设(=独立手工跑)默认走 2, 保持旧行为". 调度器路径总是显式传 TIER, 不受影响.
 # ★相对路径→绝对路径 (脚本内部 cd 换目录后, 相对路径会解析错位)
 case "$INPUT_DIR" in /*) ;; *) INPUT_DIR="$START_DIR/$INPUT_DIR";; esac
 case "$OUT" in /*) ;; *) OUT="$START_DIR/$OUT";; esac
@@ -150,7 +152,18 @@ except Exception:
     pass
 PYEOF
 )
-if [ "${#KERNELS[@]}" -eq 0 ]; then KERNELS=(matmul_kernel); echo "  ⚠ 无 kernel 名 → 回退 matmul_kernel"; fi
+if [ "${#KERNELS[@]}" -eq 0 ]; then
+  # ★修复: 不再静默回退 matmul_kernel — 无 kernel 名 = 应用没启动任何目标 kernel (最可能是
+  #   coder 改出的代码 triton 编译/运行失败). 静默回退会掩盖真因(崩溃 trace), 让下游 msprof op
+  #   按错误名采不到 → "找不到算子名"假象, 所有分析跟着失败.
+  #   直接打错退出 → scheduler 走采集失败重试/跳过, 真因留在 warmup.txt / task_run.txt 可查.
+  echo "  ❌ 未检测到任何目标 kernel (kernel 未启动: 应用崩溃或全部被框架过滤)"
+  echo "  ── warmup 输出尾部 (找崩溃原因) ──"
+  tail -20 "$OUT/05_task/warmup.txt" 2>/dev/null || true
+  echo "  ── 通用 msprof 输出尾部 ──"
+  tail -20 "$OUT/05_task/task_run.txt" 2>/dev/null || true
+  exit 1
+fi
 echo "  待采 kernel: ${KERNELS[*]}"
 
 IDX=0; BOARD_OK=0

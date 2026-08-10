@@ -14,6 +14,7 @@
   from bench_common import measure_msprof, measure_msprof_op
 """
 import csv
+import json
 import os
 import subprocess
 import sys
@@ -113,6 +114,85 @@ def measure_msprof_op(app_cmd: str, kernel_name: str,
         raise RuntimeError(f"msprof op 无 OPPROF: {tail.strip()[:300]}")
     board = parse_board(opprof)
     return board
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PyTorch 统一 msprof 测量 (pt_msprof.py 用) — 一次 msprof 同时算 端到端 + 纯kernel
+#  口径与 agents/verifier._read_durations 一致 → 两端(我们/PyTorch)可比:
+#    端到端   = Σ全部 kernel 行 (含 aclnn 框架) ÷ N
+#    纯kernel = Σ非 aclnn 行              ÷ N
+#  ⚠ 热身行要跳过 (app 内部 warmup+measure 次 launch; 每遍 kernel 数 = 总行数/(warmup+measure))
+# ═══════════════════════════════════════════════════════════════════════
+
+def _read_op_summary_rows(prof_out: Path) -> list:
+    """读 op_summary → [(op_name, dur_us), ...] 按行序 (launch 顺序)."""
+    summaries = sorted(prof_out.rglob("op_summary*.csv"))
+    if not summaries:
+        return []
+    try:
+        with open(summaries[0], encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return []
+    out = []
+    for row in rows:
+        dur = row.get("Task Duration(us)") or row.get("TaskDuration")
+        op = row.get("Op Name") or row.get("OpName") or ""
+        try:
+            d = float(dur)
+        except (TypeError, ValueError):
+            continue
+        out.append((op, d))
+    return out
+
+
+def measure_pytorch_msprof(app_cmd: str, out_json: Path, flops: float,
+                           measure: int = 30, warmup: int = 5,
+                           extras: dict = None) -> dict:
+    """把 PyTorch bench 包进**一次** msprof → 从 op_summary 同时算 端到端 + 纯kernel (÷measure),
+    连同 flops 写 out_json. 返回 metrics dict; 失败 (无 msprof/无 kernel) 返回 None (调用方回退 Event).
+    ★app 内部应 warmup + measure 次 launch (bench 脚本的 --warmup/--measure); 热身行跳过."""
+    try:
+        import shutil as _sh
+        msprof_out = out_json.parent / "msprof_pt"
+        _sh.rmtree(msprof_out, ignore_errors=True)
+        msprof_out.mkdir(parents=True, exist_ok=True)
+        cmd = ["msprof", f"--output={msprof_out}", f"--application={app_cmd}", "--ai-core=on"]
+        print(f"  [PT-msprof] 一次 msprof 采集 {app_cmd[:80]}...", flush=True)
+        subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        rows = _read_op_summary_rows(msprof_out)
+        total = len(rows)
+        if total < measure:
+            print(f"  ⚠ [PT-msprof] 仅 {total} 行 < measure({measure}) → 回退 Event", flush=True)
+            return None
+        k_per_iter = total / (warmup + measure)          # 每遍 kernel 数 (含框架)
+        skip = int(warmup * k_per_iter)
+        take = int(measure * k_per_iter)
+        measured = rows[skip:skip + take] if take else rows[skip:]
+        if not measured:
+            return None
+        all_us = sum(d for _, d in measured)
+        target_us = sum(d for op, d in measured if not op.lower().startswith("aclnn"))
+        e2e_us = all_us / measure
+        kernel_us = target_us / measure
+        e2e_s = e2e_us / 1e6
+        tflops = (flops / 1e12 / e2e_s) if e2e_s else None
+        data = {"tflops": round(tflops, 2) if tflops else None,
+                "time_us": round(e2e_us, 1),
+                "kernel_time_us": round(kernel_us, 1) if kernel_us else None,
+                "method": "msprof", "warmup": warmup, "measure": measure,
+                "rows_total": total, "rows_measured": len(measured),
+                # ★每遍 kernel 数: ≈1.0 = 已融合成单 kernel (工业级融合成功标志)
+                "kernels_per_iter": round(len(measured) / measure, 1) if measured else None}
+        if extras:
+            data.update(extras)
+        out_json.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"  [PT-msprof] 端到端 {e2e_us:.1f}us / 纯kernel {kernel_us:.1f}us (÷{measure}) → {out_json.name}",
+              flush=True)
+        return data
+    except Exception as e:
+        print(f"  ⚠ [PT-msprof] 失败: {str(e)[:150]} → 回退 Event", flush=True)
+        return None
 
 
 def flatten_per_path(board: dict) -> dict:

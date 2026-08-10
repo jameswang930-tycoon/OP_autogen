@@ -24,37 +24,47 @@ if str(_PROJECT_DIR) not in sys.path:
 #  v4: 只跑 msprof 端到端 (整文件) → 端到端耗时 → 加速比
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _read_target_duration(prof_out: Path) -> tuple:
-    """读 op_summary, 返回 (目标 kernel 非 aclnn 的 Task Duration(us) 之和, 行数).
-    ★求和 = 一次执行的端到端 (多 kernel 如 MLP: fc1+bias_gelu+fc2 求和);
-      KERNEL_LOOP=N 时行数=N×kernel数, 和=N×端到端 → 除 N 得单次.
+def _read_durations(prof_out: Path) -> tuple:
+    """读 op_summary, 一次同时返回两种口径的 Task Duration(us) 之和与行数:
+      (目标kernel(非aclnn)之和, 全部kernel(含aclnn框架)之和, 目标行数, 总行数).
+    ★纯 kernel 耗时 = 目标(非aclnn)之和; 端到端耗时 = 全部之和 (含 torch 框架 kernel).
+      KERNEL_LOOP=N 时 和=N×单次 → 除 N 得单次.
       msprof 合并同名连续 kernel 也不影响总和 (时间不丢), 故求和法稳健.
-      排除 aclnn 框架 kernel — 与 task.json total_ns (baseline) 口径一致."""
+      目标口径与 task.json total_ns (baseline) 一致; 端到端口径两端(我们/PyTorch)统一.
+      注: 端到端是 device 端到端 (所有 kernel 执行时间之和), 不含 host 侧 launch/gap;
+          两端同法, 故可比."""
     import csv as _csv
     summaries = sorted(prof_out.rglob("op_summary*.csv"))
     if not summaries:
-        return None, 0
+        return None, None, 0, 0
     try:
         with open(summaries[0], encoding="utf-8") as f:
             rows = list(_csv.DictReader(f))
     except Exception:
-        return None, 0
-    total_us, count = None, 0
+        return None, None, 0, 0
+    target_us, all_us = None, None
+    target_n = all_n = 0
     for row in rows:
         dur = row.get("Task Duration(us)") or row.get("TaskDuration")
         op = row.get("Op Name") or row.get("OpName") or ""
-        if dur and not op.lower().startswith("aclnn"):
-            try:
-                total_us = (total_us or 0) + float(dur)
-                count += 1
-            except ValueError:
-                pass
-    return total_us, count
+        if not dur:
+            continue
+        try:
+            d = float(dur)
+        except ValueError:
+            continue
+        if not op.lower().startswith("aclnn"):
+            target_us = (target_us or 0) + d
+            target_n += 1
+        all_us = (all_us or 0) + d
+        all_n += 1
+    return target_us, all_us, target_n, all_n
 
 
 def verify_end_to_end(kernel_op: Path, round_dir: Path,
                       baseline_ns: Optional[float] = None,
-                      num_kernels: Optional[int] = None) -> dict:
+                      num_kernels: Optional[int] = None,
+                      num_launches: Optional[int] = None) -> dict:
     """v4 验证: warmup + 一次 msprof 内循环 KERNEL_LOOP 次取平均 (整文件).
 
     策略 (与 bench_910b3 同技术, 取代旧的 3 次独立 msprof — 每次 msprof 有 ~1-2min 启动开销):
@@ -112,8 +122,8 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
                            encoding="utf-8", errors="backslashreplace", timeout=7200, env=env)
     except Exception as e:
         return {"ok": False, "error": f"msprof run failed: {e}"}
-    total_us, n_rows = _read_target_duration(msprof_out)
-    if total_us is None or n_rows < 1:
+    target_us, all_us, n_rows, n_all = _read_durations(msprof_out)
+    if target_us is None or n_rows < 1:
         tail = (r.stderr or "")[-800:] + (r.stdout or "")[-800:]
         return {"ok": False, "error": tail.strip() or "msprof 无目标 kernel"}
     # ★H1 自校正循环丢失: 从 kernel 源码判断 KERNEL_LOOP 循环是否还在.
@@ -128,21 +138,28 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
     if loop_ok:
         divisor = loop
     else:
-        nk = num_kernels or 1
-        divisor = max(1, int(round(n_rows / nk)))   # 实测有效遍数 (循环丢失时 = 1)
+        # ★修复: 除数用"每遍实际 launch 总数"而非去重 kernel 数.
+        #   op_summary 一行=一次 launch; 多 kernel 多 launch (如 attention_mlp 9次/遍, 去重只 5)
+        #   用去重数会高估遍数 → 单遍耗时被除多 → 加速比虚高 (如 ÷2). num_launches = Σ launch_count.
+        _lp = num_launches or num_kernels or 1
+        divisor = max(1, int(round(n_rows / _lp)))   # 实测有效遍数 (循环丢失时 = 1)
         print(f"    ⚠ 警告! kernel 源码无 KERNEL_LOOP 循环 (coder 弄丢?) "
               f"→ 用实测 {divisor} 遍平均, 不再 ÷{loop}")
-    per_pass_us = total_us / divisor
+    # ★两种口径同一次 op_summary 算出 (÷同一 divisor = 单次):
+    #   纯 kernel 耗时 = 目标(非aclnn)之和; 端到端耗时 = 全部(含框架)之和
+    per_pass_us = target_us / divisor          # 纯 kernel 单次
+    e2e_per_pass_us = (all_us or target_us) / divisor   # 端到端单次 (无框架行时退化为纯kernel)
     ns = per_pass_us * 1000
+    e2e_ns = e2e_per_pass_us * 1000
     # ★显式处理 baseline 缺失: 基准测量调用(baseline_ns=None)不算加速比 → None;
     #   轮次验证若 baseline 缺失 → None → 调度器告警, 不再静默当 1.0 (曾导致永远 1.000x)
     speedup = (baseline_ns / ns) if baseline_ns else None
-    print(f"    msprof 记录 {n_rows} 行目标 kernel (期望 ~{loop}×{num_kernels or '?'}), "
-          f"有效遍数={divisor}, 单次端到端={per_pass_us:.1f}us")
+    print(f"    msprof: 目标kernel {n_rows}行/全部 {n_all}行 (期望目标 ~{loop}×{(num_launches or num_kernels) or '?'}), "
+          f"有效遍数={divisor}, 纯kernel={per_pass_us:.1f}us 端到端={e2e_per_pass_us:.1f}us")
     # ★合理性告警: 行数远少于期望 → 循环丢失 或 msprof 严重漏记 (暴露, 不静默)
     if n_rows < loop:
         print(f"    ⚠ 警告! 目标 kernel 行数 {n_rows} < loop({loop}) "
-              f"(coder 丢掉了 KERNEL_LOOP 循环? 或 msprof 漏记) → 单次端到端可能不准, 加速比存疑!")
-    return {"ok": True, "ns": round(ns, 1),
+              f"(coder 丢掉了 KERNEL_LOOP 循环? 或 msprof 漏记) → 单次耗时可能不准, 加速比存疑!")
+    return {"ok": True, "ns": round(ns, 1), "e2e_ns": round(e2e_ns, 1),
             "speedup": round(speedup, 4) if speedup is not None else None,
             "loop": loop, "rows": n_rows, "duration_us": round(per_pass_us, 1)}

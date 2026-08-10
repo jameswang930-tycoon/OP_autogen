@@ -106,16 +106,16 @@ class FakePopen:
     def __getattr__(self, n):
         return getattr(self._p, n)
 
-def fake_verify(kernel_op, round_dir, baseline_ns=None, num_kernels=None):
+def fake_verify(kernel_op, round_dir, baseline_ns=None, num_kernels=None, num_launches=None):
     rd = str(round_dir)
     if "baseline" in rd:
-        return {"ok": True, "ns": BASELINE_NS, "speedup": 1.0, "loop": 30, "rows": 90,
-                "duration_us": BASELINE_NS/1000}
+        return {"ok": True, "ns": BASELINE_NS, "e2e_ns": BASELINE_NS, "speedup": 1.0,
+                "loop": 30, "rows": 90, "duration_us": BASELINE_NS/1000}
     m = re.search(r"round(\d+)", rd)
     rn = int(m.group(1)) if m else 1
     sp = SIM_SPEED.get(rn, 1.2)
     base = baseline_ns or BASELINE_NS
-    return {"ok": True, "ns": round(base / sp, 1), "speedup": sp,
+    return {"ok": True, "ns": round(base / sp, 1), "e2e_ns": round(base / sp, 1), "speedup": sp,
             "loop": 30, "rows": 90, "duration_us": round(base / sp / 1000, 1)}
 
 def fake_generate_v4(self, extracted, tier, history, kernel_code, round_num,
@@ -180,7 +180,8 @@ def part_a():
 
 # ═══════════ Part B: 全链路循环 ═══════════
 def part_b():
-    # F4: 临时写两个 pytorch 基准 (多 kernel 应选 MLP)
+    # F4: 临时写两个 pytorch 基准 — _sim_op 不在 PT_BENCH_MAP (非受支持算子)
+    #   → ★修复后不再回退到 matmul 基准 (避免 apples-to-oranges 误导), 应跳过 vs-PyTorch.
     (PROJ / "bench_910b3" / "pytorch_tflops.json").write_text(
         json.dumps({"tflops": 17.0}), encoding="utf-8")
     (PROJ / "bench_910b3" / "pytorch_mlp_tflops.json").write_text(
@@ -206,12 +207,13 @@ def part_b():
     assert st["baseline_ns"] == BASELINE_NS, st
     assert st["num_kernels"] == 3
     assert st["baseline_mnk"] == [2048, 2048, 2048], "尺寸记录"
-    assert st["pytorch_tflops"] == 42.0, f"F4 多kernel应选 MLP基准, got {st['pytorch_tflops']}"
-    assert st["pytorch_baseline"] == "pytorch_mlp_tflops.json", st
+    # ★修复: _sim_op 未映射 → 跳过 pytorch 基准, 不落误导的 matmul 数据
+    assert st.get("pytorch_tflops") is None, f"F4 _sim_op 未映射应跳过 pytorch 基准, got {st.get('pytorch_tflops')}"
+    assert st.get("pytorch_baseline") is None, st
     assert isinstance(st.get("initial_tflops"), (int, float))
     assert "current_kernel" in st
     print(f"[B] ✅ state: baseline_ns={st['baseline_ns']} mk={st['num_kernels']} "
-          f"initial_tflops={st.get('initial_tflops')} pytorch_tflops={st['pytorch_tflops']}(MLP基准)")
+          f"initial_tflops={st.get('initial_tflops')} pytorch=跳过(未映射, 修复后不回退 matmul)")
 
     # history 决策序列 (r1..r7 + r8跳过)
     dec = [(h["round"], h["tier"], h["decision"], h["result"]) for h in hist]

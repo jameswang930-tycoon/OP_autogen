@@ -167,7 +167,15 @@ def main():
     #    若缺 (旧式三文件 op) → 用 merge_single_file.py 生成一次
     kernel_op = op_dir / "kernel_op.py"
     if not kernel_op.exists():
-        merge(op_dir, kernel_op)
+        try:
+            merge(op_dir, kernel_op)
+        except Exception as e:
+            # ★修复: 旧式三文件目录缺 test 驱动/文件结构不完整时 merge 会抛异常 (如 FileNotFoundError),
+            #   不再让整个 main 崩溃出 traceback — 给清晰错误退出.
+            print(f"[ERROR] 合并旧式三文件失败: {e}")
+            print(f"  {op_dir} 不是标准的旧式三文件目录 (缺 test_matmul.py/test*.py/config.json), "
+                  f"或文件内容无法合并成 kernel_op.py")
+            return 1
     if not kernel_op.exists():
         print(f"[ERROR] 单文件不存在: {kernel_op}")
         return 1

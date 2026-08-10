@@ -131,17 +131,22 @@ def generate_matmul_candidates(M: int = 2048, N: int = 2048, K: int = 2048,
     #   分数/输出数值错且计时偏快可能被误选. 传 bk_min=ceil_pow2(dim) 保证覆盖整个头维.
     bk_range = _pow2_range(max(16, bk_min), bk_max_val)
 
+    # ★安全余量 ×0.9 对 L0A/L0B/L0C 也生效: 贴边界候选 (如 BN×BK 正好=L0B) 会 OOM 打崩设备
+    #   (报 "575:NPU function error: Aclrt" + 设备被污染, 后续候选全挂)
+    L0A_LIM = int(L0A_MAX * 0.9)
+    L0B_LIM = int(L0B_MAX * 0.9)
+    L0C_LIM = int(L0C_MAX * 0.9)
     candidates = []
     total = 0
     for bm in bm_range:
-        # BN 上限受 L0C 约束: bm×bn ≤ L0C_MAX
+        # BN 上限受 L0C 约束: bm×bn ≤ L0C (留余量)
         for bn in bn_range:
-            if bm * bn > L0C_MAX:
+            if bm * bn > L0C_LIM:
                 continue
             bm_bn = bm * bn
-            # BK 上限受 L0A 和 L0B 约束
+            # BK 上限受 L0A 和 L0B 约束 (留余量)
             for bk in bk_range:
-                if bm * bk > L0A_MAX or bn * bk > L0B_MAX:
+                if bm * bk > L0A_LIM or bn * bk > L0B_LIM:
                     continue
                 total += 1
                 # UB 约束 (3 缓冲: A tile + B tile + C tile)
@@ -272,6 +277,18 @@ def _build_runner_body(module_code: str, setup: str, cands_json: str,
 
     print(f"[sweep] {{n_total}} candidates, warmup={{WARMUP}}, loop={{LOOP}}", flush=True)
 
+    # ★增量保存: 每测完一个候选就写结果文件 — 设备级致命错误会杀进程, 不保存则已测的好结果全丢
+    out_path = os.environ.get("SWEEP_OUTPUT", "sweep_result.json")
+    def _save_partial():
+        try:
+            _v = [r for r in results if r.get("ns")]
+            json.dump({{"total_candidates": n_total, "valid": len(_v),
+                       "errors": len(results) - len(_v), "warmup": WARMUP, "loop": LOOP,
+                       "results": results}},
+                      open(out_path, "w"), ensure_ascii=False, indent=1)
+        except Exception:
+            pass
+
     # ★复用单个 Event 对: 每候选新建会累积 ACL Event 资源 → 数百候选后 aclrtCreateEvent 失败
     #   (报 "575:NPU function error: Aclrt"). 设备级错误后重建 Event 对 + sync 恢复.
     ev_s = torch.npu.Event(enable_timing=True)
@@ -306,7 +323,9 @@ def _build_runner_body(module_code: str, setup: str, cands_json: str,
                 pass
             if consecutive_err >= 5:
                 print("  [sweep] ⛔ 连续 5 个候选设备错误 (某 BLOCK 可能打崩设备) → 提前停止", flush=True)
+                _save_partial()   # 停之前保存已测结果
                 break
+        _save_partial()   # ★每候选保存一次 (即使 fatal 杀进程, 已测的也在文件里)
 
     valid = [r for r in results if r.get("ns")]
     errs  = [r for r in results if not r.get("ns")]

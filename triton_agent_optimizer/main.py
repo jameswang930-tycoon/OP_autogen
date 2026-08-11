@@ -34,8 +34,12 @@ LLM 调用（服务器无 Claude API, 用本地 codeagent）:
      LLM_CLI_COMMAND="nga run" python3 main.py input/flash_attention --fresh --max-rounds 30   # 多头因果 flash (Tier1 因果剪枝)
      # ── 归约 / 逐元素 (访存 + 计算优化) ──
      LLM_CLI_COMMAND="nga run" python3 main.py input/rms_norm --fresh --max-rounds 30          # RMSNorm 归约 (Tier4/5)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/rms_norm_residual --fresh --max-rounds 30  # RMSNorm+残差 (Tier2 残差并入/Tier4)
      LLM_CLI_COMMAND="nga run" python3 main.py input/layernorm --fresh --max-rounds 30         # LayerNorm 两遍扫 (Tier1 单遍合并)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/softmax --fresh --max-rounds 30           # 行级 softmax 归约 (Tier4/5)
      LLM_CLI_COMMAND="nga run" python3 main.py input/sigmoid --fresh --max-rounds 30           # 纯逐元素 sigmoid (Tier5 原生指令)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/vector_add --fresh --max-rounds 30        # 逐元素加法 (Tier4 连续化/Tier5)
+     LLM_CLI_COMMAND="nga run" python3 main.py input/fused_add_mul --fresh --max-rounds 30     # (x+z)*w 逐元素链 (Tier2 融合/Tier5)
      # ── 卷积族 (算法 im2col + 融合) ──
      LLM_CLI_COMMAND="nga run" python3 main.py input/conv2d --fresh --max-rounds 30            # 卷积 (Tier1 im2col 走 cube)
      LLM_CLI_COMMAND="nga run" python3 main.py input/conv_bias_relu --fresh --max-rounds 30    # conv+bias+relu 3kernel (Tier2 融合)

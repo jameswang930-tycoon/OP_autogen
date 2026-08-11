@@ -129,6 +129,38 @@ def _keep_floor() -> float:
     return float(os.environ.get("KEEP_FLOOR", "1.01"))
 
 
+# ★设备级错误签名 (与 sweep_blocks._is_device_error 同源):
+#   kernel 运行时崩 AICore (HIVM root-alloc / OOM / 非法指令) → 报这类错 → 设备可能被污染.
+#   污染的设备下一轮 msprof 采集会"找不到 kernel"(op_summary 空) → 莫名采集失败.
+_DEV_ERR_KEYS = ("aclrt", "aclerror", "npu function error", "575", "synchronizedevice",
+                 "aicore", "acl error", "device error", "ecc error", "out of memory",
+                 "root alloc", "hivm.hir")
+
+
+def _is_device_error(s: str) -> bool:
+    """文本是否含设备级错误签名 (verify/采集 失败时用来判断要不要重置设备)."""
+    s = (s or "").lower()
+    return any(k in s for k in _DEV_ERR_KEYS)
+
+
+def _reset_device() -> bool:
+    """★设备重置: 起独立子进程 sync + empty_cache, 清掉上一轮崩溃留下的设备污染.
+    真硬件级 poison (AICore hung) 可能需要驱动级重置 (npu-smi / 重启进程), 这步清不掉时会返回 False.
+    返回 True=重置子进程正常跑完 (不保证彻底清干净)."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            [sys.executable or "python3", "-c",
+             "import torch, torch_npu; "
+             "torch.npu.synchronize(); torch.npu.empty_cache(); "
+             "print('device reset OK')"],
+            capture_output=True, text=True, timeout=120,
+            encoding="utf-8", errors="backslashreplace")
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _extract_mnk(code: str):
     """从 kernel_op.py ①config 区提取 M/N/K (默认值) → (M,N,K) 或 None。"""
     vals = {}
@@ -1116,6 +1148,7 @@ class Scheduler:
 
         total_start = time.time()
         coll_fail = 0   # ★H2: 连续采集失败计数 (失败重试/跳过, 不是一停到底)
+        _dev_poisoned = False   # ★设备污染标志: verify 崩了 AICore → 下轮采集前先重置设备
         total_rounds = st.get("total_rounds", 0)
         # ★D7: 总预算 = max_rounds + 已用 promote 额度 (promote 轮免费, 不挤占有效优化轮)
         while total_rounds < self.max_rounds + int(st.get("promote_budget", 0)):
@@ -1132,10 +1165,35 @@ class Scheduler:
                     and rn % rebase_every == 0):
                 self._maybe_rebaseline(tier, rn)
 
+            # ★设备污染恢复: 上一轮 verify 崩了 AICore (HIVM/OOM/非法指令) → 设备可能被污染,
+            #   本轮 msprof 会"找不到 kernel"(op_summary 空) → 莫名采集失败. 采集前先重置设备.
+            if _dev_poisoned:
+                print("  [设备] ⚠ 检测到上一轮 verify 崩溃 (设备可能污染) → 重置设备后再采集...")
+                _ok = _reset_device()
+                print(f"  [设备] 重置 {'完成' if _ok else '子进程异常 (真硬件 poison 可能需 npu-smi/重启进程)'}")
+                _dev_poisoned = False
+
             # ① 采集+解析 (run_optimize 自动产出 07_tier{N}_fields)
             _t0 = time.time()
             diagnosis = self._run_optimize(round_dir, tier)
             if not diagnosis:
+                # ★采集失败诊断: surface 真正原因 (run_optimize 把崩溃 trace 写在 warmup.txt/task_run.txt)
+                #   最常见 = 上轮 verify 崩了 AICore 污染设备 / 当前 kernel 运行时崩溃
+                _wf = round_dir / "05_task" / "warmup.txt"
+                _tf = round_dir / "05_task" / "task_run.txt"
+                _wt = _wf.read_text(encoding="utf-8", errors="replace")[-400:] if _wf.exists() else ""
+                _tt = _tf.read_text(encoding="utf-8", errors="replace")[-400:] if _tf.exists() else ""
+                _last_err = (self.traj["history"][-1].get("error", "") if self.traj["history"] else "")
+                if _is_device_error(_wt + _tt + _last_err):
+                    print("  [诊断] ★采集失败原因: 设备级错误 (aclrt/575/HIVM/OOM) — 上轮 verify 崩了 AICore, "
+                          "设备被污染 → msprof 采不到 kernel. 下轮起会自动重置设备.")
+                    _dev_poisoned = True
+                else:
+                    print(f"  [诊断] 采集失败 — warmup/msprof 未见目标 kernel. 可能 kernel 运行时崩溃/msprof 漏采.")
+                if _wt.strip():
+                    print(f"  ── warmup.txt 尾部 ──\n{_wt.strip()[-300:]}")
+                if _tt.strip():
+                    print(f"  ── task_run.txt 尾部 ──\n{_tt.strip()[-300:]}")
                 # ★H2: 采集失败不再一票否决整个 run — 先重试同轮 1 次,
                 #   仍失败则跳过本轮(沿用当前 kernel 进下一轮), 连续 3 次才停
                 coll_fail += 1
@@ -1504,7 +1562,13 @@ class Scheduler:
                         self._save_traj()
                         break
                     prev_err = v.get("error", "unknown error")
-                    print(f"  ⚠ 运行失败(第{attempt+1}次): {prev_err[:200]}... 回传 Coder 同轮改")
+                    # ★verify 崩了 AICore (设备级错误) → 标记设备污染, 下轮采集前重置
+                    #   (否则下轮 msprof 在污染设备上"找不到 kernel" → 莫名采集失败链)
+                    if _is_device_error(prev_err):
+                        _dev_poisoned = True
+                        print(f"  ⚠ 运行失败(第{attempt+1}次) [设备级错误]: {prev_err[:200]}... → 标记设备污染, 下轮采集前重置")
+                    else:
+                        print(f"  ⚠ 运行失败(第{attempt+1}次): {prev_err[:200]}... 回传 Coder 同轮改")
                 if v is None:
                     # ★3次都是 coder 应用失败 → 本轮 FAIL (不产生假 speedup), 错误已在 prev_err → history
                     # ★Bug 9: 用 prev_speedup 而非假 1.0, 否则 history 出现假掉点 + no_improve 误计

@@ -1,12 +1,12 @@
 # Triton Agent Optimizer — 完整架构设计 (v4.2)
 
-> **核心差异化优势**：不靠盲试（AutoKernel 300~400 轮），用 **真机 msprof + msprof op** 精确诊断瓶颈（真实带宽/L2/算力/冲突），6 层策略按「结构影响从大到小」逐轮优化，每轮只看**当前策略需要的字段**，Planner（笨 LLM）定方向、Coder **确定性改码**、**只用 msprof 端到端验证加速比**。
+> **核心差异化优势**：不靠盲试（AutoKernel 300~400 轮），用 **真机 msprof + msprof op** 精确诊断瓶颈（真实带宽/L2/算力/冲突），6 层策略按「结构影响从大到小」逐轮优化，每轮只看**当前策略需要的字段**，Planner（笨 LLM）定方向、Coder **确定性改码**、**msprof 端到端验证加速比 + Event 设备侧计时**（工业级绝对端到端）。
 >
 > **数据源 = 真机双源**：① 通用 `msprof`（骨架：kernel 数/耗时/形状/launch/L2）+ ② 逐 kernel `msprof op`（深层：真实带宽/引擎利用率/算力/冲突）→ `integrate.py` 按 kernel 名合并 → `diagnosis.json`（roofline 核心）。
 >
 > **环境**：Ascend 910B3（保密服务器，只能 paste-in）+ CANN 8.5.1 / triton-ascend 3.2.0 / torch_npu 2.9.0。
 > **LLM 调用**：服务器无 Claude API，用本地 codeagent：`echo "<prompt>" | nga run`（`LLM_CLI_COMMAND="nga run"`）。
-> **更新**：2026-08-10 — v4.2：sweep 每轮传 planner + 严格晋升/回退/手递 + 优秀案例 + Unicode 清洗 + 10 算子 + 自动 bench/chart。
+> **更新**：2026-08-11 — v4.3：① bench 全切 Event（工业级+PyTorch，不用 msprof）② 迭代每轮补 Event e2e_event_ns ③ 严格最优 KEEP（>best_speedup）+ best_kernel 绑定 + 失败回滚 ④ sweep 每 tier3 round 都跑 ⑤ 设备污染检测+重置 ⑥ vs_industrial 比值 + strategy_summary。
 
 ---
 
@@ -19,12 +19,14 @@
 | **kernel 链** | round1 读源文件，roundN 读上一轮成功输出；**源文件永不修改**；失败不提交 |
 | **每轮只看该策略字段** | 6 层策略各有自己的数据段（50 字段），Planner 只喂当前层要的 |
 | **确定性改码** | Planner 输出 `changes[]`（old_code→new_code 逐字符匹配），Coder 精确替换 + Unicode 清洗，找不到就报告不猜 |
-| **sweep 分块地基** | round1 自动枚举全部 L0 合法 BLOCK 候选, 真机实测选最优 → 每轮传给 planner (含真实状态) |
-| **验证 = 正确性 + msprof** | 先 MATMUL_VERIFY 正确性校验 (对 torch 参考), 再 msprof 端到端测时 → 加速比 |
+| **sweep 分块地基** | round1 + **每个 tier3 round** 自动枚举全部 L0 合法 BLOCK, 在 best_kernel.py 上实测选最优 → 每轮传 planner |
+| **验证 = 正确性 + msprof + Event** | MATMUL_VERIFY 校验 → msprof 端到端测速比 + Event 设备侧 e2e_event_ns (工业级绝对值) |
+| **严格最优 KEEP** | 本轮 speedup **> 历史最高 best_speedup** 才进链; 绑定 best_kernel/best_round + 复制 best_kernel.py; 失败/回退回滚轮首快照 |
+| **设备污染恢复** | verify 崩 AICore (HIVM/OOM/575) → 下轮采集前自动重置设备 (修 msprof 采不到 kernel 级联) |
 | **严格晋升 + 可回退** | planner promote 必须给数据依据 (promote_evidence); 支持回退前层; 防死循环 (同路径≥3次拒绝) |
 | **跳转手递** | 跨 tier 跳转时, 当前 planner 写 10_tier_handoff.json (瓶颈+方向) → 目标 tier planner 读 |
 | **优秀案例** | 单轮相对上一最优 >1.3× 加速 → 自动记 memory/tier{N}_cases.json, 后续 planner 参考 |
-| **自动 bench + 图表** | 缺 PyTorch 基准时自动跑 bench; 优化结束自动生成轨迹图 (vs-PyTorch 时间对比) |
+| **自动 bench + 图表** | 缺 PyTorch 基准自动跑 (Event); 每轮自动出策略摘要; 结束自动轨迹图 + vs_industrial 比值 |
 
 ---
 
@@ -40,41 +42,44 @@ main.py input/matmul [--fresh] [--resume] [--max-rounds N] [--target X]
              └─ integrate → diagnosis.json (roofline)
         ② _diagnose → 写 roundN/07_tier{N}_fields/ (当前 tier 筛字段)
         ③ (tier2) _run_fusion → roundN/08_fusion/ (HIVM MLIR + nga 融合分析)
-        ④ sweep (round1 或 tier3+hash变):
-             ├─ 程序化枚举全部 L0 合法 BLOCK → 09_tier3_sweep/
+        ④ sweep (round1 + 每个 tier3 round 都跑):
+             ├─ 在 best_kernel.py (历史最优) 上程序化枚举 L0 合法 BLOCK → 09_tier3_sweep/
              ├─ 单进程 torch.npu.Event 实测 → 最优写入 round_dir/kernel_op.py
-             └─ 结果持久化 st["last_sweep_result"] → 每轮传 planner (含状态)
+             └─ 结果持久化 st["last_sweep_result"] + history 记 sweep_ran/sweep_adopted
         ⑤ _plan (planner) → roundN/plan.md
              读: 07字段 + planner_context.json + 轨迹 + 手递 + sweep数据 + 优秀案例
              出: changes[] + promote(需evidence) + handoff(跳转给目标tier)
         ⑥ _code (coder 确定性替换 + Unicode 清洗) → roundN/kernel_op.py + diff.patch
-        ⑦ verify (正确性校验 + msprof 端到端) → 加速比 vs 初始基准
-        ⑧ 记录 + 决策: 严格晋升/回退(防死循环)/停止 + 优秀案例 + 手递
-      结束: 自动跑 PyTorch bench (AUTO_RUN_PT_BENCH) + 自动生成轨迹图 (AUTO_CHART)
+        ⑦ verify (正确性校验 + msprof 端到端 + Event e2e_event_ns) → ★严格最优 KEEP (>best_speedup)
+        ⑧ 记录 + 决策: 严格最优/回滚/晋升(防死循环)/停止 + 优秀案例 + 手递 + 设备污染检测
+      每轮: strategy_summary → final_output/{all,successful}_strategies.md
+      结束: 自动跑 PyTorch bench (Event) + 自动轨迹图 + vs_industrial_ratio
 ```
 
 ---
 
-## 1.5 三种测量方法对照
+## 1.5 测量方法对照（msprof 诊断 + Event 工业级绝对值，双轨）
 
 | 场景 | 工具 | 方式 | 为什么 |
 |---|---|---|---|
-| **sweep 分块扫描** | `torch.npu.Event` | 单进程, 每候选预热3次+计时10次取平均 | 快速筛选77个候选(几分钟); 只需相对排序, 不需绝对精度 |
-| **PyTorch bench** | `torch.npu.Event` | 一次窗口30次forward÷30 | 与sweep同口径, 保证bench和sweep可比 |
-| **verifier 每轮验证** | **msprof** | 一次msprof内KERNEL_LOOP=30遍, op_summary求和÷30 | 精确绝对值 + 深度profiling(带宽/引擎/冲突); 最终加速比以此为准 |
+| **sweep 分块扫描** | `torch.npu.Event` | 单进程, 每候选预热+窗口计时取平均 | 快速筛候选(几分钟); 只需相对排序 |
+| **PyTorch/工业级 bench** | `torch.npu.Event` | warmup + 一次窗口包 measure 次 ÷measure | ★工业级设备侧绝对值(无 profiler 扰动), 两端同口径 |
+| **verifier 每轮验证** | **msprof + Event** | msprof KERNEL_LOOP=30 遍(op_summary 求和÷30) 给 ns/e2e_ns; 另注入 Event 给 e2e_event_ns | msprof 给纯kernel拆解+诊断; Event 给工业级绝对端到端 |
 
-**为什么sweep不用msprof?** msprof按kernel名合并, 77个候选用同一个kernel函数名 → 无法区分不同BLOCK的耗时。torch.npu.Event在runner内部逐候选计时, 不受此限制。两种方法都是设备级计时(非CPU侧), 相对排序一致。sweep选出最优BLOCK后, verifier用msprof重新测——最终加速比以verifier为准。
+**为什么 Event 是工业级主测?** msprof 带 profiler 挂载开销(绝对值偏高, 但跨轮一致→相对 speedup 用它); `torch.npu.Event` 是设备侧事件计时(无扰动, 官方/NVIDIA/vLLM-Ascend 标准), 最终报告绝对 latency 用它。两者并存: msprof 拆解, Event 权威。
 
-**sweep和bench口径一致**(都用Event), **verifier用msprof**(更精确)。sweep只需"哪个BLOCK最快"的相对排序, 不需匹配verifier的绝对ns。
+**口径**: 相对 speedup 用 msprof (`baseline_e2e_ns/e2e_ns`); 绝对 latency 用 Event (`e2e_event_ns`, 轨迹图/工业级对比都用 Event-Event 同口径)。
 
 ---
 
 ```
-┌─ kernel 链 (采纳/回退) ──────────────────────────────────────────────┐
+┌─ kernel 链 (★严格最优 采纳/回退) ──────────────────────────────────┐
 │ round1: current_kernel = input/<op>/kernel_op.py (源, 永不改)       │
-│ roundN: current_kernel = 上一个**被采纳**的 kernel                    │
-│  采纳 = 本轮 speedup ≥ 上一被采纳版 (speedup 输出=初始基线/本轮,累计) │
-│  REVERT(变慢) / FAIL(≤3次重试) : 不提交, 沿用上一个被采纳版(上上个)  │
+│ roundN: current_kernel = 历史最高加速比那轮 (best_kernel, 严格最优)  │
+│  ★采纳 = 本轮 speedup > best_speedup (历史最高) — 优化必须超越最优   │
+│  采纳时同步 best_kernel/best_round + 复制 best_kernel.py            │
+│  REVERT(不达最高)/FAIL(≤3次重试) : 回滚轮首快照, 沿用历史最优       │
+│  设备污染(verify 崩 AICore) → 下轮采集前 _reset_device              │
 └──────────────────────────────────────────────────────────────────────┘
            │
            ▼
@@ -99,11 +104,16 @@ _code (coder 确定性):
   (old_code 找不到 → 报告, 不猜; NOOP 标记)
            │
            ▼
-verify: msprof 跑 roundN/kernel_op.py (warmup + 3轮平均)
-  speedup = baseline_ns / ns   (baseline = round1 采集的原始 kernel)
+verify: 正确性校验(MATMUL_VERIFY) → msprof 跑 (warmup + KERNEL_LOOP 平均)
+        + Event 注入计时 → e2e_event_ns
+  speedup = baseline_e2e_ns / e2e_ns   (严格最优: > best_speedup 才 KEEP)
            │
            ▼
-记录 hist + 晋升 (planner.promote / 3轮无改进 / 达标 / tier6停)
+记录 hist (+ e2e_event_ns/sweep_ran/sweep_adopted) + 晋升 (planner.promote / 3轮无改进 / 达标 / tier6停)
+           │
+           ▼
+每轮产出 strategy_summary → final_output/{all,successful}_strategies.md
+最终: vs_industrial_ratio = 我们最优Event / 工业级Event (优化效果终极指标)
 ```
 
 ---
@@ -196,9 +206,12 @@ echo "你是 Triton 优化 Planner。先调用 skill: skills/triton-op-planner/S
 | `VERIFY_LOOP` | 30 | 一次 msprof 内 kernel 内部循环次数 (÷N 取单次) |
 
 ### 6.5 加速比
-- **加速比 = 时间比**：`baseline_time / current_time`
+- **加速比 = 时间比**：`baseline_time / current_time`（msprof 端到端口径）
 - **端到端耗时 = 目标 kernel (非 aclnn) Task Duration 之和**（多 kernel 如 MLP: fc1+bias_gelu+fc2 求和才是总耗时; 单 kernel 即本身; baseline 与 verify 同口径）
 - baseline = round1 采集的原始 kernel 端到端; current = 本轮验证 msprof 端到端
+- **★严格最优 KEEP**：本轮 `speedup > best_speedup`（历史最高）才进链；`best_speedup` 绑定 `best_kernel`/`best_round` + 复制 `best_kernel.py`
+- **Event 绝对端到端**：每轮另测 `e2e_event_ns`（`torch.npu.Event` 设备侧），与 msprof 并列；工业级基准对比用它
+- **vs_industrial_ratio**：我们最优 Event / 工业级最优 Event（<1=快于工业级）
 - 图上 TFLOPS = 诊断 cube_fops 总和 / baseline_ns（多 matmul 正确, 非 2MNK 单算）
 - vs PyTorch = 我们算力 / torch.matmul 算力
 
@@ -214,10 +227,10 @@ echo "你是 Triton 优化 Planner。先调用 skill: skills/triton-op-planner/S
 ### agents（智能体层）
 | 文件 | 作用 |
 |---|---|
-| `scheduler.py` | 状态机：kernel 链、tier 字段提取、hist 记录、NOOP 检测、晋升决策 |
+| `scheduler.py` | 状态机：kernel 链（严格最优 KEEP + best_kernel 绑定 + 失败回滚）、tier 字段提取、hist 记录、NOOP 检测、晋升决策、设备污染检测+重置、vs_industrial 比值 |
 | `planner.py` | `generate_v4`：读文件路径(不嵌入内容)，输出 changes[] + promote |
-| `coder.py` | 确定性 changes[] 替换 + BOM/垃圾清理 + 防截断校验 |
-| `verifier.py` | `verify_end_to_end`：warmup + 3 轮 msprof 平均 |
+| `coder.py` | 确定性 changes[] 替换 + Unicode 清洗（含制表符）+ 保 header + failed_kernel.py 留证 |
+| `verifier.py` | `verify_end_to_end`：正确性校验 + msprof 双口径 + ★Event e2e_event_ns（注入 KERNEL_LOOP） |
 | `llm_client.py` | `echo '<prompt>' | nga run` + 实时流式输出（API/CLI/stub 三模式，CLI 优先） |
 
 ### analyzers（采集解析层）
@@ -238,11 +251,11 @@ echo "你是 Triton 优化 Planner。先调用 skill: skills/triton-op-planner/S
 ### docx（知识库）
 `OPTIMIZATION_METHODOLOGY.md`（6层方法论）/ `msprof_fields_reference.md`（字段来源）/ `aggregation_rules.md`（聚合规则）/ `final_product_spec.md`（产物规格）/ `field_extraction_checklist.md`（缺字段核对）/ `playbook_tier1~6.md`（改码教程）。
 
-### bench_910b3（硬件基准套件）
-`bench_kernels.py`（6个测速 kernel）/ `bench_common.py`（msprof 测量工具）/ `run_bench.py`（自动跑+算+输出）/ `bench_pytorch.py`（PyTorch 基准线）。
+### bench_910b3（硬件基准套件，★全 Event 设备侧计时）
+`bench_industrial.py`（工业级基准 eager/compile/cann-fused/fa）/ `bench_all.py`（全算子取最优）/ `bench_pytorch*.py`（PyTorch 基准线，自带 Event）/ `bench_common.py`（msprof 诊断工具）/ `run_bench.py`（硬件峰值校准）/ `bench_kernels.py`（6个测速 kernel）。
 
 ### 其他
-`feedback/trajectory_chart.py`（v4 轨迹图）/ `input/matmul/kernel_op.py`（单文件源）。
+`feedback/trajectory_chart.py`（v4 轨迹图）/ `feedback/strategy_summary.py`（每轮策略摘要，final_output/{all,successful}_strategies.md）/ `input/matmul/kernel_op.py`（单文件源）。
 
 ---
 
@@ -301,6 +314,16 @@ cat <round_dir>/06_diagnosis/diagnosis.json
   - 硬件基准套件 bench_910b3 + PyTorch 基准线
   - 轨迹图 v4 兼容
   - 全部提交 commit `2c53616`
+- **08-10 (v4.2)**：端到端口径统一（纯kernel+E2E 双指标，主=E2E）+ 工业级基准（各 mode 取 min）+ 基准产物收纳 outputs/ + 严格晋升/回退/手递 + 优秀案例。
+- **08-11 (v4.3)**：
+  - ★bench 全切 Event 设备侧计时（industrial/PyTorch，不用 msprof；删 pt_msprof.py）
+  - ★迭代每轮补 Event `e2e_event_ns`（verify 注入 KERNEL_LOOP，工业级绝对值；原 msprof 字段全保留）
+  - ★严格最优 KEEP（`> best_speedup`）+ best_kernel/best_round 绑定 + 复制 best_kernel.py + 失败回滚（修 sweep 交叉 bug / input 链断裂）
+  - sweep 每个 tier3 round 都跑（去 hash 跳过）+ 在 best_kernel 上扫 + BLOCK 匹配容错
+  - 设备污染检测 + 重置（修 msprof 采不到 kernel 的采集失败级联）
+  - vs_industrial_ratio（我们最优 Event / 工业级 Event）+ strategy_summary 每轮策略摘要
+  - coder 制表符/header 保护 + failed_kernel.py 留证
+  - main.py 注释补齐全部 14 算子运行命令
 
 ---
 

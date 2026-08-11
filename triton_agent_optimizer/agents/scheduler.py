@@ -1338,7 +1338,10 @@ class Scheduler:
                     try:
                         _d = json.loads(_p.read_text(encoding="utf-8"))
                         _t = _d.get("time_us")
-                        if _t and (_best_t is None or _t < _best_t):
+                        # ★只认"真正执行"的 mode (与 bench_all 同逻辑): compile 回退成 eager 时
+                        #   actual_mode≠mode → 跳过, 否则回退的重复测量可能噪声性地顶替成最优.
+                        _actual = _d.get("actual_mode", _m)
+                        if _t and _actual == _m and (_best_t is None or _t < _best_t):
                             _best_t, _best_k, _best_file = _t, _d.get("kernel_time_us"), _f
                     except Exception:
                         pass
@@ -1346,8 +1349,8 @@ class Scheduler:
                     st["industrial_time_us"] = _best_t
                     st["industrial_kernel_time_us"] = _best_k
                     st["industrial_baseline"] = _best_file
-                    print(f"  [工业级] 基准 {_best_file} ({'/'.join(_ind_modes)} 取 min): "
-                          f"e2e={_best_t}us kernel={_best_k}us")
+                    print(f"  [工业级] 基准 {_best_file} ({'/'.join(_ind_modes)} 取 min, 仅真执行): "
+                          f"e2e={_best_t}us (Event) kernel={_best_k}us")
                 else:
                     print(f"  ⚠ 缺工业级基准 (跑 python3 bench_910b3/bench_industrial.py {self.kernel_name} "
                           f"--mode {'fa' if self.kernel_name == 'flash_attention' else 'eager / compile'} "
@@ -1739,11 +1742,42 @@ class Scheduler:
         _cur_ns = round(_bs / _last_ks, 1) if (_bs and _last_ks) else None
         _prom = st.get("promote_budget", 0)
         _n_eff = st.get("total_rounds", 0) - _prom
+        # ★vs 工业级比值: 我们最优 kernel 的端到端(Event) / 工业级最优端到端(Event).
+        #   取 best_round 那轮的 e2e_event_ns (历史最高加速比的代码的 Event 实测);
+        #   工业级 = st["industrial_time_us"] (bench_all 各 mode 取 min, Event).
+        #   ratio < 1 → 我们比工业级快; > 1 → 慢. 这是"优化效果"的终极指标.
+        _best_round = st.get("best_round")
+        _our_best_evt_ns = None
+        if _best_round:
+            _bh = next((h for h in self.traj.get("history", [])
+                        if h.get("round") == _best_round), None)
+            if _bh:
+                _our_best_evt_ns = _bh.get("e2e_event_ns")
+        # 兜底: 用 baseline_e2e_event_ns / best_speedup 反推
+        if _our_best_evt_ns is None and st.get("baseline_e2e_event_ns") and st.get("best_speedup"):
+            _our_best_evt_ns = round(st["baseline_e2e_event_ns"] / st["best_speedup"], 1)
+        _ind_us = st.get("industrial_time_us")
+        _vs_ind_ratio = None
+        _vs_ind_speedup = None   # 工业级/我们 (>1 = 我们更快, 与 speedup 同方向, 更直观)
+        if _our_best_evt_ns and _ind_us:
+            _ind_ns = _ind_us * 1000.0
+            _vs_ind_ratio = round(_our_best_evt_ns / _ind_ns, 3)          # 我们/工业级
+            _vs_ind_speedup = round(_ind_ns / _our_best_evt_ns, 3)        # 工业级/我们
+            st["vs_industrial_ratio"] = _vs_ind_ratio
+            st["our_best_e2e_event_ns"] = _our_best_evt_ns
         print(f"\n══ 完成: best_speedup={st.get('best_speedup')}x (端到端口径) ══")
         print(f"  [产出] 总执行 {st.get('total_rounds', 0)} 轮 (含 {_prom} 次 promote, 有效优化 {_n_eff} 轮), "
               f"总耗时 {time.time()-total_start:.0f}s")
         print(f"  [产出] ★端到端: baseline {_be2e}ns → 当前 {_cur_e2e}ns, 加速比 {_cs}x (best {st.get('best_speedup')}x)")
         print(f"  [产出] 纯kernel: baseline {_bs}ns → 当前 {_cur_ns}ns, 加速比 {_last_ks if _last_ks is not None else '?'}x")
+        # ★vs 工业级比值 (优化效果终极指标, 两端都 Event 同口径)
+        if _vs_ind_ratio is not None:
+            _verdict = ("✓ 快于工业级" if _vs_ind_speedup > 1 else "✗ 慢于工业级")
+            print(f"  [产出] ★vs工业级: 我们最优 {_our_best_evt_ns}ns / 工业级最优 {_ind_us}us "
+                  f"(Event) = {_vs_ind_ratio}x  → 工业级/我们 = {_vs_ind_speedup}x  {_verdict}")
+        else:
+            print(f"  [产出] vs工业级: 缺数据 (我们 Event={_our_best_evt_ns}, 工业级={_ind_us}us) — "
+                  f"跑 bench_all 或开 AUTO_RUN_PT_BENCH")
         print(f"  [产出] 最终 kernel 文件 → {st.get('current_kernel')}")
 
         # ★自动生成轨迹图 (优化结束后; 失败/无 matplotlib 不阻断). env AUTO_CHART=0 关闭.
@@ -1787,8 +1821,13 @@ class Scheduler:
                     "effective_rounds": _n_eff,
                     # ★两种口径: 端到端(主) + 纯kernel(参考)
                     "baseline_ns": _bs, "final_ns": _cur_ns,            # 纯 kernel
-                    "baseline_e2e_ns": _be2e, "final_e2e_ns": _cur_e2e, # 端到端
-                    "industrial_time_us": st.get("industrial_time_us"), # 工业级基准 (torch.compile/CANN-FA)
+                    "baseline_e2e_ns": _be2e, "final_e2e_ns": _cur_e2e, # 端到端 (msprof)
+                    "our_best_e2e_event_ns": _our_best_evt_ns,          # ★我们最优 Event 端到端 (工业级口径)
+                    "industrial_time_us": st.get("industrial_time_us"), # 工业级基准 (Event, 各 mode min)
+                    "industrial_baseline": st.get("industrial_baseline"),
+                    # ★优化效果终极指标: 我们最优/工业级最优 (两端 Event 同口径)
+                    "vs_industrial_ratio": _vs_ind_ratio,               # 我们/工业级 (<1=快于工业级)
+                    "vs_industrial_speedup": _vs_ind_speedup,           # 工业级/我们 (>1=快于工业级, 同 speedup 方向)
                     "current_speedup": _cs, "best_speedup": st.get("best_speedup"),
                     "final_kernel_source": str(_src),
                     "generated_at": datetime.now().isoformat(),

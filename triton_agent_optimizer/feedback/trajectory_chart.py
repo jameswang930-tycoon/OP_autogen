@@ -158,11 +158,9 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     #     若 pytorch 快于我们的 baseline → 虚线 >1; 慢 → <1.
     if pt_bench:
         _pt_ns = (pytorch_time_us or 0) * 1000.0
-        # ★统一端到端口径: 我们 baseline_e2e_ns (msprof Σ全部) vs torch time_us (pt_msprof Σ全部)
-        _base_ns = state.get("baseline_e2e_ns") or state.get("baseline_ns")
-        # ★只认时间口径 (同算子同形状直接可比). 无时间数据 → 不画虚线.
-        #   (★修复: 原 tflops 兜底 pytorch_tflops/initial_tflops 已移除 — 跨算子类型用 TFLOPS
-        #   比是 apples-to-oranges, 访存型算子 tflops 天然 0.x 会让虚线位置完全失真)
+        # ★统一 Event 设备端口径: bench_pytorch 现用 Event 测 time_us → 我们的 baseline_e2e_event_ns (Event)
+        #   优先 Event-vs-Event (同口径); 缺 Event 基线才退化用 msprof baseline_e2e_ns.
+        _base_ns = state.get("baseline_e2e_event_ns") or state.get("baseline_e2e_ns") or state.get("baseline_ns")
         if _pt_ns and _base_ns:
             pytorch_speedup = _base_ns / _pt_ns
         else:
@@ -171,7 +169,7 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
             ax.axhline(y=pytorch_speedup, color="gray", linestyle="--", linewidth=2.5,
                        alpha=0.8, zorder=1)
             ax.text(len(rounds)-1, pytorch_speedup + 0.03,
-                    f"PyTorch eager* ({pytorch_time_us:.0f}us)\n*口径: torch 含框架 kernel, triton 不含 → 仅参考",
+                    f"PyTorch ({pytorch_time_us:.0f}us, Event)\n口径: 双端 Event 设备侧",
                     fontsize=9, color="gray", ha="right", va="bottom",
                     bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
 
@@ -181,13 +179,14 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     industrial_time_us = state.get("industrial_time_us")
     if industrial_time_us:
         _ind_ns = industrial_time_us * 1000.0
-        _base_ns = state.get("baseline_e2e_ns") or state.get("baseline_ns")
+        # ★industrial 现用 Event 测 → 优先 Event 基线 (同口径); 缺则 msprof
+        _base_ns = state.get("baseline_e2e_event_ns") or state.get("baseline_e2e_ns") or state.get("baseline_ns")
         if _ind_ns and _base_ns:
             ind_speedup = _base_ns / _ind_ns
             ax.axhline(y=ind_speedup, color="#d32f2f", linestyle="--", linewidth=2.0,
                        alpha=0.8, zorder=1)
             ax.text(len(rounds)-1, ind_speedup + 0.03,
-                    f"Industrial (torch.compile/CANN-FA) ({industrial_time_us:.0f}us)",
+                    f"Industrial (torch.compile/CANN-FA) ({industrial_time_us:.0f}us, Event)",
                     fontsize=9, color="#d32f2f", ha="right", va="bottom",
                     bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
 

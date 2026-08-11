@@ -1020,6 +1020,8 @@ class Scheduler:
                                      else (round(new_speedup, 4) if new_speedup else st.get("current_speedup", 1.0)))
             if _eb:
                 st["baseline_e2e_ns"] = _eb
+            if vb.get("e2e_event_ns"):
+                st["baseline_e2e_event_ns"] = vb["e2e_event_ns"]
             st["last_rebase_round"] = rn
             # ★不进 history (避免与正常轮同 round 号, trajectory 图点重叠):
             #   REBASELINE 是测量事件不是优化轮, 只更新 state; 换基后后续轮 speedup 用新基准.
@@ -1287,13 +1289,14 @@ class Scheduler:
                         pass
                 elif pt_file:
                     # ★自动跑对应的 PyTorch bench 生成基准 (需 NPU; 失败不阻断). env AUTO_RUN_PT_BENCH=0 关闭.
+                    #   bench_pytorch_*.py 自带 Event 设备侧计时 (与 industrial 同法, 无 msprof).
                     _script = PT_SCRIPT_MAP.get(pt_file)
                     if os.environ.get("AUTO_RUN_PT_BENCH", "1") == "1" and _script:
-                        print(f"  [PyTorch] 缺 {pt_file} → 自动跑 msprof 包裹的 bench_910b3/{_script} "
-                              f"(AUTO_RUN_PT_BENCH=1, 一次 msprof 出 端到端+纯kernel)")
+                        print(f"  [PyTorch] 缺 {pt_file} → 自动跑 bench_910b3/{_script} "
+                              f"(AUTO_RUN_PT_BENCH=1, Event 设备侧计时)")
                         try:
                             _r = subprocess.run(
-                                ["python3", str(_PROJECT / "bench_910b3" / "pt_msprof.py"), _script],
+                                ["python3", str(_PROJECT / "bench_910b3" / _script)],
                                 capture_output=True, text=True, timeout=7200,
                                 encoding="utf-8", errors="backslashreplace")
                             if pt.exists():
@@ -1368,6 +1371,9 @@ class Scheduler:
                             # ★端到端基线 (同一次 msprof 的 Σ全部kernel 口径)
                             if vb.get("e2e_ns"):
                                 st["baseline_e2e_ns"] = vb["e2e_ns"]
+                            # ★Event 设备侧基线 (工业级, 与 bench_pytorch/industrial 同口径)
+                            if vb.get("e2e_event_ns"):
+                                st["baseline_e2e_event_ns"] = vb["e2e_event_ns"]
                             if cube_fops:
                                 st["initial_tflops"] = round(
                                     cube_fops / (vb["ns"] / 1e9) / 1e12, 2)
@@ -1513,6 +1519,7 @@ class Scheduler:
                 v = {"ok": True,                             # ★F1: ns 反推, 不再留 None 脏字段
                      "ns": round(_bns / speedup, 1) if _bns and speedup else None,
                      "e2e_ns": round(_be2e / speedup, 1) if _be2e and speedup else None,
+                     "e2e_event_ns": None,                     # promote 不改码, 不重测 Event
                      "speedup": speedup, "note": "promote轮(无改动)"}
                 self.current_kernel = round_kernel
                 st["current_kernel"] = str(round_kernel)
@@ -1595,9 +1602,11 @@ class Scheduler:
             _be2e = st.get("baseline_e2e_ns")
             speedup = (_be2e / _e2e) if (_e2e and _be2e) else (v.get("speedup", 1.0) or 1.0)
             ns = v.get("ns")
+            _evt_ns = v.get("e2e_event_ns")   # ★工业级 Event 设备侧端到端 (无 profiler 扰动)
             _be = st.get("baseline_ns")
+            _evt_s = f" Event={_evt_ns}ns" if _evt_ns else " Event=无"
             print(f"  加速比: {speedup:.3f}x (端到端口径; 纯kernel基线 {_be}ns / 端到端基线 {_be2e}ns; "
-                  f"本轮 纯kernel={ns}ns e2e={_e2e}ns; 上一轮 {prev_speedup:.3f}x)"
+                  f"本轮 纯kernel={ns}ns e2e(msprof)={_e2e}ns{_evt_s}; 上一轮 {prev_speedup:.3f}x)"
                   + ("  ✅采纳" if kept else "  ↩未采纳"))
             t_round = time.time() - round_start
             print(f"  ⏱ ⑤Coder: {t_code:.1f}s")
@@ -1635,7 +1644,8 @@ class Scheduler:
                     "speedup": round(speedup, 4),             # ★主加速比 = 端到端口径 (初始端到端基线/本轮)
                     "kernel_speedup": round(_be / ns, 4) if (_be and ns) else None,  # 纯 kernel 口径参考
                     "prev_speedup": round(prev_speedup, 4),   # 上一轮已接受 kernel 的加速比 (保留判定用)
-                    "ns": ns, "e2e_ns": _e2e, "decision": decision, "result": result,
+                    "ns": ns, "e2e_ns": _e2e, "e2e_event_ns": _evt_ns,   # ★e2e_event_ns = 工业级 Event 设备侧
+                    "decision": decision, "result": result,
                     # ★sweep 状态 (每轮记): 是否跑了 sweep / 是否采纳 sweep 测的最优块
                     "sweep_ran": _sweep_ran, "sweep_adopted": _sweep_adopted,
                     "sweep_status": _sweep_status,

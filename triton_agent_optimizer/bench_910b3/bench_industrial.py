@@ -316,19 +316,9 @@ def _compile_torchair(fn, op, mode):
         return fn, "eager"
 
 
-def _set_actual(mode_str: str):
-    """把"实际执行模式"写进文件 (内层进程写, 外层读回 → json 记录, 让用户分辨 compile 是否真编译了)."""
-    try:
-        f = os.environ.get("_INDUSTRIAL_ACTUAL_FILE")
-        if f:
-            Path(f).write_text(mode_str, encoding="utf-8")
-    except Exception:
-        pass
-
-
-def _run_loop(op, mode, sh, warmup, measure):
-    """内层 (msprof 下): warmup + measure 次 forward.
-    compile 用 TorchAir (GE 图融合 → CANN 融合 kernel); cann-fused 直接调 CANN 融合算子 (失败回退 compile)."""
+def _build_fn(op, mode, sh):
+    """返回 (forward_fn, actual_mode) — 各 mode 的 forward 构造 (供 Event 计时用).
+    compile=TorchAir GE 融合; cann-fused=直接 CANN 融合算子(失败回退 compile); fa=CANN FA; eager=aclnn 厂商."""
     import torch
     actual = mode
     fn = _make_forward(op, sh)
@@ -339,22 +329,27 @@ def _run_loop(op, mode, sh, warmup, measure):
         if cf is not None:
             fn, actual = cf, "cann-fused"
         else:
-            fn, actual = _compile_torchair(fn, op, mode)   # 回退 GE 图融合 (同批 CANN 融合 kernel)
-            actual = "cann-fused→" + actual               # 记录实际 (cann-fused→compile / →eager)
+            fn, actual = _compile_torchair(fn, op, mode)   # 回退 GE 图融合
+            actual = "cann-fused→" + actual
     elif mode == "fa":
-        actual = "fa"   # flash_attention 的 forward 已是 CANN FA
-    # warmup + measure
+        actual = "fa"
+    return fn, actual
+
+
+def _run_loop(op, mode, sh, warmup, measure):
+    """warmup + measure 次 forward (供需要跑一遍的场景; 不含计时)."""
+    fn, _ = _build_fn(op, mode, sh)
+    import torch
     for _ in range(warmup):
         fn()
     torch.npu.synchronize()
     for _ in range(measure):
         fn()
     torch.npu.synchronize()
-    _set_actual(actual)   # ★记录实际执行模式 (外层读回 → json) — 让"compile 没融合"可分辨
 
 
 def main():
-    p = argparse.ArgumentParser(description="工业级基准 (msprof 端到端)")
+    p = argparse.ArgumentParser(description="工业级基准 (Event 设备侧端到端)")
     p.add_argument("op", type=str, help="matmul/matmul_relu/matmul_transpose/rms_norm/layernorm/"
                                         "sigmoid/softmax/vector_add/fused_add_mul/flash_attention/conv2d/conv_bias_relu")
     p.add_argument("--mode", type=str, default="eager", choices=["eager", "compile", "cann-fused", "fa"])
@@ -363,74 +358,34 @@ def main():
     args = p.parse_args()
     sh = _shapes(args.op)
     flops = _flops(args.op, sh)
+    out_json = _BENCH_DIR / "outputs" / f"industrial_{args.op}_{args.mode}_tflops.json"
+    out_json.parent.mkdir(parents=True, exist_ok=True)
 
-    if os.environ.get("_INDUSTRIAL_IN_MSPROF") != "1":
-        # ── 外层: 一次 msprof 包内层 → 同时算 端到端/纯kernel → 写 json ──
-        # ★必须先设标记再调 measure_pytorch_msprof: 它用 dict(os.environ,...) 传给 msprof,
-        #   msprof 重启本脚本时才能拿到 _INDUSTRIAL_IN_MSPROF=1 走"内层"路径 (否则无限套娃 msprof).
-        os.environ["_INDUSTRIAL_IN_MSPROF"] = "1"
-        # ★actual 文件: 内层进程写实际执行模式 (compile 是否回退 eager), 外层读回写进 json
-        _am_file = _BENCH_DIR / "outputs" / f".actual_{args.op}_{args.mode}.txt"
-        try:
-            _am_file.unlink(missing_ok=True)
-        except Exception:
-            pass
-        os.environ["_INDUSTRIAL_ACTUAL_FILE"] = str(_am_file)
-        from bench_910b3.bench_common import measure_pytorch_msprof
-        import subprocess
-        app_cmd = (f"python3 {Path(__file__).resolve()} {args.op} --mode {args.mode} "
-                   f"--measure {args.measure} --warmup {args.warmup}")
-        out_json = _BENCH_DIR / "outputs" / f"industrial_{args.op}_{args.mode}_tflops.json"
-        result = measure_pytorch_msprof(app_cmd, out_json, flops,
-                                        measure=args.measure, warmup=args.warmup,
-                                        extras={"op": args.op, "mode": args.mode})
-        # 读回实际模式 → 追加进 json (让"compile 没融合"可分辨: actual_mode=eager 说明 torchair 回退)
-        if result is not None:
-            try:
-                if _am_file.exists():
-                    result["actual_mode"] = _am_file.read_text(encoding="utf-8").strip()
-                    out_json.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
-            except Exception:
-                pass
-            print(f"[industrial] {args.op}/{args.mode} → {out_json.name}: "
-                  f"e2e={result['time_us']}us kernel={result.get('kernel_time_us')}us "
-                  f"actual={result.get('actual_mode', args.mode)}")
-            return
-        # msprof 失败 → 兜底 Event 计时; ★若已有旧 msprof 好结果则保留, 不覆盖 (否则好数据被差数据顶掉)
-        old = None
-        if out_json.exists():
-            try:
-                old = json.loads(out_json.read_text(encoding="utf-8"))
-            except Exception:
-                old = None
-        if old and old.get("time_us") and old.get("method") == "msprof":
-            print(f"  ⚠ msprof 不可用, 但 {out_json.name} 已有 msprof 结果 ({old['time_us']}us) → 保留, 不覆盖")
-            return
-        print("  ⚠ msprof 不可用 → 兜底 Event 计时")
-        import torch
-        _run_loop(args.op, args.mode, sh, args.warmup, args.measure)
-        torch.npu.synchronize()
-        s = torch.npu.Event(enable_timing=True); e = torch.npu.Event(enable_timing=True)
-        s.record()
-        fn = _make_forward(args.op, sh)
-        for _ in range(args.measure):
-            fn()
-        e.record(); torch.npu.synchronize()
-        e2e_us = s.elapsed_time(e) / args.measure * 1000.0
-        out_json.write_text(json.dumps({
-            "tflops": round(flops / 1e12 / (e2e_us / 1e6), 2) if flops else None,
-            "time_us": round(e2e_us, 1), "kernel_time_us": None,
-            "method": "event", "op": args.op, "mode": args.mode,
-            "warmup": args.warmup, "measure": args.measure,
-        }, ensure_ascii=False, indent=1), encoding="utf-8")
-        print(f"[industrial] {args.op}/{args.mode} (Event兜底) e2e={e2e_us:.1f}us → {out_json.name}")
-        return
-
-    # ── 内层: 在 msprof 下, 实际跑 forward ──
+    # ★Event 设备侧计时 (工业级, 无 msprof profiler 扰动):
+    #   build fn (各 mode 实际执行的 forward) → warmup → Event 窗口包 measure 次 → ÷measure
     import torch
-    env = dict(os.environ, _INDUSTRIAL_IN_MSPROF="1")
-    os.environ.update(env)
-    _run_loop(args.op, args.mode, sh, args.warmup, args.measure)
+    fn, actual = _build_fn(args.op, args.mode, sh)
+    for _ in range(args.warmup):
+        fn()
+    torch.npu.synchronize()
+    s = torch.npu.Event(enable_timing=True); e = torch.npu.Event(enable_timing=True)
+    s.record()
+    for _ in range(args.measure):
+        fn()
+    e.record(); torch.npu.synchronize()
+    e2e_us = s.elapsed_time(e) / args.measure * 1000.0   # ms→us, ÷measure = 单次
+    data = {
+        "tflops": round(flops / 1e12 / (e2e_us / 1e6), 2) if flops else None,
+        "time_us": round(e2e_us, 1),
+        "kernel_time_us": None,                          # Event 给不出纯kernel拆解 (要拆解走 msprof 诊断)
+        "method": "event",                                # ★Event 设备侧 (工业级)
+        "actual_mode": actual,                            # 实际执行 (compile 是否回退 eager)
+        "op": args.op, "mode": args.mode,
+        "warmup": args.warmup, "measure": args.measure,
+    }
+    out_json.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"[industrial] {args.op}/{args.mode} (Event) → {out_json.name}: "
+          f"e2e={round(e2e_us,1)}us actual={actual}")
 
 
 if __name__ == "__main__":

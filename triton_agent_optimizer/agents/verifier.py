@@ -168,4 +168,94 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
               f"(coder 丢掉了 KERNEL_LOOP 循环? 或 msprof 漏记) → 单次耗时可能不准, 加速比存疑!")
     return {"ok": True, "ns": round(ns, 1), "e2e_ns": round(e2e_ns, 1),
             "speedup": round(speedup, 4) if speedup is not None else None,
-            "loop": loop, "rows": n_rows, "duration_us": round(per_pass_us, 1)}
+            "loop": loop, "rows": n_rows, "duration_us": round(per_pass_us, 1),
+            "e2e_event_ns": _event_e2e_ns(kernel_op, round_dir, loop)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ★工业级 Event 计时 (设备侧, torch.npu.Event) — 每 round 成功后补测一次
+#    与 msprof 并列: msprof 给诊断/纯kernel拆解; Event 给权威绝对端到端 (无 profiler 扰动).
+#    法: 改写 kernel_op.py 的 main(), 在 KERNEL_LOOP 循环前注入 warmup + Event 窗口,
+#        跑一遍 → 解析 stdout 的 EVENT_E2E_US → ns. 失败返回 None (不阻断主流程).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _inject_event_timing(src: str) -> str:
+    """把 kernel_op.py 的 `for X in range(LOOP): <body>` 循环前注入 Event 计时分支.
+    KERNEL_EVENT_TIME=1 时: warmup W 次 + Event 窗口包 LOOP 次 → 打印 EVENT_E2E_US, return.
+    否则原样跑 (不影响正常/msprof 路径). 14 个算子 main() 都是同一个标准模式 → 通用."""
+    import re as _re
+    lines = src.splitlines(keepends=True)
+    for_idx = None
+    base_indent = 0
+    for i, ln in enumerate(lines):
+        m = _re.match(r'(\s*)for\s+\w+\s+in\s+range\(\s*LOOP\s*\)\s*:', ln)
+        if m:
+            for_idx = i
+            base_indent = len(m.group(1))
+            break
+    if for_idx is None:
+        return ""   # 找不到标准循环 → 调用方放弃
+    # 收集循环体: for_idx 之后缩进 > base_indent 的行 (含空行)
+    body_start = for_idx + 1
+    body_end = body_start
+    while body_end < len(lines):
+        ln = lines[body_end]
+        if ln.strip() == "":
+            body_end += 1
+            continue
+        cur_indent = len(_re.match(r'\s*', ln).group())
+        if cur_indent > base_indent:
+            body_end += 1
+        else:
+            break
+    body = "".join(lines[body_start:body_end])
+    if not body.strip():
+        return ""
+    # 循环体再缩进 4 空格 (放进新 for 的内部)
+    body_deep = "".join(("    " + ln if ln.strip() else ln) for ln in body.splitlines(keepends=True))
+    ind = " " * base_indent
+    # 注入块: 在原 for 之前插入 (原 for+body 保留在后, 仅非 Event 模式走)
+    inject = (
+        f"{ind}# ★工业级 Event 计时 (注入; KERNEL_EVENT_TIME 触发, 不影响正常/msprof 路径)\n"
+        f"{ind}if os.environ.get('KERNEL_EVENT_TIME'):\n"
+        f"{ind}    _W = int(os.environ.get('KERNEL_EVENT_WARMUP', '5'))\n"
+        f"{ind}    for _ in range(_W):\n{body_deep}"
+        f"{ind}    torch.npu.synchronize()\n"
+        f"{ind}    _ev_s = torch.npu.Event(enable_timing=True)\n"
+        f"{ind}    _ev_e = torch.npu.Event(enable_timing=True)\n"
+        f"{ind}    _ev_s.record()\n"
+        f"{ind}    for _ in range(LOOP):\n{body_deep}"
+        f"{ind}    _ev_e.record()\n"
+        f"{ind}    torch.npu.synchronize()\n"
+        f"{ind}    print('EVENT_E2E_US:%.2f' % (_ev_s.elapsed_time(_ev_e) / LOOP * 1000.0))\n"
+        f"{ind}    raise SystemExit(0)\n"
+    )
+    return "".join(lines[:for_idx]) + inject + "".join(lines[for_idx:])
+
+
+def _event_e2e_ns(kernel_op: Path, round_dir: Path, loop: int) -> Optional[float]:
+    """对 kernel_op.py 跑一次 Event 计时 → 返回单次端到端 ns (设备侧), 失败返回 None.
+    ★工业级: torch.npu.Event 紧凑循环, 无 msprof profiler 扰动."""
+    import os as _os
+    import subprocess
+    import shutil as _sh
+    try:
+        src = kernel_op.read_text(encoding="utf-8")
+        injected = _inject_event_timing(src)
+        if not injected:
+            return None
+        evt_kernel = round_dir / "event_kernel.py"
+        evt_kernel.write_text(injected, encoding="utf-8")
+        env = dict(_os.environ, KERNEL_EVENT_TIME="1",
+                   KERNEL_LOOP=str(loop), KERNEL_EVENT_WARMUP="5",
+                   MATMUL_VERIFY="")   # Event 计时不算正确性 (verify 已先校验过)
+        r = subprocess.run(["python3", str(evt_kernel)], capture_output=True, text=True,
+                           encoding="utf-8", errors="backslashreplace",
+                           timeout=1800, env=env)
+        out = (r.stdout or "") + (r.stderr or "")
+        m = re.search(r"EVENT_E2E_US:([\d.]+)", out)
+        if not m:
+            return None
+        return round(float(m.group(1)) * 1000.0, 1)   # us → ns
+    except Exception:
+        return None

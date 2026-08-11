@@ -1431,6 +1431,8 @@ class Scheduler:
             _sweep_adopted = False            # ★history 记录: 是否采纳了 sweep 测的最优块
             if (rn == 1 or tier == 3) and os.environ.get("TIER3_SWEEP", "1") == "1":
                 # ★每个 round1/tier3 round 都跑 (去掉 hash 跳过 — 用户要求每次 tier3 都触发)
+                print(f"  [Tier3] 分块 sweep 触发 (round{rn} tier{tier}) — "
+                      f"{'round1 地基' if rn == 1 else 'tier3 每轮重扫'}")
                 tier3_sweep = self._tier3_sweep_data(tier, rn, round_dir)
                 if tier3_sweep and tier3_sweep.get("available"):
                     _sweep_ran = True
@@ -1460,8 +1462,10 @@ class Scheduler:
                     _sweep_status = f"failed: {tier3_sweep.get('error', '?')[:60]}"
                     tier3_sweep = None   # 失败 → 不传坏数据给 planner
                 else:
-                    # ★B5: _tier3_sweep_data 返回 None (行级 op/无可扫) → 不声称本轮实测
+                    # ★B5: _tier3_sweep_data 返回 None (行级 op/无可扫) → 显式告知 (不再静默)
                     _sweep_status = "skipped_no_free_params"
+                    print(f"  [Tier3] 分块 sweep 跳过: {self.kernel_name} 无自由分块参数 "
+                          f"(行级/逐元素算子, SWEEP_META=None → 无 BLOCK 可扫, 正常走 LLM)")
 
             # ★关键: 即使本轮 sweep 没跑, 也把上次成功的 sweep 结果传给 planner (tier3 尤其需要)
             #   ★B2: 本轮尝试过但失败 → 不喂过期缓存 (防"已穷举=最优"假象, 让 planner 走 LLM 兜底)

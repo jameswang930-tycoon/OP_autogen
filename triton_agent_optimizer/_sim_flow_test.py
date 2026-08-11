@@ -17,7 +17,7 @@ OP = PROJ / "input" / "_sim_op"
 OUT = PROJ / "outputs" / "_sim_op"
 N_FAIL_START = 8          # round>=8 模拟采集失败
 BASELINE_NS = 5_000_000.0
-SIM_SPEED = {1:1.0, 2:1.12, 3:0.95, 4:1.2, 6:1.25, 7:1.3}
+SIM_SPEED = {1:1.05, 2:1.12, 3:0.95, 4:1.2, 6:1.25, 7:1.3}
 
 def canned_diagnosis():
     k = {

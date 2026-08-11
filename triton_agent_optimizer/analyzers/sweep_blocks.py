@@ -616,39 +616,61 @@ def _generate_runner(op_dir: Path, candidates: List[Tuple],
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _read_current_block(code: str, varnames: Tuple[str, ...]) -> Optional[tuple]:
-    """读 config 区当前 BLOCK 值."""
+    """读 config 区当前 BLOCK 值.
+    ★容错多种写法 (coder 可能改格式, 不能让 sweep 静默哑掉):
+      - `BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64`   (逗号连等, 最常见)
+      - `BLOCK_M = 64`  拆成多行单赋值
+      - `BLOCK_M: tl.constexpr = 64`  带类型标注
+      - `BLOCK_M = 64  # 注释`  带行尾注释
+    """
     if varnames == ("BLOCK_M", "BLOCK_N", "BLOCK_K"):
+        # ① 逗号连等: BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64 (允许中间跨空白/换行)
         m = re.search(r"BLOCK_M\s*,\s*BLOCK_N\s*,\s*BLOCK_K\s*=\s*([\d, ]+)", code)
         if m:
             vals = [int(x) for x in re.split(r"[,，\s]+", m.group(1).strip()) if x.strip().isdigit()]
             if len(vals) == 3:
                 return tuple(vals)
-    else:
+        # ② 拆多行/带标注: 逐变量找 `BLOCK_X [: ...] = N` (取第一个数字, 忽略行尾注释)
         vals = []
-        for var in varnames:
-            m = re.search(rf"{var}\s*=\s*(\d+)", code)
-            if not m:
+        for var in ("BLOCK_M", "BLOCK_N", "BLOCK_K"):
+            mv = re.search(rf"{var}\s*(?::\s*[^=\n]+)?\s*=\s*(\d+)", code)
+            if not mv:
                 return None
-            vals.append(int(m.group(1)))
+            vals.append(int(mv.group(1)))
         return tuple(vals)
-    return None
+    # conv2d 族: (BLOCK_K, BLOCK_OW) 等通用变量
+    vals = []
+    for var in varnames:
+        m = re.search(rf"{var}\s*(?::\s*[^=\n]+)?\s*=\s*(\d+)", code)
+        if not m:
+            return None
+        vals.append(int(m.group(1)))
+    return tuple(vals)
 
 
 def _apply_block(code: str, varnames: Tuple[str, ...], vals: tuple) -> str:
-    """把 config 区 BLOCK 赋值替换成 vals."""
+    """把 config 区 BLOCK 赋值替换成 vals.
+    ★容错: 逗号连等优先; 否则逐变量替换 (兼容拆多行/tl.constexpr 标注)."""
     if varnames == ("BLOCK_M", "BLOCK_N", "BLOCK_K"):
+        # ① 逗号连等: 整体替换
         m = re.search(r"BLOCK_M\s*,\s*BLOCK_N\s*,\s*BLOCK_K\s*=\s*[\d, ]+", code)
-        if not m:
-            raise ValueError("源码缺 BLOCK_M, BLOCK_N, BLOCK_K 赋值")
-        return (code[:m.start()]
-                + f"BLOCK_M, BLOCK_N, BLOCK_K = {vals[0]}, {vals[1]}, {vals[2]}"
-                + code[m.end():])
-    # 通用: 逐变量替换
+        if m:
+            return (code[:m.start()]
+                    + f"BLOCK_M, BLOCK_N, BLOCK_K = {vals[0]}, {vals[1]}, {vals[2]}"
+                    + code[m.end():])
+        # ② 拆多行/带标注: 逐变量替换 (保留各自写法, 只改数字)
+        for var, val in zip(("BLOCK_M", "BLOCK_N", "BLOCK_K"), vals):
+            m = re.search(rf"({var}\s*(?::\s*[^=\n]+)?\s*=\s*)\d+", code)
+            if not m:
+                raise ValueError(f"源码缺 {var} 赋值 (无法写回 sweep 最优块)")
+            code = code[:m.start()] + m.group(1) + str(val) + code[m.end():]
+        return code
+    # conv2d 族通用: 逐变量替换 (兼容标注)
     for var, val in zip(varnames, vals):
-        m = re.search(rf"{var}\s*=\s*\d+", code)
+        m = re.search(rf"({var}\s*(?::\s*[^=\n]+)?\s*=\s*)\d+", code)
         if not m:
             raise ValueError(f"源码缺 {var} 赋值")
-        code = code[:m.start()] + f"{var} = {val}" + code[m.end():]
+        code = code[:m.start()] + m.group(1) + str(val) + code[m.end():]
     return code
 
 

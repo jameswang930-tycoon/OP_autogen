@@ -50,7 +50,8 @@ def ok_verify(base=5_000_000.0):
         rd = str(round_dir)
         if "baseline" in rd:
             return {"ok": True, "ns": base, "e2e_ns": base, "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": base/1000}
-        return {"ok": True, "ns": base, "e2e_ns": base, "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": base/1000}
+        # ★strict-best: 优化轮须严格 > baseline(1.0) 才 KEEP → sp=1.05 (改进)
+        return {"ok": True, "ns": base/1.05, "e2e_ns": base/1.05, "speedup": 1.05, "loop": 30, "rows": 90, "duration_us": base/1.05/1000}
     return verify
 
 def optimize_ok(self, round_dir, tier):

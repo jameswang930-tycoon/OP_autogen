@@ -160,46 +160,224 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 1B. 完整数据流图（端到端，v4）
+## 1B. 完整数据流图（每阶段：读什么 → 执行什么 → 写什么/传什么）
+
+> 路径约定：`round_dir` = `outputs/<op>/<tier_name>/roundN/`（每轮一个，自包含）。
+> 每个阶段框按「**读**（输入文件: 位置/内容）→ **执行** → **写**（产出文件 + 传给下一步的信息）」标注。
 
 ```
-input/<op>/kernel_op.py
-   │  (round1 采集源; 之后采集上一轮输出目录 — kernel 链连续)
-   ▼
-Scheduler._run_optimize → bash analyzers/run_optimize.sh <input> <round> M N K
-   ├─① warmup 裸跑 (JIT 预热)
-   ├─② 通用 msprof → task.json            (骨架: 每kernel耗时/launch/api_overhead/l2)
-   ├─③ 逐 kernel msprof op → board_<i>.json  (deep: 带宽/引擎/conflict/fops)
-   ├─④ integrate.py → diagnosis.json      (骨架+deep 合并 + roofline)
-   ├─⑤ extract_tier_fields → 07_tier<N>_fields
-   └─⑥ (TIER==2) HIVM → 08_fusion/fusion_analysis.json
-   │
-   ▼
-round1 基准: baseline_ns(纯) / baseline_e2e_ns(端到端) / num_kernels / num_launches / baseline_mnk / initial_tflops / pytorch基准(msprof) / 工业级基准(各mode取min)
-   + verify_end_to_end 复测源 kernel (正确性校验+warmup+msprof, 与后续轮同口径)
-   │
-   ▼
-_diagnose → 07 字段 (全局摘要 + 本层字段)
-   │
-   ▼
-Planner.generate_v4 → plan.md (JSON: strategy + changes[] + promote + promote_to)
-   │
-   ▼
-Coder.apply → roundN/kernel_op.py + diff.patch   (old_code→new_code 确定性替换)
-   │
-   ▼
-verify_end_to_end → 正确性校验 + warmup + 1×msprof KERNEL_LOOP → 读全部op_summary合并 → 纯kernel ns + 端到端 e2e_ns → 主加速比=端到端 (纯kernel参考)
-   │
-   ▼
-KEEP / REVERT (对比 prev_speedup) + history 记录 (含每轮 tflops) + promote 决策
-   │
-   ▼
-optimization_trajectory.json
-   │
-   ▼
-feedback/trajectory_chart.py → final_output/trajectory_chart.png
-   (加速比曲线 · 各 tier 色带 · KEEP/REVERT 点 · PyTorch 虚线 + 工业级红线[自动读 bench_910b3/outputs/])
+═══════════════════════════════════════════════════════════════════════
+ 阶段 0 │ 输入
+═══════════════════════════════════════════════════════════════════════
+输入文件:
+  input/<op>/kernel_op.py              源算子单文件
+    ├ ① config: M/N/K/DTYPE/BLOCK_* (env 可覆盖)
+    ├ ② @triton.jit kernel(s)  (被优化的对象)
+    └ ③ __main__ 测试驱动: KERNEL_LOOP 循环 + MATMUL_VERIFY 正确性校验块
+  bench_910b3/outputs/*.json           (仅 round1 读) 基准线
+    ├ pytorch_<op>_tflops.json         PyTorch 端到端/纯kernel (msprof 测)
+    └ industrial_<op>_<mode>_tflops.json  工业级各 mode (eager/compile/cann-fused/fa)
+  outputs/<op>/optimization_trajectory.json  (--resume 续跑读; 否则 round1 新建)
+                    │
+                    ▼  (scheduler 每轮建 round_dir, 把源 kernel 自包含拷进 round_dir/input/)
+
+═══════════════════════════════════════════════════════════════════════
+ 阶段 1 │ 采集+解析  (bash analyzers/run_optimize.sh)  —— 五条支线
+═══════════════════════════════════════════════════════════════════════
+
+ ┌─ 支线 A · warmup 预热 ──────────────────────────────────────────────┐
+ │  读: round_dir/input/kernel_op.py                                   │
+ │  执行: 裸跑一次 (JIT 编译 + 设备初始化, 防 msprof 首次漏采)          │
+ │  写: round_dir/05_task/warmup.txt  (崩溃 trace 在这查)              │
+ └────────────────────────────────────────────────────────────────────┘
+
+ ┌─ 支线 B · 通用 msprof (任务级骨架) ─────────────────────────────────┐
+ │  读: round_dir/input/kernel_op.py                                   │
+ │  执行: msprof --application=python3 kernel_op.py --ai-core=on       │
+ │  产出 msprof 原始 CSV (round_dir/05_task/task_prof/):               │
+ │    op_summary*.csv     每 kernel 一行: Op Name/Type, Task Type,     │
+ │                        Task Duration(us), Block Dim, Input/Output   │
+ │                        Shape&Dtype, aic_*/aiv_*_time(us), cycles   │
+ │    op_statistic*.csv   每类算子 次数/总耗时/占比                     │
+ │    api_statistic*.csv  launch/API 开销明细                          │
+ │    l2_cache*.csv       L2 命中率                                    │
+ │  解析: pipeline_parse_task.py  (按 distinct Op Name 去重成 slot)    │
+ │  写: round_dir/06_diagnosis/task.json                              │
+ │    ├ execution_summary: total_ns / num_kernels / num_cores         │
+ │    ├ normalized.kernel_slots[]  每 kernel: task{...}, deep=null     │
+ │    ├ normalized.framework_kernels[]  (aclnn* 框架, 非优化目标)       │
+ │    └ normalized.multi_kernel[] / api_overhead[] / l2_hit_rate      │
+ └────────────────────────────────────────────────────────────────────┘
+                    │  (task.json 给出 distinct 非 aclnn kernel 名单)
+                    ▼
+ ┌─ 支线 C · 逐 kernel msprof op (深层画像, 循环每个 kernel) ──────────┐
+ │  读: task.json 的 kernel 名单 + round_dir/input/kernel_op.py        │
+ │  执行 (循环每个 KNAME): msprof op --kernel-name=KNAME               │
+ │  产物 msprof op 原始 (round_dir/04_board/op_<i>/OPPROF_*/, 8 CSV):  │
+ │    OpBasicInfo.csv          Task Duration/Block Dim/Freq            │
+ │    PipeUtilization.csv      各 pipe time & ratio                    │
+ │    ArithmeticUtilization.csv cube/vec fops, 精度占比                 │
+ │    Memory.csv               main_mem/l1/l2/gm_to_ub 带宽            │
+ │    MemoryL0.csv             l0a/l0b/l0c 带宽                        │
+ │    MemoryUB.csv             ub vector/scalar 带宽                   │
+ │    L2Cache.csv              hit rate                               │
+ │    ResourceConflictRatio.csv bank/mte/wait 冲突                     │
+ │  解析: pipeline_parse_board.py  (MB/s→GB/s, 归一化)                 │
+ │  写: round_dir/06_diagnosis/board_<i>.json  (每 kernel 一个 deep)   │
+ │    ├ engine_utilization{} / bandwidth_gb_s{} / compute{}           │
+ │    ├ conflict{} / l2_hit_rate                                      │
+ │    └ raw (8 CSV 全字段)                                            │
+ └────────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼  (board_<i>.json 按 kernel 名回填进 kernel_slot)
+ ┌─ 合并 · integrate.py ──────────────────────────────────────────────┐
+ │  读: task.json + board_*.json + bench_910b3/hardware_peak.json     │
+ │  执行: 按 kernel 名填 slot.deep; 用峰值算 roofline (mem/comp util)  │
+ │  写: round_dir/06_diagnosis/diagnosis.json  (★本轮诊断中枢)        │
+ │    ├ summary: num_kernels/total_ns/api_overhead_total_us/l2/...    │
+ │    └ kernels[i]{ task(骨架), deep{bandwidth,engine,compute,        │
+ │              conflict,l2, roofline{util,bottleneck_type}}, filled_by│
+ └────────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+ ┌─ 字段筛选 + 校验 ──────────────────────────────────────────────────┐
+ │  读: diagnosis.json + 当前 TIER                                     │
+ │  执行: extract_tier_fields(diagnosis, TIER)  + check_fields.py     │
+ │  写: round_dir/07_tier<N>_fields/                                  │
+ │    ├ tier<N>_fields.txt    全局摘要 + per-kernel + 本层字段         │
+ │    ├ tier<N>_fields.json   结构化                                  │
+ │    └ planner_context.json 完整数据上下文 (planner 直接 cat 读)      │
+ │  写: round_dir/05_task/field_check.log  (列名不匹配明细)            │
+ └────────────────────────────────────────────────────────────────────┘
+
+ ┌─ 支线 D · (仅 TIER==2) HIVM 融合分析 ──────────────────────────────┐
+ │  读: round_dir/input/kernel_op.py                                  │
+ │  执行: bishengir-compile ttadapter.mlir → HIVM 文本                 │
+ │  写: round_dir/08_fusion/hivm_try.txt → hivm_fusion_view.txt       │
+ │  执行: run_hivm_fusion.py (nga run fusion skill 分析 RAW/WAR/WAW)   │
+ │  写: round_dir/08_fusion/fusion_analysis.json                      │
+ │    └ raw_deps[]/war_deps[]/waw_deps[]/fusion_candidates[]          │
+ └────────────────────────────────────────────────────────────────────┘
+
+ ┌─ 支线 E · (仅 round1 或 tier==3) Tier3 分块 sweep ─────────────────┐
+ │  读: 当前 kernel_op.py (读 BLOCK 当前值 + 拷一份到 round_dir/)     │
+ │  执行: sweep_blocks.sweep() 程序化枚举 L0 合法 BLOCK + Event 实测   │
+ │  写: round_dir/09_tier3_sweep/                                     │
+ │    ├ sweep_result.json  configs[]{block,ns,speedup} + best + written│
+ │    └ sweep_runner.py    (生成的 runner 脚本)                       │
+ │  写: round_dir/kernel_op.py  (★sweep 把最优 BLOCK 写回, 覆盖)      │
+ │  传: best/written 给 planner_context (告诉它 BLOCK 已穷举)         │
+ └────────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+
+═══════════════════════════════════════════════════════════════════════
+ 阶段 2 │ round1 设基准 (仅首轮执行; 后续轮跳过)
+═══════════════════════════════════════════════════════════════════════
+读: diagnosis.summary (total_ns/num_kernels)
+    bench_910b3/outputs/{pytorch,industrial}_*.json  (各 mode 取 min = 工业级天花板)
+    源 kernel_op.py (verify 复测用)
+执行: verify_end_to_end 复测源 kernel (正确性校验+warmup+msprof → baseline_e2e_ns)
+写: outputs/<op>/optimization_trajectory.json 的 state{}
+    ├ baseline_ns(纯) / baseline_e2e_ns(端到端) / num_kernels / num_launches
+    ├ baseline_mnk / initial_tflops
+    ├ pytorch_time_us / industrial_time_us / industrial_baseline
+    └ current_kernel (→ 源 kernel_op.py)
+写: outputs/<op>/baseline_verify/msprof_0/  (复测产物)
+                    │
+                    ▼
+
+═══════════════════════════════════════════════════════════════════════
+ 阶段 3 │ Planner  (agents/planner.py → nga run LLM)
+═══════════════════════════════════════════════════════════════════════
+读 (planner 全部输入文件):
+  - skills/triton-op-planner/SKILL.md                      输出格式/铁律
+  - docx/playbook_tier<N>.md                               本层「问题→方案→正确代码」
+  - round_dir/07_tier<N>_fields/tier<N>_fields.txt         筛好的诊断字段
+  - round_dir/07_tier<N>_fields/planner_context.json       完整数据上下文
+  - 当前 kernel_op.py (current_kernel, 整份代码)            改的对象
+  - outputs/<op>/optimization_trajectory.json              state + 全量 history(前层试过啥)
+  - round_dir/08_fusion/fusion_analysis.json               (仅 tier2)
+  - round_dir/09_tier3_sweep/sweep_result.json             (sweep 结论: BLOCK 已穷举)
+  - state.handoff                                          (跳转来的瓶颈分析+方向)
+执行: nga run 调 planner skill → LLM 分析瓶颈 → 出策略
+写: round_dir/plan.md  (JSON)
+    ├ strategy + expected_impact
+    ├ changes[]{old_code, new_code, reason, section, tier}  ★精确替换片段
+    ├ promote / promote_to / promote_evidence / handoff      晋升决策
+传: plan 对象 → 交给 Coder
+                    │
+                    ▼
+
+═══════════════════════════════════════════════════════════════════════
+ 阶段 4 │ Coder  (agents/coder.py apply)
+═══════════════════════════════════════════════════════════════════════
+读:
+  - round_dir/plan.md 的 changes[]            要应用的 old_code→new_code
+  - 当前 kernel_op.py (current_kernel)        原始代码
+  - skills/triton-op-coder/SKILL.md           改码铁律 (ASCII/不改函数名/...)
+  - previous_error                            上轮报错(有则走 LLM 修复; 查 memory/codeerror 已知方案)
+执行:
+  - 无错: 确定性 code.replace(old_code, new_code) (替换全部出现处, 最稳)
+  - 有错: nga run 调 coder skill 带错误修复
+  - Python 语法 + 函数完整性 + no-op 校验 + Unicode 脏字符清洗
+写: round_dir/kernel_op.py   (本轮新代码, ★不碰源 input/)
+    round_dir/diff.patch    (与上一轮差异)
+传: optimized_code 写入 round_dir/kernel_op.py → 交给 Verifier
+                    │
+                    ▼
+
+═══════════════════════════════════════════════════════════════════════
+ 阶段 5 │ Verifier  (agents/verifier.py verify_end_to_end)
+═══════════════════════════════════════════════════════════════════════
+读: round_dir/kernel_op.py (验证 coder 的新输出)
+执行 (三步):
+  ① warmup × VERIFY_WARMUP(3)  裸跑预热 JIT/cache
+  ② 正确性校验  MATMUL_VERIFY=1 跑一次 → 必须 stdout 含 "result check: PASS"
+                 (不过 → 本轮 FAIL, 错误回传 Coder 同轮重试 ≤3 次)
+  ③ msprof 测时  一次 msprof, app 内 KERNEL_LOOP(30) 遍
+读: round_dir/msprof_0/op_summary*.csv  (全部合并; msprof 可能拆多文件)
+执行: _read_durations 同一次算两种口径 ÷ 实测遍数:
+       纯 kernel ns = Σ 非 aclnn 行;   端到端 e2e_ns = Σ 全部行(含框架)
+写: round_dir/msprof_0/  (msprof 原始产物)
+传 (返回 dict, 不写业务文件): {ok, ns(纯), e2e_ns(端到端), speedup, loop, rows}
+                    │
+                    ▼
+
+═══════════════════════════════════════════════════════════════════════
+ 阶段 6 │ 决策 + 记录  (scheduler)  —— 回路
+═══════════════════════════════════════════════════════════════════════
+执行:
+  - 主加速比 = baseline_e2e_ns / e2e_ns  (纯 kernel 兜底)
+  - speedup ≥ prev_speedup×噪声地板(1.01) → KEEP (current_kernel → 本轮 round_dir)
+    否则 → REVERT (沿用上一轮 kernel)
+  - 晋升/回退: planner.promote_to (可回退前层) + 连续 3 轮无改进兜底晋升
+  - (晋升时) 写跳转手递: round_dir/10_tier_handoff.json
+写: outputs/<op>/optimization_trajectory.json
+    ├ state 更新 (tier/round/current_speedup/current_kernel/best_speedup/sweep/...)
+    └ history 追加一条 {round,tier,strategy,change,changes_full,
+                         speedup(e2e),kernel_speedup(纯),ns,e2e_ns,
+                         decision(KEEP/REVERT/FAIL),result(OK/NOOP/FAIL),error,tflops}
+                    │
+                    ▼  回【阶段 1】跑下一轮 (tier/round 推进)
+                       直到 max_rounds / 达标 / Tier6 连续无改进 → 出循环
+                    │
+                    ▼
+
+═══════════════════════════════════════════════════════════════════════
+ 阶段 7 │ 最终产物 (循环结束后, 一次性生成)
+═══════════════════════════════════════════════════════════════════════
+读: outputs/<op>/optimization_trajectory.json (state + history)
+    bench_910b3/outputs/{pytorch,industrial}_*.json (轨迹图虚线)
+写: outputs/<op>/final_output/
+    ├ kernel_op.py         当前已采纳的最优 kernel (可直接取用)
+    ├ baseline_kernel.py   baseline 副本
+    ├ final_summary.json   双口径加速比 + industrial_time_us
+    └ trajectory_chart.png 加速比曲线 + tier 色带 + KEEP/REVERT 点
+                           + PyTorch 灰虚线 + 工业级红虚线
 ```
+
+**一句话主线**：`kernel_op.py` →(采集)→ `diagnosis.json` →(筛字段)→ `07_fields` →(planner)→ `plan.md` →(coder)→ `roundN/kernel_op.py` →(verify)→ `ns/e2e_ns` →(决策)→ `optimization_trajectory.json` →(结束)→ `final_output/`。
 
 ---
 
@@ -484,24 +662,89 @@ outputs/<op>/
 > **bench 基准产物** 统一放 `bench_910b3/outputs/`（industrial_*.json / pytorch_*.json / .actual_*.txt / industrial_summary.json / msprof 临时目录）；
 > `python3 bench_910b3/bench_all.py --clean` 一键清空。
 
-`optimization_trajectory.json`:
+`optimization_trajectory.json`（完整展开样例 + 每字段说明；`...` 仅表示 history 再重复若干轮）:
 ```json
 {
-  "v": 4,
-  "state": {"tier": 3, "round": 8, "best_speedup": 17.793, "current_speedup": 17.793,
-            "baseline_ns": 5900000.0, "baseline_e2e_ns": 6320000.0, "num_kernels": 3,
-            "num_launches": 3, "baseline_mnk": [2048,2048,2048],
-            "initial_tflops": 5.8, "pytorch_time_us": 45.0,
-            "industrial_time_us": 43.0, "industrial_baseline": "industrial_matmul_compile_tflops.json",
-            "current_kernel": "outputs/<op>/03_tiling_block_config/round8/kernel_op.py"},
-  "history": [
-    {"round": 1, "tier": 1, "strategy": "...", "change": "BLOCK_M,BLOCK_N,BLOCK_K=64,64,64",
-     "speedup": 1.5, "kernel_speedup": 1.5, "prev_speedup": 1.0, "ns": 3933333.0,
-     "e2e_ns": 4210000.0, "decision": "KEEP", "result": "OK",
-     "error": "", "tflops": 8.7}
+  "v": 4,                              // schema 版本 (v4 状态机; 旧 v3 trajectory 会被检测并重置)
+
+  "state": {                           // ── 全局状态机 (scheduler 每轮读写, 每轮落盘, --resume 续跑用它) ──
+    "tier": 3,                         // 当前所在优化层 (1~6)
+    "round": 8,                        // 当前 tier 内轮次 (每晋升一层重置; 跨 tier 连续编号看 total_rounds)
+    "total_rounds": 10,                // 总执行轮 (含 promote 轮; max_rounds 配额对它, promote 轮用 promote_budget 免费扩容)
+    "best_speedup": 17.793,            // 历史最高加速比 (端到端口径; 累计最优, 只增不减)
+    "current_speedup": 17.793,         // 当前已采纳 kernel 的加速比 (★主 = 端到端口径, 保留判定的基准)
+
+    "baseline_ns": 5900000.0,          // ★纯 kernel 基线 ns (源 kernel 的 Σ非aclnn 耗时; 纯 kernel 加速比的分母, 参考口径)
+    "baseline_e2e_ns": 6320000.0,      // ★端到端基线 ns (Σ全部含框架; 主加速比的分母)
+    "num_kernels": 3,                  // 优化目标 kernel 数 (verifier 行数告警用)
+    "num_launches": 3,                 // 每遍实际 launch 总数 (Σ launch_count; 循环丢失时 ÷ 的兜底除数)
+    "baseline_mnk": [2048, 2048, 2048],// 基准 M/N/K (跨尺寸失真 guard: 本轮 mnk 不同则告警)
+    "initial_tflops": 5.8,             // 源 kernel 初始 TFLOPS (轨迹图左轴; cube_fops÷baseline_ns 算)
+
+    "pytorch_time_us": 45.0,           // PyTorch 基准端到端 us (msprof 测, 轨迹图灰虚线)
+    "pytorch_kernel_time_us": 42.0,    // PyTorch 纯 kernel us (参考; torch 计算全 aclnn, 与端到端近似)
+    "pytorch_baseline": "pytorch_mlp_tflops.json",  // PyTorch 基准来源 json
+    "industrial_time_us": 43.0,        // ★工业级基准端到端 us (各 mode 取 min; 轨迹图红虚线 = 优化天花板)
+    "industrial_kernel_time_us": null, // 工业级纯 kernel us (参考)
+    "industrial_baseline": "industrial_matmul_compile_tflops.json",  // 最优来源 mode
+
+    "current_kernel": "outputs/<op>/03_tiling_block_config/round8/kernel_op.py",  // 当前已采纳 kernel 路径 (下轮采集/读它的源)
+
+    "handoff": null,                   // 跳转手递 (tier 间传递瓶颈分析+优化方向; 消费后置 null)
+    "tier_jumps": [                    // 跳转路径记录 (防死循环: 同 from->to ≥3 次拒绝)
+      {"pair": "2->3", "round": 5}
+    ],
+    "promote_budget": 1,               // 已用 promote 额度 (promote 轮不挤占 max_rounds)
+    "last_rebase_round": 0,            // 上次环境漂移重基准的轮号 (每 REBASELINE_EVERY 轮重测)
+    "tier3_swept": true,               // Tier3 分块是否已扫 (结构 hash 变才重扫)
+    "tier3_sweep_code_hash": "a1b2c3d4e5f60123",  // 上次 sweep 时的 kernel 结构 hash (变则重扫)
+    "last_sweep_result": {             // 上次 sweep 结论 (每轮传给 planner; 含真实状态 ran/skipped/reused/failed)
+      "available": true,
+      "best": {"block": [128, 128, 64], "ns": 4200000, "speedup": 1.12, "is_current": true},
+      "vars": ["BLOCK_M", "BLOCK_N", "BLOCK_K"],
+      "n_configs": 287,
+      "result_path": "outputs/<op>/.../09_tier3_sweep/sweep_result.json",
+      "written": true                  // sweep 是否真写回了新块 (false = 当前块保留)
+    }
+  },
+
+  "history": [                         // ── 每轮一条 (改了啥 + 结果), planner 看前层试过什么, 轨迹图打点 ──
+    {
+      "round": 1,                      // 本轮 round 号 (tier 内)
+      "tier": 1,                       // 本轮所在层
+      "strategy": "fp16 累加 + im2col 上 cube",   // planner 给的策略名
+      "change": "BLOCK_M,BLOCK_N,BLOCK_K=64,64,64",  // 改动梗概 (压成一句, 给 planner 上下文 + 图标签)
+      "changes_full": [                // 完整 changes[] (old_code/new_code 全文, 审计/复盘不丢信息)
+        {"old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 32",
+         "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
+         "reason": "...", "section": "config", "tier": 1}
+      ],
+      "expected_impact": "1.10x",      // planner 预期加速比 (下轮反馈"预期 vs 实际"学习闭环)
+
+      "speedup": 1.5,                  // ★本轮端到端加速比 (= baseline_e2e_ns / e2e_ns; 主指标, 累计输出)
+      "kernel_speedup": 1.5,           // 本轮纯 kernel 加速比 (= baseline_ns / ns; 参考口径)
+      "prev_speedup": 1.0,             // 上一轮已接受 kernel 的加速比 (保留判定基准)
+
+      "ns": 3933333.0,                 // 本轮纯 kernel 耗时 ns (baseline_ns / kernel_speedup)
+      "e2e_ns": 4210000.0,             // 本轮端到端耗时 ns (★主加速比的实测值)
+
+      "decision": "KEEP",              // 决策: KEEP(采纳进链)/REVERT(慢回退)/FAIL(coder或verify失败)
+      "result": "OK",                  // 结果: OK/NOOP(coder没改动)/FAIL; NOOP 检测本轮输出==改前
+
+      "error": "",                     // 报错文本 (空=正常; coder/verify 失败时记, 下轮 planner 可见)
+      "tflops": 8.7                    // 本轮真实 TFLOPS (cube_fops÷ns; kernel 结构变 FLOPs 也变, 图不失真)
+    }
+    // ... 每轮一条, 同上结构
   ]
 }
 ```
+
+**字段层级速记**：
+- `state` = 全局状态机（当前 tier/round、双口径基线、PyTorch/工业级基准、当前 kernel、sweep 结果）— 每轮读写，`--resume` 续跑靠它
+- `state.baseline_e2e_ns` / `current_speedup` = **主指标对**（端到端基线 + 当前加速比，加速比可信的核心）
+- `state.industrial_time_us` = 工业级天花板（轨迹图红线，看优化效果）
+- `state.last_sweep_result` = Tier3 分块扫描结论（每轮喂 planner，告诉它 BLOCK 已穷举）
+- `history[i]` = 每轮一行（策略+改动梗概+完整 changes+双口径加速比+决策+报错+TFLOPS）— planner 看前层试过什么、轨迹图打点
 
 ---
 
@@ -543,30 +786,13 @@ cat outputs/<op>/optimization.log
 
 ---
 
-## 9. 与 v3 的差异（为什么重写）
-
-| 项 | v3 (旧) | v4 (当前) |
-|---|---|---|
-| 输入 | 三文件 (test_matmul.py+triton_kernel.py+config.json) | **单文件 kernel_op.py** (config+kernel+test) |
-| 调度 | Orchestrator + RecordManager | **Scheduler 状态机** 一体 |
-| 诊断 | CPU 仿真 + HIVMIR 文本解析 (dsl_merger 29字段) | **真机 msprof 双源** (通用+op) → diagnosis.json |
-| 验证 | CPU Emulator Stage1 + 真机 Stage2 | **正确性校验 + 端到端 msprof** (warmup + 1×msprof KERNEL_LOOP; 纯kernel+E2E 双口径, 主=E2E) |
-| 对比基准 | 无 (只 vs naive torch) | **工业级天花板** (eager/compile/cann-fused/fa 各 mode 取 min) + PyTorch 统一 msprof |
-| 改码 | LLM 全改 | **确定性 changes[] 替换** + LLM 仅修错 |
-| 晋升 | 规则 | planner `promote_to` (可回退前层) + 无改进兜底 |
-| HIVM | 每轮全流程 | 仅 **Tier2 融合** |
-| 记忆 | 经验库检索 | 基本弃用 (仅 coder 错修参考) |
-```
-
----
-
-## 10. 六层优化策略：读取字段详解
+## 9. 六层优化策略：读取字段详解
 
 > 每轮 `run_optimize.sh` 产出 `diagnosis.json` 后，scheduler 按当前 tier 用 `TIER_FIELDS` + `TIER_PER_KERNEL` 筛字段 → `07_tier<N>_fields/` 喂 Planner。
 > 字段来源: `summary.*`(通用 msprof 骨架) / `kernels[i].task.*`(骨架 per-kernel) / `kernels[i].deep.*`(msprof op 深层画像)。
 > **全局摘要(前层信号)** 任何 tier 都喂: `num_kernels`(多→融合空间) / `num_kernels_total`(含框架) / `api_overhead_total_us`(launch 开销) —— 让 planner 先做"前层优先检查"，不能只闷头调本层参数。
 
-### 10.1 Tier1 算法结构
+### 9.1 Tier1 算法结构
 
 **优化什么**: 算法选择 / 精度(fp16/int8) / 算术强度 → 决定 kernel 走什么算法规格。
 **读的字段**:
@@ -586,7 +812,7 @@ cat outputs/<op>/optimization.log
 | `kernels[].deep.roofline.bottleneck_type` | 瓶颈类型 | 一针见血: compute/memory/latency/balanced → 本层是否瓶颈 |
 | `kernels[].task.pipes_us.aiv_vec_time_us` | 向量耗时 (per-kernel) | 向量 kernel (rms_norm/softmax/bias_gelu) 的实际耗时占比 |
 
-### 10.2 Tier2 算子融合
+### 9.2 Tier2 算子融合
 
 **优化什么**: 多 kernel → 单 kernel (逐元素并入 matmul epilogue / 残差 / 冗余 load)。
 **读的字段**:
@@ -604,7 +830,7 @@ cat outputs/<op>/optimization.log
 | `kernels[].deep.roofline.compute_utilization` | 算力利用率 (per-kernel) | 低利用率的独立小 kernel = 最该并入的候选 |
 | `kernels[].launch_count` | launch 次数 (per-kernel) | 每 kernel 被 launch 几次, 占比口径 |
 
-### 10.3 Tier3 分块配置
+### 9.3 Tier3 分块配置
 
 **优化什么**: BLOCK_M/N/K (L0A/L0B/L0C/UB 约束, 2 幂) — round1/tier3 自动 sweep 实测最优块。
 **读的字段**:
@@ -622,7 +848,7 @@ cat outputs/<op>/optimization.log
 | `kernels[].task.pipes_us.aic_mte1_time_us` | MTE1(L1→L0A/B)耗时 (per-kernel) | 搬运实际耗时 → BLOCK 该调大/调小 |
 | `kernels[].deep.conflict.bank_cflt_ratio` | bank 冲突 (per-kernel) | 大块时 UB bank 冲突 |
 
-### 10.4 Tier4 访存
+### 9.4 Tier4 访存
 
 **优化什么**: GM 带宽 / L2 复用 / 连续化 / 128-bit 对齐 / 流水线。
 **读的字段**:
@@ -640,7 +866,7 @@ cat outputs/<op>/optimization.log
 | `kernels[].deep.roofline.arithmetic_intensity` | 算术强度 | 确认访存型 → 本层优化优先 |
 | `kernels[].task.est_bytes_in/out` | 绝对搬运量 (per-kernel) | 冗余搬运判断: 中间 tensor 写 GM 又读回 → L2 复用/降搬运 |
 
-### 10.5 Tier5 计算占用
+### 9.5 Tier5 计算占用
 
 **优化什么**: 向量化 / rsqrt / FMA / ILP / bank 冲突。
 **读的字段**:
@@ -657,7 +883,7 @@ cat outputs/<op>/optimization.log
 | `kernels[].deep.conflict.total_cflt_ratio` | vec 总冲突 | 向量总冲突占比 |
 | `kernels[].deep.conflict.wait_ratio` | vec 被阻塞占比 (per-kernel) | 等待/流水气泡 → ILP 提升 |
 
-### 10.6 Tier6 架构专属
+### 9.6 Tier6 架构专属
 
 **优化什么**: 引擎失衡 / wait_ratio / mte 冲突 / 代码风格。
 **读的字段**:
@@ -674,9 +900,9 @@ cat outputs/<op>/optimization.log
 
 ---
 
-## 11. diagnosis.json 完整结构与字段来源
+## 10. diagnosis.json 完整结构与字段来源
 
-### 11.1 数据流：msprof 产物 → diagnosis.json
+### 10.1 数据流：msprof 产物 → diagnosis.json
 
 ```
 通用 msprof (任务级)                     msprof op (逐 kernel, 每 kernel 一次)
@@ -701,35 +927,200 @@ cat outputs/<op>/optimization.log
               06_diagnosis/diagnosis.json
 ```
 
-### 11.2 diagnosis.json 顶层结构
+### 10.2 diagnosis.json 顶层结构（完整展开，每字段附示例值）
+
+> 下面是一个**真实可读的完整 JSON 样例**（两层 MLP = 3 个目标 kernel：fc1 / bias_gelu / fc2），每个字段后面注释它记录什么。`...` 仅表示“同上结构再重复若干个”，不是省略字段。
 
 ```json
 {
-  "meta":        {"source": "msprof (generic) + msprof op per-kernel", "num_kernels": N, "filled_kernels": M},
-  "summary":     {"num_kernels", "num_kernels_total", "total_ns", "num_cores",
-                  "api_overhead_total_us", "l2_hit_rate", "filled_kernels"},
-  "kernels": [   {  // 每优化目标 kernel 一个 (= kernel_slot + deep)
-      "kernel_name", "framework", "launch_count",
-      "task":  { "task_type", "task_duration_us", "block_dim", "input/output_shapes|dtypes",
-                 "aicore_time_us", "aiv_time_us", "total_cycles",
-                 "pipes_us": {"aic_cube/mac/scalar/mte1/mte2/mte3/fixpipe_time_us",
-                              "aiv_vec/scalar/mte2/mte3_time_us"},
-                 "est_bytes_in", "est_bytes_out", "transfers": [...] },
-      "deep":  { "freq_mhz", "bandwidth_gb_s": {...}, "engine_utilization": {...},
-                 "compute": {...}, "conflict": {...}, "l2_hit_rate",
-                 "roofline": {"achieved_memory_bw_gb_s", "peak_memory_bw_gb_s", "memory_utilization",
-                              "achieved_compute_tflops", "peak_compute_tflops", "compute_utilization",
-                              "arithmetic_intensity", "bottleneck_type"} },
-      "filled_by": "msprof op"
-  }],
-  "framework_kernels": [...],   // aclnn* 框架 kernel (非优化目标, 仅观察)
-  "api_overhead":    [...],     // 来自 api_statistic.csv
-  "multi_kernel":    [...],     // 来自 op_statistic.csv
-  "notes": [...]
+  "meta": {
+    "source": "msprof (generic) + msprof op per-kernel",   // 标记数据来自两条 msprof 链路
+    "generated_at": "2026-08-11T14:30:00",                  // integrate.py 生成时刻
+    "num_kernels": 3,                                       // 优化目标 kernel 数 (非 aclnn)
+    "filled_kernels": 3,                                    // 其中 deep 被 msprof op 填满的个数
+    "inputs": {
+      "task": "round_dir/05_task/task.json",                // 骨架来源
+      "boards": ["round_dir/06_diagnosis/board_1.json",     // 每 kernel 一个 deep 来源
+                 "round_dir/06_diagnosis/board_2.json",
+                 "round_dir/06_diagnosis/board_3.json"]
+    },
+    "schema_version": "4.0"
+  },
+
+  "summary": {                          // ── 全局汇总 (integrate.py 从 task.json 汇总, 喂 Tier1~6 全局摘要) ──
+    "num_kernels": 3,                   // 优化目标 kernel 数 (= len(kernels[]), 排除 aclnn)
+    "num_kernels_total": 7,             // 全部 distinct op 名数 (含 aclnn 框架 kernel)
+    "total_ns": 5900000,                // 端到端耗时 ns = Σ 非 aclnn kernel 的 Task Duration ×1000 (与 verify 同口径)
+    "num_cores": 20,                    // ★实际是 launch grid (Block Dim 最大值), 不是物理核数 (910B3 固定 20 核)
+    "api_overhead_total_us": 180.5,     // Σ api_overhead[].total_us = host 侧 launch/API 总开销 (大 → 融合收益)
+    "l2_hit_rate": 0.42,                // 全局 L2 命中率 (0~1; 来自 l2_cache.csv, 已归一化)
+    "filled_kernels": 3                 // deep 被 msprof op 填满的 kernel 数 (<num_kernels 说明有 kernel 没采到 op)
+  },
+
+  "kernels": [                          // ── 逐优化目标 kernel (每 kernel = 骨架 task + 深层 deep) ──
+    {
+      "kernel_name": "matmul_kernel",   // op_summary 里的 Op Name (msprof op 按它匹配 deep)
+      "framework": false,               // 是否 aclnn 框架 kernel (true 的不进这里, 进 framework_kernels[])
+      "launch_count": 2,                // 该 kernel 被 launch 几次 (fc1 用了 2 次 → 占比要 ×2)
+      "task": {                         // ── 骨架: 来自 op_summary.csv (通用 msprof, 每 kernel 一行) ──
+        "task_type": "AI_CORE:CUBE",    // Task Type 列: 引擎类型 (Cube/Vec…), 决定走计算还是访存优化
+        "task_duration_us": 1850.0,     // Task Duration(us) 列: 单次 launch 耗时 (占比口径的分子)
+        "block_dim": 20,                // Block Dim 列: launch grid (并行度; 太少 = 并行不足)
+        "input_shapes": "(2048,2048);(2048,2048)",   // Input Shape 列: 输入张量形状 (算搬运字节用)
+        "input_dtypes": "float32",      // Input Data Type 列: 输入类型 (算字节/精度)
+        "output_shapes": "(2048,2048)", // Output Shape 列: 输出形状
+        "output_dtypes": "float32",     // Output Data Type 列: 输出类型
+        "aicore_time_us": 1820.0,       // aicore time 列: cube 核总时间
+        "aiv_time_us": 0.0,             // aiv time 列: 向量核总时间
+        "total_cycles": 3276000,        // total cycles 列: 总周期
+        "pipes_us": {                   // per-pipe 耗时 (来自 aic_*/aiv_*_time(us) 列, 兼容列名 cube↔mac/fixpipe↔fixp)
+          "aic_cube_time_us": 1820.0,   // cube 计算耗时 (Tier5 看是否计算瓶颈)
+          "aic_mac_time_us": 1820.0,    // MAC 耗时 (真实列名常是这个, cube 别名)
+          "aic_mte1_time_us": 410.0,    // MTE1 (L1→L0A/B) 搬运耗时 (Tier3 看 BK 是否过大)
+          "aic_mte2_time_us": 320.0,    // MTE2 (GM→L1) 搬运耗时 (Tier4 看访存)
+          "aic_mte3_time_us": 95.0,     // MTE3 (L0C→fixpipe→UB→GM) 写回耗时
+          "aiv_vec_time_us": 0.0        // 向量耗时 (rms_norm/softmax/bias_gelu 命门)
+        },
+        "est_bytes_in": 33554432,       // 估算输入搬运字节 = Σ(元素数×dtype字节) (shape 推)
+        "est_bytes_out": 16777216,      // 估算输出搬运字节
+        "transfers": [                  // 计算出的每通路带宽 (字节 + pipe 耗时 → GB/s)
+          {"path": "GM读→L1/UB(MTE2)", "bytes": 33554432, "time_us": 320.0, "bw_gb_s": 104.9},
+          {"path": "L1→L0A/L0B(MTE1)", "bytes": 33554432, "time_us": 410.0, "bw_gb_s": 81.8},
+          {"path": "L0C/UB→GM(写)", "bytes": 16777216, "time_us": 95.0, "bw_gb_s": 176.6},
+          {"path": "Cube MAC", "macs": 17179869184, "time_us": 1820.0, "tflops": 9.4}
+        ]
+      },
+      "deep": {                         // ── 深层: 来自 msprof op 的 8 个 CSV (board_<i>.json), 按名匹配填充 ──
+        "freq_mhz": 1800,               // OpBasicInfo Current Freq: 运行频率
+        "bandwidth_gb_s": {             // 各通路真实带宽 (Memory/MemoryL0/MemoryUB, MB/s→GB/s 换算)
+          "main_mem_read_gb_s": 95.2,   // GM 读带宽 (Memory.csv main_mem_read_bw)
+          "main_mem_write_gb_s": 45.1,  // GM 写带宽
+          "l1_read_gb_s": null,         // L1 读带宽 (合法缺则 null)
+          "l1_write_gb_s": null,
+          "l2_read_gb_s": 320.0,        // L2 读带宽
+          "l2_write_gb_s": 180.0,
+          "gm_to_ub_gb_s": 95.2,        // GM→UB 读带宽 (aiv_gm_to_ub_bw)
+          "ub_to_gm_gb_s": 45.1,        // UB→GM 写带宽 (aiv_ub_to_gm_bw)
+          "ub_vector_read_gb_s": 210.0, // UB 向量读 (MemoryUB aiv_ub_read_bw_vector)
+          "ub_vector_write_gb_s": 110.0,
+          "ub_scalar_read_gb_s": null,
+          "ub_scalar_write_gb_s": null,
+          "ub_mte_read_gb_s": null,     // 910B3 合法缺 (仅推理产品有)
+          "ub_mte_write_gb_s": null,
+          "l0a_read_gb_s": 1200.0,      // L0A 读 (MemoryL0 aic_l0a_read_bw)
+          "l0a_write_gb_s": null,
+          "l0b_read_gb_s": 1180.0,      // L0B 读
+          "l0b_write_gb_s": null,
+          "l0c_read_gb_s": null,
+          "l0c_write_gb_s": 600.0       // L0C 写
+        },
+        "engine_utilization": {         // 各引擎占比 (PipeUtilization *_ratio, 缺则 time/总时长)
+          "cube": 0.71,                 // cube 占比 (高 = 计算为主)
+          "vec": 0.0,                   // 向量占比 (高 = 向量型算子瓶颈)
+          "mte1": 0.16,                 // MTE1 (L1→L0A/B) 占比 (高 = 内层搬运瓶颈)
+          "mte2": 0.12,                 // MTE2 (GM→L1) 占比 (高 = 外层访存瓶颈)
+          "mte3": 0.04,                 // MTE3 (写回) 占比
+          "scalar": 0.01,               // 标量占比 (高 = 地址/循环开销)
+          "fixpipe": 0.03               // fixpipe 占比 (定标)
+        },
+        "compute": {                    // 真实运算量/精度 (ArithmeticUtilization)
+          "cube_fops": 17179869184,     // cube 浮点运算数 (FLOPs 来源, 算 TFLOPS 用)
+          "cube_ratio": 0.85,           // cube 指令占比 (低 = 没走 cube, 如 conv 该 im2col)
+          "cube_fp16_ratio": 0.0,       // cube fp16 占比 (精度选择依据)
+          "cube_int8_ratio": 0.0,       // cube int8 占比
+          "cube_instr_number": 4096,    // cube 总指令数
+          "vector_fops": 0,             // 向量运算数 (非 matmul kernel 的真实计算量)
+          "vec_ratio": 0.0,             // 向量占比
+          "vec_fp32_ratio": 0.0,
+          "vec_instr_number": 0,
+          "aic_total_cycles": 3276000,  // aic 总周期
+          "aiv_total_cycles": 0         // aiv 总周期
+        },
+        "conflict": {                   // 冲突/等待 (ResourceConflictRatio 全列, 原样保留键名)
+          "bank_cflt_ratio": 0.03,      // bank 冲突 (128-bit 对齐可解, Tier5)
+          "bankgroup_cflt_ratio": 0.01, // bankgroup 冲突
+          "mte_cflt_ratio": 0.02,       // mte 冲突 (Tier6)
+          "wait_ratio": 0.05,           // vec 被阻塞占比 (流水气泡, Tier5/6)
+          "total_cflt_ratio": 0.06      // vec 总冲突
+        },
+        "l2_hit_rate": 0.45,            // 该 kernel 的 L2 命中率 (L2Cache, 0~1)
+        "roofline": {                   // ★ integrate.py 计算 (不是 CSV 直读); 峰值取 hardware_peak.json
+          "achieved_memory_bw_gb_s": 140.3,   // = main_mem_read + main_mem_write (读+写之和)
+          "peak_memory_bw_gb_s": 1638.4,      // GM 峰值 (实测或理论 HBM2e)
+          "memory_utilization": 0.086,        // = achieved/peak (Tier4 访存利用率)
+          "achieved_compute_tflops": 17.18,   // = (cube_fops+vector_fops)/1e12
+          "peak_compute_tflops": 294.9,       // cube fp16 峰值
+          "peak_compute_fp32_tflops": 73.7,   // cube fp32 峰值 (= fp16/4)
+          "compute_utilization": 0.233,       // = achieved / max(fp16峰, fp32峰) (用 max 防 fp32 被低估)
+          "compute_utilization_fp16": 0.058,  // 按 fp16 峰值算
+          "compute_utilization_fp32": 0.233,  // 按 fp32 峰值算
+          "arithmetic_intensity": 122.5,      // = achieved_compute×1e12 / achieved_mem / 1e9 (计算/访存)
+          "bottleneck_type": "compute_bound"  // mem≥0.8&comp<0.5→memory; comp≥0.8&mem<0.5→compute; 都<0.3→latency; 否则 balanced
+        }
+      },
+      "filled_by": "msprof op"          // deep 由 msprof op 填满; "msprof only" = 没采到 op (deep=null)
+    }
+    // ... 其余 kernel (bias_gelu_kernel / matmul_kernel2) 同上结构
+  ],
+
+  "framework_kernels": [                // ── aclnn* 框架 kernel (torch_npu 数据准备/参考), 非优化目标, 仅观察 ──
+    {
+      "kernel_name": "aclnnMatmul",     // Op Name 以 aclnn 开头 → 框架 kernel
+      "framework": true,
+      "launch_count": 4,                // 被 launch 几次
+      "task": { "task_duration_us": 12.3, "task_type": "AI_CORE:AI_VECTOR", "...": "..." },
+      "deep": null,                     // 框架 kernel 不跑 msprof op (没 deep)
+      "filled_by": null
+    }
+    // ...
+  ],
+
+  "api_overhead": [                     // ── launch/API 开销明细 (api_statistic.csv, Tier2 判断融合收益) ──
+    {
+      "level": "L1",                    // 调用层级
+      "api_name": "aclrtLaunchKernel",  // API 名
+      "total_us": 120.5,                // 该 API 总耗时
+      "count": 6,                       // 调用次数
+      "avg_us": 20.1,                   // 平均
+      "max_us": 35.2                    // 最大
+    }
+    // ...
+  ],
+
+  "multi_kernel": [                     // ── 每类算子次数/耗时 (op_statistic.csv, 判断是否值得融合) ──
+    {
+      "op_type": "Matmul",              // 算子类型
+      "core_type": "AIC",               // 核类型
+      "count": 2,                       // 次数
+      "total_time_us": 3700.0,          // 总耗时
+      "avg_us": 1850.0,                 // 平均
+      "min_us": 1800.0,                 // 最小
+      "max_us": 1900.0,                 // 最大
+      "ratio": 0.62                     // 占比
+    }
+    // ...
+  ],
+
+  "notes": [                            // ── 生成说明 (integrate.py 写的固定提示) ──
+    "骨架=通用msprof(task.json); deep=msprof op 按 kernel 名填充",
+    "roofline 每 kernel 一个: 带宽对1638.4GB/s, 算力对294.9/73.7TFLOPS(fp16/fp32)",
+    "峰值优先取 bench_910b3/hardware_peak.json 实测, 无则回退理论值",
+    "filled_by='msprof only' = 该 kernel 没跑到 op (deep=null)",
+    "kernels[].task.transfers 的 bytes 为估算 (每元素每通路搬一次)"
+  ]
 }
 ```
 
-### 11.3 字段来源明细（每个字段 ← 哪个文件哪个列 / 怎么算）
+**字段层级速记**：
+- `meta` = 这次生成的元信息（来源/时刻/输入文件/计数）
+- `summary` = 全局汇总（kernel 数/端到端耗时/launch 开销/L2）— Tier1~6 全局摘要都从这里取
+- `kernels[i].task` = 骨架（op_summary.csv，per-kernel 耗时/形状/pipe 耗时/搬运估值）
+- `kernels[i].deep` = 深层（msprof op 8 CSV，per-kernel 带宽/引擎/算力/冲突/L2）
+- `kernels[i].deep.roofline` = **算出来的**（achieved vs peak → 利用率 → bottleneck_type）
+- `framework_kernels` = aclnn 框架 kernel（不优化，只观察）
+- `api_overhead` / `multi_kernel` = launch 开销 / 算子统计（Tier2 融合判断）
+
+### 10.3 字段来源明细（每个字段 ← 哪个文件哪个列 / 怎么算）
 
 #### summary.*（integrate.py 从 task.json 汇总）
 

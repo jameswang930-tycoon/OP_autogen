@@ -477,6 +477,10 @@ class Scheduler:
             _st.setdefault("handoff", None)
             _st.setdefault("tier_jumps", [])
             _st.setdefault("promote_budget", 0)
+            _st.setdefault("best_round", 0)
+            _st.setdefault("best_e2e_ns", None)
+            # 旧 trajectory 缺 best_kernel → 用 current_kernel 兜底 (保证不脱钩)
+            _st.setdefault("best_kernel", _st.get("current_kernel", str(self.op_dir / "kernel_op.py")))
             print(f"  [Scheduler] 续跑: 从 tier{_st.get('tier')} "
                   f"round{_st.get('round')} 继续, kernel={self.current_kernel}")
 
@@ -492,7 +496,12 @@ class Scheduler:
                                        "total_rounds": 0,        # ★D7: 含 promote 轮的总执行数 (防 promote 白耗 max_rounds)
                                        "handoff": None,          # ★P1: 跳转手递 (下个 tier 的 planner 读)
                                        "tier_jumps": [],         # ★P1: 跳转路径记录 (防死循环)
-                                       "last_sweep_result": None},  # ★sweep 结果持久化 (每轮传给 planner)
+                                       "last_sweep_result": None,  # ★sweep 结果持久化 (每轮传给 planner)
+                                       # ★best 绑定: best_speedup 必须绑定打出该加速比的代码路径,
+                                       #   否则"最高加速比"和"最优代码"脱钩 (曾致 113x 代码丢失).
+                                       #   current_kernel === best_kernel (KEEP 仅在严格 > best 时推进).
+                                       "best_kernel": str(self.op_dir / "kernel_op.py"),
+                                       "best_round": 0, "best_e2e_ns": None},
                      "history": []}
         self.current_kernel = self.op_dir / "kernel_op.py"
         # ★D6: 保存原始 kernel 副本 → 环境漂移时重测 baseline 用它 (优化后 current_kernel 已不是原始版)
@@ -515,6 +524,8 @@ class Scheduler:
                                   "baseline_ns": None, "num_kernels": None,
                                   "current_speedup": 1.0,
                                   "baseline_e2e_ns": None,
+                                  "best_kernel": str(self.op_dir / "kernel_op.py"),
+                                  "best_round": 0, "best_e2e_ns": None,
                                   "handoff": None, "tier_jumps": []},
                 "history": []}
 
@@ -703,7 +714,10 @@ class Scheduler:
             if tier == 3:
                 lines.append("★分块层: 已穷举全部 L0 合法 2幂候选, 当前已是最优. 禁止猜新 BLOCK. promote 到下一层.")
             else:
-                lines.append(f"BLOCK 已优化 (sweep状态={sweep_status}), 聚焦本层策略.")
+                # ★sweep 在非分块层跑且采纳了最优块 → 明确告诉 planner 照此, 不要乱调分块
+                lines.append(f"BLOCK 已由 sweep 实测优化 (状态={sweep_status}, 采纳={sw.get('written', True)}).")
+                lines.append("★这是端到端实测的最优分块, 照此 BLOCK 改; 自本次 sweep 起若未动算子融合/算法结构, "
+                             "禁止再调分块参数 (已是最优); 除非 msprof 明确发现新的访存/计算瓶颈再调.")
             extracted = extracted + "\n" + "\n".join(lines)
         elif sweep_status.startswith("failed") or sweep_status == "not_triggered":
             extracted = extracted + f"\n# ══ 分块 sweep: {sweep_status} (无实测数据, BLOCK 未由 sweep 优化, 可自由调整) ══"
@@ -844,14 +858,21 @@ class Scheduler:
             from analyzers import sweep_blocks
         except Exception as e:
             return {"available": False, "error": f"sweep_blocks 不可用: {str(e)[:80]}"}
-        kernel = self.current_kernel
+        # ★sweep 必须在「历史最优代码」上扫 (best_kernel.py), 不在 current_kernel 上扫:
+        #   current_kernel 可能被噪声/失败污染; best_kernel 绑定 best_speedup, 是权威最优.
+        _bk = self.kernel_dir / "best_kernel.py"
+        kernel = _bk if _bk.exists() else self.current_kernel
         meta = sweep_blocks.SWEEP_META.get(self.kernel_name)
         if meta is None or not kernel.exists():
             return None                      # rms_norm 行级, 无自由分块参数 → 正常走 LLM
         code = kernel.read_text(encoding="utf-8")
         cur = sweep_blocks._read_current_block(code, meta["vars"])
         if cur is None:
-            return {"available": False, "error": "读不到 BLOCK 值"}
+            # ★大声报错 (不静默): coder 改了 BLOCK 变量名/格式 → sweep 匹配不上 → 必须暴露
+            _hint = ("BLOCK_M/N/K 改名或格式变 (拆多行/tl.constexpr 标注/换序)? "
+                     "sweep 只认 `BLOCK_M, BLOCK_N, BLOCK_K = a, b, c` 或单行 `BLOCK_X = N`")
+            print(f"  [Tier3] ⚠ sweep 读不到 BLOCK: {_hint}")
+            return {"available": False, "error": f"读不到 BLOCK 值: {_hint}"}
 
         # ★Bug 修复: 防止 sweep 写回 input 源文件 (current_kernel 在 round1 = input/<op>/kernel_op.py).
         #   sweep() 把最优块写回 op_dir/kernel_op.py → 若 op_dir 是 input 源目录会破坏基准.
@@ -1341,57 +1362,48 @@ class Scheduler:
                 print(f"  ⏱ ③融合分析: {t_fusion:.1f}s")
 
             # ★D1: 自动分块实测 v2 — 全量 L0 合法 BLOCK 候选, 单进程 torch.npu.Event 实测, 喂 planner.
-            #   ★触发: round1 (不管 tier, 分块是地基, 先固定好起点) 或 tier==3 (结构变更后重扫).
+            #   ★触发策略 (用户明确要求): round1 一次 + 每个 tier3 round 都跑 (不再用 hash 跳过).
+            #     分块是 tier3 的核心, 每轮都基于当前 best 代码重新找最优块, 最稳.
             #   报错/无可扫 → None, 走 LLM 兜底. TIER3_SWEEP=1 默认.
-            # ★v2 重扫条件: kernel 代码结构(非 BLOCK 赋值) 的 hash 变化 → 重扫.
             # ★计时: t_plan 从 sweep 前开始计 (sweep 计入 planner 阶段).
             _t_plan0 = time.time()
             tier3_sweep = None
             _sweep_status = "not_triggered"   # ★告诉 planner sweep 真实状态
+            _sweep_ran = False                # ★history 记录: 本轮 sweep 是否成功执行
+            _sweep_adopted = False            # ★history 记录: 是否采纳了 sweep 测的最优块
             if (rn == 1 or tier == 3) and os.environ.get("TIER3_SWEEP", "1") == "1":
-                import hashlib
-                _code_body = re.sub(r'(BLOCK_\w+)\s*[,=]\s*\d+', '',   # 去 BLOCK 赋值
-                                    self.current_kernel.read_text(encoding="utf-8")
-                                    if self.current_kernel.exists() else "")
-                _code_norm = re.sub(r'\s+', ' ', _code_body).strip()
-                _code_hash = hashlib.sha256(_code_norm.encode()).hexdigest()[:16]
-                _prev_hash = st.get("tier3_sweep_code_hash", "")
-                if _code_hash != _prev_hash or not st.get("tier3_swept"):
-                    # ★B2: 成功才标记已扫 — 失败不写 hash/tier3_swept,
-                    #   下次结构未变也会重试 (瞬时失败不永久禁用自动分块扫描).
-                    tier3_sweep = self._tier3_sweep_data(tier, rn, round_dir)
-                    if tier3_sweep and tier3_sweep.get("available"):
-                        st["tier3_swept"] = True
-                        st["tier3_sweep_code_hash"] = _code_hash
-                        _best = tier3_sweep.get("best") or {}
-                        _bns = _best.get("ns")
-                        _bns_s = f"{_bns:.0f}ns" if isinstance(_bns, (int, float)) else "?"
-                        _w_s = ("最优已写入 kernel" if tier3_sweep.get("written", True)
-                                else "当前块保留 (未改动)")
-                        print(f"  ⏱ 分块实测完成: {len(tier3_sweep.get('configs', []))} config, "
-                              f"最优 {_best.get('block')} {_bns_s} "
-                              f"({time.time()-_t_plan0:.0f}s) → {_w_s}")
-                        # ★只存结论 (best + status + 报告路径), 不存全部 configs → 防 trajectory 膨胀
-                        st["last_sweep_result"] = {
-                            "available": True,
-                            "best": tier3_sweep["best"],
-                            "vars": tier3_sweep.get("vars", []),
-                            "n_configs": len(tier3_sweep.get("configs", [])),
-                            "result_path": tier3_sweep.get("result_path") or "",
-                            "written": tier3_sweep.get("written", True),
-                        }
-                        _sweep_status = "ran_this_round"
-                    elif tier3_sweep and tier3_sweep.get("available") is False:
-                        print(f"  [Tier3] 分块实测不可用 "
-                              f"({tier3_sweep.get('error','行级/无候选')}) → 走 LLM (兜底)")
-                        _sweep_status = f"failed: {tier3_sweep.get('error', '?')[:60]}"
-                        tier3_sweep = None   # 失败 → 不传坏数据给 planner
-                    else:
-                        # ★B5: _tier3_sweep_data 返回 None (行级 op/无可扫) → 不声称本轮实测
-                        _sweep_status = "skipped_no_free_params"
+                # ★每个 round1/tier3 round 都跑 (去掉 hash 跳过 — 用户要求每次 tier3 都触发)
+                tier3_sweep = self._tier3_sweep_data(tier, rn, round_dir)
+                if tier3_sweep and tier3_sweep.get("available"):
+                    _sweep_ran = True
+                    _sweep_adopted = bool(tier3_sweep.get("written", True))
+                    st["tier3_swept"] = True
+                    _best = tier3_sweep.get("best") or {}
+                    _bns = _best.get("ns")
+                    _bns_s = f"{_bns:.0f}ns" if isinstance(_bns, (int, float)) else "?"
+                    _w_s = ("最优已写入 kernel" if tier3_sweep.get("written", True)
+                            else "当前块保留 (未改动)")
+                    print(f"  ⏱ 分块实测完成: {len(tier3_sweep.get('configs', []))} config, "
+                          f"最优 {_best.get('block')} {_bns_s} "
+                          f"({time.time()-_t_plan0:.0f}s) → {_w_s}")
+                    # ★只存结论 (best + status + 报告路径), 不存全部 configs → 防 trajectory 膨胀
+                    st["last_sweep_result"] = {
+                        "available": True,
+                        "best": tier3_sweep["best"],
+                        "vars": tier3_sweep.get("vars", []),
+                        "n_configs": len(tier3_sweep.get("configs", [])),
+                        "result_path": tier3_sweep.get("result_path") or "",
+                        "written": tier3_sweep.get("written", True),
+                    }
+                    _sweep_status = "ran_this_round"
+                elif tier3_sweep and tier3_sweep.get("available") is False:
+                    print(f"  [Tier3] 分块实测不可用 "
+                          f"({tier3_sweep.get('error','行级/无候选')}) → 走 LLM (兜底)")
+                    _sweep_status = f"failed: {tier3_sweep.get('error', '?')[:60]}"
+                    tier3_sweep = None   # 失败 → 不传坏数据给 planner
                 else:
-                    print(f"  [Tier3] kernel 结构未变 (hash={_code_hash}), 跳过重扫, 复用历史最佳")
-                    _sweep_status = "skipped_structure_unchanged"
+                    # ★B5: _tier3_sweep_data 返回 None (行级 op/无可扫) → 不声称本轮实测
+                    _sweep_status = "skipped_no_free_params"
 
             # ★关键: 即使本轮 sweep 没跑, 也把上次成功的 sweep 结果传给 planner (tier3 尤其需要)
             #   ★B2: 本轮尝试过但失败 → 不喂过期缓存 (防"已穷举=最优"假象, 让 planner 走 LLM 兜底)
@@ -1421,6 +1433,10 @@ class Scheduler:
             round_kernel = round_dir / "kernel_op.py"
             prev_speedup = st.get("current_speedup", 1.0)   # 上一轮已接受 kernel 的加速比 (基线=1.0)
             kept = False                                      # 本轮是否被采纳进 kernel 链
+            # ★input 链不变量保护: 快照本轮开始时的 current_kernel (= 历史最优代码).
+            #   sweep 可能在轮中把 current_kernel 指向 round_dir; coder 覆写同路径; verify 一失败
+            #   current_kernel 就卡在坏代码 → 下一轮读坏代码 (input 链断). 失败/未采纳时回滚到此快照.
+            _pre_round_kernel = self.current_kernel
             pre_code = self.current_kernel.read_text(encoding="utf-8") \
                 if self.current_kernel.exists() else ""    # NOOP 对比用 (改之前的版本)
             if getattr(plan, "promote", False):
@@ -1467,8 +1483,11 @@ class Scheduler:
                             speedup = _be2e / _e2e
                         else:
                             speedup = v.get("speedup", 1.0) or 1.0   # None→1.0 防御 (纯 kernel 兜底)
-                        floor = _keep_floor()
-                        if speedup >= prev_speedup * floor:
+                        # ★严格最优 KEEP: 本轮必须严格 > 历史最高 best_speedup 才进链.
+                        #   优化就是越改越快 — 不超过历史最优不算优化 (原 ≥prev×floor 会采纳变慢的噪声峰).
+                        #   采纳时 current_kernel === best_kernel (同步更新, 见下方 best 绑定).
+                        _best_sp = st.get("best_speedup", 1.0)
+                        if speedup > _best_sp:
                             self.current_kernel = round_kernel
                             st["current_kernel"] = str(round_kernel)
                             st["current_speedup"] = round(speedup, 4)
@@ -1477,7 +1496,8 @@ class Scheduler:
                             if os.environ.get("SANITY_VERIFY", "0") == "1":
                                 self._sanity_verify(round_kernel)
                         else:
-                            print(f"  ↩ 回退: 本轮 {speedup:.3f}x < 上一轮 {prev_speedup:.3f}x×{floor} (噪声地板), 沿用上一轮 kernel")
+                            print(f"  ↩ 回退: 本轮 {speedup:.3f}x ≤ 历史最高 {_best_sp:.3f}x "
+                                  f"(严格最优: 不超越历史最高不采纳, 沿用 best kernel)")
                         # ★bug 修复: 本轮成功 (即便前几次 coder 失败过) → 清空 prev_err,
                         #   否则 hist["error"] 记的是之前 coder 失败的旧错误, planner 误以为成功轮有错
                         prev_err = ""
@@ -1490,6 +1510,13 @@ class Scheduler:
                     # ★Bug 9: 用 prev_speedup 而非假 1.0, 否则 history 出现假掉点 + no_improve 误计
                     v = {"ok": False, "error": f"coder 连续3次未成功应用: {(prev_err or '')[:160]}",
                          "speedup": prev_speedup, "ns": None}
+
+            # ★input 链不变量: 本轮未采纳 (REVERT/FAIL) → current_kernel 必须回到轮首快照 (= 历史最优).
+            #   sweep 可能在轮中把 current_kernel 指向 round_dir, coder 覆写了同路径; 不回滚就会
+            #   让下一轮读到坏代码. (promote 轮 kept=True, 不进这里.)
+            if not kept:
+                self.current_kernel = _pre_round_kernel
+                st["current_kernel"] = str(_pre_round_kernel)
 
             # ★兜底: 保证每个 round 目录都有 kernel_op.py (格式一致)
             if not round_kernel.exists():
@@ -1541,6 +1568,9 @@ class Scheduler:
                     "kernel_speedup": round(_be / ns, 4) if (_be and ns) else None,  # 纯 kernel 口径参考
                     "prev_speedup": round(prev_speedup, 4),   # 上一轮已接受 kernel 的加速比 (保留判定用)
                     "ns": ns, "e2e_ns": _e2e, "decision": decision, "result": result,
+                    # ★sweep 状态 (每轮记): 是否跑了 sweep / 是否采纳 sweep 测的最优块
+                    "sweep_ran": _sweep_ran, "sweep_adopted": _sweep_adopted,
+                    "sweep_status": _sweep_status,
                     "error": (prev_err[:120] if prev_err else "")}
             # ★F3: 每轮真实 tflops (kernel 结构变化后 FLOPs 变, 轨迹图用 hist 值, 不再 initial×speedup 失真)
             _cf = sum((k.get("deep") or {}).get("compute", {}).get("cube_fops") or 0
@@ -1580,6 +1610,18 @@ class Scheduler:
                 print(f"  ⚠ [优秀案例] 记录跳过: {str(_ec)[:120]}")
             if st.get("best_speedup") is None or speedup > st["best_speedup"]:
                 st["best_speedup"] = speedup
+                # ★best 绑定: 同步记录打出该加速比的代码路径 + 复制到 best_kernel.py.
+                #   采纳(strict > best)时 current_kernel=round_kernel; 这里把它们与 best_speedup 绑死,
+                #   防"最高加速比和最优代码脱钩". final_output 也用 best_kernel (不是 current).
+                if kept:
+                    st["best_kernel"] = str(round_kernel)
+                    st["best_round"] = rn
+                    st["best_e2e_ns"] = _e2e
+                    try:
+                        import shutil as _sh
+                        _sh.copy2(round_kernel, self.kernel_dir / "best_kernel.py")
+                    except Exception:
+                        pass
             self.traj["history"].append(hist)
 
             # 晋升决策: planner.promote (读瓶颈判断) + 连续3轮无改进兜底 + 达标/到Tier6停止
@@ -1629,13 +1671,20 @@ class Scheduler:
                 print(f"  ⚠ 轨迹图生成失败: {str(e)[:120]}")
 
         # ★最终产物: 把找到的最优 kernel 写进 final_output/ — 不只留图表, 代码也要可直取.
-        #   写: ①最终 kernel_op.py (当前被采纳链上的最优) ②baseline 副本 ③final_summary.json 摘要.
+        #   ★用 best_kernel (历史最高加速比那轮的代码), 不是 current_kernel:
+        #     严格最优 KEEP 下两者通常一致, 但 best_kernel 是权威记录 (绑定 best_speedup/best_round).
         try:
             import shutil as _sh
             _final_dir = self.kernel_dir / "final_output"
             _final_dir.mkdir(parents=True, exist_ok=True)
-            _src = self.current_kernel if (self.current_kernel and self.current_kernel.exists()) else None
-            if _src is None and st.get("current_kernel"):
+            _bk = self.kernel_dir / "best_kernel.py"
+            _src = _bk if _bk.exists() else (self.current_kernel
+                                             if (self.current_kernel and self.current_kernel.exists()) else None)
+            if _src is None and st.get("best_kernel"):
+                _p = Path(st["best_kernel"])
+                if _p.exists():
+                    _src = _p
+            elif _src is None and st.get("current_kernel"):
                 _p = Path(st["current_kernel"])
                 if _p.exists():
                     _src = _p

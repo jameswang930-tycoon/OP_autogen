@@ -162,6 +162,11 @@ _UNICODE_FIXES = {
     "•": "*", "◦": "*", "▪": "*", "‣": "*",
     "©": "(c)", "®": "(r)", "™": "(tm)",
     "№": "No.", "§": "S.", "¶": "P.",
+    # ── 制表符/框线 (注释里常见, 如 ═══ 分隔线; LLM 重吐整文件时最易改崩这片 → 统一转 ASCII) ──
+    "═": "=", "║": "|", "╔": "=", "╗": "=", "╚": "=", "╝": "=",
+    "╠": "=", "╣": "=", "╦": "=", "╩": "=", "╬": "=",
+    "─": "-", "│": "|", "┌": "+", "┐": "+", "└": "+", "┘": "+",
+    "├": "+", "┤": "+", "┬": "+", "┴": "+", "┼": "+",
     # ── 不可见/空字符 (LLM 常混入 → "空行 invalid character" 报错, 最常见于首/末行) ──
     #   BOM/零宽/方向符 → 删; 空格类变体 → 普通空格; 行/段分隔 → 空格 (防结构错位)
     "﻿": "", "‌": "", "‍": "", "‎": "", "‏": "",
@@ -201,6 +206,27 @@ def _closest_ascii(ch: str) -> str:
             "π": "pi", "ρ": "r", "σ": "s", "τ": "t", "φ": "phi", "ω": "w", "Δ": "D", "Σ": "S", "Ω": "O",
             "√": "sqrt", "∑": "sum", "∏": "prod", "∫": "int", "∂": "d", "∇": "grad"}
     return _map.get(ch, "")  # 未知 → 删除 (比留非法字符安全)
+
+
+def _preserve_header(text: str, original: str) -> str:
+    """★保 shebang + coding 声明 (防 LLM 重吐整文件时吞/改 header → 'line 3 invalid syntax').
+    原代码有 shebang(`#!...`) 或 coding(`# -*- coding -*-`), 清理后的 text 丢了 → 从 original 补回最前.
+    清理后已含则不动. 注: coding 声明必须在第 1/2 行才有效, 所以只补这两类前缀."""
+    import re as _re
+    orig_lines = original.splitlines()
+    # 取原代码前两行的 shebang / coding
+    header = []
+    for ln in orig_lines[:2]:
+        if ln.startswith("#!") or "coding" in ln and ":" in ln:
+            header.append(ln)
+    if not header:
+        return text   # 原代码无 header, 不补
+    # 清理后的 text 已含这些 header 行 → 不重复补
+    text_first2 = "\n".join(text.splitlines()[:2])
+    missing = [h for h in header if h.strip() not in text_first2]
+    if not missing:
+        return text
+    return "\n".join(missing) + "\n" + text
 
 
 def _generate_diff(original: str, optimized: str) -> str:
@@ -304,6 +330,22 @@ class CoderAgent:
     def __init__(self, use_llm: bool = True):
         self.use_llm = use_llm
 
+    @staticmethod
+    def _dump_failed(code: str, kernel_path: Optional[str], why: str):
+        """★失败留证: 把 coder 产出的坏代码写到 round_dir/failed_kernel.py (不覆盖 kernel_op.py).
+        便于事后排查真实坏字符 (用户常反映 'kernel_op.py 看着没问题' — 因为失败时写回的是原码,
+        坏的中间产物被丢了; 留这份才能定位). 永不抛异常."""
+        try:
+            if not kernel_path:
+                return
+            from pathlib import Path as _P
+            fp = _P(kernel_path).parent / "failed_kernel.py"
+            fp.write_text((f"# failed_kernel.py — coder 输出未通过校验: {why}\n"
+                           f"# (kernel_op.py 仍是上一轮的正确代码, 这份只是排查用)\n"
+                           + code), encoding="utf-8")
+        except Exception:
+            pass
+
     def apply(
         self,
         kernel_code: str,
@@ -336,6 +378,7 @@ class CoderAgent:
                 if applied:
                     ok, err = _validate_python(new_code)
                     if not ok:
+                        self._dump_failed(new_code, kernel_path, f"Step0 替换后语法错: {err}")
                         return CoderResult(success=False, optimized_code=kernel_code,
                                            diff="", error_message=f"替换后语法错: {err}")
                     diff = _generate_diff(kernel_code, new_code)
@@ -370,6 +413,7 @@ class CoderAgent:
         # Step 3: Python 语法检查
         valid, err = _validate_python(optimized)
         if not valid:
+            self._dump_failed(optimized, kernel_path, f"Step3 LLM 输出语法错: {err}")
             return CoderResult(
                 success=False,
                 optimized_code=kernel_code,
@@ -458,7 +502,7 @@ class CoderAgent:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _clean_output(self, raw: str, original: str) -> str:
-        """清理 LLM 输出 — 去 BOM/行首垃圾/markdown 代码块包裹/★Unicode 脏字符。"""
+        """清理 LLM 输出 — 去 BOM/行首垃圾/markdown 代码块包裹/★Unicode 脏字符/保 header。"""
         text = raw.lstrip('﻿').lstrip()   # 去 BOM + 行首空白
         # 去行首垃圾: 找到第一个有效起点 (#/import/from/"""/@triton/class/def), 前面有垃圾就切掉
         if text:
@@ -479,7 +523,12 @@ class CoderAgent:
         #   智能引号 ' ' " " (U+2018/9/C/D) → ASCII ' "
         #   省略号 … (U+2026) → ...
         #   不间断空格 (U+00A0) / 全角空格 (U+3000) → 普通空格
+        #   ★制表符 ═ ─ │ 等 (注释分隔线) → ASCII, 防 LLM 重吐整文件时改崩 header
         text = _sanitize_unicode(text)
+
+        # ★保 header (防 LLM 吞/改 shebang + coding 声明 → "line 3 invalid syntax"):
+        #   原代码有 shebang/coding, 清理后丢了 → 从原代码补回最前面.
+        text = _preserve_header(text, original)
 
         # 如果输出为空或太短, 返回原始代码
         if len(text) < 10:

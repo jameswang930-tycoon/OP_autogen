@@ -1708,6 +1708,14 @@ class Scheduler:
             rn += 1
             st["total_rounds"] = total_rounds   # 总执行轮 (含 promote)
             self._save_traj()
+            # ★每轮产出策略摘要 → final_output/{all,successful}_strategies.md
+            #   (env AUTO_STRATEGY_SUMMARY=0 关闭; 失败不阻断迭代)
+            if os.environ.get("AUTO_STRATEGY_SUMMARY", "1") == "1":
+                try:
+                    from feedback.strategy_summary import generate as _gen_strat
+                    _gen_strat(self.kernel_dir)
+                except Exception as _e:
+                    print(f"  ⚠ 策略摘要生成失败: {str(_e)[:100]}")
 
         self._write_timing_stats()   # ★各阶段耗时统计 (项目自身瓶颈)
         # ★最后产出汇总: 总轮次/总耗时/两种口径 (端到端主 + 纯kernel参考)

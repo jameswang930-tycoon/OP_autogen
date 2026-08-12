@@ -552,7 +552,9 @@ def build_planner_context(diagnosis: dict, tier: int, state: dict, history: list
         "history": _compact_history(history),          # ★轻量摘要 (去 changes_full/error 截断/限20轮), GLM5.1 预算
         "handoff": handoff or None,                    # ★P1: 跳转来的瓶颈分析+优化方向
         "fusion_analysis": _sanitize_for_ctx(fusion_analysis) if fusion_analysis else None,
-        "tier3_sweep": ({"best": tier3_sweep.get("best"), "status": "available"}
+        "tier3_sweep": ({"best": tier3_sweep.get("best"), "status": "available",
+                         "fresh": bool(tier3_sweep.get("fresh")),      # ★B1: 本轮实测 vs 缓存
+                         "from_round": tier3_sweep.get("from_round")}  # ★B1: 实测轮次 (过期判断)
                         if tier3_sweep and tier3_sweep.get("available") else None),
     }
     # ★只给 tier2 带 framework_kernels/api_overhead (其余 tier 不需要, 减小 context)
@@ -812,8 +814,21 @@ class Scheduler:
 
     # ── ③ 诊断: 按当前阶段筛选字段 → 写 07 (planner 只读这个) ──
     def _diagnose(self, diagnosis: dict, tier: int, round_dir: Path) -> str:
-        extracted = extract_tier_fields(diagnosis, tier)
+        # ★O1 (2026-08-12): run_optimize.sh 阶段2 已按同款 TIER_FIELDS 产出 07_tier{tier}_fields
+        #   (scheduler 传 TIER env, 内容与本函数 extract 完全同源) → 直接复用, 消除双写/重复计算.
+        #   兜底: 文件缺失 (stub 测试/旧版 run_optimize/手工采集) → 自己算并写.
         d7 = round_dir / f"07_tier{tier}_fields"
+        f = d7 / f"tier{tier}_fields.txt"
+        if f.exists():
+            try:
+                extracted = f.read_text(encoding="utf-8")
+                if extracted.strip() and "Per-Kernel 概览" in extracted:
+                    print(f"  [诊断] 复用 run_optimize 的 07_tier{tier}_fields "
+                          f"({len(extracted.splitlines())} 行 → {d7})")
+                    return extracted
+            except Exception:
+                pass
+        extracted = extract_tier_fields(diagnosis, tier)
         d7.mkdir(parents=True, exist_ok=True)
         (d7 / f"tier{tier}_fields.txt").write_text(extracted, encoding="utf-8")
         # 结构化 JSON: {字段说明: 值} (含全局摘要 + 当前 tier 字段)
@@ -840,6 +855,11 @@ class Scheduler:
         kernel_code = self.current_kernel.read_text(encoding="utf-8") if self.current_kernel.exists() else ""
         skill = (_PROJECT / "skills" / "triton-op-planner" / "SKILL.md")
         cfg = _extract_config_constants(kernel_code)
+        # ★B1: 本轮新扫的 sweep 结果打 fresh 标记 → planner_context 与 _plan 提示都能区分"本轮实测"
+        #   (缓存结果不标记, 保持 from_round 供过期判断)
+        if tier3_sweep and tier3_sweep.get("available") and sweep_status == "ran_this_round":
+            tier3_sweep = dict(tier3_sweep)
+            tier3_sweep["fresh"] = True
         # ★P2: 完整数据上下文 (每 kernel 全量 task/deep + 占比 + Top + 轨迹 + 手递) → planner 读文件
         ctx_path = build_planner_context(
             diagnosis, tier, self.traj["state"], self.traj.get("history", []),
@@ -854,15 +874,25 @@ class Scheduler:
             _n_cfg = len(sw.get("configs") or []) or sw.get("n_configs") or 0
             _rp = sw.get("result_path") or str(round_dir / "09_tier3_sweep" / "sweep_result.json")
             _wrote_s = "最优已自动写入 kernel_op.py" if sw.get("written", True) else "当前块保留 (sweep 未改动)"
-            lines = ["", f"# ══ sweep 分块结论 (状态: {sweep_status}) ══",
+            # ★B1 修复 (2026-08-12): 区分「本轮新扫」vs「过期缓存」—
+            #   缓存 (reused_from_cache, 可能 N 轮前, kernel 结构已变) 不能当"已穷举最优",
+            #   否则 planner 被错误约束"禁止猜新 BLOCK" (曾误导 tier3 planner 不调分块).
+            _is_fresh = (sweep_status == "ran_this_round") or bool(sw.get("fresh"))
+            _src_s = "本轮实测" if _is_fresh else f"缓存 (R{sw.get('from_round', '?')} 实测, 可能过期)"
+            lines = ["", f"# ══ sweep 分块结论 (状态: {sweep_status}, 来源: {_src_s}) ══",
                      f"最优 BLOCK: {best.get('block', '?')} = {_ns_s}"
                      + (f" (vs 当前 {best.get('speedup', '?')}x)" if best.get("speedup") else ""),
                      f"{_wrote_s}. 完整 {_n_cfg} 候选数据 → {_rp}"]
             if tier == 3:
-                lines.append("★分块层: 已穷举全部 L0 合法 2幂候选, 当前已是最优. 禁止猜新 BLOCK. promote 到下一层.")
+                if _is_fresh:
+                    lines.append("★分块层: 已穷举全部 L0 合法 2幂候选, 当前已是最优. 禁止猜新 BLOCK. promote 到下一层.")
+                else:
+                    lines.append("★注意: 这是缓存的 sweep 结果 (非本轮实测, kernel 结构可能已变), 只作参考.")
+                    lines.append("   若本轮 kernel 结构已变 (融合/算法/访存改动), 分块可自行评估, 不强制禁止调 BLOCK; "
+                                 "如需要可触发一轮新 sweep 实测.")
             else:
                 # ★sweep 在非分块层跑且采纳了最优块 → 明确告诉 planner 照此, 不要乱调分块
-                lines.append(f"BLOCK 已由 sweep 实测优化 (状态={sweep_status}, 采纳={sw.get('written', True)}).")
+                lines.append(f"BLOCK 已由 sweep 实测优化 (状态={sweep_status}, 来源={_src_s}, 采纳={sw.get('written', True)}).")
                 lines.append("★这是端到端实测的最优分块, 照此 BLOCK 改; 自本次 sweep 起若未动算子融合/算法结构, "
                              "禁止再调分块参数 (已是最优); 除非 msprof 明确发现新的访存/计算瓶颈再调.")
             extracted = extracted + "\n" + "\n".join(lines)
@@ -1613,6 +1643,7 @@ class Scheduler:
                         "n_configs": len(tier3_sweep.get("configs", [])),
                         "result_path": tier3_sweep.get("result_path") or "",
                         "written": tier3_sweep.get("written", True),
+                        "from_round": rn,   # ★B1: 实测轮次 (缓存过期判断: kernel 结构可能已变)
                     }
                     _sweep_status = "ran_this_round"
                 elif tier3_sweep and tier3_sweep.get("available") is False:

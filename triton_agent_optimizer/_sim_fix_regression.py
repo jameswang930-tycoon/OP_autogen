@@ -681,6 +681,122 @@ def test_collect_fail_chain():
         restore()
 
 # ═══════════════════════════════════════════════════════════════════
+#  Part 12: --resume 续跑路径 (旧测试未覆盖)
+# ═══════════════════════════════════════════════════════════════════
+def test_resume_flow():
+    restore = _snap_restore()
+    PlannerAgent.generate_v4 = flip_gen()
+    try:
+        # 第一次跑: 2 轮 (不 rmtree OUT — 模拟真实续跑)
+        s1 = Scheduler(OP, max_rounds=2, target_speedup=0.0, stub=True)
+        s1._run_optimize = types.MethodType(optimize_ok, s1)
+        s1._run_fusion = types.MethodType(lambda self, rd: {"op_count": 5, "fusion_candidates": []}, s1)
+        V_mod.verify_end_to_end = ok_verify()
+        s1.run()
+        st1, hist1 = read_hist()
+        # 第二次跑: resume=True, 应从 round3 续 (tier/round/baseline/best 保留)
+        s2 = Scheduler(OP, max_rounds=4, target_speedup=0.0, stub=True, resume=True)
+        s2._run_optimize = types.MethodType(optimize_ok, s2)
+        s2._run_fusion = types.MethodType(lambda self, rd: {"op_count": 5, "fusion_candidates": []}, s2)
+        V_mod.verify_end_to_end = ok_verify()
+        s2.run()
+        st2, hist2 = read_hist()
+        r_cont = [h["round"] for h in hist2 if h["round"] > max(hist1[-1]["round"], 0)]
+        ok = (len(hist2) > len(hist1)
+              and r_cont and r_cont[0] == len(hist1) + 1          # 从 round3 续
+              and st2.get("baseline_ns") == st1.get("baseline_ns")  # baseline 保留
+              and st2.get("best_e2e_event_ns") == st1.get("best_e2e_event_ns"))  # best 保留
+        log("P12-resume续跑", ok,
+            f"r1跑{len(hist1)}轮 → resume 后续跑{len(hist2)-len(hist1)}轮, 续轮={r_cont}, "
+            f"baseline保留={st2.get('baseline_ns')==st1.get('baseline_ns')}")
+    finally:
+        restore()
+
+# ═══════════════════════════════════════════════════════════════════
+#  Part 13: tier3 轮 sweep + REVERT (修复在 tier3 重扫场景也生效)
+# ═══════════════════════════════════════════════════════════════════
+def test_tier3_sweep_revert():
+    """修复验证: r1 正常(含 round1 sweep 地基) → r2 promote 到 tier3 → r3 tier3 sweep 重扫
+    (BLOCK→128,128,64) → coder 翻 BLOCK_K (总能匹配) → verify 失败 → 内容快照恢复 →
+    r4 采集输入 = sweep 最优 + 无 r3 coder 改动 (旧实现: r4 读到 r3 失败代码)."""
+    restore = _snap_restore()
+    SW_mod.SWEEP_META["_sim_op"] = {"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"),
+                                    "type": "matmul", "multi": False}
+    def stub_sweep(op_dir, quick=False, out_dir=None, op_name=None):
+        kp = op_dir / "kernel_op.py"
+        code = kp.read_text(encoding="utf-8")
+        new = re.sub(r"BLOCK_M, BLOCK_N, BLOCK_K = [\d, ]+",
+                     "BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64", code, count=1)
+        kp.write_text(new, encoding="utf-8")
+        return {"results": [{"block": [128, 128, 64], "ns": 100.0},
+                            {"block": [64, 64, 32], "ns": 200.0}],
+                "unchanged": False, "candidates_tested": 2, "best_block": [128, 128, 64]}
+    SW_mod.sweep = stub_sweep
+    def gen(self, extracted, tier, history, kernel_code, round_num, **kw):
+        # 翻 BLOCK_K (从当前 kernel_code 提取, 保证 coder 总能匹配)
+        m = re.search(r"(BLOCK_M, BLOCK_N, BLOCK_K = (\d+), (\d+), (\d+))", kernel_code)
+        old = m.group(1) if m else "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32"
+        bm, bn, bk = (int(m.group(2)), int(m.group(3)), int(m.group(4))) if m else (64, 64, 32)
+        new = f"BLOCK_M, BLOCK_N, BLOCK_K = {bm}, {bn}, {64 if bk == 32 else 32}"
+        promote, promote_to = (False, 0)
+        if round_num == 2:
+            promote, promote_to = (True, 3)
+        pt = json.dumps({"strategy": "s",
+                         "changes": [{"old_code": old, "new_code": new,
+                                      "reason": "t", "section": "① config", "tier": tier}],
+                         "promote": promote, "promote_to": promote_to,
+                         "promote_reason": "sim" if promote else "",
+                         "promote_evidence": "block_dim=20<40 且 mte1 已低, 分块层可接手" if promote else ""})
+        return RoundPlan(round_num=round_num, tier=tier, tier_name="", strategy="s",
+                         target_speedup=1.1, specific_change="", expected_impact="",
+                         verification_method="msprof", plan_text=pt,
+                         promote=promote, promote_to=promote_to,
+                         promote_reason="sim" if promote else "",
+                         promote_evidence="evidence" if promote else "")
+    PlannerAgent.generate_v4 = gen
+    snapshots = []
+    def optimize_snap(self, round_dir, tier):
+        snapshots.append({"rd": str(round_dir), "tier": tier,
+                          "code": self.current_kernel.read_text(encoding="utf-8")
+                                  if self.current_kernel.exists() else ""})
+        return canned_diagnosis()
+    def fail_t3_verify(kernel_op, round_dir, baseline_ns=None, num_kernels=None, num_launches=None):
+        if "baseline" in str(round_dir):
+            return {"ok": True, "ns": 5_000_000.0, "e2e_ns": 5_000_000.0,
+                    "e2e_event_ns": 5_000_000.0, "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": 5000.0}
+        m = re.search(r"round(\d+)", str(round_dir))
+        rn = int(m.group(1)) if m else 0
+        if rn == 3:
+            return {"ok": False, "error": "sim run error", "speedup": 1.0, "ns": None}   # tier3 sweep 轮 verify 失败
+        return {"ok": True, "ns": 5_000_000.0/1.05, "e2e_ns": 5_000_000.0/1.05,
+                "e2e_event_ns": 5_000_000.0/1.05, "speedup": 1.05, "loop": 30, "rows": 90, "duration_us": 5000.0}
+    try:
+        s = make_sched(optimize_snap, fail_t3_verify, max_rounds=5)
+        s.run()
+        st, hist = read_hist()
+        tiers = [h["tier"] for h in hist]
+        # r3 (tier3 sweep 轮) coder 成功应用后 verify 失败 → 回滚: r4 输入 = sweep 最优 (128,128,64)
+        #   且 BLOCK_K 未被 r3 coder 翻转 (回滚前 r3 会把 BLOCK_K 64→32)
+        r4_snap = next((sn for sn in snapshots if "round4" in sn["rd"]), None)
+        ok1 = r4_snap is not None and "BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64" in r4_snap["code"]
+        # r3 的 diff.patch 应为真实改动 (coder 跑过), 且失败产物留证
+        r3_rd = OUT / TIER_NAMES[3] / "round3"
+        diff = (r3_rd / "diff.patch").read_text(encoding="utf-8") if (r3_rd / "diff.patch").exists() else ""
+        ran_coder = ("---" in diff or "@@" in diff)
+        ok2 = ran_coder and (r3_rd / "failed_kernel.py").exists()
+        # r4 采集路径指向 round3 (恢复后的 sweep 最优)
+        ok3 = r4_snap is not None and "round3" in r4_snap["rd"].replace("\\", "/") \
+              or (r4_snap is not None and "round3" in r4_snap["rd"])
+        ok = ok1 and ok2
+        if not ok:
+            finding("BUG", "tier3 sweep 轮 REVERT 后链仍损坏",
+                    f"r4输入=sweep最优={ok1} r3跑过coder+留证={ok2} tiers={tiers}")
+        log("P13-tier3-sweep+REVERT(修复验证)", ok,
+            f"tiers={tiers} r4输入=128,128,64={ok1} r3 coder改动+failed留证={ok2}")
+    finally:
+        restore()
+
+# ═══════════════════════════════════════════════════════════════════
 #  main
 # ═══════════════════════════════════════════════════════════════════
 def setup():
@@ -717,6 +833,8 @@ if __name__ == "__main__":
         test_sweep_helpers(); print()
         test_best_kernel_binding(); print()
         test_collect_fail_chain(); print()
+        test_resume_flow(); print()
+        test_tier3_sweep_revert(); print()
         print("═" * 60)
         print(f"检查项: {len(RESULTS)}  通过: {sum(1 for _, o, _ in RESULTS if o)}  失败: {sum(1 for _, o, _ in RESULTS if not o)}")
         for tag, ok, d in RESULTS:

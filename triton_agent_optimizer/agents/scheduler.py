@@ -824,7 +824,10 @@ class Scheduler:
             result = CoderResult(success=False, optimized_code=original, diff="",
                                  error_message=f"编码异常: {str(e)[:200]}")
         round_dir.mkdir(parents=True, exist_ok=True)
-        (round_dir / "diff.patch").write_text(result.diff or "(no change)", encoding="utf-8")
+        # ★bug 修复: diff.patch 只在 coder 成功时写 — 失败尝试 (no-op/LLM 兜底重试) 会返回原码,
+        #   若覆盖会把同轮成功尝试的真实 diff 抹成 "(no change)" (审计丢失).
+        if result.success or not (round_dir / "diff.patch").exists():
+            (round_dir / "diff.patch").write_text(result.diff or "(no change)", encoding="utf-8")
         n_changes = len(_extract_changes_from_plan(plan.plan_text))
         if result.success:
             lines = result.lines_changed or 0

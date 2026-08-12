@@ -148,11 +148,20 @@ def _keep_floor() -> float:
 _DEV_ERR_KEYS = ("aclrt", "aclerror", "npu function error", "575", "synchronizedevice",
                  "aicore", "acl error", "device error", "ecc error", "out of memory",
                  "root alloc", "hivm.hir")
+# ★2026-08-12 排除签名: **编译期错误** (HIVM 编译错 vsel/root-alloc 分析失败 / Python 语法错)
+#   ≠ 设备崩溃. 报错文本含这些 → 不判设备污染 — 否则 'hivm.hir.vsel' op unsupported op 这类
+#   coder 写出的坏代码报错被误标"设备被污染" → 白白重置设备 + 误导采集失败诊断.
+_DEV_ERR_EXCLUDE = ("unsupported op", "invalid syntax", "syntaxerror",
+                    "not supported", "not implemented", "compilation error",
+                    "compile failed", "mlir")
 
 
 def _is_device_error(s: str) -> bool:
-    """文本是否含设备级错误签名 (verify/采集 失败时用来判断要不要重置设备)."""
+    """文本是否含设备级错误签名 (verify/采集 失败时用来判断要不要重置设备).
+    ★先排除编译期错误 (vsel/语法错/MLIR 编译失败), 再匹配设备签名."""
     s = (s or "").lower()
+    if any(x in s for x in _DEV_ERR_EXCLUDE):
+        return False
     return any(k in s for k in _DEV_ERR_KEYS)
 
 

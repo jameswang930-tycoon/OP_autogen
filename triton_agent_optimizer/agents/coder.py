@@ -91,11 +91,14 @@ def _build_user_prompt(
     parts.append("")
 
     if previous_error:
-        parts.append("## Previous Attempt Failed")
+        parts.append("## Previous Attempt Failed (★只读参考, 严禁抄写)")
         parts.append(f"The last code change caused this error:")
         parts.append(f"```")
         parts.append(previous_error[:1000])
         parts.append(f"```")
+        parts.append("★这段报错/修复方案是**参考信息**, 不是代码 — 禁止把其中的解释文字、英文句子、")
+        parts.append("  'vsel'/关键词、括号内容原样抄进输出代码 (会导致 unterminated string literal/语法错).")
+        parts.append("  只能理解错误后修改代码本身; 输出必须是合法 Python 代码 (注释里也别抄整段).")
         parts.append("Please fix this error while still implementing the plan.")
         parts.append("")
 
@@ -543,7 +546,10 @@ class CoderAgent:
                 cross = mem.search_all(previous_error)
                 all_fixes = [f for f in [known, cross] if f]
                 if all_fixes:
-                    previous_error = f"{previous_error}\n\n[已知修复方案]\n" + "\n".join(all_fixes)
+                    # ★2026-08-12: 已知方案是"参考信息" — 弱模型会把这段含 'vsel' 等英文单引号的
+                    #   解释文本抄进输出代码 → unterminated string literal 语法错. 明确标注只读.
+                    previous_error = (f"{previous_error}\n\n[已知修复方案 - ★只读参考, 严禁抄进代码, "
+                                      f"只能理解后修改代码]\n" + "\n".join(all_fixes))
             except Exception:
                 pass
 

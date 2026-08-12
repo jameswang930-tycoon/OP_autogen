@@ -111,6 +111,11 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
         return {"ok": False, "error": f"正确性校验运行失败: {e}"}
     _chk_out = (rc.stdout or "") + (rc.stderr or "")
     if "result check: PASS" not in _chk_out:
+        # ★2026-08-12 报错分类: HIVM 编译错 (vsel/root alloc) / Python 语法错 / Traceback
+        #   ≠ 数值错误 — 分类后 planner/coder 拿到准确报错 (vsel → 改连续仿射寻址; 数值错 → 改计算逻辑)
+        if re.search(r"error:|Traceback|unsupported op|SyntaxError|not supported|MLIR", _chk_out):
+            return {"ok": False,
+                    "error": f"kernel 编译/运行失败 (非数值错): {_chk_out.strip()[-400:]}"}
         return {"ok": False, "error": f"正确性未通过 (MATMUL_VERIFY 需输出 result check: PASS): {_chk_out.strip()[-400:]}"}
     print("    [Verify] ✅ 正确性 PASS (MATMUL_VERIFY)")
 

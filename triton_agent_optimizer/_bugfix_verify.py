@@ -93,3 +93,41 @@ check("O1: 兜底写了 txt", (rd_d / "07_tier1_fields" / "tier1_fields.txt").ex
 check("O1: 兜底写了 json", (rd_d / "07_tier1_fields" / "tier1_fields.json").exists())
 
 print("\n═══ B1 + O1 验证全部通过 ═══")
+
+# ═══════════════════════════════════════════════════════════════
+#  V3: vsel 编译错 ≠ 设备污染 (2026-08-12) — _is_device_error 排除编译期签名
+# ═══════════════════════════════════════════════════════════════
+from agents.scheduler import _is_device_error
+s_vsel = ("正确性未通过: error: 'hivm.hir.vsel' op unsupported op for finding "
+          "the root alloc in load chain")
+s_dev = "aclrtSynchronizeDevice failed: device error 575"
+s_hivm_run = "kernel runtime error: hivm.hir root alloc failed, aicore crash"  # 运行期 HIVM 崩
+s_syntax = "SyntaxError at line 9: unterminated string literal"
+s_mlir = "error: 'hivm.hir.vsel' op not supported by MLIR pass"
+check("V3: vsel 编译错 → 非设备污染", not _is_device_error(s_vsel), s_vsel)
+check("V3: 真设备崩 575 → 设备污染", _is_device_error(s_dev), s_dev)
+check("V3: 运行期 HIVM 崩 (无排除词) → 设备污染", _is_device_error(s_hivm_run), s_hivm_run)
+check("V3: 语法错 → 非设备污染", not _is_device_error(s_syntax), s_syntax)
+check("V3: MLIR not supported → 非设备污染", not _is_device_error(s_mlir), s_mlir)
+
+# verify 报错文案分类: 编译/运行失败 ≠ 数值错
+import agents.verifier as V
+from unittest import mock
+
+def _fake_rc(stdout):
+    from types import SimpleNamespace
+    return lambda *a, **kw: SimpleNamespace(stdout=stdout, stderr="")
+
+# vsel 编译错 → 归"编译/运行失败"
+with mock.patch("subprocess.run", new=_fake_rc(
+        "error: 'hivm.hir.vsel' op unsupported op for finding the root alloc\n")):
+    r = V.verify_end_to_end(tmp / "matmul" / "kernel_op.py", tmp / "vchk", None)
+check("V3: verify 报错分类为编译/运行失败", "编译/运行失败" in r["error"] and "vsel" in r["error"], r["error"][:80])
+
+# 纯数值错 (result check: CHECK) → 仍归"正确性未通过"
+with mock.patch("subprocess.run", new=_fake_rc(
+        "[info] result check: CHECK  max|O-ref|=0.5\n")):
+    r = V.verify_end_to_end(tmp / "matmul" / "kernel_op.py", tmp / "vchk2", None)
+check("V3: 纯数值错仍归'正确性未通过'", "正确性未通过" in r["error"], r["error"][:80])
+
+print("\n═══ V3 (vsel 分类) 验证全部通过 ═══")

@@ -88,6 +88,7 @@ def kernel(x_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
 - `num_ctas > 1`（集群特性）
 - `@tl.aggregate` 装饰器
 - `@triton.autotune`（我们的 mock 环境不支持）
+- ⚠ **load 地址/偏移必须连续仿射**（`base + arange×stride`）：禁止用 load 出来的值当 offset（gather/离散寻址）、禁止地址里夹 `tl.where`/条件表达式（会 lower 成 `vsel`，HIVM 报 `'hivm.hir.vsel' op unsupported op for finding the root alloc` 编译失败）；mask 必须由 arange 静态推导（不依赖另一个 load 的值）。报错"root alloc/vsel" → 先查 load 地址链。
 
 ### 禁止使用（Python 语法不支持）
 - `try/except`、`for i in some_list`（动态循环）

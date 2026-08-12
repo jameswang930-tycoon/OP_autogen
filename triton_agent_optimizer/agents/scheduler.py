@@ -1036,8 +1036,18 @@ class Scheduler:
             _new_e2e_speedup = (_eb / _ec) if (_eb and _ec) else None
             drift = new_base / st["baseline_ns"] if st.get("baseline_ns") else 1.0
             st["baseline_ns"] = new_base
-            st["current_speedup"] = (round(_new_e2e_speedup, 4) if _new_e2e_speedup
-                                     else (round(new_speedup, 4) if new_speedup else st.get("current_speedup", 1.0)))
+            # ★修复 2026-08-12: cur 复测假小 (窗口未跑满) → 不更新 current_speedup (否则假 260x 毒
+            #   no_improve 判定/显示; 与 best 假小护栏同源同阈值 EVENT_MIN_RATIO)
+            _min_ratio = float(os.environ.get("EVENT_MIN_RATIO", "10"))
+            _cur_evt = cur.get("e2e_event_ns")
+            _eb_evt0 = vb.get("e2e_event_ns") or st.get("baseline_e2e_event_ns")
+            _cur_suspect = bool(_cur_evt and _eb_evt0 and _cur_evt < _eb_evt0 / _min_ratio)
+            if _cur_suspect:
+                print(f"  ⚠ [重基准] cur Event {_cur_evt:.0f}ns 疑似假小 (< 基线/{_min_ratio:.0f}) "
+                      f"→ 不更新 current_speedup (沿用)")
+            else:
+                st["current_speedup"] = (round(_new_e2e_speedup, 4) if _new_e2e_speedup
+                                         else (round(new_speedup, 4) if new_speedup else st.get("current_speedup", 1.0)))
             if _eb:
                 st["baseline_e2e_ns"] = _eb
             if vb.get("e2e_event_ns"):
@@ -1059,11 +1069,16 @@ class Scheduler:
                 _best_evt_new = None
             if _best_evt_new is None and cur.get("e2e_event_ns"):
                 _best_evt_new = cur["e2e_event_ns"]
-            if _best_evt_new:
+            # ★修复 2026-08-12: rebaseline 同步也加假小护栏 — 复测 Event 远小于新基线
+            #   (窗口未跑满/循环被改坏) → 不覆盖 best (否则无条件覆盖照样毒 best, 且 cur 未必是最优).
+            _eb_evt = vb.get("e2e_event_ns") or st.get("baseline_e2e_event_ns")
+            if _best_evt_new and _eb_evt and _best_evt_new >= _eb_evt / _min_ratio:
                 st["best_e2e_event_ns"] = round(_best_evt_new, 1)
-                _eb_evt = vb.get("e2e_event_ns") or st.get("baseline_e2e_event_ns")
                 if _eb_evt:
                     st["best_speedup"] = round(_eb_evt / _best_evt_new, 4)
+            elif _best_evt_new:
+                print(f"  ⚠ [重基准] best Event {_best_evt_new:.0f}ns 疑似假小 (< 新基线/{_min_ratio:.0f}) "
+                      f"→ 跳过 best 同步 (防毒 best)")
             st["last_rebase_round"] = rn
             # ★不进 history (避免与正常轮同 round 号, trajectory 图点重叠):
             #   REBASELINE 是测量事件不是优化轮, 只更新 state; 换基后后续轮 speedup 用新基准.
@@ -1558,6 +1573,8 @@ class Scheduler:
             #   旧实现: _decide_tier 的拒绝发生在 promote 分支之后 → 分支已跳过 coder/verify (轮次白耗)
             #   + promote_budget 照涨 (max_rounds 失效). 现在拒绝在进入分支前就完成.
             _promote_allowed = True
+            _suspect = False          # ★假小 Event 标志 (hist error 提示用; promote 轮也走 hist, 须初始化)
+            _cmp_extra = ""
             if getattr(plan, "promote", False):
                 _prom_ev = (getattr(plan, "promote_evidence", "") or getattr(plan, "promote_reason", "")).strip()
                 if not _prom_ev:
@@ -1613,7 +1630,19 @@ class Scheduler:
                         #   Event 设备侧无欠采, 比绝对延迟最稳; Event 缺才退化 msprof speedup.
                         _evt = v.get("e2e_event_ns")
                         _best_evt = st.get("best_e2e_event_ns")
-                        if _evt and _best_evt:
+                        # ★假小护栏 (2026-08-12): Event 远小于基线 (默认 <基线/10, env EVENT_MIN_RATIO 可调)
+                        #   → 疑似"窗口没跑满": coder 改坏的代码在 KERNEL_EVENT_TIME 模式下 launch 被移走/
+                        #   条件包裹/循环改坏 → 窗口内实际 0~1 次 launch → Event 假小几十倍 → 毒 best
+                        #   (用户报告: 加速比突然 200x → 真实优化轮永不 KEEP). 拦截: 不采纳 + 不更新 best.
+                        _min_ratio = float(os.environ.get("EVENT_MIN_RATIO", "10"))
+                        _base_evt = st.get("baseline_e2e_event_ns")
+                        _suspect = bool(_evt and _base_evt and _evt < _base_evt / _min_ratio)
+                        if _suspect:
+                            _adopt = False
+                            _cmp = (f"⚠ Event {_evt:.0f}ns < 基线/{_min_ratio:.0f} ({_base_evt:.0f}ns) "
+                                    f"→ 疑似假小 (窗口未跑满? coder 改坏循环体?), 不采纳防毒 best")
+                            _cmp_extra = _cmp   # ★顺序: 先赋新 _cmp 再存 (防取到上一轮残留值)
+                        elif _evt and _best_evt:
                             _adopt = _evt < _best_evt
                             _cmp = f"Event {_evt:.0f}ns {'<' if _adopt else '>='} best {_best_evt:.0f}ns"
                         elif _evt:                      # 首次有 Event → 建基准, 采纳
@@ -1730,7 +1759,9 @@ class Scheduler:
                     "change": _summarize_changes(plan),       # 例: "BLOCK_M,BLOCK_N,BLOCK_K=64,64,64"
                     # ★changes_full = 完整 changes[] 数组 (old_code/new_code 全文, 审计/复盘不丢信息)
                     "changes_full": _extract_changes_from_plan(plan.plan_text) or [],
-                    "speedup": round(speedup, 4),             # ★主加速比 = 端到端口径 (初始端到端基线/本轮)
+                    "speedup": round(prev_speedup if _suspect else speedup, 4),
+                    # ★主加速比 = 端到端口径 (初始端到端基线/本轮);
+                    #   假小轮记 prev_speedup (假 260x 会误当"有改进"打断 no_improve 计数 → 晋升节奏乱)
                     "kernel_speedup": round(_be / ns, 4) if (_be and ns) else None,  # 纯 kernel 口径参考
                     "prev_speedup": round(prev_speedup, 4),   # 上一轮已接受 kernel 的加速比 (保留判定用)
                     "ns": ns, "e2e_ns": _e2e, "e2e_event_ns": _evt_ns,   # ★e2e_event_ns = 工业级 Event 设备侧
@@ -1738,7 +1769,8 @@ class Scheduler:
                     # ★sweep 状态 (每轮记): 是否跑了 sweep / 是否采纳 sweep 测的最优块
                     "sweep_ran": _sweep_ran, "sweep_adopted": _sweep_adopted,
                     "sweep_status": _sweep_status,
-                    "error": (prev_err[:120] if prev_err else "")}
+                    "error": ((prev_err[:120] if prev_err else "")
+                              + (" | " + _cmp_extra if _cmp_extra else ""))}
             # ★F3: 每轮真实 tflops (kernel 结构变化后 FLOPs 变, 轨迹图用 hist 值, 不再 initial×speedup 失真)
             _cf = sum((k.get("deep") or {}).get("compute", {}).get("cube_fops") or 0
                       for k in (diagnosis.get("kernels") or []))
@@ -1777,20 +1809,25 @@ class Scheduler:
                 print(f"  ⚠ [优秀案例] 记录跳过: {str(_ec)[:120]}")
             # ★best 以 Event 绝对延迟为准 (min, 免 msprof 欠采毒 best); best_speedup 派生自 Event 显示.
             #   方案A: 无 Event 不更新 best (不退化 msprof, 堵假值后门).
+            #   ★修复 2026-08-12: ① best 只在 kept 时更新 (与 best_kernel/best_round 强绑定 —
+            #      REVERT 轮假小 Event 不得毒 best_speedup, 防"加速比 200x 假值"与真实代码脱钩);
+            #     ② 假小护栏 (EVENT_MIN_RATIO): 远小于基线的 Event 视为窗口未跑满, 不更新 best.
             _bevt_base = st.get("baseline_e2e_event_ns")
-            if _evt_ns and (st.get("best_e2e_event_ns") is None or _evt_ns < st["best_e2e_event_ns"]):
+            _min_ratio = float(os.environ.get("EVENT_MIN_RATIO", "10"))
+            _suspect2 = bool(_evt_ns and _bevt_base and _evt_ns < _bevt_base / _min_ratio)
+            if (_evt_ns and not _suspect2 and kept
+                    and (st.get("best_e2e_event_ns") is None or _evt_ns < st["best_e2e_event_ns"])):
                 st["best_e2e_event_ns"] = _evt_ns
                 if _bevt_base and _evt_ns:
                     st["best_speedup"] = round(_bevt_base / _evt_ns, 4)   # 派生显示用 (Event 口径)
-                if kept:
-                    st["best_kernel"] = str(round_kernel)
-                    st["best_round"] = rn
-                    st["best_e2e_ns"] = _e2e
-                    try:
-                        import shutil as _sh
-                        _sh.copy2(round_kernel, self.kernel_dir / "best_kernel.py")
-                    except Exception:
-                        pass
+                st["best_kernel"] = str(round_kernel)
+                st["best_round"] = rn
+                st["best_e2e_ns"] = _e2e
+                try:
+                    import shutil as _sh
+                    _sh.copy2(round_kernel, self.kernel_dir / "best_kernel.py")
+                except Exception:
+                    pass
             self.traj["history"].append(hist)
 
             # 晋升决策: planner.promote (读瓶颈判断) + 连续3轮无改进兜底 + 达标/到Tier6停止

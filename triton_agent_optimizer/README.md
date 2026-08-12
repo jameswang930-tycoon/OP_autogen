@@ -335,6 +335,7 @@ cat <round_dir>/06_diagnosis/diagnosis.json
   - ★verifier Event 注入同步改多窗口 median（KEEP 决策依据更稳；注入产物加 compile 校验）
   - flash_attention 输入对齐 fp16（工业级 FA 即 fp16，原 fp32 vs fp16 不可比；verify 参考升 fp32）
   - 删死代码（_build_fn/_run_loop）；_sim_fix_regression.py 补 P15（bench 测量回归）+ P7 强化（Event 注入 compile 校验）
+  - ★假小 Event 防毒（用户报告 "加速比突然 200x → 真实优化轮永不 KEEP"）: coder 改坏代码 → Event 窗口未跑满 → 假小值毒 best → 三层护栏 (KEEP 决策拦 / best 只在 kept 时更新 / rebaseline 复测也拦, EVENT_MIN_RATIO 默认 10 可调) + 假小提示进 hist error; 回归 P16
 
 ---
 

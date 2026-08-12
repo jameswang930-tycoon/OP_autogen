@@ -970,6 +970,71 @@ def test_bench_measure():
         f"12脚本--help+新参数={ok2}")
 
 # ═══════════════════════════════════════════════════════════════════
+#  Part 16: ★假小 Event 防毒回归 (用户报告: 加速比突然 200x → 真实优化轮永不 KEEP)
+# ═══════════════════════════════════════════════════════════════════
+def test_fake_small_event():
+    """★回归: coder 改坏代码 → Event 窗口未跑满 → 假小 Event (如 200x) 不得:
+    ① KEEP ② 更新 best_e2e_event_ns/best_speedup ③ rebaseline 时覆盖 best/current_speedup.
+    真实改进轮 (1.25x) 必须正常 KEEP (护栏不误杀)."""
+    restore = _snap_restore()
+    os.environ["REBASELINE_EVERY"] = "1"
+    PlannerAgent.generate_v4 = flip_gen()
+    def verify(kernel_op, round_dir, baseline_ns=None, num_kernels=None, num_launches=None):
+        rd = str(round_dir)
+        rd_n = rd.replace("\\", "/")
+        if "baseline_verify" in rd_n:
+            return {"ok": True, "ns": 5_000_000.0, "e2e_ns": 5_000_000.0, "e2e_event_ns": 5_000_000.0,
+                    "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": 5000.0}
+        if rd_n.endswith("rebaseline/base"):   # 漂移新基线 5.2M
+            return {"ok": True, "ns": 5_200_000.0, "e2e_ns": 5_200_000.0, "e2e_event_ns": 5_200_000.0,
+                    "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": 5200.0}
+        if rd_n.endswith("rebaseline/cur"):    # ★复测 cur 假小 (窗口未跑满)
+            return {"ok": True, "ns": 20000.0, "e2e_ns": 20000.0, "e2e_event_ns": 20000.0,
+                    "speedup": 260.0, "loop": 30, "rows": 90, "duration_us": 20.0}
+        if rd_n.endswith("rebaseline/best"):   # ★best_kernel 复测失败 → 回退 cur(假小) → 护栏拦截
+            return {"ok": False, "error": "sim best re-verify fail", "speedup": 1.0, "ns": None}
+        m = re.search(r"round(\d+)", rd)
+        rn = int(m.group(1)) if m else 0
+        if rn == 1:                          # round1 与基线同速 → KEEP, best=5M
+            return {"ok": True, "ns": 5_000_000.0, "e2e_ns": 5_000_000.0, "e2e_event_ns": 5_000_000.0,
+                    "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": 5000.0}
+        if rn == 2:                            # ★假小 250x (用户报告场景)
+            return {"ok": True, "ns": 20000.0, "e2e_ns": 20000.0, "e2e_event_ns": 20000.0,
+                    "speedup": 250.0, "loop": 30, "rows": 90, "duration_us": 20.0}
+        if rn == 3:                            # 真实改进 1.25x (护栏不得误杀)
+            return {"ok": True, "ns": 4_000_000.0, "e2e_ns": 4_000_000.0, "e2e_event_ns": 4_000_000.0,
+                    "speedup": 1.25, "loop": 30, "rows": 90, "duration_us": 4000.0}
+        return {"ok": True, "ns": 4_500_000.0, "e2e_ns": 4_500_000.0, "e2e_event_ns": 4_500_000.0,
+                "speedup": 1.11, "loop": 30, "rows": 90, "duration_us": 4500.0}
+    try:
+        s = make_sched(optimize_ok, verify, max_rounds=4)
+        s.run()
+        st, hist = read_hist()
+        r2 = [h for h in hist if h["round"] == 2][0]
+        r3 = [h for h in hist if h["round"] == 3][0]
+        # ① 假小轮 (Event < 1M ns) 永不 KEEP (r2 假 250x → REVERT)
+        ok1 = r2["decision"] == "REVERT" and all(
+            h["decision"] != "KEEP" for h in hist
+            if (h.get("e2e_event_ns") or 0) < 1_000_000)
+        # ② 假小提示进 hist error (planner 可见)
+        ok2 = "假小" in (r2.get("error") or "")
+        # ③ r3 真实 1.25x → KEEP + best 更新 (护栏不误杀)
+        ok3 = r3["decision"] == "KEEP" and abs((st.get("best_e2e_event_ns") or 0) - 4_000_000.0) < 1
+        # ④ rebaseline (r2 前) cur 假小 → best 未被 20000 覆盖, current_speedup 未被毒成 260
+        ok4 = st.get("best_e2e_event_ns") != 20000.0 and st.get("current_speedup") < 100
+        ok = ok1 and ok2 and ok3 and ok4
+        if not ok:
+            finding("BUG", "假小 Event 防毒回归失败",
+                    f"r2 REVERT+best未毒={ok1} error提示={ok2} r3 KEEP+best更新={ok3} "
+                    f"rebaseline未毒={ok4} best={st.get('best_e2e_event_ns')} "
+                    f"current={st.get('current_speedup')}")
+        log("P16-假小Event防毒(回归)", ok,
+            f"r2(假250x)→REVERT且best保持5M={ok1} 提示进hist={ok2} "
+            f"r3(真1.25x)→KEEP且best=4M={ok3} rebaseline未毒={ok4}")
+    finally:
+        restore()
+
+# ═══════════════════════════════════════════════════════════════════
 #  main
 # ═══════════════════════════════════════════════════════════════════
 def setup():
@@ -1010,6 +1075,7 @@ if __name__ == "__main__":
         test_tier3_sweep_revert(); print()
         test_coder_cleaning(); print()
         test_bench_measure(); print()
+        test_fake_small_event(); print()
         print("═" * 60)
         print(f"检查项: {len(RESULTS)}  通过: {sum(1 for _, o, _ in RESULTS if o)}  失败: {sum(1 for _, o, _ in RESULTS if not o)}")
         for tag, ok, d in RESULTS:

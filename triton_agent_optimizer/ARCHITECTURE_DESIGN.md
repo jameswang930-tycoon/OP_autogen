@@ -627,7 +627,11 @@ triton_agent_optimizer/
 
 ### 4.1 Scheduler — 状态机核心
 - **状态**: `traj["state"]` = {tier, round, total_rounds, promote_budget, best_speedup, **best_e2e_event_ns(★KEEP 主依据: 历史最小 Event 延迟)**, baseline_ns(纯), baseline_e2e_ns(端到端 msprof), **baseline_e2e_event_ns(Event)**, num_kernels, num_launches, baseline_mnk, initial_tflops, pytorch基准, industrial_time_us(Event 各 mode min), current_speedup, current_kernel, **best_kernel, best_round, best_e2e_ns**, vs_industrial_ratio, last_sweep_result, handoff, tier_jumps, last_rebase_round}
-- **★严格最优 KEEP**: 本轮 Event 绝对延迟 `e2e_event_ns < best_e2e_event_ns`（历史最小）才进链 — 设备侧无 profiler 扰动, 免 msprof 欠采毒 best; **Event 缺失(非晋升轮) → 方案A 不采纳**（不退化 msprof 兜底, 堵假值后门）; `best_speedup` 是派生显示值 = baseline_e2e_event_ns / best_e2e_event_ns
+- **★严格最优 KEEP**: 本轮 Event 绝对延迟 `e2e_event_ns < best_e2e_event_ns`（历史最小）才进链 — 设备侧无 profiler 扰动, 免 msprof 欠采毒 best; **Event 缺失(非晋升轮) → 方案A 不采纳**（不退化 msprof 兜底, 堵假值后门）
+- **★假小 Event 护栏 (2026-08-12, 用户报告 "加速比突然 200x → 真实优化轮永不 KEEP")**: coder 改坏的代码在 KERNEL_EVENT_TIME 模式下窗口没跑满 (launch 被移走/条件包裹/循环改坏) → Event 假小几十倍 → 被 KEEP → 毒 best → 后续真实优化轮永远比不过。修复三层:
+  - KEEP 决策: `e2e_event_ns < baseline_e2e_event_ns / EVENT_MIN_RATIO(默认10)` → 判"疑似假小" → 不采纳 (提示进 hist error, planner 可见)
+  - best 更新: 只在 kept 时更新 (与 best_kernel/best_round 强绑定, 防 best_speedup 与代码脱钩); 假小轮 hist 的 speedup 记 prev_speedup (防打断 no_improve 计数)
+  - rebaseline 同步: 复测值同样过假小护栏 (不覆盖 best / 不毒 current_speedup); `best_speedup` 是派生显示值 = baseline_e2e_event_ns / best_e2e_event_ns
 - **★input 链不变量**: 未采纳/失败 → `current_kernel` 回滚轮首快照 — sweep 把 current 指向 round_dir 时 coder 会覆写同路径, 必须**内容快照恢复**（失败代码另存 failed_kernel.py 留证）
 - **★晋升门前置**: planner promote 无 promote_evidence/reason → 本轮**转正常优化轮**（不白耗轮次、不涨 budget）; budget 只在真晋升轮 +1
 - **★max_rounds 硬上限**: loop 条件 = `(total_rounds - promote_budget) < max_rounds`（有效优化轮计数, promote 轮免费; 旧实现 budget 无限膨胀 → 上限失效）

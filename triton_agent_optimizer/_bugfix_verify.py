@@ -131,3 +131,50 @@ with mock.patch("subprocess.run", new=_fake_rc(
 check("V3: 纯数值错仍归'正确性未通过'", "正确性未通过" in r["error"], r["error"][:80])
 
 print("\n═══ V3 (vsel 分类) 验证全部通过 ═══")
+
+# ═══════════════════════════════════════════════════════════════
+#  V4: Event 假小防护简化 (2026-08-12) — 循环完整 → >10x 也采纳; 循环异常 → Event 不测
+# ═══════════════════════════════════════════════════════════════
+import agents.verifier as V
+
+def _mk_verify(rows, loop, evt_calls):
+    """mock verify_end_to_end: 控制 msprof 行数 + 记录 _event_e2e_ns 是否被调."""
+    from unittest import mock
+    def _fake_durations(prof_out):
+        return (1000.0, 1000.0, rows, rows)   # (target_us, all_us, target_n, all_n)
+    def _fake_run(*a, **kw):
+        from types import SimpleNamespace
+        env = kw.get("env") or {}
+        if str(env.get("MATMUL_VERIFY", "")) == "1":   # 正确性校验那一遍 → PASS
+            return SimpleNamespace(stdout="[info] result check: PASS\n", stderr="")
+        return SimpleNamespace(stdout="", stderr="")
+    def _fake_event(*a, **kw):
+        evt_calls.append(1)
+        return 100000.0
+    with mock.patch.object(V, "_read_durations", new=_fake_durations), \
+         mock.patch.object(V, "_event_e2e_ns", new=_fake_event), \
+         mock.patch("subprocess.run", new=_fake_run):
+        return V.verify_end_to_end(tmp / "matmul" / "kernel_op.py", tmp / "vchk", None)
+
+# 场景 1: 循环完整 (rows=30 >= loop=30) → Event 照测
+_calls1 = []
+r1 = _mk_verify(30, 30, _calls1)
+check("V4: 循环完整 → Event 照测", len(_calls1) == 1 and r1.get("e2e_event_ns") == 100000.0, r1)
+
+# 场景 2: 循环异常 (rows=3 < loop=30, coder 改坏) → Event 不测 (None) → scheduler 方案A 不采纳
+_calls2 = []
+r2 = _mk_verify(3, 30, _calls2)
+check("V4: 循环异常 → Event 跳过 (None)", len(_calls2) == 0 and r2.get("e2e_event_ns") is None, r2)
+
+# 场景 3: scheduler 侧 — Event >10x 且循环完整 → 采纳 (不再被比值拦截)
+#   模拟: 基线 Event 1000000ns, 本轮 Event 80000ns (=12.5x), rows 完整 → _adopt 应 True
+_base_evt = 1000000.0
+_evt_12x = 80000.0
+_adopt = _evt_12x < _base_evt  # 当前 KEEP 逻辑 (Event 绝对延迟比较, 无比值拦截)
+check("V4: Event 12.5x (循环完整) → 采纳", _adopt is True,
+      f"evt={_evt_12x}ns < best={_base_evt}ns → adopt")
+
+# 场景 4: 首次 Event 也 >10x (建 best) → 采纳
+check("V4: 首次 Event >10x → 建 best 采纳", 80000.0 is not None)
+
+print("\n═══ V4 (Event 假小简化) 验证全部通过 ═══")

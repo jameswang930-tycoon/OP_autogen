@@ -1173,18 +1173,15 @@ class Scheduler:
             _new_e2e_speedup = (_eb / _ec) if (_eb and _ec) else None
             drift = new_base / st["baseline_ns"] if st.get("baseline_ns") else 1.0
             st["baseline_ns"] = new_base
-            # ★修复 2026-08-12: cur 复测假小 (窗口未跑满) → 不更新 current_speedup (否则假 260x 毒
-            #   no_improve 判定/显示; 与 best 假小护栏同源同阈值 EVENT_MIN_RATIO)
-            _min_ratio = float(os.environ.get("EVENT_MIN_RATIO", "10"))
+            # ★2026-08-12 简化: cur 复测的 Event 真实性由 verify 行数保证 (循环异常 → Event None),
+            #   不再用 EVENT_MIN_RATIO 比值拦截 (曾误伤真实 >10x 优化轮). 有 Event 就按新基准确认.
             _cur_evt = cur.get("e2e_event_ns")
             _eb_evt0 = vb.get("e2e_event_ns") or st.get("baseline_e2e_event_ns")
-            _cur_suspect = bool(_cur_evt and _eb_evt0 and _cur_evt < _eb_evt0 / _min_ratio)
-            if _cur_suspect:
-                print(f"  ⚠ [重基准] cur Event {_cur_evt:.0f}ns 疑似假小 (< 基线/{_min_ratio:.0f}) "
-                      f"→ 不更新 current_speedup (沿用)")
-            else:
-                st["current_speedup"] = (round(_new_e2e_speedup, 4) if _new_e2e_speedup
-                                         else (round(new_speedup, 4) if new_speedup else st.get("current_speedup", 1.0)))
+            if _cur_evt and _eb_evt0:
+                print(f"  [重基准] cur Event {_cur_evt:.0f}ns (新基线 {_eb_evt0:.0f}ns, "
+                      f"{(f'-> {_eb_evt0/_cur_evt:.1f}x' if _cur_evt else '')})")
+            st["current_speedup"] = (round(_new_e2e_speedup, 4) if _new_e2e_speedup
+                                     else (round(new_speedup, 4) if new_speedup else st.get("current_speedup", 1.0)))
             if _eb:
                 st["baseline_e2e_ns"] = _eb
             if vb.get("e2e_event_ns"):
@@ -1206,16 +1203,13 @@ class Scheduler:
                 _best_evt_new = None
             if _best_evt_new is None and cur.get("e2e_event_ns"):
                 _best_evt_new = cur["e2e_event_ns"]
-            # ★修复 2026-08-12: rebaseline 同步也加假小护栏 — 复测 Event 远小于新基线
-            #   (窗口未跑满/循环被改坏) → 不覆盖 best (否则无条件覆盖照样毒 best, 且 cur 未必是最优).
+            # ★2026-08-12 简化: best 复测同步同样由 verify 行数保证 Event 真实 (循环异常 → None),
+            #   不再用 EVENT_MIN_RATIO 比值拦截 (曾误伤真实 >10x).
             _eb_evt = vb.get("e2e_event_ns") or st.get("baseline_e2e_event_ns")
-            if _best_evt_new and _eb_evt and _best_evt_new >= _eb_evt / _min_ratio:
+            if _best_evt_new and _eb_evt:
                 st["best_e2e_event_ns"] = round(_best_evt_new, 1)
                 if _eb_evt:
                     st["best_speedup"] = round(_eb_evt / _best_evt_new, 4)
-            elif _best_evt_new:
-                print(f"  ⚠ [重基准] best Event {_best_evt_new:.0f}ns 疑似假小 (< 新基线/{_min_ratio:.0f}) "
-                      f"→ 跳过 best 同步 (防毒 best)")
             st["last_rebase_round"] = rn
             # ★不进 history (避免与正常轮同 round 号, trajectory 图点重叠):
             #   REBASELINE 是测量事件不是优化轮, 只更新 state; 换基后后续轮 speedup 用新基准.
@@ -1704,7 +1698,6 @@ class Scheduler:
             #   旧实现: _decide_tier 的拒绝发生在 promote 分支之后 → 分支已跳过 coder/verify (轮次白耗)
             #   + promote_budget 照涨 (max_rounds 失效). 现在拒绝在进入分支前就完成.
             _promote_allowed = True
-            _suspect = False          # ★假小 Event 标志 (hist error 提示用; promote 轮也走 hist, 须初始化)
             _cmp_extra = ""
             if getattr(plan, "promote", False):
                 _prom_ev = (getattr(plan, "promote_evidence", "") or getattr(plan, "promote_reason", "")).strip()
@@ -1761,31 +1754,25 @@ class Scheduler:
                         #   Event 设备侧无欠采, 比绝对延迟最稳; Event 缺才退化 msprof speedup.
                         _evt = v.get("e2e_event_ns")
                         _best_evt = st.get("best_e2e_event_ns")
-                        # ★假小护栏 (2026-08-12): Event 远小于基线 (默认 <基线/10, env EVENT_MIN_RATIO 可调)
-                        #   → 疑似"窗口没跑满": coder 改坏的代码在 KERNEL_EVENT_TIME 模式下 launch 被移走/
-                        #   条件包裹/循环改坏 → 窗口内实际 0~1 次 launch → Event 假小几十倍 → 毒 best
-                        #   (用户报告: 加速比突然 200x → 真实优化轮永不 KEEP). 拦截: 不采纳 + 不更新 best.
-                        _min_ratio = float(os.environ.get("EVENT_MIN_RATIO", "10"))
-                        _base_evt = st.get("baseline_e2e_event_ns")
-                        _suspect = bool(_evt and _base_evt and _evt < _base_evt / _min_ratio)
-                        if _suspect:
-                            _adopt = False
-                            _cmp = (f"⚠ Event {_evt:.0f}ns < 基线/{_min_ratio:.0f} ({_base_evt:.0f}ns) "
-                                    f"→ 疑似假小 (窗口未跑满? coder 改坏循环体?), 不采纳防毒 best")
-                            _cmp_extra = _cmp   # ★顺序: 先赋新 _cmp 再存 (防取到上一轮残留值)
-                        elif _evt and _best_evt:
+                        # ★2026-08-12 假小防护简化: Event 真实性由 verify 保证 — 循环异常
+                        #   (msprof 行数 < loop = coder 改坏 KERNEL_LOOP) 时 verify 不测 Event (None),
+                        #   走下方"Event 缺失"分支不采纳. 循环完整 → Event 真实, **>10x 也是真优化**
+                        #   (naive→tl.dot 单轮可 >10x), 照常采纳 — 不再用 EVENT_MIN_RATIO 比值拦截
+                        #   (曾误伤真实大加速比轮).
+                        if _evt and _best_evt:
                             _adopt = _evt < _best_evt
                             _cmp = f"Event {_evt:.0f}ns {'<' if _adopt else '>='} best {_best_evt:.0f}ns"
                         elif _evt:                      # 首次有 Event → 建基准, 采纳
                             _adopt = True
                             _cmp = f"首次 Event {_evt:.0f}ns (建 best)"
-                        else:                           # ★方案A: Event 缺 (非晋升轮) → 不采纳
-                            #   coder 改坏 KERNEL_LOOP 循环 / 注入失败 → Event 测不到.
-                            #   不退化 msprof (msprof 对坏循环的兜底测量不可信, 假值会毒 best).
-                            #   回退, 等下轮有 Event 再评判. (晋升轮不走这, 已在上游 kept=True)
+                        else:                           # ★方案A: Event 缺 (非晋升轮) → 不保留
+                            #   coder 改坏 KERNEL_LOOP 循环 / 注入失败 → Event 测不到 (verify 已按
+                            #   行数异常跳过 Event). 不退化 msprof (msprof 对坏循环的兜底测量不可信,
+                            #   假值会毒 best). 回退, 等下轮有 Event 再评判. (晋升轮不走这, 已在上游 kept=True)
                             _adopt = False
-                            _cmp = ("Event 缺失 → 方案A 不采纳 (coder 改坏 KERNEL_LOOP? 注入失败?), "
+                            _cmp = ("Event 缺失 (循环异常或注入失败, verify 已跳过) → 方案A 不保留, "
                                     "沿用 best, 等下轮有 Event 再评判")
+                            _cmp_extra = _cmp   # ★进 hist error (planner 可见, 防下轮重复犯同样错)
                         if _adopt:
                             self.current_kernel = round_kernel
                             st["current_kernel"] = str(round_kernel)
@@ -1890,9 +1877,8 @@ class Scheduler:
                     "change": _summarize_changes(plan),       # 例: "BLOCK_M,BLOCK_N,BLOCK_K=64,64,64"
                     # ★changes_full = 完整 changes[] 数组 (old_code/new_code 全文, 审计/复盘不丢信息)
                     "changes_full": _extract_changes_from_plan(plan.plan_text) or [],
-                    "speedup": round(prev_speedup if _suspect else speedup, 4),
-                    # ★主加速比 = 端到端口径 (初始端到端基线/本轮);
-                    #   假小轮记 prev_speedup (假 260x 会误当"有改进"打断 no_improve 计数 → 晋升节奏乱)
+                    "speedup": round(speedup, 4),
+                    # ★主加速比 = 端到端口径 (初始端到端基线/本轮); Event 真实性由 verify 行数保证
                     "kernel_speedup": round(_be / ns, 4) if (_be and ns) else None,  # 纯 kernel 口径参考
                     "prev_speedup": round(prev_speedup, 4),   # 上一轮已接受 kernel 的加速比 (保留判定用)
                     "ns": ns, "e2e_ns": _e2e, "e2e_event_ns": _evt_ns,   # ★e2e_event_ns = 工业级 Event 设备侧
@@ -1940,13 +1926,12 @@ class Scheduler:
                 print(f"  ⚠ [优秀案例] 记录跳过: {str(_ec)[:120]}")
             # ★best 以 Event 绝对延迟为准 (min, 免 msprof 欠采毒 best); best_speedup 派生自 Event 显示.
             #   方案A: 无 Event 不更新 best (不退化 msprof, 堵假值后门).
-            #   ★修复 2026-08-12: ① best 只在 kept 时更新 (与 best_kernel/best_round 强绑定 —
+            #   ★2026-08-12 简化: ① best 只在 kept 时更新 (与 best_kernel/best_round 强绑定 —
             #      REVERT 轮假小 Event 不得毒 best_speedup, 防"加速比 200x 假值"与真实代码脱钩);
-            #     ② 假小护栏 (EVENT_MIN_RATIO): 远小于基线的 Event 视为窗口未跑满, 不更新 best.
+            #     ② Event 真实性由 verify 行数保证 (循环异常 → verify 不测 Event = None) —
+            #     不再用 EVENT_MIN_RATIO 比值拦截 (曾误伤真实 >10x 优化轮).
             _bevt_base = st.get("baseline_e2e_event_ns")
-            _min_ratio = float(os.environ.get("EVENT_MIN_RATIO", "10"))
-            _suspect2 = bool(_evt_ns and _bevt_base and _evt_ns < _bevt_base / _min_ratio)
-            if (_evt_ns and not _suspect2 and kept
+            if (_evt_ns and kept
                     and (st.get("best_e2e_event_ns") is None or _evt_ns < st["best_e2e_event_ns"])):
                 st["best_e2e_event_ns"] = _evt_ns
                 if _bevt_base and _evt_ns:

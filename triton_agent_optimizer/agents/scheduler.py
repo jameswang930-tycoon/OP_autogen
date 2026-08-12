@@ -533,7 +533,8 @@ class Scheduler:
                                        #   否则"最高加速比"和"最优代码"脱钩 (曾致 113x 代码丢失).
                                        #   current_kernel === best_kernel (KEEP 仅在严格 > best 时推进).
                                        "best_kernel": str(self.op_dir / "kernel_op.py"),
-                                       "best_round": 0, "best_e2e_ns": None},
+                                       "best_round": 0, "best_e2e_ns": None,
+                                       "best_e2e_event_ns": None},  # ★历史最小 Event 延迟 (KEEP 主依据)
                      "history": []}
         self.current_kernel = self.op_dir / "kernel_op.py"
         # ★D6: 保存原始 kernel 副本 → 环境漂移时重测 baseline 用它 (优化后 current_kernel 已不是原始版)
@@ -1547,19 +1548,30 @@ class Scheduler:
                     v = self._verify(round_dir, st.get("baseline_ns"))
                     t_verify += time.time() - _tv
                     if v.get("ok"):
-                        # ★主加速比 = 端到端 (优化效果口径, 含框架 kernel); 纯 kernel 作参考.
-                        #   baseline_e2e_ns 缺失 (VERIFY_BASELINE=0 等) → 兜底纯 kernel 口径.
+                        # msprof speedup (仅记录/显示用; 不再做 KEEP 主依据 — 见下 Event 决策)
                         _e2e = v.get("e2e_ns")
                         _be2e = st.get("baseline_e2e_ns")
                         if _e2e and _be2e:
                             speedup = _be2e / _e2e
                         else:
-                            speedup = v.get("speedup", 1.0) or 1.0   # None→1.0 防御 (纯 kernel 兜底)
-                        # ★严格最优 KEEP: 本轮必须严格 > 历史最高 best_speedup 才进链.
-                        #   优化就是越改越快 — 不超过历史最优不算优化 (原 ≥prev×floor 会采纳变慢的噪声峰).
-                        #   采纳时 current_kernel === best_kernel (同步更新, 见下方 best 绑定).
-                        _best_sp = st.get("best_speedup", 1.0)
-                        if speedup > _best_sp:
+                            speedup = v.get("speedup", 1.0) or 1.0
+                        # ★决策主依据 = Event 绝对延迟 (更小=更快). 免 msprof 欠采毒 best:
+                        #   msprof 对小/短 kernel 会欠采 e2e_ns → 假性 speedup 200x → 毒 best_speedup
+                        #   → 真实轮(实际更快, Event 显示更小)永远比不过假 200x → 误 REVERT.
+                        #   Event 设备侧无欠采, 比绝对延迟最稳; Event 缺才退化 msprof speedup.
+                        _evt = v.get("e2e_event_ns")
+                        _best_evt = st.get("best_e2e_event_ns")
+                        if _evt and _best_evt:
+                            _adopt = _evt < _best_evt
+                            _cmp = f"Event {_evt:.0f}ns {'<' if _adopt else '>='} best {_best_evt:.0f}ns"
+                        elif _evt:                      # 首次有 Event → 建基准, 采纳
+                            _adopt = True
+                            _cmp = f"首次 Event {_evt:.0f}ns (建 best)"
+                        else:                           # Event 缺 → 退化 msprof speedup > best_speedup
+                            _bsp = st.get("best_speedup", 1.0)
+                            _adopt = speedup > _bsp
+                            _cmp = f"msprof {speedup:.3f}x {'>' if _adopt else '<='} best {_bsp:.3f}x (无Event退化)"
+                        if _adopt:
                             self.current_kernel = round_kernel
                             st["current_kernel"] = str(round_kernel)
                             st["current_speedup"] = round(speedup, 4)
@@ -1568,8 +1580,7 @@ class Scheduler:
                             if os.environ.get("SANITY_VERIFY", "0") == "1":
                                 self._sanity_verify(round_kernel)
                         else:
-                            print(f"  ↩ 回退: 本轮 {speedup:.3f}x ≤ 历史最高 {_best_sp:.3f}x "
-                                  f"(严格最优: 不超越历史最高不采纳, 沿用 best kernel)")
+                            print(f"  ↩ 回退: {_cmp} — 未超越历史最优, 沿用 best kernel")
                         # ★bug 修复: 本轮成功 (即便前几次 coder 失败过) → 清空 prev_err,
                         #   否则 hist["error"] 记的是之前 coder 失败的旧错误, planner 误以为成功轮有错
                         prev_err = ""
@@ -1689,11 +1700,12 @@ class Scheduler:
                           f"(>{EXCELLENT_THRESHOLD:.2f}) → memory/tier{tier}_cases.json")
             except Exception as _ec:
                 print(f"  ⚠ [优秀案例] 记录跳过: {str(_ec)[:120]}")
-            if st.get("best_speedup") is None or speedup > st["best_speedup"]:
-                st["best_speedup"] = speedup
-                # ★best 绑定: 同步记录打出该加速比的代码路径 + 复制到 best_kernel.py.
-                #   采纳(strict > best)时 current_kernel=round_kernel; 这里把它们与 best_speedup 绑死,
-                #   防"最高加速比和最优代码脱钩". final_output 也用 best_kernel (不是 current).
+            # ★best 以 Event 绝对延迟为准 (min, 免 msprof 欠采毒 best); best_speedup 派生自 Event 显示.
+            _bevt_base = st.get("baseline_e2e_event_ns")
+            if _evt_ns and (st.get("best_e2e_event_ns") is None or _evt_ns < st["best_e2e_event_ns"]):
+                st["best_e2e_event_ns"] = _evt_ns
+                if _bevt_base and _evt_ns:
+                    st["best_speedup"] = round(_bevt_base / _evt_ns, 4)   # 派生显示用 (Event 口径)
                 if kept:
                     st["best_kernel"] = str(round_kernel)
                     st["best_round"] = rn
@@ -1703,6 +1715,19 @@ class Scheduler:
                         _sh.copy2(round_kernel, self.kernel_dir / "best_kernel.py")
                     except Exception:
                         pass
+            elif not _evt_ns:
+                # Event 缺 (旧路径/Event 失败) → 退化 msprof speedup
+                if st.get("best_speedup") is None or speedup > st["best_speedup"]:
+                    st["best_speedup"] = speedup
+                    if kept:
+                        st["best_kernel"] = str(round_kernel)
+                        st["best_round"] = rn
+                        st["best_e2e_ns"] = _e2e
+                        try:
+                            import shutil as _sh
+                            _sh.copy2(round_kernel, self.kernel_dir / "best_kernel.py")
+                        except Exception:
+                            pass
             self.traj["history"].append(hist)
 
             # 晋升决策: planner.promote (读瓶颈判断) + 连续3轮无改进兜底 + 达标/到Tier6停止

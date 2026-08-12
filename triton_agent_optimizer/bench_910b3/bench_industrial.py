@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""工业级基准 — 各算子用"真正的工业级优化实现"测端到端耗时 (msprof 同口径).
+"""工业级基准 — 各算子用"真正的工业级优化实现"测端到端耗时 (★Event 设备侧).
 
 ═══ 为什么 ═══
   跟 naive torch 比不够 — 要跟工业级天花板比. Ascend 910B 上的工业级实现:
@@ -9,17 +9,22 @@
   → 我们的 triton kernel 端到端 vs 这些工业级实现的端到端.
 
 ═══ 用法 (910B 服务器) ═══
-  python3 bench_industrial.py <op> [--mode eager|compile|fa] [--measure 30] [--warmup 5]
+  python3 bench_industrial.py <op> [--mode eager|compile|fa] [--warmup-ms 25] [--rep-ms 100] [--n-buf 32]
   例:
     python3 bench_industrial.py matmul --mode compile    # MLP 融合链 compile
     python3 bench_industrial.py flash_attention --mode fa  # CANN FlashAttention
     python3 bench_industrial.py rms_norm --mode eager
   输出: bench_910b3/industrial_<op>_<mode>_tflops.json
-        time_us(端到端, msprof Σ全部含框架) / kernel_time_us(纯kernel, Σ非aclnn)
+        time_us(★median) / time_us_min / time_us_mean / rep / warmup / n_buf / actual_mode
 
-═══ 口径 ═══
-  与 verify/pt_msprof 完全一致: 一次 msprof 启动, 内层 warmup+measure 次 forward,
-  跳过热身行 ÷measure. 端到端 = Σ全部 kernel 行, 纯kernel = Σ非 aclnn 行.
+═══ 测量方法 (2026-08-12 对齐 triton testing.do_bench) ═══
+  Event 设备侧计时 (无 profiler 扰动), 每候选:
+    - 时间预算自适应: 先 5 次估时长 → warmup 25ms / rep 100ms 折算次数
+    - 多窗口 median: n_rep 个独立 Event 对 (设备流水连续, 最后 sync) → median
+    - ★输入轮换破 L2: 连续 forward 同一批张量, 工作集<192MB(L2) 时后 N 次全 L2 命中虚高;
+      Ascend 无清 L2 API → n_buf 组输入轮换 (组数×单组工作集 > L2) 等效 do_bench clear_cache
+  口径声明: 工业级 = torch 全流程 (含 host 调度/内存分配); 我们 verify 的 Event = triton 纯
+  kernel launch 链 → 大算子 (ms 级) 差异可忽略, 小算子 (us 级) 我们占便宜, 对比时声明.
 """
 import argparse
 import json

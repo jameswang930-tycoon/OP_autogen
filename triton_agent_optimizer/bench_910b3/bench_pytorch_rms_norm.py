@@ -13,7 +13,7 @@
 
 用法 (910B3):
   conda activate triton-npu && source /usr/local/Ascend/ascend-toolkit/set_env.sh
-  python3 bench_910b3/bench_pytorch_rms_norm.py          # M=N=2048 fp32, warmup3 + 30 次窗口
+  python3 bench_910b3/bench_pytorch_rms_norm.py          # M=N=2048 fp32, do_bench 同款: 多窗口 median + 轮换破 L2
   RMS_M=1024 RMS_N=4096 python3 bench_910b3/bench_pytorch_rms_norm.py   # 改尺寸
   python3 bench_910b3/bench_pytorch_rms_norm.py --dtype float16
 """

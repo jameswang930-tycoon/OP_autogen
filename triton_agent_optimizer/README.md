@@ -257,8 +257,8 @@ echo "你是 Triton 优化 Planner。先调用 skill: skills/triton-op-planner/S
 ### docx（知识库）
 `OPTIMIZATION_METHODOLOGY.md`（6层方法论）/ `msprof_fields_reference.md`（字段来源）/ `aggregation_rules.md`（聚合规则）/ `final_product_spec.md`（产物规格）/ `field_extraction_checklist.md`（缺字段核对）/ `playbook_tier1~6.md`（改码教程）。
 
-### bench_910b3（硬件基准套件，★全 Event 设备侧计时）
-`bench_industrial.py`（工业级基准 eager/compile/cann-fused/fa）/ `bench_all.py`（全算子取最优）/ `bench_pytorch*.py`（PyTorch 基准线，自带 Event）/ `bench_common.py`（msprof 诊断工具）/ `run_bench.py`（硬件峰值校准）/ `bench_kernels.py`（6个测速 kernel）。
+### bench_910b3（硬件基准套件，★全 Event 设备侧计时，do_bench 同款测量）
+`bench_industrial.py`（工业级基准 eager/compile/cann-fused/fa，多窗口 median + 输入轮换破 L2）/ `bench_all.py`（全算子取最优，仅真执行）/ `bench_pytorch*.py`（PyTorch 基准线，同款测量）/ `bench_common.py`（测量工具: msprof 双模式 + ★measure_event）/ `run_bench.py`（硬件峰值校准）/ `bench_kernels.py`（6个测速 kernel）。
 
 ### 其他
 `feedback/trajectory_chart.py`（v4 轨迹图）/ `feedback/strategy_summary.py`（每轮策略摘要，final_output/{all,successful}_strategies.md）/ `input/matmul/kernel_op.py`（单文件源）。
@@ -330,6 +330,11 @@ cat <round_dir>/06_diagnosis/diagnosis.json
   - vs_industrial_ratio（我们最优 Event / 工业级 Event）+ strategy_summary 每轮策略摘要
   - coder 制表符/header 保护 + failed_kernel.py 留证
   - main.py 注释补齐全部 14 算子运行命令
+- **08-12 (v4.4 修复轮)**：
+  - ★bench 测量方法学修复（对齐 triton do_bench）：多窗口 median（原单窗口 ÷N 只有 1 个样本）+ 时间预算自适应（warmup 25ms/rep 100ms）+ ★输入轮换破 L2 复用（Ascend 无清 L2 API，组数×工作集>L2 等效 clear_cache）+ 口径声明（工业级=torch 全流程 vs 我们=纯kernel，json 记 time_us_min/mean）
+  - ★verifier Event 注入同步改多窗口 median（KEEP 决策依据更稳；注入产物加 compile 校验）
+  - flash_attention 输入对齐 fp16（工业级 FA 即 fp16，原 fp32 vs fp16 不可比；verify 参考升 fp32）
+  - 删死代码（_build_fn/_run_loop）；_sim_fix_regression.py 补 P15（bench 测量回归）+ P7 强化（Event 注入 compile 校验）
 
 ---
 

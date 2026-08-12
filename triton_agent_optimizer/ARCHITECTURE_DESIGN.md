@@ -92,7 +92,7 @@ Scheduler (agents/scheduler.py) — 状态机主循环 (tier 1~6 × round N)
    │    读全部 op_summary*.csv 合并 → 同一次同算两种口径 ÷ 实测遍数:
    │      纯kernel ns = Σ非aclnn行; 端到端 e2e_ns = Σ全部行(含框架kernel)
    │    + ★Event 设备侧计时 (e2e_event_ns, 工业级权威绝对值, 无 profiler 扰动):
-   │      改写 kernel_op 注入 warmup + torch.npu.Event 窗口 → 跑一遍 → EVENT_E2E_US
+   │      改写 kernel_op 注入 warmup + KERNEL_EVENT_REPS(5) 个独立窗口 → median → EVENT_E2E_US
    │    (源码无 KERNEL_LOOP 循环 → 自动改除实测遍数, 防虚高)
    │
    ├─⑥ 决策  ★严格最优 KEEP: 本轮 Event 绝对延迟 < 历史最小 best_e2e_event_ns 才进链
@@ -395,6 +395,8 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
   ② 正确性校验  MATMUL_VERIFY=1 跑一次 → 必须 stdout 含 "result check: PASS"
                  (不过 → 本轮 FAIL, 错误回传 Coder 同轮重试 ≤3 次)
   ③ msprof 测时  一次 msprof, app 内 KERNEL_LOOP(30) 遍
+  ④ ★Event 设备侧 (多窗口 median): 注入 KERNEL_EVENT_REPS(5) 个独立 Event 窗口
+     (每窗口包 LOOP 次, 设备流水连续最后 sync) → 取 median → e2e_event_ns
 读: round_dir/msprof_0/op_summary*.csv  (全部合并; msprof 可能拆多文件)
 执行: _read_durations 同一次算两种口径 ÷ 实测遍数:
        纯 kernel ns = Σ 非 aclnn 行;   端到端 e2e_ns = Σ 全部行(含框架)
@@ -674,8 +676,8 @@ triton_agent_optimizer/
 - 先跑 MATMUL_VERIFY=1 正确性校验 (必须输出 `result check: PASS`; 否则本轮 FAIL 回传 coder 修)
 - `verify_end_to_end`: warmup(VERIFY_WARMUP=3) + 一次 msprof 内 kernel 循环 KERNEL_LOOP(VERIFY_LOOP=30) 次
 - `_read_durations`: 读**全部 op_summary*.csv 合并**, 同一次同算两种口径之和 → 纯kernel(Σ非aclnn) + 端到端(Σ全部含框架)
-- ★`_event_e2e_ns`: 改写 kernel_op 注入 warmup + `torch.npu.Event` 窗口包 LOOP 次 → `e2e_event_ns` (设备侧权威绝对值, 工业级, 无 profiler 扰动)
-- 返回 {ok, ns(msprof纯), e2e_ns(msprof端到端), e2e_event_ns(Event), speedup, loop, rows, duration_us}
+- ★`_event_e2e_ns` (2026-08-12 改多窗口 median): 改写 kernel_op 注入 warmup + KERNEL_EVENT_REPS(默认5) 个独立 Event 窗口 (每窗口包 LOOP 次) → 取 median → `e2e_event_ns` (设备侧权威绝对值, 工业级, 无 profiler 扰动; 单窗口 ÷N 只有 1 个样本, median 抗抖动)
+- 返回 {ok, ns(msprof纯), e2e_ns(msprof端到端), e2e_event_ns(Event, median), speedup, loop, rows, duration_us}
 - msprof 用于诊断/纯kernel 拆解; Event 用于工业级绝对 latency; 两者并列保留
 
 ### 4.6 LLMClient
@@ -704,7 +706,7 @@ triton_agent_optimizer/
 
 - **两种计时并存**（口径分离）:
   - **msprof**（诊断 + 纯kernel 拆解）: `e2e_ns` = Σ全部 kernel 行含框架, `ns` = Σ非aclnn 纯 kernel; 有 profiler 挂载开销但**跨轮一致**, 相对 speedup 显示用它
-  - **Event**（工业级权威绝对值）: `e2e_event_ns` = `torch.npu.Event` 设备侧计时（warmup + 窗口包 LOOP 次 ÷LOOP）; 无 profiler 扰动, **最终报告绝对 latency 和 KEEP 决策都用它**; bench（industrial/PyTorch）全走 Event → 两端同口径
+  - **Event**（工业级权威绝对值）: `e2e_event_ns` = `torch.npu.Event` 设备侧计时（★多窗口 median: warmup + KERNEL_EVENT_REPS 个独立窗口包 LOOP 次 → median）; 无 profiler 扰动, **最终报告绝对 latency 和 KEEP 决策都用它**; bench（industrial/PyTorch）全走 Event → 两端同口径
 - **★bench 测量纪律 (2026-08-12 修复, 对齐 triton testing.do_bench)**:
   - **多窗口 median**: 先 5 次估时长 → warmup/rep 次数按 ms 预算自适应 (快 kernel 自动加次) → n_rep 个**独立 Event 对** → 取 median (另报 min/mean)。旧"单窗口 ÷N"只有 1 个样本。
   - **★输入轮换破 L2**: 连续 forward 同一批张量, 工作集 <192MB(L2) 时后 N 次全 L2 命中 → 测到 L2 带宽 (数字虚高); Ascend 无清 L2 API → n_buf 组输入轮换 (组数×单组工作集 > L2) 等效 do_bench 的 clear_cache。json 记 `n_buf`。

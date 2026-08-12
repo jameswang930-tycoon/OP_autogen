@@ -181,8 +181,10 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
 
 def _inject_event_timing(src: str) -> str:
     """把 kernel_op.py 的 `for X in range(LOOP): <body>` 循环前注入 Event 计时分支.
-    KERNEL_EVENT_TIME=1 时: warmup W 次 + Event 窗口包 LOOP 次 → 打印 EVENT_E2E_US, return.
-    否则原样跑 (不影响正常/msprof 路径). 14 个算子 main() 都是同一个标准模式 → 通用."""
+    KERNEL_EVENT_TIME=1 时: warmup W 次 + ★KERNEL_EVENT_REPS 个独立 Event 窗口 (每窗口包 LOOP 次)
+    → 取 median 打印 EVENT_E2E_US, return. 否则原样跑 (不影响正常/msprof 路径).
+    ★2026-08-12: 单窗口 ÷LOOP 只有 1 个样本 → 改多窗口 median (与 bench measure_event 同款,
+    抗单次抖动, KEEP 决策更稳). 14 个算子 main() 都是同一个标准模式 → 通用."""
     import re as _re
     lines = src.splitlines(keepends=True)
     for_idx = None
@@ -213,6 +215,8 @@ def _inject_event_timing(src: str) -> str:
         return ""
     # 循环体再缩进 4 空格 (放进新 for 的内部)
     body_deep = "".join(("    " + ln if ln.strip() else ln) for ln in body.splitlines(keepends=True))
+    # ★多窗口 rep 循环内再深 4 格 (两层 for: rep → LOOP → body)
+    body_deep2 = "".join(("    " + ln if ln.strip() else ln) for ln in body_deep.splitlines(keepends=True))
     ind = " " * base_indent
     # 注入块: 在原 for 之前插入 (原 for+body 保留在后, 仅非 Event 模式走)
     inject = (
@@ -221,13 +225,18 @@ def _inject_event_timing(src: str) -> str:
         f"{ind}    _W = int(os.environ.get('KERNEL_EVENT_WARMUP', '5'))\n"
         f"{ind}    for _ in range(_W):\n{body_deep}"
         f"{ind}    torch.npu.synchronize()\n"
-        f"{ind}    _ev_s = torch.npu.Event(enable_timing=True)\n"
-        f"{ind}    _ev_e = torch.npu.Event(enable_timing=True)\n"
-        f"{ind}    _ev_s.record()\n"
-        f"{ind}    for _ in range(LOOP):\n{body_deep}"
-        f"{ind}    _ev_e.record()\n"
+        f"{ind}    _REPS = int(os.environ.get('KERNEL_EVENT_REPS', '5'))\n"
+        f"{ind}    _ts = []\n"
+        f"{ind}    for _r in range(_REPS):\n"
+        f"{ind}        _ev_s = torch.npu.Event(enable_timing=True)\n"
+        f"{ind}        _ev_e = torch.npu.Event(enable_timing=True)\n"
+        f"{ind}        _ev_s.record()\n"
+        f"{ind}        for _ in range(LOOP):\n{body_deep2}"
+        f"{ind}        _ev_e.record()\n"
+        f"{ind}        _ts.append(_ev_s.elapsed_time(_ev_e))\n"
         f"{ind}    torch.npu.synchronize()\n"
-        f"{ind}    print('EVENT_E2E_US:%.2f' % (_ev_s.elapsed_time(_ev_e) / LOOP * 1000.0))\n"
+        f"{ind}    _ts.sort()\n"
+        f"{ind}    print('EVENT_E2E_US:%.2f' % (_ts[len(_ts) // 2] / LOOP * 1000.0))\n"
         f"{ind}    raise SystemExit(0)\n"
     )
     out = "".join(lines[:for_idx]) + inject + "".join(lines[for_idx:])

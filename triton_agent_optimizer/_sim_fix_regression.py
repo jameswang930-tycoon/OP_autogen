@@ -526,14 +526,23 @@ def test_event_injection():
         if name in ("无循环→放弃", "while循环→放弃"):
             good = inj == ""
         else:
+            # ★2026-08-12: 注入产物必须 (a) 含多窗口 median 结构 (b) 本身可编译 (语法合法)
             good = ("KERNEL_EVENT_TIME" in inj and "EVENT_E2E_US" in inj
-                    and "for _ in range(LOOP):" in inj and inj.count("run_one" if False else "torch.npu.synchronize()") >= 2)
+                    and "KERNEL_EVENT_REPS" in inj and "_ts.sort()" in inj
+                    and "for _ in range(LOOP):" in inj
+                    and inj.count("torch.npu.synchronize()") >= 2)
+            if good:
+                try:
+                    compile(inj, "<event>", "exec")
+                except SyntaxError as e:
+                    good = False
+                    print(f"  ❌ {name}: 注入产物语法错: {e}")
         ok_all &= good
         log(f"P7-Event注入[{name}]", good, f"len={len(inj)}")
     # 数值: 5 遍 vs 30 遍的 LOOP 除数正确性 (静态看除法表达式)
     inj = Ver_mod._inject_event_timing(std_body())
-    assert "elapsed_time(_ev_e) / LOOP * 1000.0" in inj, inj
-    log("P7-Event注入除数", True, "elapsed_time/LOOP*1000 → us→ns 单次平均正确")
+    assert "elapsed_time(_ev_e))" in inj and "/ LOOP * 1000.0" in inj, inj
+    log("P7-Event注入除数", True, "median/LOOP*1000 → us→ns 单次平均正确 (多窗口 median)")
 
 # ═══════════════════════════════════════════════════════════════════
 #  Part 8: coder Unicode 清洗 / header 保护 / changes 替换 / extract_json

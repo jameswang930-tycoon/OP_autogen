@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bench_common — msprof 测量工具 (双模式).
+"""bench_common — 测量工具 (三块).
 
 模式 A: 通用 msprof → op_summary 目标 kernel Task Duration(us) → 聚合 GB/s / TFLOPS
   (与主优化循环 verify 同一数据源, 保证口径一致)
@@ -8,10 +8,15 @@
   (main_mem_r/w, l1, l2, gm_to_ub, ub_to_gm, l0a/l0b/l0c, engine_util, conflict)
   → 这才是填 timing_estimator 微路径占位的真实数据源
 
+★模式 C: measure_event — 工业级 Event 设备侧计时 (2026-08-12 新增, 对齐 triton testing.do_bench)
+  - 时间预算自适应 (warmup 25ms / rep 100ms 折算次数)
+  - 多窗口 median: n_rep 个独立 Event 对 → median (另报 min/mean)
+  - ★输入轮换破 L2: 调用方 fn(i) 按 i 轮换输入 buffer (Ascend 无清 L2 API, 轮换等效 clear_cache)
+
 科学原则: run_bench.py 对每类跑多个变体, 每个度量取全变体最大值.
 
-用法 (库文件, 由 run_bench.py 调用):
-  from bench_common import measure_msprof, measure_msprof_op
+用法 (库文件, 由 run_bench.py / bench_industrial.py / bench_pytorch_*.py 调用):
+  from bench_common import measure_msprof, measure_msprof_op, measure_event
 """
 import csv
 import json

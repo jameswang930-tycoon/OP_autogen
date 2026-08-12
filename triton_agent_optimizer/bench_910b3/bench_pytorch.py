@@ -7,7 +7,7 @@ scheduler (main.py) 启动时会读它存进 trajectory state。
 ═══ 怎么运行 (910B3 服务器) ═══
   conda activate triton-npu
   source /usr/local/Ascend/ascend-toolkit/set_env.sh
-  python3 bench_pytorch.py                  # M=N=K=2048 fp32 (对齐优化算子), warmup 3 + 30 次窗口
+  python3 bench_pytorch.py                  # M=N=K=2048 fp32 (对齐优化算子), do_bench 同款: 多窗口 median + 轮换破 L2
   MATMUL_M=1024 python3 bench_pytorch.py           # 改尺寸
   python3 bench_pytorch.py --dtype float32  # 测 fp32
   python3 bench_pytorch.py --rounds 10      # 调轮数

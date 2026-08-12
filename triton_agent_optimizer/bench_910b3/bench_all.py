@@ -12,8 +12,9 @@
   并写 bench_910b3/industrial_summary.json (供轨迹图/报告参考)
 
 ═══ 口径 ═══
-  每个候选 = bench_industrial.py (一次 msprof, 端到端=Σ全部含框架, 纯kernel=Σ非aclnn, ÷measure).
-  每算子最优 = 各 mode 的 time_us 最小值 (eager=CANN厂商kernel, compile=TorchAir融合, fa=CANN-FA).
+  每个候选 = bench_industrial.py (★Event 设备侧, 多窗口 median + 输入轮换破 L2, 见 bench_common.measure_event).
+  每算子最优 = 各 mode 的 time_us(median) 最小值 (eager=CANN厂商kernel, compile=TorchAir融合, fa=CANN-FA),
+  且只从"真正执行"的方法里选 (actual_mode==mode; 回退的是别的方法的重复测量, 不顶替).
 """
 import argparse
 import json

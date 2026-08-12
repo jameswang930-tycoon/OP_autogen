@@ -13,7 +13,7 @@
 
 用法 (910B3):
   conda activate triton-npu && source /usr/local/Ascend/ascend-toolkit/set_env.sh
-  python3 bench_910b3/bench_pytorch_mlp.py                          # 2048³ fp32, warmup3 + 30 次窗口
+  python3 bench_910b3/bench_pytorch_mlp.py                          # 2048³ fp32, do_bench 同款: 多窗口 median + 轮换破 L2
   MATMUL_M=1024 MATMUL_K=1024 MLP_HIDDEN=1024 MATMUL_N=1024 python3 bench_910b3/bench_pytorch_mlp.py
   python3 bench_910b3/bench_pytorch_mlp.py --dtype float16
 """

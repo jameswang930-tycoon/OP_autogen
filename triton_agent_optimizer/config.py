@@ -467,12 +467,9 @@ class PlatformPaths:
 
 @dataclass
 class HardwareParams:
-    """910B3 硬件参数——从 simulator.py 的 SATURATION_PARAMS + MEMORY_CAPACITY_KB
-    动态读取, 确保与 cost model 保持同步。
-
-    不在此文件中硬编码任何数值——单一数据源原则:
-      costModel/cost_emulator/simulator.py 是唯一权威的硬件参数来源。
-    """
+    """910B3 硬件参数——由 Config._load_hardware_params 填充 (硬编码验证值,
+    来自华为官方文档 + bench_910b3 实测/推导; 旧版曾从 simulator.py 动态读取,
+    costModel 已弃用, 该动态加载已移除)."""
 
     saturation_params: Dict[int, Dict[str, float]] = field(default_factory=dict)
     memory_capacity_kb: Dict[str, Optional[float]] = field(default_factory=dict)
@@ -485,65 +482,6 @@ class HardwareParams:
     freq_ghz: float = 1.8         # 核心频率
     ub_kb_per_core: int = 192     # UB per core (来自 bench, 比 simulator 的 512KB 更可信)
     l2_mb_shared: int = 192       # L2 共享缓存
-
-    _simulator_module: Any = None
-
-    def load_from_simulator(self, simulator_path: Path):
-        """从 simulator.py 动态导入并读取硬件参数。
-
-        读取:
-          - SATURATION_PARAMS: 7 个引擎的饱和度曲线 (vpeak/k0/peak_clamp)
-          - MEMORY_CAPACITY_KB: UB/L1/L0/GM 容量
-          - ENGINE_FOR: 操作名 → 引擎编号
-          - ENG_NAME: 引擎编号 → 引擎名
-
-        注意: simulator.py 不在 sys.path 上, 需要通过 importlib 加载。
-        """
-        import importlib.util
-
-        spec = importlib.util.spec_from_file_location(
-            "simulator", str(simulator_path)
-        )
-        if spec is None or spec.loader is None:
-            raise FileNotFoundError(
-                f"Cannot load simulator from {simulator_path}"
-            )
-
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["simulator"] = module
-        spec.loader.exec_module(module)
-        self._simulator_module = module
-
-        self.saturation_params = module.SATURATION_PARAMS
-        self.memory_capacity_kb = module.MEMORY_CAPACITY_KB
-        self.engine_names = module.ENG_NAME
-        self.engine_for = module.ENGINE_FOR
-
-    def peak_bandwidth_gb_s(self, engine: int) -> float:
-        """引擎的峰值带宽 (GB/s/核), 单核。"""
-        return self.saturation_params[engine]["peak_clamp"]
-
-    def aggregate_bandwidth_gb_s(self, engine: int) -> float:
-        """引擎的聚合带宽 (GB/s), 多核并行。
-
-        传输引擎用 AI Core 数 (20), VecUnit 用 Vec Core 数 (40)。
-        CubeUnit 的并行核数待实测确认, 暂用 20。
-        """
-        if engine == 2:  # VecUnit: 40 Vec Cores
-            return self.peak_bandwidth_gb_s(2) * self.n_vec_cores
-        # transfer engines 0/1/3/4/6 和 cube engine 5: 20 AI Cores
-        return self.peak_bandwidth_gb_s(engine) * self.n_ai_cores
-
-    def get_engine_status(self, engine: int) -> str:
-        """引擎校准状态: 'MEASURED' | 'PLACEHOLDER'"""
-        p = self.saturation_params[engine]
-        if engine in (0, 1, 2):
-            return "MEASURED"
-        return "PLACEHOLDER"
-
-    def is_reliable(self, engine: int) -> bool:
-        """该引擎的参数是否可靠 (可用于精确优化决策)。"""
-        return self.get_engine_status(engine) == "MEASURED"
 
 
 # ═════════════════════════════════════════════════════════════════════════════════

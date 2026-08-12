@@ -509,6 +509,7 @@ class Scheduler:
             _st.setdefault("handoff", None)
             _st.setdefault("tier_jumps", [])
             _st.setdefault("promote_budget", 0)
+            _st.setdefault("last_rebase_round", 0)
             _st.setdefault("best_round", 0)
             _st.setdefault("best_e2e_ns", None)
             # 旧 trajectory 缺 best_kernel → 用 current_kernel 兜底 (保证不脱钩)
@@ -529,6 +530,10 @@ class Scheduler:
                                        "handoff": None,          # ★P1: 跳转手递 (下个 tier 的 planner 读)
                                        "tier_jumps": [],         # ★P1: 跳转路径记录 (防死循环)
                                        "last_sweep_result": None,  # ★sweep 结果持久化 (每轮传给 planner)
+                                       # ★D7: promote 额度 (与 resume 路径 setdefault 对齐; 缺键会让
+                                       #   trajectory 状态前后不一致, 见 _load_traj/旧轨迹兜底)
+                                       "promote_budget": 0,
+                                       "last_rebase_round": 0,   # ★D6: 最近一次重基准的 round (防同轮重复)
                                        # ★best 绑定: best_speedup 必须绑定打出该加速比的代码路径,
                                        #   否则"最高加速比"和"最优代码"脱钩 (曾致 113x 代码丢失).
                                        #   current_kernel === best_kernel (KEEP 仅在严格 > best 时推进).
@@ -559,7 +564,8 @@ class Scheduler:
                                   "baseline_e2e_ns": None,
                                   "best_kernel": str(self.op_dir / "kernel_op.py"),
                                   "best_round": 0, "best_e2e_ns": None,
-                                  "handoff": None, "tier_jumps": []},
+                                  "handoff": None, "tier_jumps": [],
+                                  "promote_budget": 0, "last_rebase_round": 0},
                 "history": []}
 
     def _save_traj(self):
@@ -1033,6 +1039,28 @@ class Scheduler:
                 st["baseline_e2e_ns"] = _eb
             if vb.get("e2e_event_ns"):
                 st["baseline_e2e_event_ns"] = vb["e2e_event_ns"]
+            # ★bug 修复: 环境漂移后同步 best Event — 旧 best_e2e_event_ns 是旧环境的绝对最小值,
+            #   不重置则新环境下的改进轮 Event 恒 > 旧 best → 永远 REVERT (即使相对新基准是真实改进,
+            #   长时运行跨时段漂移会卡死优化).
+            #   用 best_kernel.py (历史最优) 在新环境复测; current==best (严格最优 KEEP 常态) 时用 cur 的 Event.
+            _best_evt_new = None
+            try:
+                _bk = self.kernel_dir / "best_kernel.py"
+                if _bk.exists() and _bk.resolve() != Path(self.current_kernel).resolve():
+                    _vb2 = verify_end_to_end(_bk, rb_dir / "best", None,
+                                             num_kernels=st.get("num_kernels"),
+                                             num_launches=st.get("num_launches"))
+                    if _vb2.get("ok") and _vb2.get("e2e_event_ns"):
+                        _best_evt_new = _vb2["e2e_event_ns"]
+            except Exception:
+                _best_evt_new = None
+            if _best_evt_new is None and cur.get("e2e_event_ns"):
+                _best_evt_new = cur["e2e_event_ns"]
+            if _best_evt_new:
+                st["best_e2e_event_ns"] = round(_best_evt_new, 1)
+                _eb_evt = vb.get("e2e_event_ns") or st.get("baseline_e2e_event_ns")
+                if _eb_evt:
+                    st["best_speedup"] = round(_eb_evt / _best_evt_new, 4)
             st["last_rebase_round"] = rn
             # ★不进 history (避免与正常轮同 round 号, trajectory 图点重叠):
             #   REBASELINE 是测量事件不是优化轮, 只更新 state; 换基后后续轮 speedup 用新基准.
@@ -1163,8 +1191,10 @@ class Scheduler:
         coll_fail = 0   # ★H2: 连续采集失败计数 (失败重试/跳过, 不是一停到底)
         _dev_poisoned = False   # ★设备污染标志: verify 崩了 AICore → 下轮采集前先重置设备
         total_rounds = st.get("total_rounds", 0)
-        # ★D7: 总预算 = max_rounds + 已用 promote 额度 (promote 轮免费, 不挤占有效优化轮)
-        while total_rounds < self.max_rounds + int(st.get("promote_budget", 0)):
+        # ★D7: 总预算按「有效优化轮」计 (total − promote): promote 轮免费, 不挤占有效优化轮.
+        #   ★bug 修复: 旧实现 total < max_rounds + promote_budget, 两侧同步增长 → max_rounds 失效
+        #   (planner 频繁 promote 时永不达上限, 实测 max_rounds=5 跑出 18 轮, 只能靠 tier6/采集失败兜底).
+        while (total_rounds - int(st.get("promote_budget", 0))) < self.max_rounds:
             total_rounds += 1
             st["total_rounds"] = total_rounds   # ★bug 修复: 立即更新内存 (break 停止时也有正确轮数, 由 break 前 _save_traj 落盘)
             round_dir = self._round_dir(tier, rn)
@@ -1521,7 +1551,16 @@ class Scheduler:
             _pre_round_kernel = self.current_kernel
             pre_code = self.current_kernel.read_text(encoding="utf-8") \
                 if self.current_kernel.exists() else ""    # NOOP 对比用 (改之前的版本)
+            # ★bug 修复: 晋升严格门前置 — promote 无 evidence/reason 时本轮转正常优化轮.
+            #   旧实现: _decide_tier 的拒绝发生在 promote 分支之后 → 分支已跳过 coder/verify (轮次白耗)
+            #   + promote_budget 照涨 (max_rounds 失效). 现在拒绝在进入分支前就完成.
+            _promote_allowed = True
             if getattr(plan, "promote", False):
+                _prom_ev = (getattr(plan, "promote_evidence", "") or getattr(plan, "promote_reason", "")).strip()
+                if not _prom_ev:
+                    print("  ⚠ planner promote 但无 promote_evidence/reason → 晋升被拒, 本轮转正常优化轮")
+                    _promote_allowed = False
+            if getattr(plan, "promote", False) and _promote_allowed:
                 # ★晋升轮: 不调 LLM 改码, 原样拷贝当前 kernel → roundN/kernel_op.py
                 #   (保证每个 round 目录格式一致: 都有 kernel_op.py + diff.patch)
                 #   ★下一轮读 current_kernel.parent/kernel_op.py = 本轮 (链连续, 不回 input)
@@ -1614,9 +1653,25 @@ class Scheduler:
                          "speedup": prev_speedup, "ns": None}
 
             # ★input 链不变量: 本轮未采纳 (REVERT/FAIL) → current_kernel 必须回到轮首快照 (= 历史最优).
-            #   sweep 可能在轮中把 current_kernel 指向 round_dir, coder 覆写了同路径; 不回滚就会
-            #   让下一轮读到坏代码. (promote 轮 kept=True, 不进这里.)
+            #   sweep 可能在轮中把 current_kernel 指向 round_dir/kernel_op.py (轮首快照=该路径),
+            #   而 coder 已覆写同一文件 → 只回路径引用会读到 coder 的失败代码 (input 链断, 下轮采集脏输入).
+            #   ★bug 修复: 同路径时用内容快照 pre_code 恢复, 被丢弃的失败代码另存 failed_kernel.py 留证.
+            _had_round_changes = False
             if not kept:
+                if _pre_round_kernel == round_kernel and round_kernel.exists():
+                    try:
+                        _had_round_changes = (round_kernel.read_text(encoding="utf-8") != pre_code)
+                    except Exception:
+                        pass
+                    if _had_round_changes:
+                        try:
+                            (round_kernel.parent / "failed_kernel.py").write_text(
+                                f"# failed_kernel.py — verify 未通过/未采纳轮, coder 输出留证\n"
+                                f"# (current_kernel 已回滚到轮首快照; 本文件是被丢弃的中间产物)\n"
+                                + round_kernel.read_text(encoding="utf-8"), encoding="utf-8")
+                        except Exception:
+                            pass
+                        round_kernel.write_text(pre_code, encoding="utf-8")
                 self.current_kernel = _pre_round_kernel
                 st["current_kernel"] = str(_pre_round_kernel)
 
@@ -1654,11 +1709,15 @@ class Scheduler:
             # ★bug 修复: promote 轮本来就原样拷贝 pre_code (晋升不改码) → 跳过 NOOP 判定,
             #   否则 promote 轮被记成 "NOOP" 却 decision="KEEP", history 自相矛盾.
             noop = False
-            if round_kernel.exists() and pre_code and not getattr(plan, "promote", False):
-                try:
-                    noop = (round_kernel.read_text(encoding="utf-8") == pre_code)
-                except Exception:
-                    pass
+            if round_kernel.exists() and pre_code and not (getattr(plan, "promote", False) and _promote_allowed):
+                if not kept and _pre_round_kernel == round_kernel:
+                    # 该轮文件已被内容快照恢复 → 用回滚前的事实判定 (防 REVERT/FAIL 轮被误记 NOOP)
+                    noop = not _had_round_changes
+                else:
+                    try:
+                        noop = (round_kernel.read_text(encoding="utf-8") == pre_code)
+                    except Exception:
+                        pass
             result = "NOOP" if noop else ("OK" if ok else "FAIL")
             decision = "KEEP" if kept else ("FAIL" if not ok else "REVERT")
             hist = {"round": rn, "tier": tier, "strategy": plan.strategy,
@@ -1740,7 +1799,9 @@ class Scheduler:
                 break
             # ★D7: promote 轮免费 — 不消耗 max_rounds 配额 (用 promote_budget 扩总预算),
             #   但 rn 编号统一推进 (历史/目录编号一致, 不被 promote 打乱)
-            if getattr(plan, "promote", False):
+            #   ★bug 修复: 只给「真通过晋升门」的轮计 promote 额度 — 被拒 (无依据) 轮已转正常优化,
+            #   不再白涨 budget (否则有效轮计数 total−budget 停滞, max_rounds 仍失效).
+            if getattr(plan, "promote", False) and _promote_allowed:
                 st["promote_budget"] = int(st.get("promote_budget", 0)) + 1
                 print(f"  (promote 轮免费, 已用 {st['promote_budget']} 次 promote 额度)")
             st["round"] = rn + 1

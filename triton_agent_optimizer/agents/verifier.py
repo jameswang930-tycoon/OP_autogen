@@ -230,7 +230,12 @@ def _inject_event_timing(src: str) -> str:
         f"{ind}    print('EVENT_E2E_US:%.2f' % (_ev_s.elapsed_time(_ev_e) / LOOP * 1000.0))\n"
         f"{ind}    raise SystemExit(0)\n"
     )
-    return "".join(lines[:for_idx]) + inject + "".join(lines[for_idx:])
+    out = "".join(lines[:for_idx]) + inject + "".join(lines[for_idx:])
+    # ★保险: 注入块引用 os.environ — 若源文件顶部没有 import os (未来新算子), 补上防 NameError
+    #   (Event 测不到 → 方案A 永不采纳 → 误 REVERT)
+    if not re.search(r"^\s*import\s+os\b", out, re.M):
+        out = "import os\n" + out
+    return out
 
 
 def _event_e2e_ns(kernel_op: Path, round_dir: Path, loop: int) -> Optional[float]:

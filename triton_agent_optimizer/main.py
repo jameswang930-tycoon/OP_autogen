@@ -63,6 +63,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import sys
 from pathlib import Path
 
@@ -98,7 +99,13 @@ class _Tee:
         return False
 
     def fileno(self):
-        return self.streams[0].fileno()
+        for s in self.streams:
+            try:
+                return s.fileno()
+            except Exception:
+                continue
+        # 全部底层流都无 fileno (如管道/无终端环境) → 抛标准异常, 不让调用方拿到坏值
+        raise io.UnsupportedOperation("fileno")
 
     def reconfigure(self, *args, **kwargs):
         """agent 模块会调 sys.stdout.reconfigure(encoding='utf-8') — 传播给所有流."""

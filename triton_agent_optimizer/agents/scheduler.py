@@ -564,7 +564,17 @@ class Scheduler:
 
     def _save_traj(self):
         self.traj_path.parent.mkdir(parents=True, exist_ok=True)
-        self.traj_path.write_text(json.dumps(self.traj, ensure_ascii=False, indent=2),
+        st = self.traj.get("state", {})
+        # ★把最优 Event 结果提到 state 最前 (方便打开 json 一眼看到优化效果):
+        #   只重排「序列化副本」, 不动 self.traj["state"] (否则 run() 里的 st 引用会失效, 后续写丢失).
+        _best_keys = ["best_e2e_event_ns", "best_speedup", "best_round", "best_kernel",
+                      "best_e2e_ns", "vs_industrial_ratio", "our_best_e2e_event_ns",
+                      "industrial_time_us", "industrial_baseline"]
+        _front = {k: st[k] for k in _best_keys if k in st}
+        _rest = {k: v for k, v in st.items() if k not in _front}
+        _ordered_state = {**_front, **_rest}
+        _traj_copy = {**self.traj, "state": _ordered_state}
+        self.traj_path.write_text(json.dumps(_traj_copy, ensure_ascii=False, indent=2),
                                   encoding="utf-8")
 
     def _write_timing_stats(self):
@@ -1567,10 +1577,13 @@ class Scheduler:
                         elif _evt:                      # 首次有 Event → 建基准, 采纳
                             _adopt = True
                             _cmp = f"首次 Event {_evt:.0f}ns (建 best)"
-                        else:                           # Event 缺 → 退化 msprof speedup > best_speedup
-                            _bsp = st.get("best_speedup", 1.0)
-                            _adopt = speedup > _bsp
-                            _cmp = f"msprof {speedup:.3f}x {'>' if _adopt else '<='} best {_bsp:.3f}x (无Event退化)"
+                        else:                           # ★方案A: Event 缺 (非晋升轮) → 不采纳
+                            #   coder 改坏 KERNEL_LOOP 循环 / 注入失败 → Event 测不到.
+                            #   不退化 msprof (msprof 对坏循环的兜底测量不可信, 假值会毒 best).
+                            #   回退, 等下轮有 Event 再评判. (晋升轮不走这, 已在上游 kept=True)
+                            _adopt = False
+                            _cmp = ("Event 缺失 → 方案A 不采纳 (coder 改坏 KERNEL_LOOP? 注入失败?), "
+                                    "沿用 best, 等下轮有 Event 再评判")
                         if _adopt:
                             self.current_kernel = round_kernel
                             st["current_kernel"] = str(round_kernel)
@@ -1701,6 +1714,7 @@ class Scheduler:
             except Exception as _ec:
                 print(f"  ⚠ [优秀案例] 记录跳过: {str(_ec)[:120]}")
             # ★best 以 Event 绝对延迟为准 (min, 免 msprof 欠采毒 best); best_speedup 派生自 Event 显示.
+            #   方案A: 无 Event 不更新 best (不退化 msprof, 堵假值后门).
             _bevt_base = st.get("baseline_e2e_event_ns")
             if _evt_ns and (st.get("best_e2e_event_ns") is None or _evt_ns < st["best_e2e_event_ns"]):
                 st["best_e2e_event_ns"] = _evt_ns
@@ -1715,19 +1729,6 @@ class Scheduler:
                         _sh.copy2(round_kernel, self.kernel_dir / "best_kernel.py")
                     except Exception:
                         pass
-            elif not _evt_ns:
-                # Event 缺 (旧路径/Event 失败) → 退化 msprof speedup
-                if st.get("best_speedup") is None or speedup > st["best_speedup"]:
-                    st["best_speedup"] = speedup
-                    if kept:
-                        st["best_kernel"] = str(round_kernel)
-                        st["best_round"] = rn
-                        st["best_e2e_ns"] = _e2e
-                        try:
-                            import shutil as _sh
-                            _sh.copy2(round_kernel, self.kernel_dir / "best_kernel.py")
-                        except Exception:
-                            pass
             self.traj["history"].append(hist)
 
             # 晋升决策: planner.promote (读瓶颈判断) + 连续3轮无改进兜底 + 达标/到Tier6停止

@@ -49,9 +49,9 @@ def ok_verify(base=5_000_000.0):
     def verify(kernel_op, round_dir, baseline_ns=None, num_kernels=None, num_launches=None):
         rd = str(round_dir)
         if "baseline" in rd:
-            return {"ok": True, "ns": base, "e2e_ns": base, "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": base/1000}
+            return {"ok": True, "ns": base, "e2e_ns": base, "e2e_event_ns": base, "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": base/1000}
         # ★strict-best: 优化轮须严格 > baseline(1.0) 才 KEEP → sp=1.05 (改进)
-        return {"ok": True, "ns": base/1.05, "e2e_ns": base/1.05, "speedup": 1.05, "loop": 30, "rows": 90, "duration_us": base/1.05/1000}
+        return {"ok": True, "ns": base/1.05, "e2e_ns": base/1.05, "e2e_event_ns": base/1.05, "speedup": 1.05, "loop": 30, "rows": 90, "duration_us": base/1.05/1000}
     return verify
 
 def optimize_ok(self, round_dir, tier):
@@ -131,7 +131,7 @@ def test_verify_3fail():
     PlannerAgent.generate_v4 = flip_gen()
     def verify(kernel_op, round_dir, baseline_ns=None, num_kernels=None, num_launches=None):
         if "baseline" in str(round_dir):
-            return {"ok": True, "ns": 5_000_000.0, "e2e_ns": 5_000_000.0, "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": 5000.0}
+            return {"ok": True, "ns": 5_000_000.0, "e2e_ns": 5_000_000.0, "e2e_event_ns": 5_000_000.0, "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": 5000.0}
         return {"ok": False, "error": "sim kernel run error", "speedup": 0.5, "ns": None}
     s = make_sched(optimize_ok, verify, max_rounds=4)
     s.run()
@@ -159,8 +159,8 @@ def test_target_stop():
     PlannerAgent.generate_v4 = flip_gen()
     def verify(kernel_op, round_dir, baseline_ns=None, num_kernels=None, num_launches=None):
         if "baseline" in str(round_dir):
-            return {"ok": True, "ns": 5_000_000.0, "e2e_ns": 5_000_000.0, "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": 5000.0}
-        return {"ok": True, "ns": 5_000_000.0/1.3, "e2e_ns": 5_000_000.0/1.3, "speedup": 1.3, "loop": 30, "rows": 90, "duration_us": 5000.0}
+            return {"ok": True, "ns": 5_000_000.0, "e2e_ns": 5_000_000.0, "e2e_event_ns": 5_000_000.0, "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": 5000.0}
+        return {"ok": True, "ns": 5_000_000.0/1.3, "e2e_ns": 5_000_000.0/1.3, "e2e_event_ns": 5_000_000.0/1.3, "speedup": 1.3, "loop": 30, "rows": 90, "duration_us": 5000.0}
     s = make_sched(optimize_ok, verify, max_rounds=15, target=1.2)
     s.run()
     st, hist = read_hist()
@@ -177,10 +177,10 @@ def test_no_improve_promote():
     def verify(kernel_op, round_dir, baseline_ns=None, num_kernels=None, num_launches=None):
         rd = str(round_dir)
         if "baseline" in rd:
-            return {"ok": True, "ns": 5_000_000.0, "e2e_ns": 5_000_000.0, "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": 5000.0}
+            return {"ok": True, "ns": 5_000_000.0, "e2e_ns": 5_000_000.0, "e2e_event_ns": 5_000_000.0, "speedup": 1.0, "loop": 30, "rows": 90, "duration_us": 5000.0}
         rn = int(re.search(r"round(\d+)", rd).group(1))
         sp = speedups.get(rn, 1.0)
-        return {"ok": True, "ns": 5_000_000.0/sp, "e2e_ns": 5_000_000.0/sp, "speedup": sp, "loop": 30, "rows": 90, "duration_us": 5000.0}
+        return {"ok": True, "ns": 5_000_000.0/sp, "e2e_ns": 5_000_000.0/sp, "e2e_event_ns": 5_000_000.0/sp, "speedup": sp, "loop": 30, "rows": 90, "duration_us": 5000.0}
     s = make_sched(optimize_ok, verify, max_rounds=8)
     s.run()
     _, hist = read_hist()

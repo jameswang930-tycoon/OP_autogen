@@ -109,13 +109,15 @@ class FakePopen:
 def fake_verify(kernel_op, round_dir, baseline_ns=None, num_kernels=None, num_launches=None):
     rd = str(round_dir)
     if "baseline" in rd:
-        return {"ok": True, "ns": BASELINE_NS, "e2e_ns": BASELINE_NS, "speedup": 1.0,
+        return {"ok": True, "ns": BASELINE_NS, "e2e_ns": BASELINE_NS,
+                "e2e_event_ns": BASELINE_NS, "speedup": 1.0,
                 "loop": 30, "rows": 90, "duration_us": BASELINE_NS/1000}
     m = re.search(r"round(\d+)", rd)
     rn = int(m.group(1)) if m else 1
     sp = SIM_SPEED.get(rn, 1.2)
     base = baseline_ns or BASELINE_NS
-    return {"ok": True, "ns": round(base / sp, 1), "e2e_ns": round(base / sp, 1), "speedup": sp,
+    ns = round(base / sp, 1)
+    return {"ok": True, "ns": ns, "e2e_ns": ns, "e2e_event_ns": ns, "speedup": sp,
             "loop": 30, "rows": 90, "duration_us": round(base / sp / 1000, 1)}
 
 def fake_generate_v4(self, extracted, tier, history, kernel_code, round_num,

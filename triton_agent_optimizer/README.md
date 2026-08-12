@@ -289,7 +289,8 @@ bash analyzers/run_optimize.sh input/matmul input/matmul/e2e_run
 # ③ 逐 tier 筛字段核对 (解析完 07 自动产出)
 cat input/matmul/e2e_run/07_tier1_fields/tier1_fields.txt
 
-# ④ 工业级基准 (各 mode 真机测 → 取每算子 min 作为对比天花板)
+# ④ 工业级基准 (各 mode 真机测 → 取每算子 median 最小作为对比天花板; ★主循环缺时自动跑 bench_industrial.py,
+#   无需手动; AUTO_RUN_IND_BENCH=0 关闭; 这里整批跑一次可让全部算子都有)
 cd bench_910b3 && python3 bench_all.py
 python3 bench_all.py --clean      # 清理 bench_910b3/outputs/ 全部产物
 

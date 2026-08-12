@@ -17,7 +17,9 @@ v4 流程 (每轮):
      - 可回退 (防死循环: 同路径≥3次拒绝)
      - 跳转手递 (10_tier_handoff.json)
      - 优秀案例自动记录 (memory/tier{N}_cases.json, 阈值1.3×)
-     - 自动跑 PyTorch bench (AUTO_RUN_PT_BENCH) + 自动生成轨迹图 (AUTO_CHART)
+      - 自动跑 PyTorch bench (AUTO_RUN_PT_BENCH) + ★自动跑工业级基准 (AUTO_RUN_IND_BENCH,
+        缺 industrial json 时逐个 mode 跑 bench_industrial.py; 口径: mode 内 median、mode 间取最小、仅真执行)
+        + 自动生成轨迹图 (AUTO_CHART)
 
 用法:
   python -m agents.scheduler <op_dir> [--max-rounds N] [--stub]
@@ -362,6 +364,55 @@ def _fnum(v):
     if f == int(f):
         return str(int(f))
     return f"{f:.3f}" if abs(f) < 10 else f"{f:.1f}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  工业级基准 — 读取最优 + 缺省自动跑 (与 bench_all.py 同口径)
+#  ★口径: bench_industrial.py 每次测量输出 time_us = median (多窗口 Event median,
+#    与 verify 的 e2e_event_ns 完全同口径, 抗单次抖动) — 不用 mean (离群敏感) / min (单次运气值);
+#    多 mode (eager/compile/fa) 之间取 median 最小者 = "工业级最优";
+#    只认"真正执行"的 mode (actual_mode==mode, 回退成别的的重复测量不顶替).
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _load_industrial_best(op: str, modes: list) -> Optional[dict]:
+    """读每个 mode 的 industrial json → 各 mode 的 time_us(★median) 取最小 → 最优.
+    返回 {time_us, kernel_time_us, file, mode} 或 None (全部缺失)."""
+    best = None
+    for _m in modes:
+        _p = _PROJECT / "bench_910b3" / "outputs" / f"industrial_{op}_{_m}_tflops.json"
+        if not _p.exists():
+            continue
+        try:
+            _d = json.loads(_p.read_text(encoding="utf-8"))
+            _t = _d.get("time_us")
+            _actual = _d.get("actual_mode", _m)
+            if _t and _actual == _m and (best is None or _t < best["time_us"]):
+                best = {"time_us": _t, "kernel_time_us": _d.get("kernel_time_us"),
+                        "file": f"industrial_{op}_{_m}_tflops.json", "mode": _m}
+        except Exception:
+            continue
+    return best
+
+
+def _auto_run_industrial(op: str, modes: list) -> None:
+    """缺工业级基准 json 时自动跑 bench_industrial.py 生成 (Event 设备侧, 与 verify 同口径).
+    env AUTO_RUN_IND_BENCH=0 关闭; 只跑缺失的 mode (多 mode 时 bench_all 全跑太重, 逐个补)."""
+    script = _PROJECT / "bench_910b3" / "bench_industrial.py"
+    for _m in modes:
+        _f = f"industrial_{op}_{_m}_tflops.json"
+        if (_PROJECT / "bench_910b3" / "outputs" / _f).exists():
+            continue
+        print(f"  [工业级] 缺 {_f} → 自动跑 bench_industrial.py {op} --mode {_m} "
+              f"(AUTO_RUN_IND_BENCH=1, 需 NPU, 几分钟)")
+        try:
+            _r = subprocess.run([sys.executable or "python3", str(script), op, "--mode", _m],
+                                capture_output=True, text=True, timeout=7200,
+                                encoding="utf-8", errors="backslashreplace")
+            if _r.returncode != 0:
+                print(f"  ⚠ 自动跑工业级基准失败 ({_m}): "
+                      f"{(getattr(_r, 'stderr', '') or '')[-200:]}")
+        except Exception as e:
+            print(f"  ⚠ 自动跑工业级基准异常 ({_m}): {str(e)[:120]}")
 
 
 def extract_tier_fields(diagnosis: dict, tier: int) -> str:
@@ -1423,10 +1474,13 @@ class Scheduler:
                         # ★缺 json 且不自动跑 → 警告 (不阻塞, 但用户该知道).
                         print(f"  ⚠ 缺 PyTorch 基准 {pt_file} (trajectory 无 vs-PyTorch 参考线). "
                               f"跑 python3 bench_910b3/{_script or 'bench_pytorch_*.py'} 生成")
-                # ★工业级基准 (工业级天花板): 对每个算子跑过全部候选 mode 后**取 time_us 最小者**.
+                # ★工业级基准 (工业级天花板): 对每个算子跑过全部候选 mode 后**取 time_us(median) 最小者**.
                 #   - 有 CANN 融合算子的 (matmul/matmul_relu/conv_bias_relu): eager + compile + cann-fused
                 #   - 其余: eager(CANN vendor) + compile(TorchAir 图融合)
                 #   - flash_attention: 只取 fa (CANN FlashAttention 专用)
+                #   ★口径: 单 mode 内 time_us=median (与 verify Event 同口径, 抗噪声;
+                #     不用 mean/min — mean 受离群影响, min 是单次运气值不可复现);
+                #     mode 间取 median 最小者; 只认真正执行 (actual_mode==mode).
                 #   我们最终 kernel 的端到端 vs 这个"工业级最优" — 这才是看优化效果的对比.
                 if self.kernel_name == "flash_attention":
                     _ind_modes = ["fa"]
@@ -1434,32 +1488,22 @@ class Scheduler:
                     _ind_modes = ["eager", "compile", "cann-fused"]
                 else:
                     _ind_modes = ["eager", "compile"]
-                _best_t = _best_k = None
-                _best_file = None
-                for _m in _ind_modes:
-                    _f = f"industrial_{self.kernel_name}_{_m}_tflops.json"
-                    _p = _PROJECT / "bench_910b3" / "outputs" / _f
-                    if not _p.exists():
-                        continue
-                    try:
-                        _d = json.loads(_p.read_text(encoding="utf-8"))
-                        _t = _d.get("time_us")
-                        # ★只认"真正执行"的 mode (与 bench_all 同逻辑): compile 回退成 eager 时
-                        #   actual_mode≠mode → 跳过, 否则回退的重复测量可能噪声性地顶替成最优.
-                        _actual = _d.get("actual_mode", _m)
-                        if _t and _actual == _m and (_best_t is None or _t < _best_t):
-                            _best_t, _best_k, _best_file = _t, _d.get("kernel_time_us"), _f
-                    except Exception:
-                        pass
-                if _best_t:
-                    st["industrial_time_us"] = _best_t
-                    st["industrial_kernel_time_us"] = _best_k
-                    st["industrial_baseline"] = _best_file
-                    print(f"  [工业级] 基准 {_best_file} ({'/'.join(_ind_modes)} 取 min, 仅真执行): "
-                          f"e2e={_best_t}us (Event) kernel={_best_k}us")
+                _best = _load_industrial_best(self.kernel_name, _ind_modes)
+                # ★2026-08-12: 缺工业级基准 → 自动跑 bench_industrial.py 生成 (不再只警告).
+                #   env AUTO_RUN_IND_BENCH=0 关闭 (与 AUTO_RUN_PT_BENCH 同款).
+                if not _best and os.environ.get("AUTO_RUN_IND_BENCH", "1") == "1":
+                    _auto_run_industrial(self.kernel_name, _ind_modes)
+                    _best = _load_industrial_best(self.kernel_name, _ind_modes)
+                if _best:
+                    st["industrial_time_us"] = _best["time_us"]
+                    st["industrial_kernel_time_us"] = _best["kernel_time_us"]
+                    st["industrial_baseline"] = _best["file"]
+                    print(f"  [工业级] 基准 {_best['file']} ({'/'.join(_ind_modes)} 取 median 最小, 仅真执行): "
+                          f"e2e={_best['time_us']}us (Event) kernel={_best['kernel_time_us']}us")
                 else:
-                    print(f"  ⚠ 缺工业级基准 (跑 python3 bench_910b3/bench_industrial.py {self.kernel_name} "
-                          f"--mode {'fa' if self.kernel_name == 'flash_attention' else 'eager / compile'} "
+                    print(f"  ⚠ 缺工业级基准 (AUTO_RUN_IND_BENCH=1 已尝试自动生成仍失败/被关闭; 手工跑: "
+                          f"python3 bench_910b3/bench_industrial.py {self.kernel_name} --mode "
+                          f"{'fa' if self.kernel_name == 'flash_attention' else 'eager / compile'} "
                           f"生成后才有 vs-工业级 对比线)")
                 # ★基准复测: 诊断 total_ns 是单次 msprof 采样(噪声大),
                 #   用 verify 机制 (warmup + VERIFY_RUNS 轮 msprof 平均) 重测源 kernel,
@@ -1951,7 +1995,7 @@ class Scheduler:
                   f"(Event) = {_vs_ind_ratio}x  → 工业级/我们 = {_vs_ind_speedup}x  {_verdict}")
         else:
             print(f"  [产出] vs工业级: 缺数据 (我们 Event={_our_best_evt_ns}, 工业级={_ind_us}us) — "
-                  f"跑 bench_all 或开 AUTO_RUN_PT_BENCH")
+                  f"AUTO_RUN_IND_BENCH=1 已自动跑过仍失败? 看上面 [工业级] 日志 / 手工跑 bench_all")
         print(f"  [产出] 最终 kernel 文件 → {st.get('current_kernel')}")
 
         # ★自动生成轨迹图 (优化结束后; 失败/无 matplotlib 不阻断). env AUTO_CHART=0 关闭.

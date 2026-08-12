@@ -80,9 +80,13 @@ def flash_attn_mha_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
         s = tl.where(causal, s, float("-inf"))
 
         m_curr = tl.maximum(tl.max(s, axis=1), m_i)   # running max [BLOCK_M]
-        p = tl.exp(s - m_curr[:, None])               # [BLOCK_M, BLOCK_N]
+        # ★P 转 fp16: tl.dot 两个输入必须同 dtype — p 是 exp 结果(fp32), vv 是 fp16 输入,
+        #   dot(fp32, fp16) 会编译失败 → kernel 起不来 → msprof 采不到 kernel 名.
+        #   FA 标准做法: P 矩阵用 fp16 (精度损失可忽略), acc 累加保持 fp32.
+        p = tl.exp(s - m_curr[:, None]).to(tl.float16)  # [BLOCK_M, BLOCK_N]
         alpha = tl.exp(m_i - m_curr)                  # 旧块衰减 [BLOCK_M]
-        l_i = alpha * l_i + tl.sum(p, axis=1)         # running sum [BLOCK_M]
+        # ★l_i 求和用 fp32 (p 已是 fp16, 直接 sum 会 fp16 累加掉精度; FA 标准: 归一化分母保持 fp32)
+        l_i = alpha * l_i + tl.sum(p.to(tl.float32), axis=1)  # running sum [BLOCK_M]
 
         # V[h, n, d]: h*(seq*dim) + n*dim + d  → 行跨度=1 (连续✓)
         v_ptrs = v_ptr + head * (seq * dim) + offs_n[:, None] * dim + offs_k[None, :]

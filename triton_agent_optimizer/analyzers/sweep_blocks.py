@@ -488,7 +488,7 @@ def _generate_matmul_runner(op_dir: Path, candidates: List[Tuple],
         q_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=device) * 0.1).permute(1, 0, 2).contiguous()
         k_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=device) * 0.1).permute(1, 2, 0).contiguous()
         v_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=device) * 0.1).permute(1, 0, 2).contiguous()
-        o = torch.empty(nh, seq, dim, dtype=DTYPE, device=device)
+        o = torch.empty(nh, seq, dim, dtype=torch.float32, device=device)   # ★与 kernel_op.py 一致 (输出 fp32)
 
         def run_one(bm, bn, bk):
             grid = (triton.cdiv(seq, bm) * nh,)

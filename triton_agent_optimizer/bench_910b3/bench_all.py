@@ -5,7 +5,7 @@
   python3 bench_all.py                 # 跑全部算子 (每个: eager+compile, flash: fa) — 需几分钟~几十分钟
   python3 bench_all.py --op matmul     # 只跑一个算子
   python3 bench_all.py --skip-existing # 已有 json 的不重跑 (缺的才跑)
-  python3 bench_all.py --measure 30    # 每个候选测 30 次 (默认 30)
+  python3 bench_all.py --rep-ms 100    # 每个候选测量时间预算 (默认 100ms, do_bench 同款自适应次数)
 
 ═══ 输出 ═══
   终端表格: 算子 | 最优模式 | 端到端us | 纯kernelus | 来源json
@@ -63,11 +63,13 @@ def _read_json(op, mode):
         return None
 
 
-def _run_one(op, mode, measure):
-    """跑 bench_industrial.py <op> --mode <mode> → 返回结果 dict 或 None."""
+def _run_one(op, mode, rep_ms):
+    """跑 bench_industrial.py <op> --mode <mode> → 返回结果 dict 或 None.
+    ★2026-08-12 同步: bench_industrial 已改 Event 时间预算测量 (--warmup-ms/--rep-ms),
+      不再有 --measure 次数参数 — 传 --rep-ms 时间预算 (do_bench 同款自适应次数)."""
     script = _BENCH_DIR / "bench_industrial.py"
     cmd = [sys.executable or "python3", str(script), op, "--mode", mode,
-           "--measure", str(measure)]
+           "--rep-ms", str(rep_ms)]
     print(f"\n══ {op} [{mode}] ══", flush=True)
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200,
                        encoding="utf-8", errors="backslashreplace")
@@ -85,7 +87,8 @@ def main():
     p.add_argument("--op", type=str, default=None, help="只跑指定算子 (缺省=全部)")
     p.add_argument("--skip-existing", action="store_true",
                    help="已有 json 的模式不重跑 (缺的才跑)")
-    p.add_argument("--measure", type=int, default=30)
+    p.add_argument("--rep-ms", type=int, default=100,
+                   help="每个候选测量时间预算 ms (传给 bench_industrial, do_bench 同款按估时长折算次数)")
     p.add_argument("--list", action="store_true", help="只列出算子×模式, 不跑")
     p.add_argument("--clean", action="store_true",
                    help="清理 bench_910b3/outputs/ 全部产物 (json/txt/msprof临时) 后退出")
@@ -124,7 +127,7 @@ def main():
             if args.skip_existing and j and j.get("time_us"):
                 print(f"  ⏭ {op}[{mode}] 已有 json, 跳过 (--skip-existing)")
             else:
-                j = _run_one(op, mode, args.measure)
+                j = _run_one(op, mode, args.rep_ms)
             if j and j.get("time_us"):
                 _actual = j.get("actual_mode", mode)   # 实际执行模式 (compile 是否回退)
                 cands.append({"mode": mode, "time_us": j["time_us"],

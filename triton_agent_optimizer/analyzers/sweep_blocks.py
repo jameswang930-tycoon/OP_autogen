@@ -483,7 +483,7 @@ def _generate_matmul_runner(op_dir: Path, candidates: List[Tuple],
         # ── Tensor setup (flash_attention) — ★布局与 kernel 一致: Q/V[nh,seq,dim], K[nh,dim,seq] ──
         seq, nh, dim = {seq}, {nh}, {dim}
         scale = 1.0 / (dim ** 0.5)
-        DTYPE = torch.float32
+        DTYPE = torch.float16   # ★与 kernel_op.py 对齐 (fp16 输入, 工业级 FA 同口径)
         device = torch.device("npu")
         q_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=device) * 0.1).permute(1, 0, 2).contiguous()
         k_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=device) * 0.1).permute(1, 2, 0).contiguous()

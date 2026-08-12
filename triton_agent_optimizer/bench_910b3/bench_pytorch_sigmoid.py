@@ -18,34 +18,39 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--n", type=int, default=int(os.environ.get("SIGMOID_N", str(4 * 1024 * 1024))))
     p.add_argument("--dtype", type=str, default=os.environ.get("DTYPE", "float32"))
-    p.add_argument("--warmup", type=int, default=3)
-    p.add_argument("--measure", type=int, default=int(os.environ.get("BENCH_PT_MEASURE", "30")))
+    p.add_argument("--warmup-ms", type=int, default=int(os.environ.get("BENCH_WARMUP_MS", "25")),
+                   help="warmup 时间预算 (ms, do_bench 同款)")
+    p.add_argument("--rep-ms", type=int, default=int(os.environ.get("BENCH_REP_MS", "100")),
+                   help="测量时间预算 (ms, do_bench 同款)")
+    p.add_argument("--n-buf", type=int, default=32,
+                   help="轮换输入 buffer 组数 (破 L2 复用; 910B3 L2=192MB)")
     args = p.parse_args()
     if not torch.npu.is_available():
         print("[FATAL] torch.npu 不可用"); sys.exit(1)
     torch.npu.set_device(0)
     dt = torch.float16 if args.dtype == "float16" else torch.float32
     npu = torch.device("npu")
-    x = (torch.randn(args.n, dtype=dt, device=npu)) * 0.1
+    # ★轮换 buffer: 工作集 16MB << L2 192MB → 不清会全 L2 命中虚高
+    bufs = [((torch.randn(args.n, dtype=dt, device=npu)) * 0.1,) for _ in range(args.n_buf)]
 
-    def forward():
-        return torch.sigmoid(x)
+    def forward(i):
+        return torch.sigmoid(bufs[i % len(bufs)][0])
 
-    for _ in range(args.warmup):
-        forward(); torch.npu.synchronize()
-    st = torch.npu.Event(enable_timing=True); en = torch.npu.Event(enable_timing=True)
-    st.record()
-    for _ in range(args.measure):
-        forward()
-    en.record(); torch.npu.synchronize()
-    avg_s = st.elapsed_time(en) / 1000.0 / args.measure
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from bench_910b3.bench_common import measure_event
+    m = measure_event(forward, warmup_ms=args.warmup_ms, rep_ms=args.rep_ms)
+    avg_s = m["median_us"] / 1e6
     flops = 2 * args.n  # exp + div
     tflops = flops / 1e12 / avg_s
     print(f"  torch sigmoid(N={args.n}, {args.dtype}): "
-          f"avg={avg_s*1e6:.1f}us -> {tflops:.1f} TFLOPS")
-    OUT.write_text(json.dumps({"tflops": round(tflops, 2), "time_us": round(avg_s * 1e6, 1),
+          f"median={m['median_us']:.1f}us -> {tflops:.1f} TFLOPS")
+    OUT.write_text(json.dumps({"tflops": round(tflops, 2), "time_us": round(m["median_us"], 1),
+        "time_us_min": m["min_us"], "time_us_mean": m["mean_us"],
+        "rep": m["rep"], "warmup": m["warmup"], "n_buf": args.n_buf,
         "N": args.n, "dtype": args.dtype, "flops": flops,
-        "measured_at": datetime.now().isoformat(), "measure": args.measure},
+        "measured_at": datetime.now().isoformat(),
+        "note": "Event 多窗口median+输入轮换破L2 (do_bench 同款)"},
         ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"  -> {OUT}")
 

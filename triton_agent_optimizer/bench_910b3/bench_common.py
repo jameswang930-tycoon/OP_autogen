@@ -243,6 +243,64 @@ def measure_pytorch_msprof(app_cmd: str, out_json: Path, flops: float,
         return None
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  ★Event 设备侧统一测量 (对齐 triton testing.do_bench 标准) — 2026-08-12 修复
+#  修 3 个方法学缺陷:
+#   ① L2 复用虚高: 连续 forward 同一批张量, 工作集<192MB(L2) 时后 N 次全 L2 命中
+#      → 测到 L2 带宽. 修复: 每次 rep 轮换输入 buffer (调用方 fn(i) 按 i 取组).
+#   ② 单窗口 ÷N 只有 1 个样本: 修复: n_rep 个独立 Event 对 (设备流水连续, 最后 sync),
+#      返回 median/min/mean (抗单次抖动).
+#   ③ 固定次数对小 kernel 太少: 修复: 时间预算自适应 (warmup_ms/rep_ms → 次数).
+# ═══════════════════════════════════════════════════════════════════════
+
+def measure_event(fn, warmup_ms: int = 25, rep_ms: int = 100,
+                  max_rep: int = 50, min_rep: int = 5) -> dict:
+    """★工业级 Event 设备侧计时 (do_bench 同款):
+       fn(i) = 第 i 次 forward — 调用方按 i % n_buf 轮换输入 buffer (破 L2 复用).
+       流程: 5 次估时长 → n_warmup/n_rep 按时间预算自适应 → warmup → n_rep 个独立 Event 对
+       (每 rep: record → fn(i) → record, 不逐个 sync, 设备流水连续) → 最后 sync.
+       返回 {median_us, min_us, mean_us, rep, warmup, est_us, times_us} (us 为单次)."""
+    import statistics
+    import torch
+    # ── 估时长 (buffer 0, 5 次) ──
+    for _ in range(5):
+        fn(0)
+    torch.npu.synchronize()
+    s = torch.npu.Event(enable_timing=True)
+    e = torch.npu.Event(enable_timing=True)
+    s.record()
+    for _ in range(5):
+        fn(0)
+    e.record()
+    torch.npu.synchronize()
+    est_ms = s.elapsed_time(e) / 5.0
+    # ── 时间预算 → 次数 (快 kernel 自动加次, 慢 kernel 自动减次) ──
+    if est_ms > 0:
+        n_warmup = max(3, int(warmup_ms / est_ms))
+        n_rep = max(min_rep, min(max_rep, int(rep_ms / est_ms)))
+    else:
+        n_warmup, n_rep = 25, min_rep
+    # ── warmup (破坏性 JIT/图编译/冷 cache 在此消化, 不计时) ──
+    for _ in range(n_warmup):
+        fn(0)
+    torch.npu.synchronize()
+    # ── 测量: n_rep 个独立 Event 对 (每 rep 轮换 buffer, 破 L2 复用) ──
+    times = []
+    for i in range(n_rep):
+        s.record()
+        fn(i)
+        e.record()
+        times.append(s.elapsed_time(e))
+    torch.npu.synchronize()
+    us = [t * 1000.0 for t in times]
+    return {"median_us": round(statistics.median(us), 1),
+            "min_us": round(min(us), 1),
+            "mean_us": round(statistics.mean(us), 1),
+            "rep": n_rep, "warmup": n_warmup,
+            "est_us": round(est_ms * 1000.0, 1),
+            "times_us": [round(x, 1) for x in us]}
+
+
 def flatten_per_path(board: dict) -> dict:
     """从 board.json 提取扁平 per-path 度量 (跑多个变体后取最大)."""
     n = board.get("normalized", {})

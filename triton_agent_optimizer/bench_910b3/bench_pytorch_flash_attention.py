@@ -39,14 +39,17 @@ OUT = Path(__file__).resolve().parent / "outputs" / "pytorch_flash_attention_tfl
 
 def main():
     p = argparse.ArgumentParser(description="PyTorch 多头因果 Flash Attention 基准线")
-    # ★默认对齐 input/flash_attention/kernel_op.py: seq=2048, heads=8, dim=64, fp32
+    # ★默认对齐 input/flash_attention/kernel_op.py: seq=2048, heads=8, dim=64, fp16 (FA 工业级即 fp16)
     p.add_argument("--seq", type=int, default=int(os.environ.get("FA_SEQ", "2048")))
     p.add_argument("--heads", type=int, default=int(os.environ.get("FA_HEADS", "8")))
     p.add_argument("--dim", type=int, default=int(os.environ.get("FA_DIM", "64")))
-    p.add_argument("--dtype", type=str, default=os.environ.get("DTYPE", "float32"))
-    p.add_argument("--warmup", type=int, default=3)
-    p.add_argument("--measure", type=int, default=int(os.environ.get("BENCH_PT_MEASURE", "30")),
-                   help="一次 Event 窗口内 forward 次数, ÷N 求单次平均 (默认 30)")
+    p.add_argument("--dtype", type=str, default=os.environ.get("DTYPE", "float16"))
+    p.add_argument("--warmup-ms", type=int, default=int(os.environ.get("BENCH_WARMUP_MS", "25")),
+                   help="warmup 时间预算 (ms, do_bench 同款)")
+    p.add_argument("--rep-ms", type=int, default=int(os.environ.get("BENCH_REP_MS", "100")),
+                   help="测量时间预算 (ms, do_bench 同款)")
+    p.add_argument("--n-buf", type=int, default=64,
+                   help="轮换输入 buffer 组数 (破 L2 复用; FA 工作集小, 需更多组)")
     args = p.parse_args()
 
     if not torch.npu.is_available():
@@ -58,15 +61,16 @@ def main():
     scale = 1.0 / (dim ** 0.5)
     npu = torch.device("npu")
 
-    # 与 kernel_op.py 同款输入 (小值 ±0.1, 避免 fp32 dot 值域溢出)
-    q = (torch.randn(seq, nh, dim, dtype=dt, device=npu)) * 0.1
-    k = (torch.randn(seq, nh, dim, dtype=dt, device=npu)) * 0.1
-    v = (torch.randn(seq, nh, dim, dtype=dt, device=npu)) * 0.1
-    # 因果 mask: 上三角 (key n > query m 置 -inf), 与 kernel_op 一致
+    # ★轮换 buffer: FA 工作集 (q+k+v ≈ 6MB) << L2 192MB → 不清会全 L2 命中虚高 (64 组 ≈ 384MB)
+    bufs = [((torch.randn(seq, nh, dim, dtype=dt, device=npu)) * 0.1,
+             (torch.randn(seq, nh, dim, dtype=dt, device=npu)) * 0.1,
+             (torch.randn(seq, nh, dim, dtype=dt, device=npu)) * 0.1) for _ in range(args.n_buf)]
+    # 因果 mask: 上三角 (key n > query m 置 -inf), 与 kernel_op 一致 (seq 固定, 不轮换)
     causal = torch.triu(torch.ones(seq, seq, dtype=torch.bool, device=npu), diagonal=1)
 
-    def forward():
+    def forward(i):
         # ★布局 [seq,nh,dim] 的 batch 维是 seq, 直接 @ 会把 seq 当 batch → 必须先 permute 成 [nh,seq,dim]
+        q, k, v = bufs[i % len(bufs)]
         q_h = q.permute(1, 0, 2)    # [nh, seq, dim]
         k_h = k.permute(1, 0, 2)
         v_h = v.permute(1, 0, 2)
@@ -76,33 +80,26 @@ def main():
         o = p @ v_h                                 # [nh, seq, dim]
         return o.permute(1, 0, 2)                   # 回 [seq, nh, dim]
 
-    # warmup (JIT/图编译预热)
-    for _ in range(args.warmup):
-        o = forward()
-        torch.npu.synchronize()
-
-    # measure: 一次 Event 窗口内 forward measure 次, ÷measure = 单次平均
-    st = torch.npu.Event(enable_timing=True)
-    en = torch.npu.Event(enable_timing=True)
-    st.record()
-    for _ in range(args.measure):
-        o = forward()
-    en.record()
-    torch.npu.synchronize()
-    avg_s = st.elapsed_time(en) / 1000.0 / args.measure   # ms → s → ÷N
-    print(f"    {args.measure} 次窗口平均: {avg_s*1e6:.1f}us/次")
+    # ★do_bench 同款: 时间预算自适应 + 多窗口 median + 轮换破 L2
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from bench_910b3.bench_common import measure_event
+    m = measure_event(forward, warmup_ms=args.warmup_ms, rep_ms=args.rep_ms)
+    avg_s = m["median_us"] / 1e6
+    print(f"    {m['rep']} 个窗口 median: {m['median_us']:.1f}us/次 (min {m['min_us']}us)")
 
     flops = 4 * seq * seq * dim * nh                    # 每头 2 matmul (S 和 O)
     tflops = flops / 1e12 / avg_s
     print(f"\n  torch flash_attn({seq}x{nh}x{dim}, causal, {args.dtype}): "
-          f"avg={avg_s*1e6:.1f}us → {tflops:.1f} TFLOPS")
+          f"median={m['median_us']:.1f}us → {tflops:.1f} TFLOPS")
 
     OUT.write_text(json.dumps({
-        "tflops": round(tflops, 2), "time_us": round(avg_s * 1e6, 1),
+        "tflops": round(tflops, 2), "time_us": round(m["median_us"], 1),
+        "time_us_min": m["min_us"], "time_us_mean": m["mean_us"],
+        "rep": m["rep"], "warmup": m["warmup"], "n_buf": args.n_buf,
         "seq": seq, "heads": nh, "dim": dim, "dtype": args.dtype, "flops": flops,
         "causal": True,
         "measured_at": datetime.now().isoformat(),
-        "measure": args.measure,
+        "note": "Event 多窗口median+输入轮换破L2 (do_bench 同款)",
     }, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"  → {OUT}")
 

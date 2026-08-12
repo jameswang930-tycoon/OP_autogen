@@ -1,9 +1,31 @@
 # Triton Agent Optimizer v4 — 架构设计（按当前实现）
 
-> **核心思路**: 不靠盲试（AutoKernel 300~400 轮），而是用 **真机 msprof 双源采集（通用 msprof + msprof op）** 精确诊断每个 kernel 的耗时/带宽/算力/瓶颈 → 6 层优化策略逐层推进 → 每轮**正确性校验 + msprof 端到端实测（纯 kernel+端到端双口径）+ Event 设备侧计时**，**严格最优 KEEP（必须 > 历史最高）**决定保留/回退，并以**工业级最优**（eager/compile/cann-fused/fa 各 mode Event 取 min）为对比天花板，最终算 **vs 工业级比值**看优化效果。
+> **核心思路**: 不靠盲试（AutoKernel 300~400 轮），而是用 **真机 msprof 双源采集（通用 msprof + msprof op）** 精确诊断每个 kernel 的耗时/带宽/算力/瓶颈 → 6 层优化策略逐层推进 → 每轮**正确性校验 + msprof 端到端实测（纯 kernel+端到端双口径）+ Event 设备侧计时**，**严格最优 KEEP（Event 绝对延迟 < 历史最小才进链）**决定保留/回退，并以**工业级最优**（eager/compile/cann-fused/fa 各 mode Event 取 min）为对比天花板，最终算 **vs 工业级比值**看优化效果。
 >
-> **环境**: Ascend 910B3 (NPU) + CANN 9.0 + triton-ascend + nga (本地 LLM codeagent)
-> **更新**: 2026-08-11 — v4.3: ① bench 全切 Event 设备侧计时（工业级 + PyTorch，不用 msprof）；② 迭代每轮补 Event 端到端（`e2e_event_ns`，原 msprof 字段全保留）；③ 严格最优 KEEP（`> best_speedup`）+ best_kernel 绑定 + 失败回滚保 input 链；④ sweep 每个 tier3 round 都跑；⑤ 设备污染检测+重置（修 msprof 采不到 kernel 级联）；⑥ vs_industrial 比值 + strategy_summary 每轮产出
+> **环境**: Ascend 910B3 (NPU) + CANN 8.5.1 + triton-ascend 3.2.0 + torch_npu 2.9.0 + nga (本地 LLM codeagent)
+> **更新**: 2026-08-12 — v4.4 修复轮（全部有回归测试 `_sim_fix_regression.py` 31 项断言守护）:
+>   ① sweep 轮 verify 失败回滚只回路径引用 → kernel 链污染 → 内容快照恢复 + failed_kernel.py 留证
+>   ② promote 无依据被拒后轮次白耗 + promote_budget 无限膨胀 → max_rounds 失效 → 晋升门前置（被拒转正常优化轮）+ 有效轮计数
+>   ③ rebaseline 环境漂移后 best_e2e_event_ns 未重置 → 新环境改进轮永远 REVERT → 新环境复测同步 best Event
+>   ④ diff.patch 被失败尝试（no-op）覆盖 → 只在 coder 成功时写
+>   ⑤ coder 清洗 4 缺陷（用户高频报障: "syntaxerror/非法字符但看代码没有"）: 千分位逗号（1，024→1,024→leading zeros）、全角数字被删留空、markdown 结尾残留、智能引号"定界符要换/字符串内容要删"两难; 报错信息带出错行真实内容
+>   ⑥ trajectory state 补齐 promote_budget/last_rebase_round（fresh/resume 路径一致）
+>   ⑦ bench 测量方法学修复 (对齐 triton do_bench): 多窗口 median + 时间预算自适应 + ★输入轮换破 L2 复用 (Ascend 无清 L2 API) + 口径声明 (torch 全流程 vs triton 纯kernel); flash_attention 输入对齐 fp16 (工业级 FA 即 fp16); 删死代码 (_build_fn/_run_loop)
+>
+> **更新**: 2026-08-11 — v4.3: ① bench 全切 Event 设备侧计时（工业级 + PyTorch，不用 msprof）；② 迭代每轮补 Event 端到端（`e2e_event_ns`，原 msprof 字段全保留）；③ 严格最优 KEEP（Event 绝对延迟）+ best_kernel 绑定 + 失败回滚保 input 链；④ sweep 每个 tier3 round 都跑；⑤ 设备污染检测+重置（修 msprof 采不到 kernel 级联）；⑥ vs_industrial 比值 + strategy_summary 每轮产出
+
+---
+
+## 0A. 项目背景与动机（讲述开场用）
+
+**问题**：在华为昇腾 910B3 上做 Triton kernel 性能优化，现有路线要么**盲试调参**（如 AutoKernel 300~400 轮随机试，慢且无解释），要么**纯理论建模**（静态成本模型，与真机偏差大），要么**靠专家手调**（不可规模化）。昇腾生态缺一个"数据驱动、可解释、可复现"的自动优化闭环。
+
+**本项目答案**：Agent 化自动优化框架——用**真机 profiler 数据（msprof 双源）**替代盲试和静态模型，用 **LLM Agent（Planner 定方向）+ 确定性改码（Coder）+ 端到端真机验证（Verifier）** 组成闭环，把"优化"从"碰运气"变成"诊断→决策→验证→保留"的工程循环。
+
+**三个核心主张（一句话各讲一条）**：
+1. **真机数据驱动**：不猜瓶颈，msprof 双源（骨架+深层）给出每个 kernel 的真实带宽/算力/引擎占用/冲突 → 诊断先行。
+2. **确定性优于生成**：LLM 只做"决策"（输出 old_code→new_code 精确替换片段），改码是确定性字符串替换 + 语法/函数完整性校验 → 杜绝"LLM 乱改"。
+3. **测量纪律**：双轨计时（msprof 诊断 + torch.npu.Event 设备侧权威绝对值），严格最优保留（必须超越历史最优才进链），失败回滚保链路，环境漂移自动重基准 → 加速比数字可信、可复现。
 
 ---
 
@@ -16,7 +38,7 @@
   → Planner 出 changes[]（old_code→new_code 精确替换）+ promote 决策
   → Coder 确定性应用 changes[] → 本轮 kernel_op.py
   → 端到端实测: msprof（纯kernel+端到端双口径, 诊断用）+ Event（设备侧权威绝对值, `e2e_event_ns`）
-  → 严格最优 KEEP: speedup > 历史最高 best_speedup 才进链（绑定 best_kernel/best_round）
+  → 严格最优 KEEP: Event 绝对延迟 < 历史最小才进链（绑定 best_kernel/best_round; Event缺不采纳）
   → 最终算 vs_industrial 比值（我们最优 Event / 工业级最优 Event）看优化效果
   → 对比上一轮决定 KEEP / REVERT / 晋升 / 回退 / 停止
 ```
@@ -32,26 +54,33 @@ input/<op>/kernel_op.py            (源单文件: ① config + ② kernel + ③ 
 Scheduler (agents/scheduler.py) — 状态机主循环 (tier 1~6 × round N)
    │
    ├─① 采集+解析  _run_optimize()
-   │    bash analyzers/run_optimize.sh <input_dir> <round_dir> M N K   (TIER env)
+   │    bash analyzers/run_optimize.sh <input_dir> <round_dir> M N K   (TIER env; M/N/K 从当前 kernel config 提取, 防 512 默认覆盖)
    │      ├─ warmup 裸跑 (JIT 预热)
    │      ├─ 通用 msprof → pipeline_parse_task.py → task.json      (骨架: 每kernel耗时/launch/api)
    │      ├─ 逐 kernel msprof op → pipeline_parse_board.py → board_<i>.json (deep: 带宽/L2/cube/conflict)
+   │      │    (msprof op 崩 AICore → 检测设备级错误 break 剩余 kernel + sync/empty_cache 重置, 防级联)
    │      ├─ integrate.py → diagnosis.json   (骨架+deep 合并, roofline 用 hardware_peak.json 校准)
    │      ├─ 07_tier<N>_fields/*.txt|.json  (extract_tier_fields 筛出全局+当前tier字段)
    │      ├─ check_fields.py → field_check.log   (字段校验明细)
-   │      └─ (仅 TIER==2) MULTI 路径: bishengir-compile → HIVM → filter_hivm_for_fusion.py
+   │      └─ (仅 TIER==2 或 ENABLE_HIVM=1) MULTI 路径: bishengir-compile → HIVM → filter_hivm_for_fusion.py
    │            → 08_fusion/hivm_fusion_view.txt
    │
-   ├─(round1 基准) baseline_ns(纯)/baseline_e2e_ns(端到端)/num_kernels/num_launches/baseline_mnk/initial_tflops/pytorch基准/工业级基准(各mode取min)
-   │    + verify_end_to_end 复测源 kernel (正确性校验 + warmup + 1×msprof KERNEL_LOOP) → 同口径 baseline
+   ├─(round1 基准) baseline_ns(纯)/baseline_e2e_ns(端到端)/baseline_e2e_event_ns(Event)/num_kernels/num_launches/baseline_mnk/initial_tflops
+   │    + pytorch基准(Event, 缺则自动跑 bench_pytorch_*.py) + 工业级基准(各mode取min, 仅真执行)
+   │    + verify_end_to_end 复测源 kernel (正确性校验 + warmup + 1×msprof KERNEL_LOOP + Event) → 同口径 baseline
+   │
+   ├─(round1 + 每个 tier3 round) ★分块 sweep  _tier3_sweep_data() → 09_tier3_sweep/
+   │    在 best_kernel.py (历史最优) 上程序化枚举全部 L0 合法 BLOCK → 单进程 torch.npu.Event 实测
+   │    → 最优写回 round_dir/kernel_op.py → current_kernel 指向它 (结果持久化 st["last_sweep_result"] 每轮传 planner)
    │
    ├─② 诊断筛字段  _diagnose() → 07_tier<N>_fields (Planner 只读这个)
    ├─(Tier2 多一步) _run_fusion() → run_hivm_fusion.py → 08_fusion/fusion_analysis.json
    │
    ├─③ Planner  _plan()  (agents/planner.py generate_v4)
    │    读: skills/triton-op-planner/SKILL.md + docx/playbook_tier<N>.md + 当前 kernel_op.py
-   │        + 07 字段 + config 常量 + 历史(前层进度) [+ 融合分析]
-   │    出: roundN/plan.md  (JSON: strategy, changes[], promote, promote_to)
+   │        + 07 字段 + planner_context.json(每kernel全量task/deep+占比+Top耗时) + trajectory(各层进度)
+   │        + 历史梗概(前层进度) + 手递handoff + 优秀案例(memory/tier{N}_cases.json) [+ 融合分析 + sweep结论]
+   │    出: roundN/plan.md  (JSON: strategy, changes[], promote, promote_to, promote_evidence, handoff)
    │
    ├─④ Coder  _code()  (agents/coder.py apply)
    │    确定性应用 changes[] (old_code→new_code 逐字符替换全部出现处) + 语法检查
@@ -66,22 +95,28 @@ Scheduler (agents/scheduler.py) — 状态机主循环 (tier 1~6 × round N)
    │      改写 kernel_op 注入 warmup + torch.npu.Event 窗口 → 跑一遍 → EVENT_E2E_US
    │    (源码无 KERNEL_LOOP 循环 → 自动改除实测遍数, 防虚高)
    │
-   ├─⑥ 决策  ★严格最优 KEEP: speedup > 历史最高 best_speedup 才进链 (优化必须超越历史最优)
+   ├─⑥ 决策  ★严格最优 KEEP: 本轮 Event 绝对延迟 < 历史最小 best_e2e_event_ns 才进链
+   │    (设备侧无 profiler 扰动, 免 msprof 欠采毒 best; Event 缺则方案A: 不采纳)
    │    采纳时同步 best_kernel/best_round + 复制 outputs/<op>/best_kernel.py
-   │    未采纳/失败 → current_kernel 回滚轮首快照 (保 input 链不变量)
+   │    未采纳/失败 → current_kernel 回滚轮首快照 (★内容快照恢复, 防 sweep 轮链污染; 失败代码另存 failed_kernel.py)
    │    记录 history[] {..., ns, e2e_ns(msprof), e2e_event_ns(Event), sweep_ran, sweep_adopted, ...}
+   │    (每 REBASELINE_EVERY=10 轮: 环境漂移重基准 — 重测原始 baseline + 当前 kernel, 同步 best_e2e_event_ns)
+   │    (优秀案例: 本轮相对上一最优 >1.3× → 自动记 memory/tier{N}_cases.json)
+   │    (每轮产出策略摘要: strategy_summary.py → final_output/{all,successful}_strategies.md)
    │
    └─⑦ 晋升/停止
         planner.promote+promote_to → 晋升/回退目标层 (支持回退前层)
-        或 本 tier 连续 3 轮无改进 → 晋升下一层
-        speedup ≥ target → 停止; Tier6 无改进 → 停止
+         或 本 tier 连续 3 轮无改进 → 晋升下一层
+         ★达标不硬停 (D3): speedup ≥ target 后继续探后续层找更大空间 (target 置 -1)
+         停止条件: max_rounds 跑满 (有效轮) / Tier6 连续无改进 / 连续3次采集失败
    │
    ▼
 outputs/<op>/optimization_trajectory.json   (全局状态 + history, 每轮落盘)
    │
-   ▼
+    ▼
 feedback/trajectory_chart.py → final_output/trajectory_chart.png
    (加速比曲线 + 各 tier 色带 + KEEP/REVERT 点 + PyTorch 虚线 + 工业级红线[自动读 bench_910b3/outputs/])
+   (每轮另有 strategy_summary.py → final_output/{all,successful}_strategies.md)
 ```
 
 ---
@@ -111,34 +146,42 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
 │   integrate.py → diagnosis.json   (骨架+deep 合并)                        │
 │   (roofline 峰值用 bench_910b3/hardware_peak.json 校准)                   │
 │                                 ▼                                        │
-│   extract_tier_fields → 07_tier<N>_fields/*.txt|.json                    │
-│   (全局摘要[前层信号] + 当前 tier 专属字段)                               │
-│   check_fields.py → 05_task/field_check.log                              │
-│   (TIER==2) bishengir-compile → filter_hivm → 08_fusion/                 │
-│   run_hivm_fusion.py → 08_fusion/fusion_analysis.json                    │
+│  extract_tier_fields → 07_tier<N>_fields/*.txt|.json                    │
+│  (全局摘要[前层信号] + 当前 tier 专属字段)                               │
+│  check_fields.py → 05_task/field_check.log                              │
+│  (TIER==2 或 ENABLE_HIVM=1) bishengir-compile → filter_hivm → 08_fusion/│
+│  run_hivm_fusion.py → 08_fusion/fusion_analysis.json                    │
+│  (round1 + 每 tier3 轮) sweep_blocks.py → 09_tier3_sweep/               │
+│  (在 best_kernel.py 上枚举 L0 合法 BLOCK → torch.npu.Event 实测最优)    │
 └──────────────────────────────────────────────────────────────────────────┘
                                    │
                                    ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                              AGENT LAYER                                 │
+│  ┌──────────────────────────────────────────────────────────────────────┐ │
+│  │   LLMClient (agents/llm_client.py) — Planner/Coder 共用的 LLM 入口    │ │
+│  │   echo "<prompt>" | nga run (CLI 优先) / API / stub 三模式            │ │
+│  └──────────────────────────────────────────────────────────────────────┘ │
 │  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐             │
 │  │ Planner (LLM)  │  │  Coder (确定性)│  │  Verifier      │             │
 │  │ ────────────── │  │  ───────────── │  │  ─────────────  │             │
 │  │ 读 SKILL +     │  │ 应用 changes[]  │  │ 正确性校验+    │             │
 │  │ playbook_tierN │  │ old→new 逐字符 │  │ msprof 双口径 +│             │
-│  │ + 07字段       │  │ 替换全部出现处 │  │ ★Event 设备侧  │             │
-│  │ + 当前kernel   │  │ +LLM修错(≤3)   │  │ (e2e_event_ns) │             │
-│  │ + 历史(前层)   │  │ 语法检查       │  │ → ns/e2e_ns +  │             │
-│  │ → plan.md      │  │ → roundN/      │  │   e2e_event_ns │             │
-│  │  (changes[]+   │  │   kernel_op.py │  │  (循环丢自校正) │             │
+│  │ + 07字段 +     │  │ 替换全部出现处 │  │ ★Event 设备侧  │             │
+│  │ planner_ctx +  │  │ +LLM修错(≤3)   │  │ (e2e_event_ns) │             │
+│  │ 轨迹 + 手递 +  │  │ Unicode 清洗   │  │ → ns/e2e_ns +  │             │
+│  │ 优秀案例       │  │ 语法检查       │  │   e2e_event_ns │             │
+│  │ → plan.md      │  │ → roundN/      │  │  (循环丢自校正) │             │
+│  │  (changes[]+   │  │   kernel_op.py │  │                │             │
 │  │   promote_to)  │  │   +diff.patch  │  │                │             │
 │  └───────┬────────┘  └───────┬────────┘  └───────┬────────┘             │
 │          └───────────────────┼───────────────────┘                       │
 │                              ▼                                          │
 │  ┌──────────────────────────────────────────────────────────────┐       │
 │  │           Scheduler (Python 状态机 — 决策核心)                │       │
-│  │  ★严格最优 KEEP: speedup > best_speedup 才进链 (绑定 best_kernel)│       │
-│  │  未采纳/失败 → current_kernel 回滚轮首快照 (保 input 链)        │       │
+│  │  ★严格最优 KEEP: Event 绝对延迟 < 历史最小才进链 (绑定 best)  │       │
+│  │  未采纳/失败 → current_kernel 内容快照回滚 (保 input 链)       │       │
+│  │  晋升门前置(无依据转正常轮)·有效轮计数(max_rounds 硬上限)      │       │
 │  │  设备污染检测: verify 崩 AICore → 下轮采集前 _reset_device     │       │
 │  │  promote_to 晋升/回退 · 本层无改进3轮兜底 · target/Tier6 停    │       │
 │  │  → optimization_trajectory.json (每轮落盘, --resume 可续)      │       │
@@ -177,9 +220,11 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
     ├ ① config: M/N/K/DTYPE/BLOCK_* (env 可覆盖)
     ├ ② @triton.jit kernel(s)  (被优化的对象)
     └ ③ __main__ 测试驱动: KERNEL_LOOP 循环 + MATMUL_VERIFY 正确性校验块
+  main.py 启动校验: validate_kernel_op 检查 ①KERNEL_LOOP ②MATMUL_VERIFY ③__main__
+    └ ④同名 kernel 多次调用(A1 聚合风险警告) — 只警告不阻塞
   bench_910b3/outputs/*.json           (仅 round1 读) 基准线
-    ├ pytorch_<op>_tflops.json         PyTorch 端到端/纯kernel (msprof 测)
-    └ industrial_<op>_<mode>_tflops.json  工业级各 mode (eager/compile/cann-fused/fa)
+    ├ pytorch_<op>_tflops.json         PyTorch 基准 (★Event 设备侧计时, 缺则自动跑 bench_pytorch_*.py)
+    └ industrial_<op>_<mode>_tflops.json  工业级各 mode (eager/compile/cann-fused/fa, ★Event)
   outputs/<op>/optimization_trajectory.json  (--resume 续跑读; 否则 round1 新建)
                     │
                     ▼  (scheduler 每轮建 round_dir, 把源 kernel 自包含拷进 round_dir/input/)
@@ -187,6 +232,9 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
 ═══════════════════════════════════════════════════════════════════════
  阶段 1 │ 采集+解析  (bash analyzers/run_optimize.sh)  —— 五条支线
 ═══════════════════════════════════════════════════════════════════════
+前置 (进入本阶段前, scheduler 每轮检查):
+  - 上轮 verify 崩 AICore (设备污染) → 先 _reset_device (子进程 sync+empty_cache)
+  - 每 REBASELINE_EVERY=10 轮 → 环境漂移重基准 (见阶段 6)
 
  ┌─ 支线 A · warmup 预热 ──────────────────────────────────────────────┐
  │  读: round_dir/input/kernel_op.py                                   │
@@ -226,6 +274,9 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
  │    L2Cache.csv              hit rate                               │
  │    ResourceConflictRatio.csv bank/mte/wait 冲突                     │
  │  解析: pipeline_parse_board.py  (MB/s→GB/s, 归一化)                 │
+ │  ★设备污染防护: msprof op 失败(缺 Memory.csv) 时 grep 设备级错误    │
+ │    (aclrt/575/npu function) → break 剩余 kernel + sync/empty_cache   │
+ │    重置设备 (防级联: 污染设备下轮通用 msprof 也采不到)              │
  │  写: round_dir/06_diagnosis/board_<i>.json  (每 kernel 一个 deep)   │
  │    ├ engine_utilization{} / bandwidth_gb_s{} / compute{}           │
  │    ├ conflict{} / l2_hit_rate                                      │
@@ -253,9 +304,9 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
  │  写: round_dir/05_task/field_check.log  (列名不匹配明细)            │
  └────────────────────────────────────────────────────────────────────┘
 
- ┌─ 支线 D · (仅 TIER==2) HIVM 融合分析 ──────────────────────────────┐
+ ┌─ 支线 D · (TIER==2 多kernel 或 ENABLE_HIVM=1) HIVM 融合分析 ────────┐
  │  读: round_dir/input/kernel_op.py                                  │
- │  执行: bishengir-compile ttadapter.mlir → HIVM 文本                 │
+ │  执行: (rm ~/.triton 后重编译取 ttadapter) bishengir-compile → HIVM │
  │  写: round_dir/08_fusion/hivm_try.txt → hivm_fusion_view.txt       │
  │  执行: run_hivm_fusion.py (nga run fusion skill 分析 RAW/WAR/WAW)   │
  │  写: round_dir/08_fusion/fusion_analysis.json                      │
@@ -263,12 +314,15 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
  └────────────────────────────────────────────────────────────────────┘
 
  ┌─ 支线 E · (仅 round1 或 tier==3) Tier3 分块 sweep ─────────────────┐
- │  读: 当前 kernel_op.py (读 BLOCK 当前值 + 拷一份到 round_dir/)     │
- │  执行: sweep_blocks.sweep() 程序化枚举 L0 合法 BLOCK + Event 实测   │
+ │  读: ★best_kernel.py (历史最优; 缺则当前 kernel_op.py)              │
+ │      (读 BLOCK 当前值 + 拷一份到 round_dir/kernel_op.py, ★不碰源)   │
+ │  执行: sweep_blocks.sweep() 程序化枚举全部 L0 合法 BLOCK + 单进程    │
+ │        torch.npu.Event 实测 (崩溃续跑/增量保存/设备污染恢复)        │
  │  写: round_dir/09_tier3_sweep/                                     │
  │    ├ sweep_result.json  configs[]{block,ns,speedup} + best + written│
  │    └ sweep_runner.py    (生成的 runner 脚本)                       │
- │  写: round_dir/kernel_op.py  (★sweep 把最优 BLOCK 写回, 覆盖)      │
+ │  写: round_dir/kernel_op.py  (★sweep 把最优 BLOCK 写回, 覆盖; 该轮 verify 失败时
+ │                               scheduler 用内容快照恢复轮首, 失败代码另存 failed_kernel.py)│
  │  传: best/written 给 planner_context (告诉它 BLOCK 已穷举)         │
  └────────────────────────────────────────────────────────────────────┘
                     │
@@ -280,11 +334,11 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
 读: diagnosis.summary (total_ns/num_kernels)
     bench_910b3/outputs/{pytorch,industrial}_*.json  (各 mode 取 min = 工业级天花板)
     源 kernel_op.py (verify 复测用)
-执行: verify_end_to_end 复测源 kernel (正确性校验+warmup+msprof → baseline_e2e_ns)
+执行: verify_end_to_end 复测源 kernel (正确性校验+warmup+msprof+Event → baseline_e2e_ns + baseline_e2e_event_ns)
 写: outputs/<op>/optimization_trajectory.json 的 state{}
-    ├ baseline_ns(纯) / baseline_e2e_ns(端到端) / num_kernels / num_launches
+    ├ baseline_ns(纯) / baseline_e2e_ns(端到端) / baseline_e2e_event_ns(★Event 设备侧) / num_kernels / num_launches
     ├ baseline_mnk / initial_tflops
-    ├ pytorch_time_us / industrial_time_us / industrial_baseline
+    ├ pytorch_time_us(Event, 缺则自动跑 bench_pytorch_*.py) / industrial_time_us(各 mode 取 min, 仅真执行) / industrial_baseline
     └ current_kernel (→ 源 kernel_op.py)
 写: outputs/<op>/baseline_verify/msprof_0/  (复测产物)
                     │
@@ -303,6 +357,7 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
   - round_dir/08_fusion/fusion_analysis.json               (仅 tier2)
   - round_dir/09_tier3_sweep/sweep_result.json             (sweep 结论: BLOCK 已穷举)
   - state.handoff                                          (跳转来的瓶颈分析+方向)
+  - memory/tier{N}_cases.json                              (★本层优秀案例: 历史大加速比轮次, 参考学习)
 执行: nga run 调 planner skill → LLM 分析瓶颈 → 出策略
 写: round_dir/plan.md  (JSON)
     ├ strategy + expected_impact
@@ -323,7 +378,8 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
 执行:
   - 无错: 确定性 code.replace(old_code, new_code) (替换全部出现处, 最稳)
   - 有错: nga run 调 coder skill 带错误修复
-  - Python 语法 + 函数完整性 + no-op 校验 + Unicode 脏字符清洗
+  - Python 语法(报错带行内容) + 函数完整性 + no-op 校验
+  - ★Unicode 清洗: 千分位归一(1，024→1024) / 全角数字转ASCII / markdown剥壳 / 智能引号(定界符换·内容删) / 兜底二次验证
 写: round_dir/kernel_op.py   (本轮新代码, ★不碰源 input/)
     round_dir/diff.patch    (与上一轮差异)
 传: optimized_code 写入 round_dir/kernel_op.py → 交给 Verifier
@@ -343,7 +399,7 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
 执行: _read_durations 同一次算两种口径 ÷ 实测遍数:
        纯 kernel ns = Σ 非 aclnn 行;   端到端 e2e_ns = Σ 全部行(含框架)
 写: round_dir/msprof_0/  (msprof 原始产物)
-传 (返回 dict, 不写业务文件): {ok, ns(纯), e2e_ns(端到端), speedup, loop, rows}
+传 (返回 dict, 不写业务文件): {ok, ns(纯), e2e_ns(端到端), e2e_event_ns(★Event 设备侧), speedup, loop, rows}
                     │
                     ▼
 
@@ -351,19 +407,25 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
  阶段 6 │ 决策 + 记录  (scheduler)  —— 回路
 ═══════════════════════════════════════════════════════════════════════
 执行:
-  - 主加速比 = baseline_e2e_ns / e2e_ns  (纯 kernel 兜底)
-  - ★严格最优: speedup > best_speedup (历史最高) → KEEP (current_kernel → 本轮 round_dir)
-    否则 → REVERT (回滚轮首快照 = 沿用历史最优 kernel)
-  - 晋升/回退: planner.promote_to (可回退前层) + 连续 3 轮无改进兜底晋升
+  - 主加速比(显示) = baseline_e2e_ns / e2e_ns  (纯 kernel 兜底)
+  - ★严格最优: e2e_event_ns < best_e2e_event_ns (历史最小 Event) → KEEP (current_kernel → 本轮 round_dir)
+    (Event 缺 → 方案A 不采纳; best_speedup = baseline_e2e_event_ns/best_e2e_event_ns 派生)
+    否则 → REVERT (内容快照回滚轮首 = 沿用历史最优 kernel)
+  - 晋升/回退: planner.promote_to (需 promote_evidence, 可回退前层) + 连续 3 轮无改进兜底晋升
   - (晋升时) 写跳转手递: round_dir/10_tier_handoff.json
-写: outputs/<op>/optimization_trajectory.json
-    ├ state 更新 (tier/round/current_speedup/current_kernel/best_speedup/sweep/...)
+  - (每 REBASELINE_EVERY=10 轮, 在阶段1前) 环境漂移重基准: 重测原始 baseline_kernel.py + 当前 kernel
+    → 校正 baseline_ns/baseline_e2e_ns/baseline_e2e_event_ns + current_speedup, ★同步 best_e2e_event_ns
+    (用 best_kernel.py 新环境复测; 否则新环境改进轮永远比不过旧 best → 卡死 REVERT)
+  - (优秀案例) 本轮相对上一最优 > EXCELLENT_THRESHOLD(1.3×) → 自动记 memory/tier{N}_cases.json
+  - (每轮) strategy_summary.py → final_output/{all,successful}_strategies.md
+ 写: outputs/<op>/optimization_trajectory.json
+    ├ state 更新 (tier/round/current_speedup/current_kernel/best_speedup/best_e2e_event_ns/sweep/...)
     └ history 追加一条 {round,tier,strategy,change,changes_full,
-                         speedup(e2e),kernel_speedup(纯),ns,e2e_ns,
-                         decision(KEEP/REVERT/FAIL),result(OK/NOOP/FAIL),error,tflops}
+                         speedup(e2e),kernel_speedup(纯),ns,e2e_ns,e2e_event_ns,
+                         decision(KEEP/REVERT/FAIL),result(OK/NOOP/FAIL),error,tflops,sweep_ran,sweep_adopted}
                     │
                     ▼  回【阶段 1】跑下一轮 (tier/round 推进)
-                       直到 max_rounds / 达标 / Tier6 连续无改进 → 出循环
+                       直到有效轮跑满 max_rounds / Tier6 连续无改进 / 连续3次采集失败 → 出循环
                     │
                     ▼
 
@@ -373,11 +435,13 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
 读: outputs/<op>/optimization_trajectory.json (state + history)
     bench_910b3/outputs/{pytorch,industrial}_*.json (轨迹图虚线)
 写: outputs/<op>/final_output/
-    ├ kernel_op.py         当前已采纳的最优 kernel (可直接取用)
+    ├ kernel_op.py         当前已采纳的最优 kernel (取 best_kernel, 可直接取用)
     ├ baseline_kernel.py   baseline 副本
-    ├ final_summary.json   双口径加速比 + industrial_time_us
-    └ trajectory_chart.png 加速比曲线 + tier 色带 + KEEP/REVERT 点
-                           + PyTorch 灰虚线 + 工业级红虚线
+    ├ final_summary.json   双口径加速比 + Event 延迟 + vs_industrial_ratio
+    ├ trajectory_chart.png 加速比曲线 + tier 色带 + KEEP/REVERT 点
+    │                      + PyTorch 灰虚线 + 工业级红虚线
+    ├ all_strategies.md    全部轮次策略记录 (每轮由 strategy_summary.py 产出)
+    └ successful_strategies.md  仅成功优化策略 (KEEP+严格超越上一轮)
 ```
 
 **一句话主线**：`kernel_op.py` →(采集)→ `diagnosis.json` →(筛字段)→ `07_fields` →(planner)→ `plan.md` →(coder)→ `roundN/kernel_op.py` →(verify)→ `ns/e2e_ns` →(决策)→ `optimization_trajectory.json` →(结束)→ `final_output/`。
@@ -394,28 +458,29 @@ main.py input/<op> [--fresh] [--resume] [--max-rounds N] [--target X] [--stub]
   ├─ _Tee → stdout/stderr 双写终端 + outputs/<op>/optimization.log (UTF-8)
   └─ Scheduler(op_dir, max_rounds, target, stub, resume)
 
-while rn <= max_rounds:                     # 每轮一个 round_dir
+while (total_rounds - promote_budget) < max_rounds:      # ★有效优化轮计数 (promote 轮免费, max_rounds 硬上限)
     round_dir = outputs/<op>/<tier_name>/roundN
-    diagnosis = _run_optimize(round_dir, tier)   # 采集失败→重试1次→跳过→连3次停(H2)
+    diagnosis = _run_optimize(round_dir, tier)   # 采集失败→重试1次→跳过→连3次停(H2); 设备污染→下轮采集前重置
     if baseline_ns is None:                      # 首轮设基准
-        baseline_ns / baseline_e2e_ns / num_kernels / num_launches / baseline_mnk / initial_tflops
-        + pytorch基准(msprof) + 工业级基准(各mode取min)
+        baseline_ns / baseline_e2e_ns / baseline_e2e_event_ns / num_kernels / num_launches / baseline_mnk / initial_tflops
+        + pytorch基准(Event) + 工业级基准(各mode取min, 仅真执行)
         + verify_end_to_end 复测源 kernel (VERIFY_BASELINE=1) → 与后续轮同口径
     extracted = _diagnose(diagnosis, tier, round_dir)   # → 07_tier<N>_fields
     if tier == 2: fusion_analysis = _run_fusion(round_dir)   # → 08_fusion/
     if rn == 1 or tier == 3: tier3_sweep = _tier3_sweep_data(tier, rn, round_dir)
-        # 程序化枚举 L0 合法 BLOCK 候选 → 真机实测 → 最优写回 kernel_op.py
+        # 程序化枚举 L0 合法 BLOCK 候选 → 真机 Event 实测 → 最优写回 kernel_op.py
     plan = _plan(diagnosis, extracted, tier, rn, round_dir, fusion_analysis, tier3_sweep)
-    if plan.promote:                                 # 晋升轮: 原样拷贝 kernel, 不调 LLM
+    # ★晋升门前置: promote 无 promote_evidence/reason → 本轮转正常优化轮 (不白耗, 不涨 budget)
+    if plan.promote and 有依据:                     # 晋升轮: 原样拷贝 kernel, 不调 LLM
         copy current_kernel → roundN/kernel_op.py
     else:
         for attempt in range(3):
-            new_code = _code(plan, rn, round_dir, prev_err)   # → roundN/kernel_op.py
-            v = _verify(round_dir, baseline_ns)               # 正确性校验+端到端 msprof (双口径)
+            new_code = _code(plan, rn, round_dir, prev_err)   # → roundN/kernel_op.py (+diff.patch 仅成功时写)
+            v = _verify(round_dir, baseline_ns)               # 正确性校验 + msprof 双口径 + Event 注入计时
             if v.ok: break
-    speedup = baseline_e2e_ns / e2e_ns        # 主加速比=端到端 (缺则纯 kernel 兜底)
-    if speedup > best_speedup: current_kernel = roundN/kernel_op.py; KEEP   # ★严格最优
-    else: REVERT (回滚轮首快照 = 沿用历史最优)
+    # ★KEEP 决策 = Event 绝对延迟 (主), msprof speedup 为显示口径:
+    if e2e_event_ns < best_e2e_event_ns: current_kernel = roundN/kernel_op.py; KEEP
+    else: REVERT (★内容快照恢复轮首 = 沿用历史最优; 失败代码另存 failed_kernel.py)
     history.append(...); _save_traj()
     # 晋升/停止判定 → 下一轮/下一 tier/停止
 ```
@@ -433,6 +498,8 @@ triton_agent_optimizer/
 ├── config.py                      # 全局配置中心: 检测本地/服务器环境, 集中所有路径/阈值 (from config import Config)
 ├── _sim_flow_test.py              # ★端到端链路模拟回归: 打桩真机(msprof/HIVM/LLM), 真实 scheduler 逐轮执行 → 验证全流程
 ├── _sim_edge_test.py              # ★边界场景回归 #2: 采集失败/回退/晋升/目标/基准 等失败分支 (全真实执行 scheduler/coder/verifier)
+├── _sim_fix_regression.py         # ★修复回归 #3 (30 项断言): 全链路模拟 + 4 处修复验证 (sweep回滚链/promote门前置/max_rounds硬上限/
+│                                  #   rebaseline best同步) + coder 清洗回归 (千分位/全角/markdown/引号两难) + resume 续跑 + tier3 sweep 场景
 ├── README.md                      # 项目总览 + 开发记录 (会话开始先扫这里回忆进度)
 ├── ARCHITECTURE_DESIGN.md         # ★本文档: 架构设计 + 逐组件说明 (按当前实现维护)
 ├── IMPLEMENTATION_PLAN.md         # 逐文件实现计划 (实现已完成, 作架构参考保留)
@@ -441,11 +508,12 @@ triton_agent_optimizer/
 
 ├── agents/                        # ── Agent 层: 调度状态机 + 规划/改码/验证 + LLM 入口 ──
 │   ├── scheduler.py               # ★调度状态机 (核心): 驱动每轮 采集→诊断→Planner→Coder→Verify→决策→晋升;
-│   │                              #   round1 设基准(纯kernel+端到端+工业级); 主加速比=端到端; extract_tier_fields 筛字段;
-│   │                              #   sweep 触发; 优秀案例记录; 最终产物写 final_output/
+│   │                              #   round1 设基准(纯kernel+端到端+Event+工业级); KEEP 决策=Event 绝对延迟(方案A: Event缺不采纳);
+│   │                              #   晋升门前置(无依据转正常轮)+有效轮计数(max_rounds 硬上限); 回滚内容快照(failed_kernel 留证);
+│   │                              #   rebaseline 同步 best Event; extract_tier_fields 筛字段; sweep 触发; 优秀案例; 最终产物 final_output/
 │   ├── planner.py                 # Planner (LLM): 读 SKILL+playbook+07字段+planner_context+轨迹+手递 → plan.md (changes[]+promote)
 │   ├── coder.py                   # Coder (确定性改码+LLM修复): 应用 changes[] 逐字符替换 → roundN/kernel_op.py + diff.patch
-│   │                              #   语法/函数完整性/no-op 校验; Unicode 脏字符清洗
+│   │                              #   语法(报错带行内容)/函数完整性/no-op 校验; Unicode 清洗(千分位/全角/markdown/引号两难/兜底二次验证)
 │   ├── verifier.py                # Verifier: MATMUL_VERIFY 正确性校验 → msprof 双口径(ns/e2e_ns)
 │   │                              #   + ★Event 设备侧计时 (e2e_event_ns, _inject_event_timing 注入 KERNEL_LOOP)
 │   │                              #   返回 {ok, ns, e2e_ns, e2e_event_ns, speedup}
@@ -547,9 +615,6 @@ triton_agent_optimizer/
 ├── outputs/                       # ── 运行产物 (运行时生成, 不入库) ──
 │                                  #   outputs/<op>/ = 优化结果 (optimization_trajectory.json + tier/roundN/ + final_output/)
 
-├── autogen/                       # ── 编译配置 (gitignore 忽略) ──
-│   └── custom_compile_options.ini # 自定义编译选项
-
 ├── prepare/                       # ── 环境准备 ──
 │   └── setup_and_verify.sh        # 环境安装/校验脚本
 ```
@@ -559,12 +624,15 @@ triton_agent_optimizer/
 ## 4. 各组件详解
 
 ### 4.1 Scheduler — 状态机核心
-- **状态**: `traj["state"]` = {tier, round, best_speedup, baseline_ns(纯), baseline_e2e_ns(端到端 msprof), **baseline_e2e_event_ns(Event)**, num_kernels, num_launches, baseline_mnk, initial_tflops, pytorch基准, industrial_time_us(Event 各 mode min), current_speedup, current_kernel, **best_kernel, best_round, best_e2e_ns**, vs_industrial_ratio, last_sweep_result}
-- **★严格最优 KEEP**: 本轮 `speedup > best_speedup` 才进链 (优化必须超越历史最高); 采纳时同步 `best_kernel`/`best_round` + 复制 `outputs/<op>/best_kernel.py`
-- **★input 链不变量**: 未采纳/失败 → `current_kernel` 回滚轮首快照 (sweep 曾把 current 指向 round_dir 导致坏代码进链, 已修)
+- **状态**: `traj["state"]` = {tier, round, total_rounds, promote_budget, best_speedup, **best_e2e_event_ns(★KEEP 主依据: 历史最小 Event 延迟)**, baseline_ns(纯), baseline_e2e_ns(端到端 msprof), **baseline_e2e_event_ns(Event)**, num_kernels, num_launches, baseline_mnk, initial_tflops, pytorch基准, industrial_time_us(Event 各 mode min), current_speedup, current_kernel, **best_kernel, best_round, best_e2e_ns**, vs_industrial_ratio, last_sweep_result, handoff, tier_jumps, last_rebase_round}
+- **★严格最优 KEEP**: 本轮 Event 绝对延迟 `e2e_event_ns < best_e2e_event_ns`（历史最小）才进链 — 设备侧无 profiler 扰动, 免 msprof 欠采毒 best; **Event 缺失(非晋升轮) → 方案A 不采纳**（不退化 msprof 兜底, 堵假值后门）; `best_speedup` 是派生显示值 = baseline_e2e_event_ns / best_e2e_event_ns
+- **★input 链不变量**: 未采纳/失败 → `current_kernel` 回滚轮首快照 — sweep 把 current 指向 round_dir 时 coder 会覆写同路径, 必须**内容快照恢复**（失败代码另存 failed_kernel.py 留证）
+- **★晋升门前置**: planner promote 无 promote_evidence/reason → 本轮**转正常优化轮**（不白耗轮次、不涨 budget）; budget 只在真晋升轮 +1
+- **★max_rounds 硬上限**: loop 条件 = `(total_rounds - promote_budget) < max_rounds`（有效优化轮计数, promote 轮免费; 旧实现 budget 无限膨胀 → 上限失效）
+- **★rebaseline 环境漂移**: 每 REBASELINE_EVERY(默认10) 轮重测原始 baseline + 当前 kernel → 校正加速比基数, **并同步 best_e2e_event_ns**（用 best_kernel.py 新环境复测, 否则新环境改进轮永远比不过旧 best → 卡死 REVERT）
 - **★设备污染恢复**: verify 崩 AICore (HIVM/OOM/aclrt/575) → 标 `_dev_poisoned` → 下轮采集前 `_reset_device` (否则 msprof 在污染设备上"找不到 kernel"→采集失败级联)
 - **tier 目录名**: 1→`01_algorithmic_structure`, 2→`02_operator_fusion`, ..., 6→`06_910b3_architecture`
-- **每轮产物** (round_dir): `kernel_op.py` + `diff.patch` + `plan.md` + `07_tier<N>_fields/` + `msprof_0/` (验证) + `event_kernel.py` (Event 计时注入) + (失败时) `failed_kernel.py`
+- **每轮产物** (round_dir): `kernel_op.py` + `diff.patch`（★只在 coder 成功时写, 失败尝试不覆盖真实 diff）+ `plan.md` + `07_tier<N>_fields/` + `msprof_0/` (验证) + `event_kernel.py` (Event 计时注入) + (失败时) `failed_kernel.py`
 - **轨迹**: `outputs/<op>/optimization_trajectory.json`（每轮落盘, 可 `--resume` 续跑）
 - **采集链演进**: round1 采集源目录 → 之后采集上一轮输出目录 (current_kernel.parent), kernel 链连续
 
@@ -594,7 +662,13 @@ triton_agent_optimizer/
 ### 4.4 Coder (确定性改码 + LLM 修复)
 - **Step 0**: 无 previous_error 时，确定性 `code.replace(old_code, new_code)`（替换全部出现处）→ 不靠 LLM 最稳
 - **Step 1**: 有报错时，走 LLM 带错误修复（查 memory.codeerror 已知方案）
-- 校验: Python 语法 + 函数完整性（防截断）+ no-op 检测 → diff.patch
+- 校验: Python 语法 + 函数完整性（防截断）+ no-op 检测 → diff.patch（★只在成功时写）
+- **★Unicode 清洗**（用户高频报障 "syntaxerror/非法字符但看文件没有" 的根因治理）:
+  - **千分位逗号**: LLM 输出 `1，024`(全角逗号) 被表替换转成 `,` 后变 `1,024` → Python 报 leading zeros/invalid decimal literal → 千分位归一 `\b\d{1,3}(,\d{3})+\b`→去逗号（不误伤 `2048,1024`、`range(0,100,16)` 等合法写法）
+  - **全角数字/字母** `６４` → 转 ASCII（删除会留空产生 `= , 64` 新语法错）
+  - **markdown 包裹**: 剥离先于"去行首垃圾"（否则开头 ``` 被吃 → 结尾 ``` 残留 SyntaxError）
+  - **智能引号两难**: 定界符场景要换 ASCII（`print(“x”)`），字符串内容场景要删（`print("他说“好”")`）→ 试删/试换取第一个编译通过者
+  - 兜底逐行清洗后二次 compile 验证; `_validate_python` 报错**带出错行真实内容**(repr) — 消除"看代码没有非法字符"的困惑
 
 ### 4.5 Verifier (正确性校验 + msprof 双口径 + Event 设备侧计时)
 - 先跑 MATMUL_VERIFY=1 正确性校验 (必须输出 `result check: PASS`; 否则本轮 FAIL 回传 coder 修)
@@ -622,16 +696,21 @@ triton_agent_optimizer/
 | **6** | 架构专属 | `playbook_tier6_architecture.md` | 引擎失衡/wait_ratio/mte冲突/代码风格 | Tier6 无改进 → **停止** |
 
 **晋升/回退由 Planner 的 `promote_to` 决策**: 可晋升后层，也可**回退前层**（如分块调 8 轮发现算法问题 → 回 Tier1）。无改进兜底 = 本 tier 连续 3 轮 speedup ≤ prev_speedup。
+**★严格晋升**: `promote=true` 必须给 `promote_evidence`（数据依据）且过晋升门前置校验，否则本轮转正常优化轮；同一跳转路径（from→to）≥3 次拒绝（防死循环），跳转时写 `10_tier_handoff.json` 手递瓶颈分析给目标层。
 
 ---
 
 ## 6. 测量口径（加速比可信的前提）
 
 - **两种计时并存**（口径分离）:
-  - **msprof**（诊断 + 纯kernel 拆解）: `e2e_ns` = Σ全部 kernel 行含框架, `ns` = Σ非aclnn 纯 kernel; 有 profiler 挂载开销但**跨轮一致**, 相对 speedup 用它
-  - **Event**（工业级权威绝对值）: `e2e_event_ns` = `torch.npu.Event` 设备侧计时（warmup + 窗口包 LOOP 次 ÷LOOP）; 无 profiler 扰动, 最终报告绝对 latency 用它; bench（industrial/PyTorch）全走 Event → 两端同口径
-- **主加速比 = baseline_e2e_ns / e2e_ns**（端到端口径, msprof）; Event 是绝对值参考, 不参与加速比
-- **★严格最优保留判定**: 本轮 `speedup > best_speedup`（历史最高）才 KEEP 进链 — 优化必须超越历史最优, 不再用 `≥prev×噪声地板`（那会让噪声峰采纳变慢代码）
+  - **msprof**（诊断 + 纯kernel 拆解）: `e2e_ns` = Σ全部 kernel 行含框架, `ns` = Σ非aclnn 纯 kernel; 有 profiler 挂载开销但**跨轮一致**, 相对 speedup 显示用它
+  - **Event**（工业级权威绝对值）: `e2e_event_ns` = `torch.npu.Event` 设备侧计时（warmup + 窗口包 LOOP 次 ÷LOOP）; 无 profiler 扰动, **最终报告绝对 latency 和 KEEP 决策都用它**; bench（industrial/PyTorch）全走 Event → 两端同口径
+- **★bench 测量纪律 (2026-08-12 修复, 对齐 triton testing.do_bench)**:
+  - **多窗口 median**: 先 5 次估时长 → warmup/rep 次数按 ms 预算自适应 (快 kernel 自动加次) → n_rep 个**独立 Event 对** → 取 median (另报 min/mean)。旧"单窗口 ÷N"只有 1 个样本。
+  - **★输入轮换破 L2**: 连续 forward 同一批张量, 工作集 <192MB(L2) 时后 N 次全 L2 命中 → 测到 L2 带宽 (数字虚高); Ascend 无清 L2 API → n_buf 组输入轮换 (组数×单组工作集 > L2) 等效 do_bench 的 clear_cache。json 记 `n_buf`。
+  - **口径声明**: 工业级基准 = torch 全流程 (含 host 调度/内存分配); 我们 verify 的 Event = triton 纯 kernel launch 链。大算子 (ms 级) 差异可忽略; 小算子 (逐元素/归约, us 级) 我们占便宜 → 报告同时给 `time_us_min/mean`, 对比时声明。
+- **主加速比（显示口径）= baseline_e2e_ns / e2e_ns**（端到端, msprof）; **best_speedup = baseline_e2e_event_ns / best_e2e_event_ns**（Event 派生）
+- **★严格最优保留判定 = Event 绝对延迟**: 本轮 `e2e_event_ns < best_e2e_event_ns`（历史最小）才 KEEP 进链 — 设备侧无 profiler 欠采, 免 msprof 小 kernel 假性 200x 毒 best; **Event 缺失(非晋升轮) → 方案A 不采纳**（不退化 msprof, 堵假值后门）
 - **工业级对比**: round1 读 `bench_910b3/outputs/industrial_<op>_<mode>_tflops.json`（Event 测），各 mode 取 time_us 最小者（**仅真正执行**, actual_mode==mode） = industrial_time_us
 - **vs 工业级比值**（优化效果终极指标）: `vs_industrial_ratio` = 我们最优 e2e_event_ns / 工业级 time_us×1000（<1=快于工业级）; 另有 `vs_industrial_speedup` = 工业级/我们
 - **baseline 复测**: round1 用 verify 机制（warmup+msprof+Event）重测源 kernel，与后续轮完全同口径（VERIFY_BASELINE=1）
@@ -662,7 +741,7 @@ outputs/<op>/
 ├── 04_memory_access/ ...
 ├── 05_compute_occupancy/ ...
 ├── 06_910b3_architecture/ ...
-├── 09_tier3_sweep/                   # 分块 sweep 产物 (sweep_result.json / sweep_runner.py)
+│   └── (每轮 roundN/ 内含 09_tier3_sweep/ — sweep 产物: sweep_result.json / sweep_runner.py; 仅 sweep 轮有)
 ├── optimization_trajectory.json      # ★ 全局状态+history (中枢)
 └── final_output/                     # ★最终产物 (优化结束自动生成)
     ├── kernel_op.py                  #   最优 kernel (取 best_kernel, 可直接用)
@@ -683,10 +762,12 @@ outputs/<op>/
 
   "state": {                           // ── 全局状态机 (scheduler 每轮读写, 每轮落盘, --resume 续跑用它) ──
     "tier": 3,                         // 当前所在优化层 (1~6)
-    "round": 8,                        // 当前 tier 内轮次 (每晋升一层重置; 跨 tier 连续编号看 total_rounds)
-    "total_rounds": 10,                // 总执行轮 (含 promote 轮; max_rounds 配额对它, promote 轮用 promote_budget 免费扩容)
-    "best_speedup": 17.793,            // 历史最高加速比 (端到端口径; 累计最优, 只增不减)
-    "current_speedup": 17.793,         // 当前已采纳 kernel 的加速比 (★主 = 端到端口径, 保留判定的基准)
+    "round": 8,                        // 轮次编号 (★全局连续递增, 跨 tier 不重置; 目录按 <tier>/roundN 分放)
+    "total_rounds": 10,                // 总执行轮 (含 promote 轮; max_rounds 配额按「有效轮」= total−promote_budget 计)
+    "promote_budget": 1,               // 已用 promote 额度 (真晋升轮才 +1; 被拒晋升不涨)
+    "best_speedup": 17.793,            // 历史最高加速比 (★Event 派生显示值 = baseline_e2e_event_ns/best_e2e_event_ns)
+    "best_e2e_event_ns": 355000.0,     // ★KEEP 主依据: 历史最小 Event 设备侧延迟 (只增不减; rebaseline 时随环境复测同步)
+    "current_speedup": 17.793,         // 当前已采纳 kernel 的加速比 (端到端口径, 保留判定的参考)
 
     "baseline_ns": 5900000.0,          // ★纯 kernel 基线 ns (源 kernel 的 Σ非aclnn 耗时; 纯 kernel 加速比的分母, 参考口径)
     "baseline_e2e_ns": 6320000.0,      // ★端到端基线 ns (msprof Σ全部含框架; 主加速比的分母)
@@ -716,7 +797,6 @@ outputs/<op>/
     "last_rebase_round": 0,            // 上次环境漂移重基准的轮号 (每 REBASELINE_EVERY 轮重测)
     "vs_industrial_ratio": 0.82,       // ★我们最优 Event / 工业级 Event (<1=快于工业级)
     "tier3_swept": true,               // Tier3 分块是否已扫
-    "tier3_sweep_code_hash": "a1b2c3d4e5f60123",  // 上次 sweep 时的 kernel 结构 hash
     "last_sweep_result": {             // 上次 sweep 结论 (每轮传给 planner; 含真实状态 ran/skipped/reused/failed)
       "available": true,
       "best": {"block": [128, 128, 64], "ns": 4200000, "speedup": 1.12, "is_current": true},
@@ -729,7 +809,7 @@ outputs/<op>/
 
   "history": [                         // ── 每轮一条 (改了啥 + 结果), planner 看前层试过什么, 轨迹图打点 ──
     {
-      "round": 1,                      // 本轮 round 号 (tier 内)
+      "round": 1,                      // 本轮轮次号 (★全局连续, 跨 tier 不重置)
       "tier": 1,                       // 本轮所在层
       "strategy": "fp16 累加 + im2col 上 cube",   // planner 给的策略名
       "change": "BLOCK_M,BLOCK_N,BLOCK_K=64,64,64",  // 改动梗概 (压成一句, 给 planner 上下文 + 图标签)
@@ -748,7 +828,7 @@ outputs/<op>/
       "e2e_ns": 4210000.0,             // 本轮端到端耗时 ns (msprof Σ全部, ★主加速比的实测值)
       "e2e_event_ns": 4100000.0,       // ★本轮 Event 设备侧端到端 ns (工业级绝对值, 无 profiler 扰动)
 
-      "decision": "KEEP",              // 决策: KEEP(★严格>best 才采纳)/REVERT(不达历史最高)/FAIL(coder或verify失败)
+      "decision": "KEEP",              // 决策: KEEP(★Event 绝对延迟<历史最小才采纳)/REVERT(未超越)/FAIL(coder或verify失败)
       "result": "OK",                  // 结果: OK/NOOP(coder没改动)/FAIL; NOOP 检测本轮输出==改前
 
       "sweep_ran": true,               // 本轮是否执行了分块 sweep
@@ -1217,3 +1297,94 @@ cat outputs/<op>/optimization.log
 | `multi_kernel[]` | op_statistic*.csv `OP Type`/`Count`/`Total Time`/`Avg`/`Ratio` | 每类算子次数/耗时（判断是否值得融合） |
 
 > **raw**：task.json 和每个 board_<i>.json 里都保留 `raw` = 对应 CSV 的**全部列+全部行**（不遗漏），diagnosis.json 里只留 normalized 关键字段（Planner 只看筛后的 07 字段）。
+
+---
+
+## 11. 关键结果（讲述时讲数据，讲之前先填表）
+
+> **运行方法**: 每个算子跑 `LLM_CLI_COMMAND='nga run' python3 main.py input/<op> --fresh --max-rounds 30` 后，自动产出 `outputs/<op>/final_output/final_summary.json`（含双口径加速比 + Event 延迟 + vs_industrial_ratio）和 `trajectory_chart.png`。
+> **诚实说明**: 当前仓库 `outputs/` 内**无已完成的 v4 真实结果**（本地只有旧版弱数据/空轨迹），以下表格是讲述模板，务必在服务器跑完后用真实数据填充——**讲项目时数据是最有说服力的一页**。
+
+| 算子 | 形状 | 初始 Event(us) | 优化后 Event(us) | 加速比 | vs PyTorch | vs 工业级最优 | 命中策略层 |
+|---|---|---|---|---|---|---|---|
+| matmul (2层MLP) | 2048³ | | | | | | |
+| attention_mlp | 2048×2048 | | | | | | |
+| matmul_relu | 2048³ | | | | | | |
+| flash_attention | seq2048×8h | | | | | | |
+| conv2d | 64×64 | | | | | | |
+| rms_norm | 2048×2048 | | | | | | |
+| ... (14 算子) | | | | | | | |
+
+**讲结果时的口径要点**（防止被追问翻车）:
+- 加速比口径: 端到端（含框架 kernel），同口径对比；**绝对延迟用 Event**（无 profiler 扰动）
+- vs 工业级: 我们最优 Event / CANN eager·compile·cann-fused·FA 各 mode 取 min（仅真执行）
+- 每轮可审计: `roundN/{plan.md, diff.patch, kernel_op.py}` + `optimization_trajectory.json` history 全留痕
+
+---
+
+## 12. 五分钟 Demo（现场演示路径）
+
+```bash
+# ① 环境
+conda activate triton-npu && source /usr/local/Ascend/ascend-toolkit/set_env.sh && cd triton_agent_optimizer
+
+# ② 证明 LLM 链路通 (可选)
+echo "测试, 调用 skill triton-op-planner" | nga run
+
+# ③ 单文件可跑 + 数值正确 (30 秒)
+python3 input/matmul/kernel_op.py && MATMUL_VERIFY=1 python3 input/matmul/kernel_op.py
+# 预期: [info] ... launched & synced OK + result check: PASS
+
+# ④ 只采集+解析, 展示 diagnosis.json 的诊断能力 (2~5 分钟)
+bash analyzers/run_optimize.sh input/matmul /tmp/demo_run
+cat /tmp/demo_run/07_tier1_fields/tier1_fields.txt        # 每 kernel: 耗时占比+cube_util+bottleneck
+cat /tmp/demo_run/06_diagnosis/diagnosis.json             # roofline: compute/memory 利用率
+
+# ⑤ 完整优化循环 (10~30 分钟, 按需 --max-rounds)
+LLM_CLI_COMMAND='nga run' python3 main.py input/matmul --fresh --max-rounds 15
+# 每轮打印: 采集→07字段→planner策略→coder改动→验证→加速比→KEEP/REVERT
+# 结束自动: final_summary.json + trajectory_chart.png + all/successful_strategies.md
+
+# ⑥ 讲"为什么可信"的审计链
+cat outputs/matmul/final_output/successful_strategies.md   # 每轮改了什么→多少倍
+cat outputs/matmul/optimization_trajectory.json            # 全局状态+全history
+```
+
+---
+
+## 13. 局限与未来工作（主动讲, 显专业）
+
+**已知局限**:
+1. **真机采集慢**: 每轮 run_optimize 含通用 msprof + 逐 kernel msprof op（分钟级），sweep 全量候选约 5-10 分钟 → 一轮总耗时偏长（stats/timing_stats.json 可看瓶颈阶段）
+2. **LLM 输出稳定性**: planner/coder 依赖 `nga run` 输出合法 JSON/代码，虽有多层容错（extract_json 修复、Unicode 清洗、失败重试≤3），极端输出仍会 FAIL 轮
+3. **同名 kernel 聚合**: attention_mlp 的 matmul_kernel 被 5 种形状复用 → msprof 同名聚合 deep 画像混合（A1 遗留, 建议拆独立函数名）
+4. **无 GPU 侧对照**: 当前只针对 Ascend 910B3 + triton-ascend
+5. **测量稳定性**: 双次 msprof 稳定性门控未实现（防单次采样噪声）
+
+**未来工作**（README §10 开发计划 + 项目自身瓶颈优化）:
+- verify 增加 per-kernel 期望 launch 校验（防漏记虚高）
+- 采集 hash 缓存诊断（采集慢 → 结构没变跳过重采）
+- 把优秀案例库（memory/tier{N}_cases.json）做成跨算子迁移学习
+- 支持多卡/多算子批处理
+
+---
+
+## 14. 术语表（讲给不懂 Ascend 的听众）
+
+| 术语 | 含义 |
+|---|---|
+| 910B3 | 华为昇腾训练/推理 NPU, 20 AI Core(cube) + 40 Vec Core @1.8GHz, UB=192KB, L0A/B=64KB, L0C=128KB, HBM 64GB |
+| msprof | CANN 性能分析工具（任务级: 每 kernel 耗时/launch; `msprof op`: 单 kernel 深层 8 CSV） |
+| msprof op | 逐算子深度 profiling: PipeUtilization/ArithmeticUtilization/Memory/MemoryL0/MemoryUB/L2Cache/ResourceConflictRatio/OpBasicInfo |
+| HIVM | 华为中间表示 (Huawei Intermediate Representation), Triton→TTIR→HIVM→AscendC 编译链的一环; Tier2 用它的依赖分析找融合点 |
+| torch.npu.Event | NPU 设备侧事件计时（对标 CUDA Event），无 profiler 扰动，本项目 KEEP 决策与工业级对比的权威口径 |
+| MTE1/2/3 | 搬运引擎: MTE1(L1→L0A/B) / MTE2(GM→L1) / MTE3(写回 GM) |
+| Cube / Vec / Scalar / Fixpipe | 计算引擎: Cube(矩阵乘) / Vec(向量) / Scalar(标量) / Fixpipe(定标) |
+| L0A/L0B/L0C | cube 专用缓冲: A 片/B 片/累加器; 分块调参的硬件约束 |
+| UB | Unified Buffer 统一缓冲 (192KB/核) |
+| roofline | 屋顶模型: 实际带宽/算力 vs 峰值 → memory/compute/latency/balanced 瓶颈分类 |
+| KERNEL_LOOP | kernel_op.py 测试驱动的内部循环次数（verify 用一次 msprof 测 N 遍取平均） |
+| MATMUL_VERIFY | 正确性校验开关（kernel 输出 vs torch 参考, 输出 result check: PASS） |
+| nga run | 服务器本地 LLM codeagent 调用命令（保密服务器无外网 API, 用 `echo <prompt> \| nga run`） |
+| AutoKernel | 对照方案: 盲目枚举调参（300~400 轮）——本项目用"真机诊断 + 6 层策略"替代盲试 |
+| sweep | 程序化枚举全部 L0 合法 BLOCK 候选 + 真机 Event 实测, 替代 LLM 猜分块（分块层地基） |

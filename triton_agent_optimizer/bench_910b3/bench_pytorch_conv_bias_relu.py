@@ -46,9 +46,12 @@ def main():
     p.add_argument("--s", type=int, default=int(os.environ.get("CONV_S", "3")))
     p.add_argument("--pad", type=int, default=int(os.environ.get("CONV_P", "1")))
     p.add_argument("--dtype", type=str, default=os.environ.get("DTYPE", "float32"))
-    p.add_argument("--warmup", type=int, default=3)
-    p.add_argument("--measure", type=int, default=int(os.environ.get("BENCH_PT_MEASURE", "30")),
-                   help="一次 Event 窗口内 forward 次数, ÷N 求单次平均 (默认 30)")
+    p.add_argument("--warmup-ms", type=int, default=int(os.environ.get("BENCH_WARMUP_MS", "25")),
+                   help="warmup 时间预算 (ms, do_bench 同款)")
+    p.add_argument("--rep-ms", type=int, default=int(os.environ.get("BENCH_REP_MS", "100")),
+                   help="测量时间预算 (ms, do_bench 同款)")
+    p.add_argument("--n-buf", type=int, default=32,
+                   help="轮换输入 buffer 组数 (破 L2 复用; 910B3 L2=192MB)")
     args = p.parse_args()
 
     if not torch.npu.is_available():
@@ -61,46 +64,40 @@ def main():
     OH, OW = (H + 2 * PAD - R) // 1 + 1, (W + 2 * PAD - S) // 1 + 1
     npu = torch.device("npu")
 
-    # 与 kernel_op.py 同款输入 (小值 ±0.1)
-    x = (torch.randn(NB, C, H, W, dtype=dt, device=npu)) * 0.1
-    w = (torch.randn(K, C, R, S, dtype=dt, device=npu)) * 0.1
-    bias = (torch.randn(K, dtype=dt, device=npu)) * 0.1
+    # ★轮换 buffer: 小 conv 工作集 << L2 192MB → 不清会全 L2 命中虚高
+    bufs = [((torch.randn(NB, C, H, W, dtype=dt, device=npu)) * 0.1,
+             (torch.randn(K, C, R, S, dtype=dt, device=npu)) * 0.1,
+             (torch.randn(K, dtype=dt, device=npu)) * 0.1) for _ in range(args.n_buf)]
 
     import torch.nn.functional as F
 
-    def forward():
+    def forward(i):
+        x, w, bias = bufs[i % len(bufs)]
         yc = F.conv2d(x, w, padding=PAD)
         yb = yc + bias.view(1, -1, 1, 1)
         return F.relu(yb)
 
-    # warmup (JIT/图编译预热)
-    for _ in range(args.warmup):
-        y = forward()
-        torch.npu.synchronize()
-
-    # measure: 一次 Event 窗口内 forward measure 次, ÷measure = 单次平均
-    st = torch.npu.Event(enable_timing=True)
-    en = torch.npu.Event(enable_timing=True)
-    st.record()
-    for _ in range(args.measure):
-        y = forward()
-    en.record()
-    torch.npu.synchronize()
-    avg_s = st.elapsed_time(en) / 1000.0 / args.measure   # ms → s → ÷N
-    print(f"    {args.measure} 次窗口平均: {avg_s*1e6:.1f}us/次")
+    # ★do_bench 同款: 时间预算自适应 + 多窗口 median + 轮换破 L2
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from bench_910b3.bench_common import measure_event
+    m = measure_event(forward, warmup_ms=args.warmup_ms, rep_ms=args.rep_ms)
+    avg_s = m["median_us"] / 1e6
+    print(f"    {m['rep']} 个窗口 median: {m['median_us']:.1f}us/次 (min {m['min_us']}us)")
 
     n_el = NB * K * OH * OW
     flops = 2 * NB * K * OH * OW * C * R * S + 2 * n_el     # conv + (bias+relu 逐元素)
     tflops = flops / 1e12 / avg_s
     print(f"\n  torch conv+bias+relu({NB}x{C}x{H}x{W} → {K}x{OH}x{OW}, {R}x{S} pad{PAD}, {args.dtype}): "
-          f"avg={avg_s*1e6:.1f}us → {tflops:.1f} TFLOPS")
+          f"median={m['median_us']:.1f}us → {tflops:.1f} TFLOPS")
 
     OUT.write_text(json.dumps({
-        "tflops": round(tflops, 2), "time_us": round(avg_s * 1e6, 1),
+        "tflops": round(tflops, 2), "time_us": round(m["median_us"], 1),
+        "time_us_min": m["min_us"], "time_us_mean": m["mean_us"],
+        "rep": m["rep"], "warmup": m["warmup"], "n_buf": args.n_buf,
         "N": NB, "C": C, "H": H, "W": W, "K": K, "R": R, "S": S, "PAD": PAD,
         "OH": OH, "OW": OW, "dtype": args.dtype, "flops": flops,
         "measured_at": datetime.now().isoformat(),
-        "measure": args.measure,
+        "note": "Event 多窗口median+输入轮换破L2 (do_bench 同款)",
     }, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"  → {OUT}")
 

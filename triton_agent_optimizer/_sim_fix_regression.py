@@ -894,6 +894,73 @@ def test_coder_cleaning():
         f"{len(dirty_cases)} 脏场景全清洗valid={ok_all} 千分位→1024={ok_thousand} 不误伤={ok_safe} 报错带行内容={ok_err}")
 
 # ═══════════════════════════════════════════════════════════════════
+#  Part 15: bench 测量方法回归 (do_bench 同款: 多窗口median + 轮换破L2 + 时间预算自适应)
+# ═══════════════════════════════════════════════════════════════════
+def test_bench_measure():
+    """★回归 (2026-08-12 bench 修复): measure_event 必须满足
+    ① min≤median≤mean (多窗口统计) ② rep 按时间预算自适应 ③ 返回 times_us 数组 (长度=rep).
+    另: 全部 bench 脚本 --help 正常且带新参数 (--warmup-ms/--rep-ms/--n-buf)."""
+    import sys as _sys, types as _types, subprocess as _sp
+    try:
+        import bench_910b3.bench_common as BC
+    except Exception:
+        finding("BUG", "bench_common 不可 import", "检查 bench_910b3/bench_common.py 语法")
+        log("P15-bench测量(回归)", False, "import 失败")
+        return
+    # ── mock torch (本地无 NPU): measure_event 逻辑单测 ──
+    class _ME:
+        def __init__(self, enable_timing=True):
+            self.t = _tick()
+        def record(self):
+            self.t = _tick()
+        def elapsed_time(self, other):
+            return abs(self.t - other.t)
+    _tick_n = [0]
+    def _tick():
+        _tick_n[0] += 1
+        return _tick_n[0]
+    class _MockNpu:
+        class Event(_ME):
+            pass
+        @staticmethod
+        def synchronize():
+            pass
+    class _MockTorch:
+        npu = _MockNpu()
+    _sys.modules["torch"] = _MockTorch()
+    calls = [0]
+    def fn(i):
+        calls[0] += 1
+        # 每 7 次调用模拟 10x 抖动 (验证 median 抗抖)
+        _ME.elapsed_time = (lambda s, o: abs(s.t - o.t) * 10) if calls[0] % 7 == 0 \
+            else (lambda s, o: abs(s.t - o.t))
+        return i
+    m = BC.measure_event(fn, warmup_ms=25, rep_ms=100)
+    ok1 = (m["rep"] >= 5 and len(m["times_us"]) == m["rep"]
+           and m["min_us"] <= m["median_us"] <= m["mean_us"])
+    # ── 12 个 bench 脚本 --help (无 NPU 可跑, 验证参数/语法) ──
+    scripts = ["bench_pytorch.py", "bench_pytorch_mlp.py", "bench_pytorch_attention.py",
+               "bench_pytorch_rms_norm.py", "bench_pytorch_layernorm.py", "bench_pytorch_sigmoid.py",
+               "bench_pytorch_matmul_relu.py", "bench_pytorch_matmul_transpose.py",
+               "bench_pytorch_conv2d.py", "bench_pytorch_conv_bias_relu.py",
+               "bench_pytorch_flash_attention.py", "bench_industrial.py"]
+    ok2 = True
+    for sc in scripts:
+        r = _sp.run([_sys.executable, "bench_910b3/" + sc, "--help"],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    cwd=str(REPO))
+        if r.returncode != 0 or "--warmup-ms" not in (r.stdout or "") \
+                or "--rep-ms" not in (r.stdout or ""):
+            ok2 = False
+            print(f"  ❌ {sc} --help 异常")
+    ok = ok1 and ok2
+    if not ok:
+        finding("BUG", "bench 测量回归失败", f"measure_event统计={ok1} 脚本--help={ok2}")
+    log("P15-bench测量(回归)", ok,
+        f"median={m['median_us']}us rep={m['rep']} (自适应) min≤median≤mean={ok1} "
+        f"12脚本--help+新参数={ok2}")
+
+# ═══════════════════════════════════════════════════════════════════
 #  main
 # ═══════════════════════════════════════════════════════════════════
 def setup():
@@ -933,6 +1000,7 @@ if __name__ == "__main__":
         test_resume_flow(); print()
         test_tier3_sweep_revert(); print()
         test_coder_cleaning(); print()
+        test_bench_measure(); print()
         print("═" * 60)
         print(f"检查项: {len(RESULTS)}  通过: {sum(1 for _, o, _ in RESULTS if o)}  失败: {sum(1 for _, o, _ in RESULTS if not o)}")
         for tag, ok, d in RESULTS:

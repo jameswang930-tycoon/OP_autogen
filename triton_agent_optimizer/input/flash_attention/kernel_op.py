@@ -27,7 +27,9 @@ import triton.language as tl
 SEQ = int(os.environ.get("FA_SEQ", 2048))       # 序列长度
 NHEADS = int(os.environ.get("FA_HEADS", 8))     # 头数
 DIM = int(os.environ.get("FA_DIM", 64))         # 头维 (head_dim)
-DTYPE = torch.float32
+# ★fp16 输入 (与工业级 CANN FA 对齐 — 910B3 FA 天花板即 fp16; cube fp16 算力是 fp32 的 2×);
+#   累加 acc/m_i/l_i 保持 fp32 (FA 标准, 精度不丢)
+DTYPE = torch.float16
 SCALE = 1.0 / (DIM ** 0.5)
 BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64          # 查询块/键块/头维块
 # 注意: 不传 num_warps/num_stages — triton-ascend 禁止 tune 这两个参数, 自动管理 tiling/流水
@@ -108,7 +110,7 @@ def main():
     q_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=npu) * 0.1).permute(1, 0, 2).contiguous()
     k_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=npu) * 0.1).permute(1, 2, 0).contiguous()
     v_t = (torch.randn(seq, nh, dim, dtype=DTYPE, device=npu) * 0.1).permute(1, 0, 2).contiguous()
-    o = torch.empty(nh, seq, dim, dtype=DTYPE, device=npu)  # ★[nheads, seq, dim]
+    o = torch.empty(nh, seq, dim, dtype=torch.float32, device=npu)  # ★输出保持 fp32 (acc 即 fp32, 精度更稳)
 
     grid = (triton.cdiv(seq, BLOCK_M) * nh,)
     print(f"[info] flash_attn_mha seq={seq} heads={nh} dim={dim} causal=1 "
@@ -126,9 +128,10 @@ def main():
     if os.environ.get("MATMUL_VERIFY", "0") == "1":
         # o=[nheads,seq,dim] → back to [seq,nheads,dim] for comparison
         mask = torch.triu(torch.ones(seq, seq, dtype=torch.bool, device=npu), diagonal=1)  # 因果
-        q_ref = q_t.permute(1, 0, 2)   # [nh,seq,dim] → [seq,nh,dim]
-        k_ref = k_t.permute(2, 0, 1)   # [nh,dim,seq] → [seq,nh,dim]
-        v_ref = v_t.permute(1, 0, 2)   # [nh,seq,dim] → [seq,nh,dim]
+        # ★参考升 fp32 计算 (输入是 fp16, 参考用高精度避免 fp16 参考误差干扰判定; 我们输出 o 也是 fp32)
+        q_ref = q_t.permute(1, 0, 2).float()   # [nh,seq,dim] → [seq,nh,dim]
+        k_ref = k_t.permute(2, 0, 1).float()   # [nh,dim,seq] → [seq,nh,dim]
+        v_ref = v_t.permute(1, 0, 2).float()   # [nh,seq,dim] → [seq,nh,dim]
         o_ref = torch.empty_like(q_ref)
         for h in range(nh):
             sh = (q_ref[:, h, :] @ k_ref[:, h, :].t()) * SCALE

@@ -6,6 +6,7 @@
 >
 > **环境**：Ascend 910B3（保密服务器，只能 paste-in）+ CANN 8.5.1 / triton-ascend 3.2.0 / torch_npu 2.9.0。
 > **LLM 调用**：服务器无 Claude API，用本地 codeagent：`echo "<prompt>" | nga run`（`LLM_CLI_COMMAND="nga run"`）。
+> **更新**：2026-08-12 — v4.4 修复轮: ①sweep 回滚内容快照(链污染) ②promote 门前置+有效轮计数(max_rounds 硬上限) ③rebaseline 同步 best Event ④diff.patch 仅成功时写 ⑤coder 清洗 4 缺陷(千分位/全角/markdown/引号两难)+报错带行内容 ⑥bench 测量方法学修复(do_bench 同款: 多窗口 median + 时间预算自适应 + 输入轮换破 L2) + FA 对齐 fp16; 全部有回归测试 `_sim_fix_regression.py` (31 项断言)。
 > **更新**：2026-08-11 — v4.3：① bench 全切 Event（工业级+PyTorch，不用 msprof）② 迭代每轮补 Event e2e_event_ns ③ 严格最优 KEEP（>best_speedup）+ best_kernel 绑定 + 失败回滚 ④ sweep 每 tier3 round 都跑 ⑤ 设备污染检测+重置 ⑥ vs_industrial 比值 + strategy_summary。
 
 ---
@@ -62,9 +63,14 @@ main.py input/matmul [--fresh] [--resume] [--max-rounds N] [--target X]
 
 | 场景 | 工具 | 方式 | 为什么 |
 |---|---|---|---|
-| **sweep 分块扫描** | `torch.npu.Event` | 单进程, 每候选预热+窗口计时取平均 | 快速筛候选(几分钟); 只需相对排序 |
-| **PyTorch/工业级 bench** | `torch.npu.Event` | warmup + 一次窗口包 measure 次 ÷measure | ★工业级设备侧绝对值(无 profiler 扰动), 两端同口径 |
+| **sweep 分块扫描** | `torch.npu.Event` | 单进程, 每候选预热+多窗口 median | 快速筛候选(几分钟); 只需相对排序 |
+| **PyTorch/工业级 bench** | `torch.npu.Event` | ★do_bench 同款: 时间预算自适应(warmup 25ms/rep 100ms) + 多窗口 median + **输入轮换破 L2 复用** | ★工业级设备侧绝对值(无 profiler 扰动, 无 L2 命中虚高) |
 | **verifier 每轮验证** | **msprof + Event** | msprof KERNEL_LOOP=30 遍(op_summary 求和÷30) 给 ns/e2e_ns; 另注入 Event 给 e2e_event_ns | msprof 给纯kernel拆解+诊断; Event 给工业级绝对端到端 |
+
+**★bench 测量纪律 (2026-08-12, 对齐 triton testing.do_bench)**:
+- **多窗口 median**: 先 5 次估时长 → warmup/rep 次数按 ms 预算自适应 (快 kernel 自动加次) → n_rep 个**独立 Event 对** → 取 median (另报 min/mean)。旧"一次窗口包 30 次 ÷30"只有 1 个样本, 快 kernel 噪声大。
+- **★输入轮换破 L2**: 连续 forward 同一批张量, 工作集 <192MB(L2) 时后 N 次全 L2 命中 → 测到 L2 带宽 (数字虚高); Ascend 无清 L2 API → 每 rep 轮换 n_buf 组输入 (组数×单组工作集 > L2) 等效 do_bench 的 clear_cache。
+- **口径声明**: 工业级基准 = torch 全流程 (含 host 调度/内存分配); 我们 verify 的 Event = triton 纯 kernel launch 链。大算子 (ms 级) 差异可忽略; 小算子 (逐元素/归约, us 级) 我们占便宜 → 报告同时给 `time_us_min/mean` + 说明。
 
 **为什么 Event 是工业级主测?** msprof 带 profiler 挂载开销(绝对值偏高, 但跨轮一致→相对 speedup 用它); `torch.npu.Event` 是设备侧事件计时(无扰动, 官方/NVIDIA/vLLM-Ascend 标准), 最终报告绝对 latency 用它。两者并存: msprof 拆解, Event 权威。
 

@@ -18,7 +18,7 @@
 | **真机数据优先** | 只用 msprof + msprof op（弃 hivm/simulator 主流程，按需保留 fusion） |
 | **单文件驱动** | 算子 + config + 测试合成 `kernel_op.py`（①config ②kernel ③main），coder 只改它 |
 | **kernel 链** | round1 读源文件，roundN 读上一轮成功输出；**源文件永不修改**；失败不提交 |
-| **每轮只看该策略字段** | 6 层策略各有自己的数据段（50 字段），Planner 只喂当前层要的 |
+| **每轮只看该策略字段** | 6 层策略各有自己的数据段（58 字段），Planner 只喂当前层要的 |
 | **确定性改码** | Planner 输出 `changes[]`（old_code→new_code 逐字符匹配），Coder 精确替换 + Unicode 清洗，找不到就报告不猜 |
 | **sweep 分块地基** | round1 + **每个 tier3 round** 自动枚举全部 L0 合法 BLOCK, 在 best_kernel.py 上实测选最优 → 每轮传 planner |
 | **验证 = 正确性 + msprof + Event** | MATMUL_VERIFY 校验 → msprof 端到端测速比 + Event 设备侧 e2e_event_ns (工业级绝对值) |
@@ -158,16 +158,18 @@ outputs/<op>/final_output/trajectory_chart.png  ← 轨迹图
 
 ---
 
-## 5. 6 层策略 × 每轮字段（审计定版 50 字段）
+## 5. 6 层策略 × 每轮字段（审计定版 58 字段，2026-08-12 扩充）
 
 | Tier | 策略 | 字段数 | 主要字段 | 晋升条件 |
 |---|---|---|---|---|
-| 1 | 算法结构 | 11 | cube_fops/vec_fops/cube_ratio/fp16/int8占比/算力利用率/算术强度/瓶颈类型/total_ns/num_kernels | 算法已最优 |
-| 2 | 算子融合 | 8(+08_fusion) | num_kernels/api_overhead/task_type/launch_count/multi_kernel/framework + HIVM 依赖分析 | 无可融合 |
+| 1 | 算法结构 | 13 | cube_fops/vec_fops/cube_ratio/fp16/int8占比/cube fp指令/vec fp16占比/算力利用率/算术强度/瓶颈类型/total_ns/num_kernels | 算法已最优 |
+| 2 | 算子融合 | 8(+08_fusion) | num_kernels/api_overhead/task_type/launch_count/multi_kernel/framework + HIVM 依赖分析(含每op耗时占比) | 无可融合 |
 | 3 | 分块配置 | 8 | block_dim/mte1/mte2/cube_ratio/l0a读写/l0b读写 | 3轮无改进 |
-| 4 | 访存 | 9 | main_mem读写/gm_to_ub/ub_to_gm/l2/mte2/3耗时/访存利用率/算术强度 | 3轮无改进 |
+| 4 | 访存 | 12 | main_mem读写/gm_to_ub/ub_to_gm/l2/mte2/3耗时/访存利用率 + **traffic_kb(实际搬运量)/bw_usage_rate(官方通路利用率)/traffic_redundancy(冗余倍数)** | 3轮无改进 |
 | 5 | 计算占用 | 8 | cube耗时/标量耗时/scalar/fixpipe占比/cube_ratio/冲突 | 3轮无改进 |
-| 6 | 架构专属 | 6 | engine_util/mte冲突/wait_ratio/task_type/block_dim/瓶颈类型 | 3轮无改进→停 |
+| 6 | 架构专属 | 9 | engine_util/icache缺失率/cube_wait/vec_wait/mte2/3_wait/task_type/block_dim/瓶颈类型 | 3轮无改进→停 |
+
+> 2026-08-12 扩充（官方文档核实，见 `docx/msprof_fields_reference.md` 四节）：Memory.csv 的 `*_datas(KB)` 实际搬运量、`*_bw_usage_rate(%)` 官方通路利用率、PipeUtilization 的 `*_active_bw(GB/s)` 活跃带宽、`ai*_icache_miss_rate`、ResourceConflictRatio 的 `ai*_wait_ratio` 规范短名（`vec_wait_ratio` 等，消除 `_get` 子串歧义）、ArithmeticUtilization 的 vec 精度细分与 cube fp/int 指令条数、OpBasicInfo 的 `Rated Freq`/`Mix Block Dim`；roofline 新增 `traffic_redundancy_read`（实际读÷理论最小，>1.5=重复搬运）。hivm fusion view 现附每 op 估算耗时占比（Tier2 排融合优先级）。
 
 **分块调参逻辑**（用户关注点）：
 - **传输瓶颈**(memory_bound, mem_util≥0.8 且 comp<0.5) → **增大 tile**（复用↑, GM流量↓）

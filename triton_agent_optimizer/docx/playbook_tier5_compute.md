@@ -3,7 +3,7 @@
 > ## ★★速查卡（★先读这个；你实际能读全文，但速查卡在最前面=最快定位，决策先靠它，细节看情况A~J）★★
 >
 > **工作流（3 步，别跳）**：
-> 1. 读 `07_tier5_fields/tier5_fields.txt` + `planner_context.json` → 找 **aic_scalar_time / scalar / vector_fops / vec / bank_cflt_ratio / wait_ratio / cube 耗时 / bottleneck_type**
+> 1. 读 `07_tier5_fields/tier5_fields.txt` + `planner_context.json` → 找 **aic_scalar_time / scalar / vector_fops / vec / bank_cflt_ratio / vec_wait_ratio / cube 耗时 / bottleneck_type**
 > 2. 照下表定位"情况"→ 看情况 A~J 代码
 > 3. 输出 changes[]：old_code 逐字复制；拿不准不改（宁缺勿错）
 >

@@ -57,8 +57,11 @@ TIER_LABEL = {
 # ── 每 tier 要提取的字段段 (JSON path → 中文说明) ──
 #   deep 在 kernels[i].deep 下 → 前缀 kernels[].deep
 #   每 tier 的字段要足以: ①判断瓶颈是否属本层(promote) ②给出具体改法
+#   ★2026-08-12 扩充 (官方文档核实, 见 docx/msprof_fields_reference.md 四节):
+#     conflict 用规范短名 (vec_wait/mte2_wait/mte3_wait 等) — 消除 _get 子串匹配歧义 (P1)
+#     traffic_kb/bw_usage_rate/active_bw/icache_miss_rate 来自 msprof op 官方实测 (P2)
 TIER_FIELDS = {
-    1: [  # 算法结构: 算力利用 + 精度 + 强度 (11 字段)
+    1: [  # 算法结构: 算力利用 + 精度 + 强度 (13 字段)
         ("summary.num_kernels", "优化目标kernel数"),
         ("summary.total_ns", "端到端耗时ns"),
         ("kernels[].deep.compute.cube_fops", "cube浮点运算数"),
@@ -66,6 +69,8 @@ TIER_FIELDS = {
         ("kernels[].deep.compute.cube_ratio", "cube指令占比"),
         ("kernels[].deep.compute.cube_fp16_ratio", "cube fp16占比"),
         ("kernels[].deep.compute.cube_int8_ratio", "cube int8占比"),
+        ("kernels[].deep.compute.cube_fp_instr_number", "cube fp指令条数"),
+        ("kernels[].deep.compute.vec_fp16_ratio", "vec fp16占比"),
         ("kernels[].deep.engine_utilization.vec", "向量指令占比"),
         ("kernels[].deep.roofline.compute_utilization", "算力利用率"),
         ("kernels[].deep.roofline.arithmetic_intensity", "算术强度(计算/访存)"),
@@ -91,16 +96,19 @@ TIER_FIELDS = {
         ("kernels[].deep.bandwidth_gb_s.l0b_read_gb_s", "L0B读带宽"),
         ("kernels[].deep.bandwidth_gb_s.l0b_write_gb_s", "L0B写带宽"),
     ],
-    4: [  # 访存: GM带宽/L2/搬运 (9 字段)
+    4: [  # 访存: GM带宽/L2/实际搬运量 (12 字段)
         ("kernels[].deep.bandwidth_gb_s.main_mem_read_gb_s", "GM读带宽"),
         ("kernels[].deep.bandwidth_gb_s.main_mem_write_gb_s", "GM写带宽"),
         ("kernels[].deep.bandwidth_gb_s.gm_to_ub_gb_s", "GM→UB带宽"),
         ("kernels[].deep.bandwidth_gb_s.ub_to_gm_gb_s", "UB→GM带宽"),
+        ("kernels[].deep.traffic_kb.main_mem_read_kb", "实际主存读量KB"),
+        ("kernels[].deep.traffic_kb.main_mem_write_kb", "实际主存写量KB"),
+        ("kernels[].deep.bw_usage_rate.gm_to_l1", "GM→L1通路利用率"),
+        ("kernels[].deep.roofline.traffic_redundancy_read", "读搬运冗余倍数(实际/理论最小)"),
         ("kernels[].deep.l2_hit_rate", "L2命中率"),
         ("kernels[].task.pipes_us.aic_mte2_time_us", "MTE2(GM读)耗时"),
         ("kernels[].task.pipes_us.aic_mte3_time_us", "MTE3(GM写)耗时"),
         ("kernels[].deep.roofline.memory_utilization", "访存利用率"),
-        ("kernels[].deep.roofline.arithmetic_intensity", "算术强度(计算/访存)"),
     ],
     5: [  # 计算占用: cube/标量时间 + 冲突 (8 字段)
         ("kernels[].task.pipes_us.aic_cube_time_us", "cube耗时"),
@@ -112,10 +120,13 @@ TIER_FIELDS = {
         ("kernels[].deep.conflict.bankgroup_cflt_ratio", "bankgroup冲突"),
         ("kernels[].deep.conflict.total_cflt_ratio", "vec总冲突"),
     ],
-    6: [  # 910B3 架构: 引擎分布/阻塞 (6 字段)
+    6: [  # 910B3 架构: 引擎分布/阻塞/取指 (9 字段)
         ("kernels[].deep.engine_utilization", "各引擎利用率"),
-        ("kernels[].deep.conflict.mte_cflt_ratio", "mte冲突"),
-        ("kernels[].deep.conflict.wait_ratio", "vec被阻塞占比"),
+        ("kernels[].deep.icache_miss_rate", "ICache缺失率"),
+        ("kernels[].deep.conflict.cube_wait_ratio", "cube被阻塞占比"),
+        ("kernels[].deep.conflict.vec_wait_ratio", "vec被阻塞占比"),
+        ("kernels[].deep.conflict.mte2_wait_ratio", "MTE2等待占比"),
+        ("kernels[].deep.conflict.mte3_wait_ratio", "MTE3等待占比"),
         ("kernels[].task.task_type", "每kernel引擎"),
         ("kernels[].task.block_dim", "核数"),
         ("kernels[].deep.roofline.bottleneck_type", "瓶颈类型"),
@@ -302,6 +313,8 @@ TIER_PER_KERNEL = {
         ("deep.bandwidth_gb_s.main_mem_write_gb_s", "gm_w"),
         ("deep.bandwidth_gb_s.gm_to_ub_gb_s", "gm2ub"),
         ("deep.bandwidth_gb_s.ub_to_gm_gb_s", "ub2gm"),
+        ("deep.traffic_kb.main_mem_read_kb", "gm_r_kb"),   # ★实际主存读量 (官方实测, 非估算)
+        ("deep.roofline.traffic_redundancy_read", "redun"),  # ★读搬运冗余倍数 (>1.5=重复搬运)
         ("deep.l2_hit_rate", "l2"),
         ("task.est_bytes_in", "in_B"),                  # ★绝对搬运量 (L2 复用/降搬运判断)
         ("task.est_bytes_out", "out_B")],
@@ -309,12 +322,13 @@ TIER_PER_KERNEL = {
         ("task.pipes_us.aic_scalar_time_us", "scalar_us"),
         ("deep.engine_utilization.scalar", "scalar"),
         ("deep.conflict.bank_cflt_ratio", "bank_cflt"),
-        ("deep.conflict.wait_ratio", "wait")],
+        ("deep.conflict.vec_wait_ratio", "wait")],      # ★P1: 规范短名, 消除 wait_ratio 子串歧义
     6: [("deep.engine_utilization.cube", "cube"),
         ("deep.engine_utilization.vec", "vec"),
         ("deep.engine_utilization.mte2", "mte2"),
         ("deep.engine_utilization.mte3", "mte3"),
-        ("deep.conflict.wait_ratio", "wait"),
+        ("deep.icache_miss_rate.cube", "icache"),       # ★ICache 缺失率 (取指瓶颈)
+        ("deep.conflict.vec_wait_ratio", "wait"),       # ★P1: 规范短名
         ("task.task_type", "type"),
         ("task.block_dim", "cores"),
         ("deep.roofline.bottleneck_type", "bottleneck")],

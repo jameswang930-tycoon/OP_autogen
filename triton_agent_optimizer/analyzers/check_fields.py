@@ -64,8 +64,12 @@ BOARD_EXPECT = {
         ("cube_ratio",       "msprof op", "ArithmeticUtilization", "aic_cube_ratio",      ("cube", "ratio")),
         ("cube_fp16_ratio",  "msprof op", "ArithmeticUtilization", "aic_cube_fp16_ratio", ("cube", "fp16", "ratio")),
         ("cube_int8_ratio",  "msprof op", "ArithmeticUtilization", "aic_cube_int8_ratio", ("cube", "int8", "ratio")),
+        ("cube_instr_number", "msprof op", "ArithmeticUtilization", "aic_cube_total_instr_number", ("cube", "total", "instr")),
+        ("cube_fp_instr_number", "msprof op", "ArithmeticUtilization", "aic_cube_fp_instr_number", ("cube", "fp", "instr")),
         ("vector_fops",      "msprof op", "ArithmeticUtilization", "aiv_vec_fops",        ("vec", "fops")),
         ("vec_ratio",        "msprof op", "ArithmeticUtilization", "aiv_vec_ratio",       ("aiv", "vec", "ratio")),
+        ("vec_fp32_ratio",   "msprof op", "ArithmeticUtilization", "aiv_vec_fp32_ratio",  ("vec", "fp32", "ratio")),
+        ("vec_fp16_ratio",   "msprof op", "ArithmeticUtilization", "aiv_vec_fp16_ratio",  ("vec", "fp16", "ratio")),
         ("aic_total_cycles", "msprof op", "ArithmeticUtilization", "aic_total_cycles",    ("aic", "total", "cycle")),
         ("aiv_total_cycles", "msprof op", "ArithmeticUtilization", "aiv_total_cycles",    ("aiv", "total", "cycle")),
     ],
@@ -75,8 +79,51 @@ BOARD_EXPECT = {
         ("total_cflt_ratio",     "msprof op", "ResourceConflictRatio", "aiv_vec_total_cflt_ratio",     ("vec", "total", "cflt")),
         ("resc_cflt_ratio",      "msprof op", "ResourceConflictRatio", "aiv_vec_resc_cflt_ratio",      ("vec", "resc", "cflt")),
         ("mte_cflt_ratio",       "msprof op", "ResourceConflictRatio", "aiv_vec_mte_cflt_ratio",       ("vec", "mte", "cflt")),
+        ("cube_wait_ratio",      "msprof op", "ResourceConflictRatio", "aic_cube_wait_ratio",          ("cube", "wait", "ratio")),
+        ("vec_wait_ratio",       "msprof op", "ResourceConflictRatio", "aiv_vec_wait_ratio",           ("vec", "wait", "ratio")),
+        ("mte1_wait_ratio",      "msprof op", "ResourceConflictRatio", "aic/aiv_mte1_wait_ratio",      ("mte1", "wait", "ratio")),
+        ("mte2_wait_ratio",      "msprof op", "ResourceConflictRatio", "aic/aiv_mte2_wait_ratio",      ("mte2", "wait", "ratio")),
+        ("mte3_wait_ratio",      "msprof op", "ResourceConflictRatio", "aic/aiv_mte3_wait_ratio",      ("mte3", "wait", "ratio")),
     ],
 }
+
+# ★新 (P2): 官方实测字段 — 列名带 (KB)/(%)/(GB/s) 后缀, 用规范化列名精确匹配 (子串会误匹配 L1_to_GM vs GM_to_L1)
+BOARD_EXPECT_NORM = {
+    "traffic_kb": [   # (normalized键, 官方列名)
+        ("main_mem_read_kb", "read_main_memory_datas(KB)"),
+        ("main_mem_write_kb", "write_main_memory_datas(KB)"),
+        ("gm_to_l1_kb", "GM_to_L1_datas(KB)"),
+        ("l1_to_gm_kb", "L1_to_GM_datas(KB)(estimate)"),
+        ("l0c_to_l1_kb", "L0C_to_L1_datas(KB)"),
+        ("l0c_to_gm_kb", "L0C_to_GM_datas(KB)"),
+        ("gm_to_ub_kb", "GM_to_UB_datas(KB)"),
+        ("ub_to_gm_kb", "UB_to_GM_datas(KB)"),
+    ],
+    "bw_usage_rate": [
+        ("gm_to_l1", "GM_to_L1_bw_usage_rate(%)"),
+        ("l1_to_gm", "L1_to_GM_bw_usage_rate(%)(estimate)"),
+        ("l0c_to_l1", "L0C_to_L1_bw_usage_rate(%)"),
+        ("l0c_to_gm", "L0C_to_GM_bw_usage_rate(%)"),
+        ("gm_to_ub", "GM_to_UB_bw_usage_rate(%)"),
+        ("ub_to_gm", "UB_to_GM_bw_usage_rate(%)"),
+    ],
+    "active_bw_gb_s": [
+        ("mte2_aiv_gb_s", "aiv_mte2_active_bw(GB/s)"),
+        ("mte3_aic_gb_s", "aic_mte3_active_bw(GB/s)"),
+        ("mte3_aiv_gb_s", "aiv_mte3_active_bw(GB/s)"),
+        ("fixpipe_aic_gb_s", "aic_fixpipe_active_bw(GB/s)"),
+    ],
+    "icache_miss_rate": [
+        ("cube", "aic_icache_miss_rate"),
+        ("vec", "aiv_icache_miss_rate"),
+    ],
+}
+
+
+def _norm_col(c):
+    """列名规范化: 去括号块(单位/estimate后缀) + 去空格 + 小写 (与 pipeline_parse_board 同实现)."""
+    import re
+    return re.sub(r"\([^)]*\)", "", str(c)).replace(" ", "").lower()
 
 
 def _match(name, keys, exclude=()):
@@ -134,6 +181,22 @@ def check_board(bd):
         if not norm_key_exists(norm.get("conflict", {}), *keys, exclude=exclude):
             issues.append((f"conflict.{field}", tool, src, col,
                            raw_cols_exist(raw, src, keys, exclude)))
+
+    # ★P2: 官方实测字段 (traffic/bw_usage_rate/active_bw/icache) — 规范化列名精确核对
+    for section, norm_dict, prefix in (
+            ("traffic_kb", norm.get("traffic_kb", {}), "traffic_kb"),
+            ("bw_usage_rate", norm.get("bw_usage_rate", {}), "bw_usage_rate"),
+            ("active_bw_gb_s", norm.get("active_bw_gb_s", {}), "active_bw"),
+            ("icache_miss_rate", norm.get("icache_miss_rate", {}) or {}, "icache")):
+        mem_cols = [_norm_col(c) for c in raw.get("Memory", {}).get("columns", [])]
+        pu_cols = [_norm_col(c) for c in raw.get("PipeUtilization", {}).get("columns", [])]
+        for field, col in BOARD_EXPECT_NORM[section]:
+            if norm_dict.get(field) is None:
+                cols = mem_cols if section in ("traffic_kb", "bw_usage_rate") else pu_cols
+                has = _norm_col(col) in cols
+                issues.append((f"{prefix}.{field}", "msprof op",
+                               "Memory" if section in ("traffic_kb", "bw_usage_rate") else "PipeUtilization",
+                               col, has))
 
     if norm.get("l2_hit_rate") is None:
         issues.append(("l2_hit_rate", "msprof op", "L2Cache", "aic_total_hit_rate(%)",

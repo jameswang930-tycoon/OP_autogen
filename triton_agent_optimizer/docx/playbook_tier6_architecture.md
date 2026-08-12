@@ -3,14 +3,14 @@
 > ## ★★速查卡（★先读这个；你实际能读全文，但速查卡在最前面=最快定位，决策先靠它，细节看情况A~J）★★
 >
 > **工作流（3 步，别跳）**：
-> 1. 读 `07_tier6_fields/tier6_fields.txt` + `planner_context.json` → 找 **wait_ratio / mte_cflt_ratio / bank_cflt_ratio / engine_utilization(cube/vec/mte2/mte3) / task_type / block_dim**
+> 1. 读 `07_tier6_fields/tier6_fields.txt` + `planner_context.json` → 找 **vec_wait_ratio / cube_wait_ratio / mte2_wait_ratio / mte3_wait_ratio / icache_miss_rate / mte_cflt_ratio / bank_cflt_ratio / engine_utilization(cube/vec/mte2/mte3) / task_type / block_dim**
 > 2. 照下表定位"情况"→ 多数情况是**指路回前层**（本层只诊断+回退）
 > 3. 输出 changes[] 或 promote（★本层多数正确动作是 promote 回前层，附 evidence）
 >
 > **字段 → 动作速查表（★主决策表，多数是"回前层"不是改码）**：
 > | 字段/现象 | 动作（回哪层） |
 > |---|---|
-> | wait_ratio 高（vec 被阻塞等数据） | 回 Tier4（流水线/load 独立步骤） |
+> | vec_wait_ratio 高（vec 被阻塞等数据） | 回 Tier4（流水线/load 独立步骤） |
 > | mte_cflt_ratio 高（搬运冲突） | 回 Tier4/3（连续大搬运/分块） |
 > | bank_cflt_ratio >4% | 回 Tier5-F（swizzle/访问）；多数已自动处理 |
 > | cube 利用率低 且 任务是 matmul | 没用 `tl.dot`（vector 模拟）→ 改 tl.dot；用了但低 → 回 Tier3/1 |
@@ -50,7 +50,7 @@
 
 | v4 字段 | 触发 | 含义 | 动作 |
 |---|---|---|---|
-| `conflict.wait_ratio` | 高（vec 被阻塞） | 计算在等数据 | 回 Tier4（流水线/load 独立） |
+| `conflict.vec_wait_ratio` | 高（vec 被阻塞） | 计算在等数据 | 回 Tier4（流水线/load 独立） |
 | `conflict.mte_cflt_ratio` | 高 | MTE 搬运冲突 | 回 Tier4/3（传输/分块） |
 | `conflict.bank_cflt_ratio` | >4% | UB bank 冲突 | 回 Tier5 F（swizzle/访问） |
 | `engine_utilization.cube` | 低但任务是 matmul | cube 没用上 | 检查是否用 `tl.dot`（情况D） |
@@ -59,12 +59,15 @@
 | `task.block_dim` | 远小于 40 | 核没吃满 | 回 Tier3（分块） |
 | `task.block_dim` / `api_overhead` | grid 远大于物理核数 / launch 开销大 | 调度/核启动开销 | grid 固定核数 + 核内 stride 循环（情况G） |
 | 多核耗时不均 / 计算拖尾 | 尾核空转 | 负载不均衡 | stride 切分（情况H） |
-| `aic_cube_wait_ratio` / `wait_ratio` | cube/vec 被阻塞但各 pipe 利用率都不高 | 跨引擎流水气泡 | 循环分块 + 双缓冲 UB 预算（情况I） |
+| `aic_cube_wait_ratio` / `vec_wait_ratio` | cube/vec 被阻塞但各 pipe 利用率都不高 | 跨引擎流水气泡 | 循环分块 + 双缓冲 UB 预算（情况I） |
 | 纯 vector 算子 `task_type=AIV` | 却按 cube 核数定 grid | vector 核少用一半 | 按引擎选核数 40/20（情况J） |
 
 ### ★决策流程图
 ```
-wait_ratio 高 / mte_cflt 高 → 回 Tier4 (流水线/传输) 或 Tier3 (分块)
+vec_wait_ratio 高 / mte_cflt 高 → 回 Tier4 (流水线/传输) 或 Tier3 (分块)
+cube_wait_ratio 高 (cube 在等数据) → 回 Tier4/3 (流水线/分块)
+mte2_wait_ratio / mte3_wait_ratio 高 (搬运等待) → 双缓冲/流水线 (情况I)
+icache_miss_rate 高 → 指令取指瓶颈 (简化代码/减分支)
 bank/bankgroup_cflt >4% → 回 Tier5 F (swizzle/访问)
 cube 利用率低 且 任务是 matmul ?
   ├─ 没用 tl.dot (vector 模拟) → 用 tl.dot (情况D)
@@ -82,7 +85,7 @@ cube/vec 被阻塞但各 pipe 利用率都不高 (流水线气泡) → K 循环�
 
 ## 情况A：wait_ratio 高（vec 被阻塞等数据）
 
-**触发**：`conflict.wait_ratio` 高（vector 大量 cycle 在等数据/上一条完成）。
+**触发**：`conflict.vec_wait_ratio` 高（vector 大量 cycle 在等数据/上一条完成）。
 **含义**：计算单元在空等（搬运没和计算重叠，或依赖链串行）。
 **怎么查**：搜 "ascend aiv_vec_wait_ratio optimization pipeline overlap"。
 
@@ -94,7 +97,7 @@ for k in range(0, K, BLOCK_K):
     a_ptrs += BLOCK_K; b_ptrs += BLOCK_K
 # msprof: aiv_vec_wait_ratio 高, 计算有大量空等
 ```
-**出现的问题**：计算与搬运串行（等 load 完成才算）→ vector 单元大量 cycle 空等，`wait_ratio` 高。
+**出现的问题**：计算与搬运串行（等 load 完成才算）→ vector 单元大量 cycle 空等，`vec_wait_ratio` 高。
 
 ### ✅ 修改后正确代码（load 独立成步骤，让编译器流水线重叠）
 ```python
@@ -397,7 +400,7 @@ grid = (NUM_CORES,)       # + 核内 stride 循环 (情况G)
 | 错误 | 现象 | 修复 |
 |---|---|---|
 | vector 模拟 matmul | cube 利用率 ~0 | 用 `tl.dot` |
-| load→compute 强耦合 | wait_ratio 高 | load 独立步骤让编译器流水线（回 Tier4） |
+| load→compute 强耦合 | vec_wait_ratio 高 | load 独立步骤让编译器流水线（回 Tier4） |
 | 小搬运密集 | mte_cflt 高 | 大连续 load（回 Tier4） |
 | 引擎失衡 | cube/vec 一满一闲 | 回 Tier2 融合平衡 |
 | while/动态 shape | 后端降级 | 静态 for-range + constexpr |
@@ -405,5 +408,5 @@ grid = (NUM_CORES,)       # + 核内 stride 循环 (情况G)
 | 想设 num_warps/multibuffer | 报错/无效 | 编译器自动管理，别硬调 |
 | grid=每 tile 一 program 远超核数 | launch/调度开销大 | grid 固定核数 + 核内 stride 循环（情况G） |
 | 连续切分 tile | 尾核空转/计算拖尾 | stride 切分（情况H） |
-| 单 pass 无 K 循环 | multi-buffer 关, wait_ratio 高 | K 循环分块 + 留双缓冲 UB 空间（情况I） |
+| 单 pass 无 K 循环 | multi-buffer 关, vec_wait_ratio 高 | K 循环分块 + 留双缓冲 UB 空间（情况I） |
 | 纯 vec 算子按 cube 核数定 grid | vector 核少用一半 | 按引擎选核数 40/20（情况J） |

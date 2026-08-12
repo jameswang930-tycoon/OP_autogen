@@ -215,11 +215,21 @@
 ## 四、字段 → 优化策略映射（按优化大顺序 Tier 1→6，审计定版 2026-08-04）
 
 > 每 tier 提取的字段量（已审计验证：跑真实流水线 → diagnosis.json → 全部字段路径可解析）：
-> **Tier1=11 / Tier2=8 / Tier3=8 / Tier4=9 / Tier5=8 / Tier6=6，共 50 字段**。
+> **Tier1=13 / Tier2=8 / Tier3=8 / Tier4=12 / Tier5=8 / Tier6=9，共 58 字段**（2026-08-12 扩充，见下）。
 > 每个 tier 的字段要足以：① 判断瓶颈是否属本层（promote）② 给出具体改法。
 > normalized 路径前缀：`kernels[].deep.*`（msprof op 深层）、`kernels[].task.*`（通用 msprof 骨架）。
+>
+> **2026-08-12 扩充**（CANN 850alpha002 官方文档核实，A2 训练系列列名）：
+> - `deep.traffic_kb.*` ← Memory.csv `*_datas(KB)`（实际搬运量，替代 est 估算）
+> - `deep.bw_usage_rate.*` ← Memory.csv `*_bw_usage_rate(%)`（官方通路利用率，归一 0~1）
+> - `deep.active_bw_gb_s.*` ← PipeUtilization `*_active_bw(GB/s)`（真实搬运带宽，不做 MB/s 换算）
+> - `deep.icache_miss_rate.{cube,vec}` ← PipeUtilization `ai*_icache_miss_rate`
+> - `deep.conflict.{cube,vec,mte1,mte2,mte3}_wait_ratio` ← ResourceConflictRatio `ai*_wait_ratio`（规范短名，消除子串歧义）
+> - `deep.compute.vec_fp16/int32/int16/misc_ratio`、`cube_fp/int_instr_number` ← ArithmeticUtilization
+> - `execution_summary.rated_freq_mhz` / `mix_block_dim` ← OpBasicInfo `Rated Freq` / `Mix Block Dim`
+> - `deep.roofline.traffic_redundancy_read` ← 计算（实际读 datas ÷ est_bytes_in，>1.5=重复搬运）
 
-### Tier 1 算法结构 — 先定"用对算法、算力用对没"（11 字段）
+### Tier 1 算法结构 — 先定"用对算法、算力用对没"（13 字段）
 
 | normalized 字段（中文） | 来源 | 用途/判据 |
 |---|---|---|
@@ -229,6 +239,8 @@
 | `deep.compute.vector_fops` | msprof op / ArithmeticUtilization `aiv_vec_fops` | vector FLOPs（纯cube kernel 为 NA，正常） |
 | `deep.compute.cube_ratio` | msprof op / ArithmeticUtilization `aic_cube_ratio` | cube 利用率低 → 算法不行 |
 | `deep.compute.cube_fp16_ratio` / `cube_int8_ratio` | msprof op / ArithmeticUtilization | 精度判断（该用 fp16 没换 → 精度层） |
+| `deep.compute.cube_fp_instr_number` | msprof op / ArithmeticUtilization `aic_cube_fp_instr_number` | cube fp 指令条数（冗余计算判断） |
+| `deep.compute.vec_fp16_ratio` | msprof op / ArithmeticUtilization `aiv_vec_fp16_ratio` | vec fp32 占比高 → vec 可降 fp16 |
 | `deep.engine_utilization.vec` | msprof op / PipeUtilization `aiv_vec_ratio` | vec 高 cube 低 → 该用 matmul 却走逐元素 |
 | `deep.roofline.compute_utilization` | 计算 | 对 294.9TFLOPS 利用率 |
 | `deep.roofline.arithmetic_intensity` | 计算 | 计算/访存比，roofline 关键 |
@@ -260,12 +272,15 @@
 | `deep.bandwidth_gb_s.l0a_read/write` | msprof op / MemoryL0 `aic_l0a_read/write_bw` | L0A 带宽饱和 |
 | `deep.bandwidth_gb_s.l0b_read/write` | msprof op / MemoryL0 `aic_l0b_read/write_bw` | L0B 带宽饱和 |
 
-### Tier 4 内存访问 — 再调"带宽用满没、L2 命中"（9 字段）
+### Tier 4 内存访问 — 再调"带宽用满没、L2 命中"（12 字段）
 
 | normalized 字段（中文） | 来源 | 用途/判据 |
 |---|---|---|
 | `deep.bandwidth_gb_s.main_mem_read/write` | msprof op / Memory `aic_main_mem_read/write_bw` | 接近 1638.4GB/s → memory_bound → 减数据量/升精度 |
 | `deep.bandwidth_gb_s.gm_to_ub/ub_to_gm` | msprof op / Memory `aiv_gm_to_ub_bw`/`aiv_ub_to_gm_bw` | 搬运通路（纯cube kernel 为 NA，正常） |
+| `deep.traffic_kb.main_mem_read/write_kb` | msprof op / Memory `read/write_main_memory_datas(KB)` | ★实际主存读/写量（官方实测，判"数据量能否减"） |
+| `deep.bw_usage_rate.gm_to_l1` | msprof op / Memory `GM_to_L1_bw_usage_rate(%)` | ★官方通路利用率（>90% = 该通路已饱和） |
+| `deep.roofline.traffic_redundancy_read` | 计算 | ★实际读 ÷ est 最小读；>1.5 → 分块复用差/重复搬运 |
 | `deep.l2_hit_rate` | msprof op / L2Cache | 低 → 数据复用差 → 调分块驻留 L2 |
 | `kernels[].task.pipes_us.aic_mte2_time` | 通用 msprof / op_summary（归一化自 mac/mte3） | GM 读耗时 |
 | `kernels[].task.pipes_us.aic_mte3_time` | 通用 msprof / op_summary | GM 写耗时（cube缺用 aiv_mte3） |
@@ -285,16 +300,20 @@
 | `deep.conflict.bankgroup_cflt_ratio` | msprof op / ResourceConflictRatio | >4% → 调 repeatStride/blockStride |
 | `deep.conflict.total_cflt_ratio` | msprof op / ResourceConflictRatio | >5% → 触发冲突优化流程 |
 
-### Tier 6 910B3 架构 — 最后调"取指、阻塞、引擎分配"（6 字段）
+### Tier 6 910B3 架构 — 最后调"取指、阻塞、引擎分配"（9 字段）
 
 | normalized 字段（中文） | 来源 | 用途/判据 |
 |---|---|---|
 | `deep.engine_utilization`（全引擎） | msprof op / PipeUtilization | 引擎分布 |
-| `deep.conflict.mte_cflt_ratio` | msprof op / ResourceConflictRatio | mte 冲突 |
-| `deep.conflict.wait_ratio` | msprof op / ResourceConflictRatio `aiv_vec_wait_ratio` | 阻塞高 → double buffer |
+| `deep.icache_miss_rate.{cube,vec}` | msprof op / PipeUtilization `ai*_icache_miss_rate` | 指令取指（数值越小越好） |
+| `deep.conflict.cube_wait_ratio` | msprof op / ResourceConflictRatio `aic_cube_wait_ratio` | cube 被阻塞 → 流水重叠不足 |
+| `deep.conflict.vec_wait_ratio` | msprof op / ResourceConflictRatio `aiv_vec_wait_ratio` | vec 被阻塞 → double buffer |
+| `deep.conflict.mte2_wait_ratio` / `mte3_wait_ratio` | msprof op / ResourceConflictRatio `ai*_mte2/3_wait_ratio` | MTE 等待占比 → 搬运流水 |
 | `kernels[].task.task_type` | 通用 msprof / op_summary | 引擎分配 |
 | `kernels[].task.block_dim` | 通用 msprof / op_summary | 核数 |
 | `deep.roofline.bottleneck_type` | 计算 | 瓶颈类型 |
+
+> 注：`conflict.*_wait_ratio` 用**规范短名**（`vec_wait_ratio` 等，见四B 下方说明）——避免 `_get` 子串匹配把 `aiv_vec_wait_ratio`/`aic_cube_wait_ratio`/`aic_mte2_wait_ratio` 混为一谈。`Mix Block Dim`（OpBasicInfo）可用于 Mix 融合算子主/从核数分配，parser 已提取（非 Mix 为 N/A→None）。
 
 ---
 
@@ -328,12 +347,13 @@
 | 引擎归属 | `Task Type` |
 | 总耗时 | `Task Duration(us)` |
 | 核数 | `Block Dim` |
+| Mix 融合算子从核数 | `Mix Block Dim`（N/A=非 Mix，A2 系） |
 | 算子名/类型 | `Op Name` / `Op Type` |
 | 输入形状/类型 | `Input Shape(s)` / `Input Data Type(s)` |
 | 输出形状/类型 | `Output Shape(s)` / `Output Data Type(s)` |
 | AI Core/Vector 理论时间 | `aicore_time(us)` / `aiv_time(us)` |
 | 总周期 | `aic_total_cycles` / `aiv_total_cycles` |
-| 频率 | `Current Freq(MHz)` |
+| 当前/理论频率 | `Current Freq` / `Rated Freq` |
 
 **PipeUtilization.csv** — 计算/搬运单元耗时及占比
 
@@ -346,7 +366,8 @@
 | 核→GM 写 (MTE3) | `aic_mte3_time(us)` / `aic_mte3_ratio` / `aiv_mte3_time(us)` |
 | 标量指令 | `aic_scalar_time(us)` / `aic_scalar_ratio` / `aiv_scalar_time(us)` |
 | L0C→L1 (fixpipe) | `aic_fixpipe_time(us)` / `aic_fixpipe_ratio` |
-| 指令cache缺失率 | `aic_icache_miss_rate` |
+| 指令cache缺失率 | `ai*_icache_miss_rate`（aic_=cube / aiv_=vec） |
+| 活跃带宽（真实搬运） | `aiv_mte2_active_bw(GB/s)` / `aic_mte3_active_bw(GB/s)` / `aiv_mte3_active_bw(GB/s)` / `aic_fixpipe_active_bw(GB/s)`（`aic_mte1/mte2_active_bw` 需 MemoryDetail） |
 | 基础时间/周期 | `aic_time(us)` / `aiv_time(us)` / `aic_total_cycles` / `aiv_total_cycles` |
 
 **ArithmeticUtilization.csv** — 计算量及指令占比
@@ -368,6 +389,10 @@
 | L1 读/写带宽 | `aic_l1_read_bw` / `aic_l1_write_bw` |
 | GM→UB 带宽 (MTE2) | `aiv_gm_to_ub_bw` |
 | UB→GM 带宽 (MTE3) | `aiv_ub_to_gm_bw` |
+| 实际主存读/写量 (KB) | `read_main_memory_datas(KB)` / `write_main_memory_datas(KB)` |
+| 各通路实际搬运量 (KB) | `GM_to_L1_datas(KB)` / `L1_to_GM_datas(KB)(estimate)` / `L0C_to_L1_datas(KB)` / `L0C_to_GM_datas(KB)` / `GM_to_UB_datas(KB)` / `UB_to_GM_datas(KB)` |
+| 官方通路带宽利用率 | `GM_to_L1_bw_usage_rate(%)` / `L1_to_GM_bw_usage_rate(%)(estimate)` / `L0C_to_L1_bw_usage_rate(%)` / `L0C_to_GM_bw_usage_rate(%)` / `GM_to_UB_bw_usage_rate(%)` / `UB_to_GM_bw_usage_rate(%)` |
+| MTE 指令条数/占比 | `aic_mte1_instructions` / `ai*_mte2_instructions` / `ai*_mte3_instructions` + 对应 `*_ratio` |
 
 **MemoryL0.csv** — L0A/L0B/L0C 带宽
 
@@ -400,6 +425,7 @@
 | 资源冲突 | `aiv_vec_resc_cflt_ratio` |
 | mte 冲突 | `aiv_vec_mte_cflt_ratio` |
 | vec/cube 被阻塞 | `aiv_vec_wait_ratio` / `aic_cube_wait_ratio` |
+| MTE 等待占比 | `ai*_mte1_wait_ratio` / `ai*_mte2_wait_ratio` / `ai*_mte3_wait_ratio` |
 
 ### 5.2 通用 `msprof` 产出（任务级）
 

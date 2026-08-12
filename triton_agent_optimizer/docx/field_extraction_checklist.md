@@ -15,9 +15,11 @@
 ### A1. OpBasicInfo.csv（kernel 级基础信息）
 
 - [ ] `execution_summary.total_ns` ← 没提取到 → 本应从 **msprof op** 的 **OpBasicInfo.csv** 的 **`Task Duration(us)`** 提取 ✅
-- [ ] `execution_summary.num_cores` ← 没提取到 → 本应从 **msprof op** 的 **OpBasicInfo.csv** 的 **`Block Dim`** 提取 ✅
+- [ ] `execution_summary.num_cores` ← 没提取到 → 本应从 **msprof op** 的 **OpBasicInfo.csv** 的 **`Block Dim`** 提取（🔶 注意与 `Mix Block Dim` 区分，列序 Block Dim 在前）✅
 - [ ] `execution_summary.kernel_name` ← 没提取到 → 本应从 **msprof op** 的 **OpBasicInfo.csv** 的 **`Op Name`** 提取 ✅
-- [ ] `execution_summary.freq_mhz` ← 没提取到 → 本应从 **msprof op** 的 **OpBasicInfo.csv** 的 **`Current Freq(MHz)`** 提取 ✅
+- [ ] `execution_summary.freq_mhz` ← 没提取到 → 本应从 **msprof op** 的 **OpBasicInfo.csv** 的 **`Current Freq`** 提取 ✅
+- [ ] `execution_summary.rated_freq_mhz` ← 没提取到 → 本应从 **msprof op** 的 **OpBasicInfo.csv** 的 **`Rated Freq`** 提取（对比 Current Freq 检测降频）✅
+- [ ] `execution_summary.mix_block_dim` ← 没提取到 → 本应从 **msprof op** 的 **OpBasicInfo.csv** 的 **`Mix Block Dim`** 提取（N/A=非 Mix 融合算子，合法空）✅
 
 ### A2. PipeUtilization.csv（引擎利用率 + 每 pipe 耗时）
 
@@ -28,6 +30,9 @@
 - [ ] `engine_utilization.mte3` ← 没提取到 → 本应从 **msprof op** 的 **PipeUtilization.csv** 的 **`aic_mte3_ratio`**（或 `aiv_mte3_ratio`）提取 ✅
 - [ ] `engine_utilization.scalar` ← 没提取到 → 本应从 **msprof op** 的 **PipeUtilization.csv** 的 **`aic_scalar_ratio`**（或 `aiv_scalar_ratio`）提取 ✅
 - [ ] `engine_utilization.fixpipe` ← 没提取到 → 本应从 **msprof op** 的 **PipeUtilization.csv** 的 **`aic_fixpipe_ratio`** 提取（🔶 或 `aic_fixp_ratio`）✅
+- [ ] `icache_miss_rate.cube/vec` ← 没提取到 → 本应从 **msprof op** 的 **PipeUtilization.csv** 的 **`aic_icache_miss_rate` / `aiv_icache_miss_rate`** 提取（数值越小越好，Tier6 取指判据）✅
+- [ ] `active_bw_gb_s.mte2_aiv/mte3_aic/mte3_aiv/fixpipe_aic` ← 没提取到 → 本应从 **msprof op** 的 **PipeUtilization.csv** 的 **`aiv_mte2_active_bw(GB/s)` / `aic_mte3_active_bw(GB/s)` / `aiv_mte3_active_bw(GB/s)` / `aic_fixpipe_active_bw(GB/s)`** 提取（官网单位 GB/s，**不做 MB/s 换算**）✅
+  - ⚠ `aic_mte1_active_bw(GB/s)` / `aic_mte2_active_bw(GB/s)` 仅开 `--aic-metrics=MemoryDetail` 才有 → 910B3 8.5.1 默认合法缺，别去找
 
 ### A3. ArithmeticUtilization.csv（算力）
 
@@ -36,6 +41,8 @@
 - [ ] `compute.cube_ratio` ← 没提取到 → 本应从 **msprof op** 的 **ArithmeticUtilization.csv** 的 **`aic_cube_ratio`** 提取 ✅
 - [ ] `compute.cube_fp16_ratio` ← 没提取到 → 本应从 **msprof op** 的 **ArithmeticUtilization.csv** 的 **`aic_cube_fp16_ratio`** 提取 ✅
 - [ ] `compute.cube_int8_ratio` ← 没提取到 → 本应从 **msprof op** 的 **ArithmeticUtilization.csv** 的 **`aic_cube_int8_ratio`** 提取 ✅
+- [ ] `compute.cube_fp_instr_number` / `cube_int_instr_number` ← 没提取到 → 本应从 **msprof op** 的 **ArithmeticUtilization.csv** 的 **`aic_cube_fp_instr_number`** / **`aic_cube_int_instr_number`** 提取（冗余计算判断）✅
+- [ ] `compute.vec_fp16_ratio` / `vec_int32_ratio` / `vec_int16_ratio` / `vec_misc_ratio` ← 没提取到 → 本应从 **msprof op** 的 **ArithmeticUtilization.csv** 的 **`aiv_vec_fp16_ratio`** / **`aiv_vec_int32_ratio`** / **`aiv_vec_int16_ratio`** / **`aiv_vec_misc_ratio`** 提取（vec fp32 高 → 可降 fp16）✅
 - [ ] `compute.aic_total_cycles` ← 没提取到 → 本应从 **msprof op** 的 **ArithmeticUtilization.csv** 的 **`aic_total_cycles`** 提取 ✅
 - [ ] `compute.aiv_total_cycles` ← 没提取到 → 本应从 **msprof op** 的 **ArithmeticUtilization.csv** 的 **`aiv_total_cycles`** 提取 ✅
 
@@ -47,6 +54,10 @@
 - [ ] `l1_write_gb_s` ← 没提取到 → 本应从 **msprof op** 的 **Memory.csv** 的 **`aic_l1_write_bw`** 提取 ✅
 - [ ] `gm_to_ub_gb_s` (GM→UB, MTE2) ← 没提取到 → 本应从 **msprof op** 的 **Memory.csv** 的 **`aiv_gm_to_ub_bw`** 提取 ✅
 - [ ] `ub_to_gm_gb_s` (UB→GM, MTE3) ← 没提取到 → 本应从 **msprof op** 的 **Memory.csv** 的 **`aiv_ub_to_gm_bw`** 提取 ✅
+- [ ] `traffic_kb.main_mem_read_kb` ← 没提取到 → 本应从 **msprof op** 的 **Memory.csv** 的 **`read_main_memory_datas(KB)`** 提取（★实际主存读量，官方实测）✅
+- [ ] `traffic_kb.main_mem_write_kb` ← 没提取到 → 本应从 **msprof op** 的 **Memory.csv** 的 **`write_main_memory_datas(KB)`** 提取 ✅
+- [ ] `traffic_kb.gm_to_l1_kb` / `l1_to_gm_kb` / `l0c_to_l1_kb` / `l0c_to_gm_kb` / `gm_to_ub_kb` / `ub_to_gm_kb` ← 没提取到 → 本应从 **msprof op** 的 **Memory.csv** 的 **`GM_to_L1_datas(KB)`** / **`L1_to_GM_datas(KB)(estimate)`** / **`L0C_to_L1_datas(KB)`** / **`L0C_to_GM_datas(KB)`** / **`GM_to_UB_datas(KB)`** / **`UB_to_GM_datas(KB)`** 提取（列名带 (KB)/(estimate) 后缀，parser 用规范化列名匹配）✅
+- [ ] `bw_usage_rate.gm_to_l1` / `l1_to_gm` / `l0c_to_l1` / `l0c_to_gm` / `gm_to_ub` / `ub_to_gm` ← 没提取到 → 本应从 **msprof op** 的 **Memory.csv** 的 **`GM_to_L1_bw_usage_rate(%)`** 等 6 个 `*_bw_usage_rate(%)` 列提取（★官方通路利用率，归一 0~1，>90%=通路饱和）✅
 - [ ] `l2_read_gb_s` / `l2_write_gb_s` ← 没提取到 → **⚠️ Memory.csv 没有 L2 带宽列**（A2 系），别去找，属合法缺
 
 ### A5. MemoryL0.csv（L0A/L0B/L0C 带宽）
@@ -78,6 +89,7 @@
 - [ ] `conflict.total_cflt_ratio` ← 没提取到 → 本应从 **msprof op** 的 **ResourceConflictRatio.csv** 的 **`aiv_vec_total_cflt_ratio`** 提取 ✅
 - [ ] `conflict.resc_cflt_ratio` ← 没提取到 → 本应从 **msprof op** 的 **ResourceConflictRatio.csv** 的 **`aiv_vec_resc_cflt_ratio`** 提取 ✅
 - [ ] `conflict.mte_cflt_ratio` ← 没提取到 → 本应从 **msprof op** 的 **ResourceConflictRatio.csv** 的 **`aiv_vec_mte_cflt_ratio`** 提取 ✅
+- [ ] `conflict.cube_wait_ratio` / `vec_wait_ratio` / `mte1_wait_ratio` / `mte2_wait_ratio` / `mte3_wait_ratio` ← 没提取到 → 本应从 **msprof op** 的 **ResourceConflictRatio.csv** 的 **`aic_cube_wait_ratio`** / **`aiv_vec_wait_ratio`** / **`ai*_mte1_wait_ratio`** / **`ai*_mte2_wait_ratio`** / **`ai*_mte3_wait_ratio`** 提取（★规范短名，planner 精确匹配；mte wait 系列 aic/aiv 同名 → 优先 aic=cube 侧）✅
 
 ---
 

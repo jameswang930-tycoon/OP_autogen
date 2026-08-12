@@ -266,9 +266,15 @@ if [ "$MULTI" = "1" ]; then
   done
   if [ "$HIVM_OK" -eq 1 ]; then
     pass "hivm_try.txt 生成"
-    "$PY" "$SCRIPT_DIR/filter_hivm_for_fusion.py" "$FUSION_DIR/hivm_try.txt" --out "$FUSION_DIR/hivm_fusion_view.txt"
-    pass "hivm_fusion_view.txt ✓ → $FUSION_DIR (融合专用: op+同步+依赖)"
-    echo "  → LLM 读 $FUSION_DIR/hivm_fusion_view.txt: 找 RAW 链相邻逐元素 op → 融合; WAR → 换 buffer"
+    # ★P3: 传 board.json 给融合视图 → 每 op 附实测 pipe 耗时占比 (planner 排融合优先级)
+    BOARDLIST=$(ls "$D"/board_*.json 2>/dev/null | paste -sd, -)
+    if [ -n "$BOARDLIST" ]; then
+      "$PY" "$SCRIPT_DIR/filter_hivm_for_fusion.py" "$FUSION_DIR/hivm_try.txt" --out "$FUSION_DIR/hivm_fusion_view.txt" --boards "$BOARDLIST"
+    else
+      "$PY" "$SCRIPT_DIR/filter_hivm_for_fusion.py" "$FUSION_DIR/hivm_try.txt" --out "$FUSION_DIR/hivm_fusion_view.txt"
+    fi
+    pass "hivm_fusion_view.txt ✓ → $FUSION_DIR (融合专用: op+同步+依赖+每op耗时占比)"
+    echo "  → LLM 读 $FUSION_DIR/hivm_fusion_view.txt: 找 RAW 链相邻逐元素 op → 融合; WAR → 换 buffer; ★先融合耗时占比最高的链"
   else
     fail "hivm 生成失败 (看 $FUSION_DIR/hivm_try.txt)"
   fi

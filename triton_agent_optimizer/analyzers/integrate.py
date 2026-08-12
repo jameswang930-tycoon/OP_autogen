@@ -69,7 +69,13 @@ def build_deep(bd):
     comp_util = max(comp_util_fp16, comp_util_fp32)
     return {
         "freq_mhz": b_sum.get("freq_mhz"),
+        "rated_freq_mhz": b_sum.get("rated_freq_mhz"),
+        "mix_block_dim": b_sum.get("mix_block_dim"),
         "bandwidth_gb_s": bw,
+        "traffic_kb": b_norm.get("traffic_kb", {}),            # ★官方实际搬运量 (KB)
+        "bw_usage_rate": b_norm.get("bw_usage_rate", {}),      # ★官方通路带宽利用率 (0~1)
+        "active_bw_gb_s": b_norm.get("active_bw_gb_s", {}),    # ★活跃带宽 (GB/s)
+        "icache_miss_rate": b_norm.get("icache_miss_rate"),    # ★ICache 缺失率
         "engine_utilization": b_norm.get("engine_utilization", {}),
         "compute": comp,
         "conflict": b_norm.get("conflict", {}),
@@ -117,6 +123,13 @@ def integrate(task_p, out_p, board_paths):
             slot["deep"] = build_deep(b)
             slot["filled_by"] = "msprof op"
             filled += 1
+            # ★P2: 搬运冗余倍数 = 实际主存读量 (msprof op 实测) / 理论最小读量 (op_summary est, 每元素搬一次)
+            #   >1.5 → 分块复用差/重复搬运 (Tier3/4 判据); 只有两侧都有值才算 (None 说明 est 或 datas 缺)
+            _read_kb = (slot["deep"].get("traffic_kb") or {}).get("main_mem_read_kb")
+            _est = (slot.get("task") or {}).get("est_bytes_in")
+            if _read_kb and _est:
+                slot["deep"]["roofline"]["traffic_redundancy_read"] = round(
+                    _read_kb * 1024 / _est, 2)
         kernels_out.append(slot)
 
     num_kernels = t_sum.get("num_kernels", len(slots))

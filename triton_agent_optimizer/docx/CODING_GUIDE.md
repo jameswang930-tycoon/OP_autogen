@@ -71,7 +71,8 @@ def kernel(x_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
 ### 数学
 - `tl.math.exp`, `tl.math.sqrt`, `tl.math.rsqrt` ✅
 - `tl.math.log`, `tl.math.log2`, `tl.math.exp2` ✅
-- `tl.math.sin`, `tl.math.cos`, `tl.math.erf` ✅
+- `tl.math.sin`, `tl.math.cos` ✅
+- ⚠ `tl.math.erf` **triton-ascend 不可用**（编译失败）→ 激活一律用 `tl.math.tanh` 近似（与全部 playbook 一致）
 - `x + y`, `x * y`, `x - y`, `x / y` ✅
 
 ### 张量操作（3.4.0 新增支持）

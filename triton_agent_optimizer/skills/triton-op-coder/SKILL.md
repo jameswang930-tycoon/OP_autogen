@@ -45,7 +45,7 @@ argument-hint: >
 
 1. plan 的 `changes[]` 每项是 `{old_code, new_code}`。
 2. 对每项做**精确字符串替换**：在**当前文件**里找到 `old_code`，原样替换成 `new_code`。
-3. **找不到 `old_code` 就报告**（输出 `# CODER: old_code 未匹配: <内容>`），**绝不猜测乱改**。
+3. **找不到 `old_code` 就原样输出你读到的 kernel 代码**（不要加注释标记——系统会自动判定 no-op 并把"未匹配"写进历史，下轮 planner 会看到；乱加注释会绕过 no-op 检测白耗一轮 verify）。**绝不猜测乱改**。
 4. 改完跑语法检查，确保仍是合法 Python。
 5. 只有当 `changes[]` 为空、或 previous_error 需要 LLM 修报错时，才自己改码。
 
@@ -103,7 +103,7 @@ argument-hint: >
 
 ## 输出
 输出**完整**的修改后 `kernel_op.py` 源码。**不要** markdown 代码块包裹，**不要**解释文字。
-如果无法改进（plan 与代码冲突），原样输出原代码并在末尾加 `# CODER: no-op, <原因>`。
+如果无法改进（plan 与代码冲突/old_code 找不到），**原样输出原代码**（系统会判定 no-op 并把原因写进历史，不要加任何注释标记）。
 
 ## 铁律
 1. 只改 `kernel_op.py` 这一个文件。

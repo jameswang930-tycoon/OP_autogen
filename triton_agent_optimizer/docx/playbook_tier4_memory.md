@@ -1,5 +1,39 @@
 # Triton 优化 Tier 4（内存访问）策略指南 — 针对 triton-ascend 910B3
 
+> ## ★★速查卡（★先读这个；你实际能读全文，但速查卡在最前面=最快定位，决策先靠它，细节看情况A~J）★★
+>
+> **工作流（3 步，别跳）**：
+> 1. 读 `07_tier4_fields/tier4_fields.txt` + `planner_context.json` → 找 **main_mem_read/write / gm_to_ub / ub_to_gm / l2_hit_rate / mte2/mte3 耗时 / bottleneck_type**
+> 2. 照下表定位"情况"→ 看情况 A~H 代码
+> 3. 输出 changes[]：old_code 逐字复制；拿不准不改（宁缺勿错）
+>
+> **字段 → 情况速查表（★主决策表）**：
+> | 字段/现象 | 情况 | 动作（一句话） |
+> |---|---|---|
+> | gm_to_ub/main_mem_read 带宽低 + 有跨步访问 | A | 连续化（最快维匹配内存布局；innermost stride=1） |
+> | 转置 matmul（Q@K^T）用指针转置 | A-案例1 | ★host 端预转置 K，kernel 内 innermost stride=1 |
+> | 对齐告警 / main_mem 流量偏大 | B | 维度 pad 到 16B（128-bit）倍数 |
+> | l2_hit_rate 低 + main_mem_read 高 | C | swizzle（tier3 §三）/ 权重预排 |
+> | mte2/mte3 高但 cube 空等 | D | load 独立成步骤让编译器流水线（UB 留双缓冲空间） |
+> | 多个连续小 load | E | 一次大 load（★tl.arange 必须 2 幂，4 宽+mask） |
+> | 带宽 ~70% 封顶（无跨步/L2 问题） | F | 行宽对齐 512B（fp32 BLOCK_N=128，fp16=256） |
+> | store 跨步 / 输出要转置 | G | UB 内 `tl.trans` 后连续 store |
+> | S/P 中间张量进 GM | H | online softmax 融合（S/P 只在寄存器） |
+> | memory_utilization ≥ 0.8 | — | ★访存已到上限 → promote（别在本层折腾 3 轮） |
+> | 上面全不触发 | — | 访存已优 → promote Tier5（附 evidence） |
+>
+> **★我们算子对照（本层能做什么）**：
+> - `input/attention_mlp`：attention_scores 的 K^T 已预转置（正确样例）；检查其它 kernel 有无跨步
+> - `input/flash_attention`：K 已预转置（正确样例）
+> - `input/matmul_transpose`：B 转置 → 若 kernel 内指针转置 → host 预转置（情况A-案例1）
+> - `input/matmul` 等其余：已是连续访问（正确样例）→ 查 l2/对齐/流水线（C/D/F）
+> - `input/conv2d` / `conv_bias_relu`：跨步重读 → 根因是算法（外积不上 cube，**待 Tier1 im2col 重构**），本层只处理访存模式
+> - 逐元素（sigmoid/vector_add/fused_add_mul）：1D 扁平化已连续 → 查对齐/UB（B/F）
+>
+> **禁止（违反=失败）**：改算法/融合/分块（跨层）、`tl.arange(0,3)` 非 2 幂、合并不连续地址、num_warps/autotune、跨步访问不修就声称"访存已优"。
+
+---
+
 > 本层在 Tier1/2/3 之后：**优化访存模式**（连续/对齐/L2复用/流水线），**不改算法、不融合、不调分块**。
 > 昇腾 80~90% 的性能瓶颈是**内存访问效率**，不是算力。目标：数据尽量在 UB/L2 流转，少碰 HBM，每次访问"满载而归"。
 >
@@ -167,12 +201,12 @@ shift = tl.load(params_ptr + 2)
 
 ### ✅ 修改后正确代码（一次大 load，寄存器切片）
 ```python
-# ✅ 一次连续 load; ★tl.arange 两端必须 2 幂 → 用 4 宽 + mask 取前 3 个
-offs = tl.arange(0, 4)                                  # (0,3) 会编译失败: arange 要求 2 幂
+# ✅ 一次连续 load; ★tl.arange 区间长度 (end−start) 必须 2 的幂 → 用 4 宽 + mask 取前 3 个
+offs = tl.arange(0, 4)                                  # arange(0,3) 会编译失败 (长度非 2 幂)
 params = tl.load(params_ptr + offs, mask=offs < 3, other=0.0)   # 一次总线请求搬 16B
 bias, scale, shift = params[0], params[1], params[2]    # 标量切片
 ```
-**约束/坑**：仅当地址连续、mask 一致才合并；合并不连续地址会读到错数据。`tl.arange(0, 3)` **非法**（arange 要求 start/end 是 2 幂）→ 用 4 宽 + mask；4×fp32=16B 是单事务且 16B 对齐，3×fp32=12B 反而不对齐。
+**约束/坑**：仅当地址连续、mask 一致才合并；合并不连续地址会读到错数据。`tl.arange(0, 3)` **非法**（arange 区间长度要求 2 幂）→ 用 4 宽 + mask；4×fp32=16B 是单事务且 16B 对齐，3×fp32=12B 反而不对齐。
 
 ---
 
@@ -278,8 +312,8 @@ tl.store(o_ptrs, acc / l_i[:, None], mask=...)   # 只写 O 一次
 
 ## 实战案例（真实 910B3 排障）：跨步访问 → 88× 差距与修复
 
-> **来源**：attention_mlp / flash_attention / conv2d 优化后 vs PyTorch 出现几十倍差距。
-> **排查结论**：测量链路先核对无误（warmup×3 + 一次 msprof 内 KERNEL_LOOP=30 次 ÷30；PyTorch 侧 warmup×3 + Event 30 次 forward ÷30，两者对齐）→ 差距真实 → 根因全是 **DMA 跨步访问**（情况A 的真实实例）。
+> **来源**：attention_mlp / flash_attention / conv2d 优化后 vs PyTorch 出现几十倍差距（★均为 2026-08 修复前、fp32 时代的**历史排障记录**，对应修复已落地到 input/ 代码——现在跑不会再差这么多，但"跨步访问"的教训依然成立）。
+> **排查结论**：测量链路先核对无误（当时: warmup×3 + 一次 msprof 内 KERNEL_LOOP=30 次 ÷30；PyTorch 侧 warmup×3 + Event 30 次 forward ÷30，两者对齐）→ 差距真实 → 根因全是 **DMA 跨步访问**（情况A 的真实实例）。★当前测量链路已升级：Event 侧为多窗口 median（KERNEL_EVENT_REPS=5）+ 时间预算自适应 + 输入轮换破 L2（见 README §1.5），PyTorch 侧同款（bench_common.measure_event）。
 >
 > **判断铁律**：`tl.load` 的 tile 若**最后一维（innermost）stride ≠ 1** → 必跨步，必慢。对照工作正常的 matmul：`b_ptrs = b_ptr + (offs_k[:,None]*stride_bk + offs_n[None,:]*stride_bn)`，`stride_bn=1`。
 

@@ -1,5 +1,38 @@
 # Triton 优化 Tier 6（910B3 架构专属）策略指南 — 针对 triton-ascend 910B3
 
+> ## ★★速查卡（★先读这个；你实际能读全文，但速查卡在最前面=最快定位，决策先靠它，细节看情况A~J）★★
+>
+> **工作流（3 步，别跳）**：
+> 1. 读 `07_tier6_fields/tier6_fields.txt` + `planner_context.json` → 找 **wait_ratio / mte_cflt_ratio / bank_cflt_ratio / engine_utilization(cube/vec/mte2/mte3) / task_type / block_dim**
+> 2. 照下表定位"情况"→ 多数情况是**指路回前层**（本层只诊断+回退）
+> 3. 输出 changes[] 或 promote（★本层多数正确动作是 promote 回前层，附 evidence）
+>
+> **字段 → 动作速查表（★主决策表，多数是"回前层"不是改码）**：
+> | 字段/现象 | 动作（回哪层） |
+> |---|---|
+> | wait_ratio 高（vec 被阻塞等数据） | 回 Tier4（流水线/load 独立步骤） |
+> | mte_cflt_ratio 高（搬运冲突） | 回 Tier4/3（连续大搬运/分块） |
+> | bank_cflt_ratio >4% | 回 Tier5-F（swizzle/访问）；多数已自动处理 |
+> | cube 利用率低 且 任务是 matmul | 没用 `tl.dot`（vector 模拟）→ 改 tl.dot；用了但低 → 回 Tier3/1 |
+> | cube/vec 严重失衡（一满一闲） | 回 Tier2（融合平衡引擎） |
+> | block_dim 远小于 40 | 回 Tier3（减分块） |
+> | grid 远超核数 / launch 开销大 | grid 固定核数(20/40) + 核内 stride 循环（情况G） |
+> | 多核耗时不均/尾核空转 | stride 切分（情况H） |
+> | cube/vec 被阻塞但各 pipe 利用率都不高 | K 循环分块 + 双缓冲 UB 预算（情况I） |
+> | 纯 vector 算子（AIV）按 20 核定 grid | 按引擎选核数：纯 vec=40，有 tl.dot=20（情况J） |
+> | 代码有 while/动态 shape/非 tl.math | 静态 for-range + constexpr（情况F） |
+> | 全无 | ★Tier6 已最优 → 停止（附 evidence） |
+>
+> **★我们算子对照（本层能做什么）**：
+> - `input/rms_norm` / `softmax` / `bias_gelu` 类纯 vector kernel：grid 目标核数用 40（情况J）
+> - `input/matmul` / `flash_attention` 等有 tl.dot 的：grid 目标核数 20（情况G/J）
+> - 小 kernel 且 block_dim 显示远超核数：grid 固定核数 + stride 循环（情况G/H）
+> - 其余：先查 wait/mte/bank 冲突 → 按表回前层
+>
+> **禁止（违反=失败）**：设 num_warps/num_stages/multibuffer（编译器管理）、vector 模拟 matmul、tl.erf、while/动态 shape、跨层改码（**本层禁止改算法/融合/分块/访存——那些回对应层；但允许改 grid/循环结构/核数选择（情况G/H/J）和代码风格（情况F）**）。
+
+---
+
 > 本层是**最后兜底**：Tier1~5 都做完后，只剩**架构级信号**（引擎失衡/阻塞/冲突/核数不匹配）没解决。
 > 本层**不新增优化方向**，而是把架构信号映射到具体该回哪一层做，或做最后的代码风格适配。
 >
@@ -262,7 +295,7 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
 # 已 CPU 验证: 512³ BLOCK=64 时 64 个 tile 全覆盖、每核 3~4 个、max|C-ref|=4.8e-7;
 #    tile 总数不能被核数整除时 max-min ≤ 1 (比连续切分更均衡, 见情况H)
 ```
-**约束/坑**：grid 与核数匹配**按算子类型选**（有 `tl.dot` 用 cube 核数 20，纯 vector 用 vector 核数 40，见情况J）；`for tile in range(pid, num_tiles, num_cores)` 是运行时边界的循环，**迭代之间无数据依赖**才能安全分发（本 kernel 每 tile 独立）；grid 极大（>65535，`coreDim` 上限 UINT16_MAX）时设 `TRITON_ALL_BLOCKS_PARALLEL=1`（按序 launch 才生效，需实测）；**launch 开销/派发收益需真机 msprof 确认**（看调度/启动耗时是否下降）。
+**约束/坑**：`tl.arange` 的边界必须 `tl.constexpr`（2 的幂长度）；但 **`for-range` 循环的 start/stop/step 允许运行时值**（情况G 的 `for tile in range(pid, num_tiles, num_cores)` 就是运行时边界——后端能处理）；唯一禁止的是 `while`/动态形状。grid 与核数匹配**按算子类型选**（有 `tl.dot` 用 cube 核数 20，纯 vector 用 vector 核数 40，见情况J）；`for tile in range(pid, num_tiles, num_cores)` 是运行时边界的循环，**迭代之间无数据依赖**才能安全分发（本 kernel 每 tile 独立）；grid 极大（>65535，`coreDim` 上限 UINT16_MAX）时设 `TRITON_ALL_BLOCKS_PARALLEL=1`（按序 launch 才生效，需实测）；**launch 开销/派发收益需真机 msprof 确认**（看调度/启动耗时是否下降）。
 
 ---
 

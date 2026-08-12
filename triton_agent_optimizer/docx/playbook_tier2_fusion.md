@@ -1,5 +1,38 @@
 # Triton 优化 Tier 2（算子融合）策略指南 — 针对 triton-ascend 910B3
 
+> ## ★★速查卡（★先读这个；你实际能读全文，但速查卡在最前面=最快定位，决策先靠它，细节看情况A~J）★★
+>
+> **工作流（3 步，别跳）**：
+> 1. 读 `07_tier2_fields/tier2_fields.txt` + `07_tier2_fields/planner_context.json` → 找 **num_kernels / api_overhead_total_us / main_mem 带宽 / bottleneck_type**
+> 2. (有 08_fusion/fusion_analysis.json 就 `cat` 它) 照下表定位"情况"→ 看情况 A~G 代码
+> 3. 输出 changes[]：**old_code 从你读到的 kernel_op.py 逐字复制**；拿不准不改（宁缺勿错）
+>
+> **字段 → 情况速查表（★主决策表）**：
+> | 字段/现象 | 情况 | 动作（一句话） |
+> |---|---|---|
+> | matmul 后跟独立 bias/激活 kernel | A | 并进 matmul epilogue（bias+tanh-GELU 在 store 前算） |
+> | matmul 后跟独立 add（残差） | B | 残差 O 在 UB 里直接 load 相加（不进 GM） |
+> | 同一指针同一偏移 load ≥2 次 | C | 读一次，寄存器复用 |
+> | RAW 链多步纯算术（平方→求和→开方） | D | 合并表达式（★禁止改运算顺序） |
+> | 想融合但单块张量 ≥6 / ≥64KB | E | 控制融合深度 2~3 级（防寄存器/UB 溢出） |
+> | attention 的 scale/mask 是独立步骤 | F | 并进 QK^T（scale 乘进 acc；★mask 必须先于 max） |
+> | main_mem 大但算力利用率低（融合后仍高） | G | 查 GEMM 输出格式（NC1HWC0）与下游不匹配的隐式转换 |
+> | fusion_analysis 的 raw_deps 有 matmul→逐元素 链 | A/B | 优先融合占比最大的中间 kernel |
+> | 融合前中间 kernel <2×launch 开销 | — | 评估是否值得（省的是 GM+launch，不是算术量） |
+> | 上面全不触发 | — | 无可融合 → promote Tier3（★必填 promote_evidence） |
+>
+> **★我们算子对照（本层能做什么，别自己发明）**：
+> - `input/matmul`（两层 MLP）：**FC1 → 独立 bias_gelu → FC2，3 分离 kernel** → 把 bias+GELU 并进 FC1 epilogue（情况A，★本层最优先，文档有完整重构示例）
+> - `input/matmul_relu`：matmul → 独立 relu → 并进 epilogue（情况A）
+> - `input/attention_mlp`（9 kernel）：残差 add_kernel 并进 FC2（情况B）；mlp_gelu 已融合（正确样例）
+> - `input/conv_bias_relu`（3 kernel）：bias/relu 独立 kernel → 并进 conv epilogue（情况A，conv 改 im2col 后在 epilogue 加）
+> - `input/rms_norm_residual`：残差加并入（情况B）
+> - 单 kernel 算子（flash_attention/sigmoid/vector_add/softmax/rms_norm/layernorm/fused_add_mul/conv2d）：无融合空间 → 直接 promote
+>
+> **禁止（违反=失败）**：跨 store/跨迭代融合、融合时改浮点顺序、过度融合（寄存器/L0C 溢出）、num_warps/autotune、tl.erf、跨层改动（Tier2 只做融合；改算法是 Tier1、改 BLOCK 是 Tier3）。
+
+---
+
 > 本层在 Tier1（算法）之后：**合并相邻算子，消除中间 GM 往返**，不改变算法逻辑。
 > 本层**只做融合**，**不改算法选择**（Tier1）、**不调分块**（Tier3）。
 >
@@ -206,7 +239,7 @@ inv_std = tl.math.rsqrt(tl.sum(x*x, axis=0)/n_cols + eps)    # 先平方和再�
 out = x * inv_std
 # 但若改成: inv_std = tl.math.rsqrt(tl.sum((x/n_cols)**2, axis=0) ...) ← 改顺序, 精度变
 ```
-**出现的问题**：融合时**重排浮点运算**会改变舍入 → 与参考差 >1e-6，`MATCH_VERIFY` 失败。融合只允许"合并表达式"，**禁止改运算顺序/结合性**。
+**出现的问题**：融合时**重排浮点运算**会改变舍入 → 与参考差 >1e-6，`MATMUL_VERIFY` 失败。融合只允许"合并表达式"，**禁止改运算顺序/结合性**。
 
 ### ✅ 修改后正确代码（保序融合）
 ```python

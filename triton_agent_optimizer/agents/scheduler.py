@@ -408,6 +408,25 @@ def extract_tier_fields(diagnosis: dict, tier: int) -> str:
 #  ★P2: 给 planner 的完整数据上下文 — 每 kernel 全量 task/deep + 占比 + Top耗时 + 轨迹 + 手递
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ★GLM5.1 上下文预算 (2026-08-12): 压缩线=200k×70%=140k tokens, 目标把每轮 nga 输入压在 ~20k
+#   planner_context 的 history 轻量化: 去掉 changes_full(完整代码, 审计用, planner 不需要),
+#   error 截断, 限最近 n 轮 — 否则 100 轮长跑时 context 线性膨胀到 50k+ tokens.
+def _compact_history(history: list, n: int = 20) -> list:
+    """history → 轻量摘要 (planner 决策用): 只留 试过什么→结果, 不要 changes_full 全文."""
+    out = []
+    for h in history[-n:]:
+        out.append({
+            "round": h.get("round"), "tier": h.get("tier"),
+            "strategy": (h.get("strategy") or "")[:60],
+            "change": (h.get("change") or "")[:80],
+            "speedup": h.get("speedup"), "prev_speedup": h.get("prev_speedup"),
+            "decision": h.get("decision"), "result": h.get("result"),
+            "error": (h.get("error") or "")[:60],
+            "e2e_event_ns": h.get("e2e_event_ns"),
+        })
+    return out
+
+
 def _sanitize_for_ctx(obj, depth=0):
     """递归精简: 去 None/空容器, 截断超长字符串, 列表截前 N — 防 planner_context 膨胀. 保结构."""
     if depth > 6 or obj is None:
@@ -465,7 +484,7 @@ def build_planner_context(diagnosis: dict, tier: int, state: dict, history: list
                               "time_us_total": k["time_us_total"]} for k in top[:5]],
         "trajectory_state": {kk: state.get(kk) for kk in
                              ("tier", "round", "best_speedup", "current_speedup", "total_rounds", "num_kernels")},
-        "history": history[-40:],                     # ★P1: 全量最近40轮 (各层试过什么→结果)
+        "history": _compact_history(history),          # ★轻量摘要 (去 changes_full/error 截断/限20轮), GLM5.1 预算
         "handoff": handoff or None,                    # ★P1: 跳转来的瓶颈分析+优化方向
         "fusion_analysis": _sanitize_for_ctx(fusion_analysis) if fusion_analysis else None,
         "tier3_sweep": ({"best": tier3_sweep.get("best"), "status": "available"}
@@ -582,6 +601,20 @@ class Scheduler:
         _traj_copy = {**self.traj, "state": _ordered_state}
         self.traj_path.write_text(json.dumps(_traj_copy, ensure_ascii=False, indent=2),
                                   encoding="utf-8")
+        # ★GLM5.1 预算: 同步写紧凑轨迹 (planner 读它替代全量 json — 全量含 changes_full 完整代码,
+        #   100 轮长跑会膨胀到 50k+ tokens, 逼近 140k 压缩线; compact 每轮一行梗概, 恒 ~10k tokens)
+        try:
+            _ck = ("tier", "round", "best_speedup", "current_speedup", "total_rounds",
+                   "baseline_e2e_ns", "baseline_e2e_event_ns", "best_e2e_event_ns",
+                   "best_round", "current_kernel", "handoff")
+            _compact = {
+                "state": {k: st.get(k) for k in _ck if k in st},
+                "history": _compact_history(self.traj.get("history", []), n=40),
+            }
+            (self.traj_path.parent / "planner_trajectory_compact.json").write_text(
+                json.dumps(_compact, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception:
+            pass
 
     def _write_timing_stats(self):
         """★每轮各阶段耗时统计 → outputs/<op>/stats/timing_stats.json (找项目自身瓶颈).

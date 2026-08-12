@@ -1,12 +1,48 @@
 # Triton 优化 Tier 3（分块配置）策略指南 — 针对 triton-ascend 910B3
 
+> ## ★★速查卡（★先读这个；你实际能读全文，但速查卡在最前面=最快定位，决策先靠它，细节看情况A~J）★★
+>
+> **工作流（3 步，别跳）**：
+> 1. ★本层第一动作是看 `09_tier3_sweep/sweep_result.json`（框架已枚举全部 L0 合法 BLOCK 并真机实测）——**有实测数据就照数据，别手工猜 BLOCK**
+> 2. 读 `07_tier3_fields/tier3_fields.txt` 找 **block_dim / mte1 / mte2 / cube / bottleneck_type**
+> 3. 无 sweep 数据才照下表手工判断 → 输出 changes[]（old_code 逐字复制）
+>
+> **字段 → 动作速查表（★主决策表）**：
+> | 字段/现象 | 动作（一句话） |
+> |---|---|
+> | sweep_result.json 存在 | ★用它的 best 块（别猜新值；sweep 已是全链路实测最优） |
+> | mte2 高 / cube 低 / l0a/l0b_read 低 | 增 BLOCK_M/N（传输瓶颈搬更大块） |
+> | mte1 高 | 增 BLOCK_K |
+> | block_dim < 40 | 减 BLOCK_M/N（核没吃满） |
+> | memory_bound 且 mem_util≥0.8 | ★别调块（带宽已到平台）→ promote |
+> | compute_bound | ★不调块 → promote Tier1/5（附 evidence） |
+> | compute_utilization < 0.3 | 回 Tier1（是算法问题，不是分块） |
+> | 上面全不触发 | 分块已最优 → promote（附 evidence） |
+>
+> **★硬约束（改 BLOCK 前必算，违反=编译失败或设备崩）**：
+> - **全部 2 的幂**（16/32/64/128/256/512/1024；非 2 幂 tl.dot/tl.arange 会报错/降级）；L0A/B = `BM×BK×dtype ≤ 64KB`；L0C = `BM×BN×dtype ≤ 128KB`；UB ≤ 192KB
+> - **★代码对 L0A/B/L0C/UB 一律留 ×0.9 安全余量**（贴边界候选会 OOM 打崩设备 "575:NPU function error" 并污染设备）——sweep 的合法候选已自动排除贴界块，别手工选贴界值
+> - fp32 安全示例：128×128×64（L0A/B=32KB✓ L0C=64KB✓）；fp16 可 ×2
+> - 行宽对齐：fp32 BLOCK_N∈{128,256}（512B），fp16 BLOCK_N∈{256,512}
+> - ★别跳最大合法块（寄存器 spill 断崖）——sweep 实测找拐点
+>
+> **★我们算子对照（sweep 会扫的）**：
+> - matmul 族（matmul/attention_mlp/flash_attention/matmul_relu/matmul_transpose）：扫 (BM,BN,BK)
+> - conv 族（conv2d/conv_bias_relu）：扫 (BLOCK_K,BLOCK_OW)，★BLOCK_K ≥ K_OUT(32)
+> - flash_attention：BK ≤ 头维 64；grid = ceil(seq/BM)×nheads
+> - rms_norm/layernorm/sigmoid/vector_add/fused_add_mul/softmax：无自由分块参数 → sweep 跳过，无 BLOCK 可改 → 直接 promote
+>
+> **禁止（违反=失败）**：改 DTYPE/算法/融合（跨层）、num_warps/num_stages/autotune、非 16 倍数、超 L0/UB、compute_bound 还调块、**手工改一个新 BLOCK 覆盖 sweep 实测最优**。
+
+---
+
 > 本层**只调分块/调度参数**（BLOCK_M/N/K、BLOCK_SIZE、group swizzle、sub-block、mask），
 > **不改算法、不融合、不改精度**（Tier1/2/5）。违反 = 越层，fail。
 >
 > **★环境铁律（triton-ascend，违反必报错）**：
 > - `num_warps` / `num_stages` **禁止**传给 kernel（传了报 `please do not tune args`）
 > - `@triton.autotune` 可用 `configs=[]` 触发后端自动分块生成，但当前 pipeline 使用自定义 sweep（sweep_blocks.py）做全面确定性扫描，**外部 tuner 不要传显式 configs list**
-> - **分块必须 16 倍数**（Cube MMA 16×16 基础粒度；非 16 倍数掉到 ~10% 算力）
+> - **分块必须 16 倍数**（Cube MMA 16×16 基础粒度；非 16 倍数掉到 ~10% 算力）；**★优先 2 的幂**（16/32/64/128/...，sweep 只枚举 2 幂，非 2 幂 tl.dot/tl.arange 可能报错/降级）
 > - `BLOCK_*` 必须 `tl.constexpr`
 > - L0 上限：L0A/B=64KB、L0C=128KB；UB=192KB → **超过就 `ub overflow` 编译失败**
 
@@ -127,7 +163,7 @@ BLOCK_M, BLOCK_N, BLOCK_K = 100, 128, 64   # 100 不是 16 倍数 → cube 掉�
 ```python
 # grid = M/BM × N/BN, 减 BM 增 grid, 但保持 16 倍数
 BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64     # M=N=2048: grid=16×16=256 (核吃满)
-# 或更小: 96×128×64 (grid≈21×16=336), 但 96=16×6 仍是 16 倍数
+# 或更小: 64×128×64 (grid=32×16=512), 保持 2 的幂
 ```
 **约束/坑**：减到够用就行（block_dim≥40）；太小 grid 超大 → 调度开销反升（见 §六 SUB_BLOCK）。
 
@@ -235,10 +271,10 @@ BLOCK_M, BLOCK_N, BLOCK_K = 100, 96, 40
 
 ### ✅ 修改后正确代码
 ```python
-BLOCK_M, BLOCK_N, BLOCK_K = 96, 96, 32    # 都是 16 倍数 (96=16×6, 32=16×2)
+BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32    # 2 的幂 (sweep 枚举范围)
 # 或 128, 128, 64
 ```
-**约束/坑**：BLOCK_M/N/K 全部 16 倍数（64/80/96/112/128...）。
+**约束/坑**：BLOCK_M/N/K 全部 16 倍数；**优先 2 的幂**（64/128/256...，80/96/112 这类 sweep 不枚举、可能编译降级）。
 
 ---
 
@@ -333,13 +369,14 @@ tl.store(out_ptr + offs, x * 2.0, mask=mask)               # store 也 mask → 
 ## §八：★分块实测 sweep（本层优先手段，数据驱动不是猜）
 
 > **本层第一动作是跑 sweep，不是手工推 BLOCK。** §二-A 到 §七 的手工判断只在 sweep 不可用时兜底。
-> 框架在 Tier3 每轮自动跑 `sweep_blocks.sweep()`：**程序化枚举全部 L0 合法 (BM,BN,BK) 候选 → 单进程 torch.npu.Event 实测每 config 5 次平均 → 最优写回 kernel_op.py**。
+> 框架自动跑 `sweep_blocks.sweep()`：**程序化枚举全部 L0 合法 (BM,BN,BK) 候选（全部 2 的幂、L0/UB 带 ×0.9 余量）→ 单进程 torch.npu.Event 实测每 config warmup3+计时10 取平均 → 最优写回 kernel_op.py**。
+> ★sweep 在 **`outputs/<op>/best_kernel.py`（历史最优）** 上扫（不在当前 kernel/源文件上）；写回的是 **round_dir 副本 kernel_op.py**（不碰 `input/<op>` 源文件），sweep 后 current_kernel 指向该副本——**别去读 input 源文件看 BLOCK**，那是最初的值。
 
 **sweep 跑什么**：
-- matmul 族（matmul/attention_mlp/flash_attention）：枚举 `(BM,BN,BK)`，约束 = L0A/B≤64KB、L0C≤128KB、UB≤192KB、16 倍数、grid∈[16,3000]
+- matmul 族（matmul/attention_mlp/flash_attention/**matmul_relu/matmul_transpose**）：枚举 `(BM,BN,BK)`，约束 = L0A/B≤64KB、L0C≤128KB、UB≤192KB（全部 ×0.9 余量）、**全部 2 的幂**、grid∈[16,3000]
 - conv 族（conv2d/conv_bias_relu）：枚举 `(BLOCK_K,BLOCK_OW)`，**BLOCK_K ≥ K_OUT**（否则只算一半通道，见 tier4 案例3）
-- **flash_attention 特殊**：BK 上限 = 头维 dim（BK>64 无意义，K 循环就 64 长）；grid = ceil(seq/BM)×nheads
-- rms_norm：**无自由分块参数**（行级，BLOCK_N 由 N 推导 2 幂）→ sweep 跳过，走 LLM
+- **flash_attention 特殊**：BK 上限 = 头维 dim（BK>64 无意义，K 循环就 64 长）；★`bk_min = ceil_pow2(dim)`（BK<dim 只算部分头维 → 分数/输出数值错且计时偏快可能被误选）；grid = ceil(seq/BM)×nheads
+- rms_norm/layernorm/rms_norm_residual/sigmoid/vector_add/fused_add_mul/softmax：**无自由分块参数**（行级/逐元素）→ sweep 跳过，无 BLOCK 可改 → 直接 promote
 
 **怎么读 `round_dir/09_tier3_sweep/sweep_result.json`**：
 ```json
@@ -347,8 +384,8 @@ tl.store(out_ptr + offs, x * 2.0, mask=mask)               # store 也 mask → 
  "configs": [{"block":[64,64,64], "ns": 123456, "speedup": 1.2, "is_current": true}, ...],
  "best": {"block":[128,128,64], "ns": 100000, ...}}
 ```
-- `configs[]` 按 ns 升序，`[0]` = 最优；`is_current` 标当前块；`speedup` = **整体 baseline_ns ÷ 该候选 ns**（相对 round1 基线的加速比，**不是相对当前块**）——比大小看 ns，别拿 speedup 当"相对当前块"判断
-- **决策**：最优明显快于当前 → `changes[]` 直接采用最优块（数据就是答案，别猜新值）；当前已接近最优/无增益 → 分块已到位，promote 下一层
+- `configs[]` 按 ns 升序，`[0]` = 最优；`is_current` 标当前块；**`speedup` = 相对「当前块」的加速比**（`cur_ns ÷ 该候选 ns`，当前块恒 = 1.0）——**比大小看 ns**，别把 speedup 当相对 round1 基线的累计加速比
+- **决策**：最优明显快于当前 → `changes[]` 直接采用最优块（数据就是答案，别猜新值）；当前已接近最优/无增益 → 分块已到位，promote 下一层（附 evidence）
 
 **★多 kernel 共享一个 BLOCK 的协调**（attention_mlp 9 kernel / MLP 3 kernel）：
 - 多个 kernel 共用 `BLOCK_M/N/K`，**单 kernel 最优 ≠ 全链路最优**（matmul 爱大 tile、softmax 爱小 tile）

@@ -1,5 +1,40 @@
 # Triton 优化 Tier 5（计算占用）策略指南 — 针对 triton-ascend 910B3
 
+> ## ★★速查卡（★先读这个；你实际能读全文，但速查卡在最前面=最快定位，决策先靠它，细节看情况A~J）★★
+>
+> **工作流（3 步，别跳）**：
+> 1. 读 `07_tier5_fields/tier5_fields.txt` + `planner_context.json` → 找 **aic_scalar_time / scalar / vector_fops / vec / bank_cflt_ratio / wait_ratio / cube 耗时 / bottleneck_type**
+> 2. 照下表定位"情况"→ 看情况 A~J 代码
+> 3. 输出 changes[]：old_code 逐字复制；拿不准不改（宁缺勿错）
+>
+> **字段 → 情况速查表（★主决策表）**：
+> | 字段/现象 | 情况 | 动作（一句话） |
+> |---|---|---|
+> | scalar_time 高 + 指针含 div/mod 或显式 int64 | A | 消除 div-mod、int32 索引（bias_gelu 的 `offs % N` 是风险点） |
+> | vec 利用率低 + 带宽低 | B | 一次向量 load（offs 连续+对齐） |
+> | 数学多步手动组合（1/sqrt） | C | `tl.math.rsqrt` / `tl.math.tanh`（别用 tl.erf） |
+> | mul+add 未融合 | D | 直接写 `x*w+b`（编译器自动 FMA；别用 tl.fma） |
+> | 性能不升反降 / 寄存器溢出 | E | 控制展开/中间变量（2~3 级） |
+> | bank_cflt_ratio >4% | F | swizzle/访问顺序（tier3 §三/tier4 §C）；多数已自动处理 |
+> | 逐元素 x/s 除法 / 链式除法喂归约 | G | 倒数算一次 + 乘法（inv_N 在 host 算好） |
+> | vec 高 cube 低 + 外积累加（conv 现状） | H | `tl.dot` 或分块 2D 累加（★别物化 3D 中间量） |
+> | bank_cflt>4% 且尾轴非 32B/512B 倍数 | I | 尾轴对齐 + 显式 pad + mask |
+> | cube 已满（compute_bound）且 scalar/conflict 不高 | J | ★停手：查 cube_fp16_ratio→回 Tier1 精度，否则停止/晋升 |
+> | 上面全不触发 | — | 计算已优 → promote Tier6（附 evidence） |
+>
+> **★我们算子对照（本层能做什么）**：
+> - `input/matmul`：bias_gelu 的 `offs % N` → 改 2D 索引（情况A）；除法检查（情况G）
+> - `input/rms_norm` / `layernorm`：**rsqrt 已用**（`tl.math.rsqrt`，无 `/sqrt` 残留）→ 只剩 `/N → *inv_N`（情况G）；softmax 是 `e/s`（每行一次倒数提升，情况G）
+> - `input/conv2d` / `conv_bias_relu`：外积累加 → tl.dot（情况H，配合 Tier1-G 的 im2col）
+> - `input/attention_mlp`：scalar 检查（情况A）；exp/tanh 已用 math 命名空间（正确样例）
+> - 其余：查 scalar_time / bank_cflt（A/F）
+>
+> **★字段位置提醒**：`vector_fops` / `vec` / `cube_fp16_ratio` / `bottleneck_type` **不在 07_tier5_fields.txt**（那里只含 cube_us/scalar_us/scalar/fixpipe/cube_ratio/conflict/wait）——这些在 `07_tier5_fields/planner_context.json` 的 `kernels[].deep` 里。看到 07 文件里"无数据"别误判采集失败，去 context json 找。
+>
+> **禁止（违反=失败）**：改算法/融合/分块/访存（跨层）、tl.erf、tl.fma、tensor.item() 热路径、累加器非 fp32、int64 索引、跨层"假装优化"。
+
+---
+
 > 本层在 Tier1~4 之后：**指令级计算优化**（向量化/原生指令/ILP/冲突/标量），**不改算法/融合/分块/访存模式**。
 > 昇腾计算优化的核心：**引导编译器做对向量化加载、原生数学指令、循环展开**，消灭标量降级和计算空等。
 >

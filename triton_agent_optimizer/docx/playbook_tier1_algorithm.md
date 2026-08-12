@@ -1,5 +1,41 @@
 # Triton 优化 Tier 1（算法结构）策略指南 — 针对 triton-ascend 910B3
 
+> ## ★★速查卡（★先读这个；你实际能读全文，但速查卡在最前面=最快定位，决策先靠它，细节看情况A~J）★★
+>
+> **工作流（3 步，别跳）**：
+> 1. 读 `07_tier1_fields/tier1_fields.txt` 和 `07_tier1_fields/planner_context.json`（每 kernel 全量数据）→ 找 **bottleneck_type / compute_utilization / cube_fp16_ratio / num_kernels / total_ns**
+> 2. 照下表定位"情况"→ 看情况 A~G 的 ❌/✅ 代码
+> 3. 输出 changes[]：**old_code 必须从你读到的 kernel_op.py 里逐字复制**（不是凭记忆）；拿不准就不改（宁缺勿错，输出 promote 或空 changes+说明）
+>
+> **字段 → 情况速查表（★主决策表）**：
+> | 字段/现象 | 情况 | 动作（一句话） |
+> |---|---|---|
+> | compute_bound 且 cube_fp16_ratio 低 | A | DTYPE 改 fp16（值域大→bf16），acc/归约保持 fp32 |
+> | memory_bound 且 attention 物化 S[seq²] 中间量 | B | 改 online softmax（S 不进 GM） |
+> | 因果 attention 且 KV 循环全量 loop | B-剪枝 | KV 循环加因果上界 `kv_hi`（改 loop 上界） |
+> | 多个同结构 matmul 串行（如 QKV 三连） | C | 合并一个 GEMM（★注意 stride 视图） |
+> | softmax/norm 多遍扫数据 | D | 单遍：减 max + `other=-inf` + fp32 |
+> | conv 用 `wv[:,None]*xv[None,:]` 外积 | G | 改软件 im2col + `tl.dot` 走 cube（★conv2d 最优先） |
+> | K>4096 且 compute 低 | E | split-k（我们算子一般不需要） |
+> | grid 小 + launch 开销大 | F | persistent kernel（一般不需要） |
+> | compute_utilization<0.3 但算法看着对 | — | 回 Tier2/3（是分块/融合问题，不是算法） |
+> | 上面全不触发 | — | 算法已最优 → promote Tier2（★必填 promote_evidence） |
+>
+> **★我们算子对照（本层能做什么，别自己发明）**：
+> - `input/matmul`（两层 MLP，3 kernel）：fp32 若 compute_bound → 降 fp16（情况A）
+> - `input/attention_mlp`（9 kernel）：QKV 三合一（情况C）；已融合 scale（正确样例）
+> - `input/flash_attention`：已 flash + **块内 causal mask（★KV 循环未剪枝, 全量 32 块）**；fp16 输入 + fp32 输出 + fp32 参考（★fp16 正确样例）→ **B-剪枝（KV 循环加因果上界）是本层直接可做优化**
+> - `input/layernorm`：**两遍扫 + 二次 load X**（代码注释已标 Tier1 可单遍合并）→ online 单遍（一次 load 同时累 sum/sum_sq）（情况D）
+> - `input/conv2d` / `conv_bias_relu`：**外积不上 cube，慢 12×** → im2col（情况G，本层最优先）
+> - `input/softmax` / `rms_norm` / `rms_norm_residual`：已是单遍（正确样例）
+> - `input/matmul_relu` / `matmul_transpose`：fp32 matmul → compute_bound 可降 fp16（情况A）
+> - `input/sigmoid` / `vector_add` / `fused_add_mul`：无算法空间 → 直接 promote
+>
+> **禁止（违反=失败）**：num_warps/num_stages 传参、@triton.autotune、tl.erf、`input_precision="tf32"`、acc/归约用 fp16、非 16 倍数分块、**跨层改动**（Tier1 只改算法/精度/kernel 重组；改 BLOCK 是 Tier3、融合是 Tier2）。
+> **★验证命令（改完必跑）**：`MATMUL_VERIFY=1`（不是 MATMUL_VERIFY），kernel 必须输出 `result check: PASS` 才算过；fp16/bf16 输入 + fp32 累加时阈值 ~1e-2，**参考侧升 fp32 计算**（torch 参考 `.float()` 后再算，避免 fp16 参考误差干扰判定）。
+
+---
+
 > 本层是**最高优先级，最先做**：选对算法 / 精度 / 结构。算法一变，后续 Tier2(融合)/Tier3(分块) 全要重置重做。
 > 本层**只改算法结构 / 精度 / kernel 重组**，**不调分块细节**（Tier3）、**不做逐元素融合**（Tier2）。
 >
@@ -55,7 +91,7 @@ compute_utilization 极低但算法看着对 ? → 分块/融合问题, 回 Tier
 ## 情况A：fp16 计算 + fp32 累加（compute_bound，我们 MLP/attention 最相关）
 
 **触发**：`bottleneck_type=compute_bound`（comp≥0.8）且 `cube_fp16_ratio` 低。
-**收益**：fp16 cube 313 vs fp32 74 TFLOPS → 计算瓶颈下 ~4×。
+**收益**：fp16 cube 峰值约为 fp32 的 2~4×（910B3 标称 fp16 294.9 TFLOPS vs fp32 73.7 TFLOPS，实际加速倍数需真机 msprof 确认）→ 计算瓶颈下显著。
 **怎么查**：搜 "triton matmul fp16 fp32 accumulate" / "triton fp16 reduction precision"。
 
 ### ❌ 问题示例代码（fp16 累加 bug）
@@ -91,7 +127,7 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, ...,
 - 累加器、归约、`m/l` 统计量**一律 fp32**；只有输入和最终存储才 fp16
 - kernel 内归约（`tl.sum` 等）如果输入是 fp16，**先 `.to(tl.float32)` 再归约**
 - 激活（tanh）对 fp16 输入敏感：kernel 内 `val.to(tl.float32)` 算激活再存
-- 验证 `MATMUL_VERIFY=1`，误差阈值放宽到 ~1e-2（fp16 输入 + fp32 累加 vs torch fp16 参考）
+- 验证 `MATMUL_VERIFY=1`，误差阈值放宽到 ~1e-2；**参考侧升 fp32 计算**（fp16 输入下 torch 参考 `.float()` 后再算，避免 fp16 参考误差干扰判定——flash_attention 已按此模式改）
 
 ### 精度策略扩展：fp16 vs bf16 vs tf32（Ascend 910B3 视角，别只用 fp16 一招）
 
@@ -177,7 +213,7 @@ O = acc / l_row[:, None]
 - `m_row/l_row/acc` **必须 fp32**（fp16 的 max 上限 65504，长序列会饱和）
 - **causal/边界 mask 必须在 `tl.max` 之前**（先 mask 再求 max，否则无效位置污染归一化）
 - K 越界 load 的 `other` 用 **`-inf`**（不是 0——0 会贡献进 sum）
-- 这是算法级大改，必须 `MATCH_VERIFY=1` 数值校验；fp32 参考下 online 版可能差 ~1e-5（顺序不同），可接受
+- 这是算法级大改，必须 `MATMUL_VERIFY=1` 数值校验；fp32 参考下 online 版可能差 ~1e-5（顺序不同），可接受
 
 ### 因果剪枝：KV 循环只跑到 query 块末位（省 ~50% key 块，纯赚）
 
@@ -212,7 +248,7 @@ for start in range(0, kv_hi, BLOCK_N):           # ✅ 对角线上方的 key �
 **约束/坑**：
 - `kv_hi` 必须是**动态上界**（每 query 块不同），不是全局 `seq`；对角块（`start ≤ kv_hi` 的最后一个）**仍要 mask**（部分 key ≤ query）
 - 只适用于因果（非因果 attention 不能加）
-- 已用 torch 参考验证：剪枝后输出与全量 loop 逐元素一致（rel~1e-7）
+- ★当前 `input/flash_attention` 的 KV 循环**仍是全量 loop**（块内 mask）——**本层直接可做**；改后 `MATMUL_VERIFY=1` 重验 + 真机 msprof 确认收益
 - 这是我们 flash_attn 的**直接可做优化**（改 loop 上界一行 + 用 m_block 算 kv_hi）
 
 ---
@@ -407,7 +443,7 @@ def conv2d_im2col_kernel(x_ptr, w_ptr, y_ptr,
 ## 通用算法替换原则
 
 1. **先判瓶颈类型再选算法**：compute_bound → 精度/算法效率；memory_bound → 省访存（online/flash/合并）。
-2. **算法级改动必须 `MATCH_VERIFY=1` 数值校验**，尤其 softmax/flash 的合并公式（online 版 vs torch fp32 参考可能差 ~1e-5，顺序不同可接受）。
+2. **算法级改动必须 `MATMUL_VERIFY=1` 数值校验**，尤其 softmax/flash 的合并公式（online 版 vs torch fp32 参考可能差 ~1e-5，顺序不同可接受）。
 3. **GPU 版代码适配规则**：1D grid（`pid//grid_n`）、`tl.dot(a,b,acc)` 带 fp32 acc、去掉 num_warps/autotune、分块 16 倍数、激活用 tanh。
 4. **算法改完后续层全要重做**（回 Tier2/3）。
 

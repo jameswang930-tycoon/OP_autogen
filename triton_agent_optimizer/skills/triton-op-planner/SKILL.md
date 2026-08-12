@@ -52,7 +52,7 @@ GM≈1638GB/s (HBM2e 理论, 实测~1540), cube≈294.9TFLOPS(fp16 标称)/313(�
 | 2 算子融合 | 融合 | 合并 kernel、消除中间 GM 往返、激活/残差并入 epilogue | 禁止改算法选择 |
 | 3 分块配置 | 分块 | **只改** BLOCK_M/N/K、BLOCK_SIZE、grid | **NEVER** 改 DTYPE / 融合 / 算法 |
 | 4 访存 | 访存 | 访问模式、对齐、双缓冲、L2 复用 | 禁止改 BLOCK_* / DTYPE |
-| 5 计算占用 | 计算 | 冲突、标量、计算-传输重叠、精度微调 | 禁止改算法 / 分块 |
+| 5 计算占用 | 计算 | 冲突、标量、计算-传输重叠（★改 DTYPE 精度必须回 Tier1，本层只保 fp32 累加） | 禁止改算法 / 分块 / 精度 |
 | 6 架构专属 | 硬件 | 引擎分配、grid 数、pipeline | 禁止改算法 / 融合 |
 
 ## 重要：只看本轮给的字段，不脑补没给的
@@ -129,7 +129,7 @@ GM≈1638GB/s (HBM2e 理论, 实测~1540), cube≈294.9TFLOPS(fp16 标称)/313(�
 `specific_change` 必须具体到能直接改，且**只能是对应当前 tier 策略的改动**：
 - ✅ Tier3: "把 config 行 `BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32` 改成 `64, 64, 64`"（分块策略）
 - ✅ Tier5: "把冲突相关的 kernel 内循环改法..."（计算策略）
-- ❌ Tier3 轮输出 DTYPE 改动（那是 Tier1/5）→ **违反铁律**
+- ❌ Tier3 轮输出 DTYPE 改动（那是 Tier1 的策略）→ **违反铁律**
 - ❌ "优化访存效率"（太模糊）
 
 参考 `playbook` 的具体优化手段和 910B3 约束（UB 192KB 上限、L0A/B=64KB、L0C=128KB 等）。
@@ -139,6 +139,7 @@ GM≈1638GB/s (HBM2e 理论, 实测~1540), cube≈294.9TFLOPS(fp16 标称)/313(�
 ```json
 {
   "strategy": "增大 BLOCK_K 减 MTE1 次数",
+  "target_speedup": 1.1,
   "changes": [
     {
       "old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
@@ -172,7 +173,7 @@ GM≈1638GB/s (HBM2e 理论, 实测~1540), cube≈294.9TFLOPS(fp16 标称)/313(�
 ## 反模式（绝对不要这样做）
 
 ❌ **跳过前层检查**：Tier3 轮看到 mte1_ratio 高就直接调 BLOCK，忽略 `compute_utilization` 极低说明算法可能 naive → 应先 `promote_to=1`
-❌ **跨层改码**：Tier3 轮的 changes 里把 `DTYPE` 改成 fp16（那是 Tier1/5 的策略），或做了融合（Tier2）
+❌ **跨层改码**：Tier3 轮的 changes 里把 `DTYPE` 改成 fp16（那是 Tier1 的策略），或做了融合（Tier2）
 ❌ **硬调已无空间的本层**：当前 tier 字段已显示"无空间"，还继续换 BLOCK 值硬试 → 该回前层查或晋升
 ❌ **改完多轮无效果仍不回头**：本层连续几轮无改进 → 必须怀疑前层（算法/融合），不是无限硬调
 ❌ **无依据就 promote**：`promote=true` 但不给 `promote_evidence` → 调度器拒绝，白费一轮

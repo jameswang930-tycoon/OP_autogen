@@ -196,10 +196,14 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     ax.fill_between(rounds, 1.0, running_best, alpha=0.06, color="#1565c0")
 
     # ═══ Points ═══
-    r_arr, s_arr = np.array(rounds), np.array(cum_speeds)
-    bl = np.array([d=="BASELINE" for d in decisions])
-    kp = np.array([d=="KEEP" for d in decisions])
-    rv = np.array([d=="REVERT" for d in decisions])
+    # ★bug 修复 (2026-08-12): 原来点全画在 cumulative best 上 → REVERT/FAIL 轮掉速不可见
+    #   (× 挂在最高点, 像"回退轮依然保持最优", 误导). 现在**点画实际 speedup**:
+    #   KEEP 贴合蓝线 (KEEP 即新 best), REVERT/FAIL 真实掉下来, 一眼看出尝试失败.
+    r_arr, s_arr = np.array(rounds), np.array(speeds)
+    bl = np.array([d == "BASELINE" for d in decisions])
+    kp = np.array([d == "KEEP" for d in decisions])
+    rv = np.array([d == "REVERT" for d in decisions])
+    fl = np.array([d == "FAIL" for d in decisions])
 
     if bl.any(): ax.scatter(r_arr[bl], s_arr[bl], c="gray", s=120, marker="s",
                              zorder=5, label="Baseline")
@@ -208,23 +212,33 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
                              label=f"KEEP ({kp.sum()})")
     if rv.any(): ax.scatter(r_arr[rv], s_arr[rv], c="#e74c3c", s=90, marker="X",
                              linewidth=1.5, zorder=5, label=f"REVERT ({rv.sum()})")
+    if fl.any(): ax.scatter(r_arr[fl], s_arr[fl], c="#f39c12", s=90, marker="v",
+                             edgecolors="white", linewidth=0.5, zorder=5,
+                             label=f"FAIL ({fl.sum()})")
 
-    # ═══ Annotations ═══
+    # ═══ Annotations (标注用实际 speedup — REVERT/FAIL 掉速才看得见) ═══
     for i in range(1, len(rounds)):
         if decisions[i]=="KEEP" and speeds[i] > 1.07:
             ax.annotate(strategies[i][:30],
-                xy=(rounds[i], cum_speeds[i]),
-                xytext=(rounds[i]+0.4, cum_speeds[i]+0.07),
+                xy=(rounds[i], speeds[i]),
+                xytext=(rounds[i]+0.4, speeds[i]+0.07),
                 fontsize=7.5, color="#1565c0",
                 arrowprops=dict(arrowstyle="->", color="#1565c0", lw=1, alpha=0.6),
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85, ec="#1565c0", lw=0.7),
                 zorder=10)
         if decisions[i]=="REVERT" and speeds[i] < 0.97:
             ax.annotate(reasons[i][:35],
-                xy=(rounds[i], cum_speeds[i]),
-                xytext=(rounds[i]+0.5, cum_speeds[i]-0.06),
+                xy=(rounds[i], speeds[i]),
+                xytext=(rounds[i]+0.5, speeds[i]-0.06),
                 fontsize=7, color="#c62828",
                 arrowprops=dict(arrowstyle="->", color="#c62828", lw=0.7, alpha=0.5),
+                zorder=9)
+        if decisions[i]=="FAIL":
+            ax.annotate("✗采集/验证失败",
+                xy=(rounds[i], speeds[i]),
+                xytext=(rounds[i]+0.3, speeds[i]-0.05),
+                fontsize=6.5, color="#b9770e",
+                arrowprops=dict(arrowstyle="->", color="#f39c12", lw=0.6, alpha=0.6),
                 zorder=9)
 
     # ═══ Phase labels (top) ═══
@@ -248,11 +262,18 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
         ax2.tick_params(axis="y", labelcolor="#7b1fa2")
         ax2.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.1f"))
 
-    # ═══ Title ═══
+    # ═══ Title (含绝对耗时: 相对加速比看不出 baseline 2s→1s 与 2ms→1ms 的差别) ═══
     total_rounds = len(rounds) - 1
     final_s = running_best[-1]
     final_t = tflops_arr[-1] if tflops_arr is not None else None
     _tf_s = f"{initial_tflops:.1f} -> {final_t:.2f}" if final_t is not None else "—"
+    # ★绝对耗时 (Event 优先: 工业级口径; 缺则 msprof 端到端; 都没有不显示)
+    _base_ns0 = state.get("baseline_e2e_event_ns") or state.get("baseline_e2e_ns") or state.get("baseline_ns")
+    _abs_s = ""
+    if _base_ns0 and final_s:
+        _final_us = _base_ns0 / final_s / 1000.0
+        _src = "Event" if (state.get("baseline_e2e_event_ns")) else "msprof"
+        _abs_s = f"  |  耗时: {_base_ns0/1000:.0f}us → {_final_us:.0f}us ({_src})"
     # ★vs PyTorch 用端到端口径对比 (直接可比, 两端都 msprof Σ全部): 我们最优用时 vs pytorch 用时
     #   (★修复: 原 tflops 兜底对比已移除 — 跨算子类型用 TFLOPS 比失真)
     _vs_pt = ""
@@ -270,7 +291,7 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
         f"Optimization Trajectory: {kernel_dir.name}     "
         f"Rounds: {total_rounds}  |  "
         f"TFLOPS: {_tf_s}  |  "
-        f"Speedup: {final_s:.2f}x{_vs_pt}"
+        f"Speedup: {final_s:.2f}x{_abs_s}{_vs_pt}"
     )
     ax.set_title(title, fontsize=13, fontweight="bold", pad=22)
     ax.set_ylabel("Cumulative Speedup (x)", fontsize=13, color="#1565c0")
@@ -289,9 +310,30 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     fig.savefig(str(out), dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
+    # ★每轮明细导出 CSV (图同数据, 机器/Excel 可读; 含 FAIL 轮与 error)
+    try:
+        import csv as _csv
+        csv_path = out.parent / "rounds.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as _f:
+            _w = _csv.writer(_f)
+            _w.writerow(["round", "tier", "decision", "result", "strategy", "change",
+                         "speedup", "kernel_speedup", "e2e_event_us", "error"])
+            for _h in history:
+                _evt = _h.get("e2e_event_ns")
+                _w.writerow([
+                    _h.get("round"), _h.get("tier"), _h.get("decision"), _h.get("result"),
+                    (_h.get("strategy") or ""), (_h.get("change") or ""),
+                    _h.get("speedup"), _h.get("kernel_speedup"),
+                    (round(_evt / 1000.0, 1) if _evt else ""),
+                    (_h.get("error") or ""),
+                ])
+    except Exception:
+        pass
+
     print(f"[chart] {out} ({total_rounds} rounds, "
           f"{initial_tflops if initial_tflops is not None else 'N/A'}->"
-          f"{final_t if final_t is not None else 'N/A'} TFLOPS, {final_s:.2f}x)")
+          f"{final_t if final_t is not None else 'N/A'} TFLOPS, {final_s:.2f}x)"
+          f"{_abs_s}")
     return out
 
 

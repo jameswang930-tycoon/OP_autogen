@@ -2031,6 +2031,61 @@ class Scheduler:
                 _bl = self.kernel_dir / "baseline_kernel.py"
                 if _bl.exists():
                     _sh.copy2(_bl, _final_dir / "baseline_kernel.py")
+                    # ★final_diff.patch: baseline → 最优 kernel 完整 diff (用户最想知道"最终改了什么";
+                    #   每轮 diff.patch 散在 round 目录且只记成功轮, 这里统一产出终版)
+                    try:
+                        import difflib as _dfl
+                        _b_txt = _bl.read_text(encoding="utf-8").splitlines(keepends=True)
+                        _o_txt = _src.read_text(encoding="utf-8").splitlines(keepends=True)
+                        _patch = "".join(_dfl.unified_diff(
+                            _b_txt, _o_txt, fromfile="baseline_kernel.py",
+                            tofile="kernel_op.py (最优)", n=3))
+                        if _patch:
+                            (_final_dir / "final_diff.patch").write_text(
+                                _patch, encoding="utf-8")
+                    except Exception as _pd:
+                        print(f"  ⚠ final_diff.patch 生成失败: {str(_pd)[:120]}")
+                # ★final_summary 扩充 (2026-08-12): rounds[] 轻量明细 + final_diagnosis 剩余空间
+                #   + industrial_modes 各 mode 明细 — 只存最终值看不到过程/剩余空间
+                _rounds_sm = [{
+                    "round": h.get("round"), "tier": h.get("tier"),
+                    "strategy": (h.get("strategy") or "")[:80],
+                    "change": (h.get("change") or "")[:100],
+                    "decision": h.get("decision"), "result": h.get("result"),
+                    "speedup": h.get("speedup"), "kernel_speedup": h.get("kernel_speedup"),
+                    "e2e_event_ns": h.get("e2e_event_ns"),
+                    "error": (h.get("error") or "")[:120],
+                } for h in self.traj.get("history", [])]
+                _last_dg = None
+                _dg_cands = sorted(self.kernel_dir.glob("*/round*/06_diagnosis/diagnosis.json"),
+                                   key=lambda p: p.stat().st_mtime, reverse=True)
+                if _dg_cands:
+                    try:
+                        _ld = json.loads(_dg_cands[0].read_text(encoding="utf-8"))
+                        _last_dg = {
+                            "from": str(_dg_cands[0]),
+                            "kernels": [{
+                                "kernel_name": k.get("kernel_name"),
+                                "time_pct": None,
+                                "bottleneck_type": ((k.get("deep") or {}).get("roofline") or {}).get("bottleneck_type"),
+                                "compute_utilization": ((k.get("deep") or {}).get("roofline") or {}).get("compute_utilization"),
+                                "memory_utilization": ((k.get("deep") or {}).get("roofline") or {}).get("memory_utilization"),
+                                "traffic_redundancy_read": ((k.get("deep") or {}).get("roofline") or {}).get("traffic_redundancy_read"),
+                                "l2_hit_rate": (k.get("deep") or {}).get("l2_hit_rate"),
+                            } for k in (_ld.get("kernels") or [])],
+                        }
+                    except Exception:
+                        pass
+                _ind_modes_list = []
+                for _m in ("eager", "compile", "cann-fused", "fa"):
+                    _ip = _PROJECT / "bench_910b3" / "outputs" / f"industrial_{self.kernel_name}_{_m}_tflops.json"
+                    if _ip.exists():
+                        try:
+                            _id = json.loads(_ip.read_text(encoding="utf-8"))
+                            _ind_modes_list.append({"mode": _m, "time_us": _id.get("time_us"),
+                                                    "actual_mode": _id.get("actual_mode", _m)})
+                        except Exception:
+                            continue
                 (_final_dir / "final_summary.json").write_text(json.dumps({
                     "op": self.kernel_name,
                     "final_tier": st.get("tier"),
@@ -2043,18 +2098,29 @@ class Scheduler:
                     "our_best_e2e_event_ns": _our_best_evt_ns,          # ★我们最优 Event 端到端 (工业级口径)
                     "industrial_time_us": st.get("industrial_time_us"), # 工业级基准 (Event, 各 mode min)
                     "industrial_baseline": st.get("industrial_baseline"),
+                    "industrial_modes": _ind_modes_list,                # ★各 mode 明细 (分析差在哪)
                     # ★优化效果终极指标: 我们最优/工业级最优 (两端 Event 同口径)
                     "vs_industrial_ratio": _vs_ind_ratio,               # 我们/工业级 (<1=快于工业级)
                     "vs_industrial_speedup": _vs_ind_speedup,           # 工业级/我们 (>1=快于工业级, 同 speedup 方向)
                     "current_speedup": _cs, "best_speedup": st.get("best_speedup"),
+                    "rounds": _rounds_sm,                               # ★每轮轻量明细
+                    "final_diagnosis": _last_dg,                        # ★最终诊断画像 (剩余空间判断)
                     "final_kernel_source": str(_src),
                     "generated_at": datetime.now().isoformat(),
                 }, ensure_ascii=False, indent=1), encoding="utf-8")
                 print(f"  [最终产物] 优化 kernel → {_final_dir / 'kernel_op.py'} "
                       f"(累计加速比 {st.get('current_speedup')}x, 源 {_src})")
                 if _bl.exists():
-                    print(f"  [最终产物] baseline 副本 → {_final_dir / 'baseline_kernel.py'}")
-                print(f"  [最终产物] 摘要 → {_final_dir / 'final_summary.json'}")
+                    print(f"  [最终产物] baseline 副本 → {_final_dir / 'baseline_kernel.py'}"
+                          f"{' + final_diff.patch' if (_final_dir / 'final_diff.patch').exists() else ''}")
+                print(f"  [最终产物] 摘要 → {_final_dir / 'final_summary.json'} "
+                      f"(rounds={len(_rounds_sm)} + 诊断画像 + 工业级 modes={len(_ind_modes_list)})")
+                # ★统一报告 REPORT.md (汇总图/明细/diff/画像/成功策略, 汇报用)
+                try:
+                    from feedback.report import generate as _gen_report
+                    _gen_report(self.kernel_dir, _final_dir)
+                except Exception as _rp:
+                    print(f"  ⚠ REPORT.md 生成失败: {str(_rp)[:120]}")
             else:
                 print(f"  ⚠ [最终产物] 无可用最终 kernel (current_kernel 缺失), 跳过写 final_output")
         except Exception as e:

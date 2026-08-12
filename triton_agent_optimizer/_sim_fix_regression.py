@@ -797,6 +797,103 @@ def test_tier3_sweep_revert():
         restore()
 
 # ═══════════════════════════════════════════════════════════════════
+#  Part 14: coder 清洗回归 (用户报告的 "syntaxerror/非法字符/看代码没有" 场景)
+# ═══════════════════════════════════════════════════════════════════
+_SIM_KERNEL = '''#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os
+import sys
+import torch
+import torch_npu
+import triton
+import triton.language as tl
+
+M = int(os.environ.get("MATMUL_M", 2048))
+DTYPE = torch.float32
+BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+
+@triton.jit
+def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, am, ak, bk, bn, cm, cn,
+                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + (offs_m[:, None] * am + offs_k[None, :] * ak)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < (K - k), other=0.0)
+        acc = tl.dot(a, b, acc)
+        a_ptrs += BLOCK_K * ak
+    c_ptrs = c_ptr + (offs_m[:, None] * cm + offs_n[None, :] * cn)
+    tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+def main():
+    LOOP = int(os.environ.get("KERNEL_LOOP", "1"))
+    for _ in range(LOOP):
+        matmul_kernel[(1,)](None, None, None, M, N, 1, 1, 1, 1, 1, 1,
+                            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K)
+    torch.npu.synchronize()
+    print("[info] OK")
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def test_coder_cleaning():
+    """★回归 (用户报告): LLM 输出脏代码导致 "SyntaxError/非法字符, 但看文件没有".
+    根因: ①千分位 1，024 → 清洗表转 , → 1,024 → leading zeros/invalid decimal literal
+    ②全角数字被删留空 ③markdown 结尾 ``` 残留 (去垃圾正则先吃开头). 全链路需清洗后 valid."""
+    from agents.coder import CoderAgent, _validate_python
+    cleaner = CoderAgent()._clean_output
+    dirty_cases = {
+        "千分位全角逗号": _SIM_KERNEL.replace("BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+                                              "BLOCK_M, BLOCK_N, BLOCK_K = 1，024, 64, 32"),
+        "千分位半角逗号": _SIM_KERNEL.replace("BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+                                              "BLOCK_M, BLOCK_N, BLOCK_K = 1,024, 64, 32"),
+        "漏#中文单位": _SIM_KERNEL.replace("BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+                                           "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32 个元素"),
+        "智能引号": _SIM_KERNEL.replace('print("[info] OK")', 'print("“[info] OK”")'),
+        "中文括号": _SIM_KERNEL.replace('print("[info] OK")', 'print（"[info] OK"）'),
+        "上标64²": _SIM_KERNEL.replace("BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+                                       "BLOCK_M, BLOCK_N, BLOCK_K = 64², 64, 32"),
+        "零宽粘数字": _SIM_KERNEL.replace("BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+                                          "BLOCK_M, BLOCK_N, BLOCK_K = 64\u200c, 64, 32"),
+        "全角数字": _SIM_KERNEL.replace("BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+                                        "BLOCK_M, BLOCK_N, BLOCK_K = ６４, 64, 32"),
+        "markdown包裹": "```python\n" + _SIM_KERNEL + "```",
+        "开头解释文字": "以下是修改后的代码:\n" + _SIM_KERNEL,
+        "docstring特殊字符": _SIM_KERNEL.replace("def main():", 'def main():\n    """说明: → 箭头 ² 上标 """'),
+    }
+    ok_all = True
+    for name, dirty in dirty_cases.items():
+        out = cleaner(dirty, _SIM_KERNEL)
+        valid, err = _validate_python(out)
+        if not valid:
+            ok_all = False
+            print(f"  ❌ {name}: {err}")
+    # 千分位必须归一为 1024 (不是 1,024)
+    out1 = cleaner(dirty_cases["千分位半角逗号"], _SIM_KERNEL)
+    ok_thousand = "= 1024, 64, 32" in out1 and "1,024" not in out1
+    # 千分位正则不误伤合法元组 (2048,1024 无空格元组 / 标准 64, 64, 32)
+    from agents.coder import _sanitize_unicode
+    safe1 = _sanitize_unicode("a, b = 2048,1024")
+    safe2 = _sanitize_unicode("for i in range(0, 100, 16):")
+    ok_safe = safe1 == "a, b = 2048,1024" and safe2 == "for i in range(0, 100, 16):"
+    # SyntaxError 报错信息必须带出错行内容 (用户能直接看到非法字符)
+    ok_err = False
+    bad = "x = 1,024\n"
+    _, err = _validate_python(bad)
+    ok_err = "该行内容" in err and "1,024" in err
+    ok = ok_all and ok_thousand and ok_safe and ok_err
+    if not ok:
+        finding("BUG", "coder 清洗仍有漏网 (见上方 ❌)",
+                f"千分位归一={ok_thousand} 不误伤元组={ok_safe} 报错带行内容={ok_err}")
+    log("P14-coder清洗(回归)", ok,
+        f"{len(dirty_cases)} 脏场景全清洗valid={ok_all} 千分位→1024={ok_thousand} 不误伤={ok_safe} 报错带行内容={ok_err}")
+
+# ═══════════════════════════════════════════════════════════════════
 #  main
 # ═══════════════════════════════════════════════════════════════════
 def setup():
@@ -835,6 +932,7 @@ if __name__ == "__main__":
         test_collect_fail_chain(); print()
         test_resume_flow(); print()
         test_tier3_sweep_revert(); print()
+        test_coder_cleaning(); print()
         print("═" * 60)
         print(f"检查项: {len(RESULTS)}  通过: {sum(1 for _, o, _ in RESULTS if o)}  失败: {sum(1 for _, o, _ in RESULTS if not o)}")
         for tag, ok, d in RESULTS:

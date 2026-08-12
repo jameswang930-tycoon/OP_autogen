@@ -120,12 +120,20 @@ def _build_user_prompt(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _validate_python(code: str) -> tuple[bool, str]:
-    """Python 语法检查。"""
+    """Python 语法检查。
+    ★修复: 报错信息带上出错行的真实内容 (repr) — 之前只给行号, 用户/planner 看到
+    "line 13" 却不知道那行有什么 (常见: 千分位 1,024 / 全角字符 / markdown 残留),
+    导致"文件里看着没非法字符"的困惑."""
     try:
         compile(code, "<kernel>", "exec")
         return True, ""
     except SyntaxError as e:
-        return False, f"SyntaxError at line {e.lineno}: {e.msg}"
+        line_txt = ""
+        if e.lineno:
+            lines = code.split("\n")
+            if 1 <= e.lineno <= len(lines):
+                line_txt = repr(lines[e.lineno - 1])[:150]
+        return False, f"SyntaxError at line {e.lineno}: {e.msg} | 该行内容: {line_txt}"
 
 
 # ★Unicode 脏字符 → ASCII 等价物 (LLM 常把 ASCII 写成 Unicode → 语法错/运行错/HIVM编译错)
@@ -167,6 +175,16 @@ _UNICODE_FIXES = {
     "╠": "=", "╣": "=", "╦": "=", "╩": "=", "╬": "=",
     "─": "-", "│": "|", "┌": "+", "┐": "+", "└": "+", "┘": "+",
     "├": "+", "┤": "+", "┬": "+", "┴": "+", "┼": "+",
+    # ── 全角数字/字母 (LLM 常把 ASCII 数字写成全角 → 删除会留空, 必须转 ASCII) ──
+    "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+    "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+    "Ａ": "A", "Ｂ": "B", "Ｃ": "C", "Ｄ": "D", "Ｅ": "E", "Ｆ": "F", "Ｇ": "G", "Ｈ": "H",
+    "Ｉ": "I", "Ｊ": "J", "Ｋ": "K", "Ｌ": "L", "Ｍ": "M", "Ｎ": "N", "Ｏ": "O", "Ｐ": "P",
+    "Ｑ": "Q", "Ｒ": "R", "Ｓ": "S", "Ｔ": "T", "Ｕ": "U", "Ｖ": "V", "Ｗ": "W", "Ｘ": "X",
+    "Ｙ": "Y", "Ｚ": "Z", "ａ": "a", "ｂ": "b", "ｃ": "c", "ｄ": "d", "ｅ": "e", "ｆ": "f",
+    "ｇ": "g", "ｈ": "h", "ｉ": "i", "ｊ": "j", "ｋ": "k", "ｌ": "l", "ｍ": "m", "ｎ": "n",
+    "ｏ": "o", "ｐ": "p", "ｑ": "q", "ｒ": "r", "ｓ": "s", "ｔ": "t", "ｕ": "u", "ｖ": "v",
+    "ｗ": "w", "ｘ": "x", "ｙ": "y", "ｚ": "z",
     # ── 不可见/空字符 (LLM 常混入 → "空行 invalid character" 报错, 最常见于首/末行) ──
     #   BOM/零宽/方向符 → 删; 空格类变体 → 普通空格; 行/段分隔 → 空格 (防结构错位)
     "﻿": "", "‌": "", "‍": "", "‎": "", "‏": "",
@@ -175,10 +193,46 @@ _UNICODE_FIXES = {
 }
 
 
+_QUOTE_BADS = "“”‘’"
+_QUOTE_MAP = {"“": '"', "”": '"', "‘": "'", "’": "'"}
+
+
+def _fix_quote_chars(text: str) -> str:
+    """智能/中文引号两难处理:
+      场景A 定界符 (print(“[info] OK”)) → 必须换成 ASCII 引号 print("[info] OK")
+      场景B 字符串内容 (print("他说“你好”")) → 换成 ASCII 会破坏字符串, 必须删除
+      字符级替换无法区分两者 → 两种候选都试, 取第一个 compile 通过的版本;
+      都失败(文本还有其它语法问题) → 返回替换版 (至少引号已 ASCII 化, 其余交后续清洗)."""
+    if not any(q in text for q in _QUOTE_BADS):
+        return text
+    del_v = text
+    rep_v = text
+    for bad in _QUOTE_BADS:
+        del_v = del_v.replace(bad, "")
+        rep_v = rep_v.replace(bad, _QUOTE_MAP[bad])
+    for cand in (del_v, rep_v):
+        try:
+            compile(cand, "<check>", "exec")
+            return cand
+        except SyntaxError:
+            continue
+    return rep_v
+
+
 def _sanitize_unicode(text: str) -> str:
-    """把 LLM 输出里的 Unicode 脏字符替换成 ASCII 等价物."""
+    """把 LLM 输出里的 Unicode 脏字符替换成 ASCII 等价物.
+    ★修复(引号两难): 智能引号先走 _fix_quote_chars (删/换取编译通过者),
+       普通字符替换只处理定界符场景时反而会破坏字符串内部的引号."""
+    text = _fix_quote_chars(text)
     for bad, good in _UNICODE_FIXES.items():
+        if bad in _QUOTE_BADS:
+            continue   # 引号已由 _fix_quote_chars 处理
         text = text.replace(bad, good)
+    # ★千分位逗号归一: LLM 常把数值写成 1,024 / 1，024(全角已转半角) → Python 里
+    #   `1,024` 是 `1, 024` → 前导零 → SyntaxError "leading zeros/invalid decimal literal".
+    #   安全边界: 只匹配 \b数字1-3位(,数字3位)+ \b (标准千分位分组); 带空格的元组/赋值
+    #   (64, 64, 32) 不匹配; 4 位以上数字(2048,1024 合法元组)不匹配.
+    text = re.sub(r"(?<!\w)\d{1,3}(?:,\d{3})+(?!\w)", lambda m: m.group(0).replace(",", ""), text)
     # ★兜底: 如果替换后仍有非 ASCII 且 compile 失败, 暴力清掉所有非 ASCII (注释外)
     try:
         compile(text, "<check>", "exec")
@@ -194,6 +248,12 @@ def _sanitize_unicode(text: str) -> str:
                 # 非注释行: 替换剩余非 ASCII 为 ASCII 最近邻 (保守: 只清确实非法的)
                 cleaned.append("".join(ch if ord(ch) < 128 else _closest_ascii(ch) for ch in line))
         text = "\n".join(cleaned)
+        # ★修复: 兜底清洗后必须再验证一次 — 清洗可能引入新错 (如全角数字被删 → "= , 64")
+        #   (字符级删除无法保证语义, 但至少让调用方的报错信息指向真实残留行)
+        try:
+            compile(text, "<check>", "exec")
+        except SyntaxError:
+            pass   # 仍失败 → 交给调用方 _validate_python 拦 (报错信息已含出错行内容)
     return text
 
 
@@ -202,6 +262,15 @@ def _closest_ascii(ch: str) -> str:
     # 常见 Unicode → ASCII (补充 _UNICODE_FIXES 没覆盖的)
     _map = {"²": "2", "³": "3", "¹": "1", "⁰": "0", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
             "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4", "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+            # ★全角数字/字母 (兜底路径也必须转, 不能删 — 删除会留空产生 "= , 64" 新语法错)
+            "０": "0", "１": "1", "２": "2", "３": "3", "４": "4", "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+            "Ａ": "A", "Ｂ": "B", "Ｃ": "C", "Ｄ": "D", "Ｅ": "E", "Ｆ": "F", "Ｇ": "G", "Ｈ": "H",
+            "Ｉ": "I", "Ｊ": "J", "Ｋ": "K", "Ｌ": "L", "Ｍ": "M", "Ｎ": "N", "Ｏ": "O", "Ｐ": "P",
+            "Ｑ": "Q", "Ｒ": "R", "Ｓ": "S", "Ｔ": "T", "Ｕ": "U", "Ｖ": "V", "Ｗ": "W", "Ｘ": "X",
+            "Ｙ": "Y", "Ｚ": "Z", "ａ": "a", "ｂ": "b", "ｃ": "c", "ｄ": "d", "ｅ": "e", "ｆ": "f",
+            "ｇ": "g", "ｈ": "h", "ｉ": "i", "ｊ": "j", "ｋ": "k", "ｌ": "l", "ｍ": "m", "ｎ": "n",
+            "ｏ": "o", "ｐ": "p", "ｑ": "q", "ｒ": "r", "ｓ": "s", "ｔ": "t", "ｕ": "u", "ｖ": "v",
+            "ｗ": "w", "ｘ": "x", "ｙ": "y", "ｚ": "z",
             "ɑ": "a", "ɛ": "e", "ɔ": "o", "ν": "v", "β": "B", "γ": "g", "δ": "d", "θ": "th", "λ": "l", "μ": "u",
             "π": "pi", "ρ": "r", "σ": "s", "τ": "t", "φ": "phi", "ω": "w", "Δ": "D", "Σ": "S", "Ω": "O",
             "√": "sqrt", "∑": "sum", "∏": "prod", "∫": "int", "∂": "d", "∇": "grad"}
@@ -502,21 +571,23 @@ class CoderAgent:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _clean_output(self, raw: str, original: str) -> str:
-        """清理 LLM 输出 — 去 BOM/行首垃圾/markdown 代码块包裹/★Unicode 脏字符/保 header。"""
+        """清理 LLM 输出 — 去 BOM/行首垃圾/markdown 代码块包裹/★Unicode 脏字符/保 header。
+        ★修复: markdown 剥离必须先于"去行首垃圾" — 否则 ```python 开头会被垃圾正则吃掉,
+        text.startswith('```') 失活, 结尾 ``` 残留 → SyntaxError at line N (看代码没非法字符)."""
         text = raw.lstrip('﻿').lstrip()   # 去 BOM + 行首空白
+        # 先剥 markdown ```python ... ``` 包裹 (含 ``` 后无语言标注 / 行首空格变体)
+        if text.startswith("```"):
+            lines = text.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            while lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines)
         # 去行首垃圾: 找到第一个有效起点 (#/import/from/"""/@triton/class/def), 前面有垃圾就切掉
         if text:
             m = re.search(r'^(.*?)(?=(?:#|import |from |"""|\'\'\'|@triton|class |def ))', text, re.S)
             if m and m.group(1).strip():
                 text = text[m.end(1):]
-        # 去掉 ```python ... ``` 包裹
-        if text.startswith("```"):
-            lines = text.split("\n")
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines)
 
         # ★Unicode 脏字符清洗 (LLM 常把 ASCII 写成 Unicode 等价物 → 语法错/运行错):
         #   em dash — (U+2014) / en dash – (U+2013) → ASCII - (减号/连字符)

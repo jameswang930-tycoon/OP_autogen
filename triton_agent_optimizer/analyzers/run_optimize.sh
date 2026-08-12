@@ -176,9 +176,21 @@ for KNAME in "${KERNELS[@]}"; do
     "$PY" "$SCRIPT_DIR/pipeline_parse_board.py" "$BOUT" "$D/board_${IDX}.json" || true
     [ -f "$D/board_${IDX}.json" ] && BOARD_OK=$((BOARD_OK+1))
   else
-    fail "msprof op [$KNAME] 缺 Memory.csv (kernel 名不匹配? 看 board_${IDX}.txt)"
+    fail "msprof op [$KNAME] 缺 Memory.csv (kernel 名不匹配? 或 gather/非连续寻址崩 AICore?)"
+    # ★检测 msprof op 是否崩了 AICore (gather/非连续寻址 kernel 会让深度 profiling 崩)
+    #   → 后续 kernel 的 msprof op 也会因设备污染失败, 直接跳出循环 (别在死设备上浪费)
+    if grep -qEi "aclrt|575|npu function|device error|internal error" "$OUT/04_board/board_${IDX}.txt" 2>/dev/null; then
+      echo "  ⛔ [$KNAME] msprof op 崩了 AICore (设备级错误) → 跳过剩余 kernel (设备已污染)"
+      break
+    fi
   fi
 done
+
+# ★msprof op 崩了 AICore → 重置设备 (清污染, 防级联到下一轮采集)
+if [ "$BOARD_OK" -lt "${#KERNELS[@]}" ]; then
+  echo "  ⚠ 有 $(( ${#KERNELS[@]} - BOARD_OK )) 个 kernel 的 msprof op 失败 → 重置设备 (清 AICore 污染)..."
+  $PY -c "import torch,torch_npu;torch.npu.synchronize();torch.npu.empty_cache();print('device reset OK')" 2>/dev/null || echo "  ⚠ 设备重置子进程失败 (真硬件 poison 需 npu-smi/重启)"
+fi
 
 # ═══════════ 阶段 2/3: 整合 → diagnosis.json (骨架 + deep 按 kernel 名合并) ═══════════
 echo ""; echo "══ 阶段 2/3: 整合骨架 + deep → diagnosis.json ══"

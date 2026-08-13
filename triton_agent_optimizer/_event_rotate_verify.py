@@ -29,6 +29,9 @@ for p in ops:
         has_rebuild = ("for _r in range(_REPS):" in injected
                        and re.search(r"\n            \w+ = torch\.(randn?|rand|empty|zeros|ones)\(", injected))
         check(f"{p.parent.name}: 分配行重建进 rep 窗口", has_rebuild)
+        # ★V5c: _keep 持有防地址复用 (caching allocator 复用 → 破 L2 失效)
+        has_keep = "_keep = []" in injected and "_keep.append((" in injected
+        check(f"{p.parent.name}: _keep 持有张量防地址复用", has_keep)
         n_alloc += 1
 
 print(f"\n═══ V5 验证: {n_ok}/{len(ops)} 算子注入可编译, {n_alloc} 个含输入重建 ═══")

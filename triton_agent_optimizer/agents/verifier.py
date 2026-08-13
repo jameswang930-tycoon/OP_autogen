@@ -215,11 +215,14 @@ def _inject_event_timing(src: str, rebuild_inputs: bool = True) -> str:
     #   (假快) → vs_industrial 比值偏乐观. Ascend 无清 L2 API → do_bench 的 cache 清空用
     #   "每窗口前重放输入分配 (新地址)" 替代: 扫描 for LOOP 之前的 torch 张量分配行,
     #   重放进每个 rep 窗口内 → 每窗口全新输入, 与工业级基准 (fn(i) 轮换 32 组) 同口径.
+    #   ★2026-08-13 修复: 重建的张量必须被 _keep 列表持有 (防 GC) — 否则 PyTorch caching
+    #   allocator 会复用刚释放的地址 → 窗口2 起 L2 又命中 → 破 L2 失效 (实测虚高比值全 ≈1.0).
     #   分配行都在 main 的循环前 (14 个算子统一模式, 单行); 提取不到 → 不重建 (退化为热 L2, 不报错).
     _alloc_lines = []
     for _ln in lines[:for_idx]:
-        if re.match(r"^\s{4,}\w+\s*=\s*torch\.(randn?|rand|empty|zeros|ones)\(", _ln):
-            _alloc_lines.append(_ln.rstrip("\n"))
+        _am = re.match(r"^\s{4,}(\w+)\s*=\s*torch\.(randn?|rand|empty|zeros|ones)\(", _ln)
+        if _am:
+            _alloc_lines.append((_ln.rstrip("\n"), _am.group(1)))
     # 收集循环体: for_idx 之后缩进 > base_indent 的行 (含空行)
     body_start = for_idx + 1
     body_end = body_start
@@ -242,10 +245,14 @@ def _inject_event_timing(src: str, rebuild_inputs: bool = True) -> str:
     body_deep2 = "".join(("    " + ln if ln.strip() else ln) for ln in body_deep.splitlines(keepends=True))
     ind = " " * base_indent
     # ★输入重建块 (缩进到 rep 内层 12 空格, 与 _ev_s 同级): 每窗口前重新分配输入 → 新地址 → 破 L2 复用
+    #   + _keep.append: 持有本窗口张量防 GC — 否则 caching allocator 复用地址, 破 L2 失效
     #   rebuild_inputs=False → 不重建 (热 L2, 量化虚高用)
     _alloc_block = ""
+    _keep_block = ""
     if rebuild_inputs and _alloc_lines:
-        _alloc_block = "".join(("            " + _ln.lstrip() + "\n") for _ln in _alloc_lines)
+        _alloc_block = "".join(("            " + _ln.lstrip() + "\n") for _ln, _ in _alloc_lines)
+        _names = ", ".join(_n for _, _n in _alloc_lines)
+        _keep_block = f"{ind}        _keep.append(({_names}))\n"
     # 注入块: 在原 for 之前插入 (原 for+body 保留在后, 仅非 Event 模式走)
     inject = (
         f"{ind}# ★工业级 Event 计时 (注入; KERNEL_EVENT_TIME 触发, 不影响正常/msprof 路径)\n"
@@ -255,8 +262,10 @@ def _inject_event_timing(src: str, rebuild_inputs: bool = True) -> str:
         f"{ind}    torch.npu.synchronize()\n"
         f"{ind}    _REPS = int(os.environ.get('KERNEL_EVENT_REPS', '5'))\n"
         f"{ind}    _ts = []\n"
+        f"{ind}    _keep = []\n"                                  # ★持有每窗口张量 (防地址复用)
         f"{ind}    for _r in range(_REPS):\n"
-        f"{_alloc_block}"                                      # ★每窗口前重建输入 (破 L2)
+        f"{_alloc_block}"                                         # ★每窗口前重建输入 (破 L2)
+        f"{_keep_block}"                                          # ★防 GC 释放 → 地址不复用
         f"{ind}        _ev_s = torch.npu.Event(enable_timing=True)\n"        f"{ind}        _ev_e = torch.npu.Event(enable_timing=True)\n"
         f"{ind}        _ev_s.record()\n"
         f"{ind}        for _ in range(LOOP):\n{body_deep2}"

@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Triton Agent Optimizer — 交互式讲演（总览 → 下钻）</title>
+<style>
+  :root {
+    --bg: #f7f8fa; --card: #ffffff; --border: #e2e5ea;
+    --accent: #1a6bff; --text: #1f2733; --muted: #6b7686;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { position: sticky; top: 0; z-index: 50; background: var(--card);
+           border-bottom: 1px solid var(--border); padding: 10px 24px;
+           display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header .hint { color: #4a5568; font-size: 12.5px; }
+  header .legend-right { margin-left: auto; font-size: 12px; color: var(--muted); }
+  main { max-width: 1800px; margin: 0 auto; padding: 16px 24px 40px; }
+  .diagram-wrap { background: var(--card); border: 1px solid var(--border);
+                  border-radius: 12px; padding: 14px; overflow: auto; }
+  .tip { text-align: center; color: #4a5568; font-size: 13.5px; margin: 10px 0 0; }
+  svg text { font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif; }
+
+  /* ── 节点动画 ── */
+  .node { cursor: pointer; transform-box: fill-box; transform-origin: center;
+          transition: transform .22s cubic-bezier(.2,.9,.3,1.3), opacity .3s; }
+  .node:hover { transform: scale(1.045); }
+  .node:active { transform: scale(.97); }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: none; } }
+  .node { animation: fadeUp .55s both; animation-delay: calc(var(--i, 0) * 70ms); }
+
+  /* 聚焦：打开一个节点时，其余变暗 */
+  body[data-open] .node:not([data-open-node]) { opacity: .22; }
+  body[data-open] .node[data-open-node] .card { filter: drop-shadow(0 0 22px rgba(26,107,255,.65)); stroke-width: 3.2; }
+
+  /* 流动虚线（数据传递动画） */
+  .flow { stroke-dasharray: 9 7; animation: flowMove 0.9s linear infinite; }
+  @keyframes flowMove { to { stroke-dashoffset: -16; } }
+
+  /* ── 下钻面板 ── */
+  .overlay { position: fixed; inset: 0; z-index: 90; display: flex; align-items: center; justify-content: center;
+             background: rgba(20,28,40,.42); opacity: 0; pointer-events: none;
+             transition: opacity .25s ease; backdrop-filter: blur(2px); }
+  .overlay.open { opacity: 1; pointer-events: auto; }
+  .panel { position: relative; background: #fff; border-radius: 16px; box-shadow: 0 24px 80px rgba(0,0,0,.28);
+           width: min(1180px, 92vw); max-height: 86vh; overflow: auto; padding: 26px 30px 30px;
+           transform: scale(.92) translateY(14px); transition: transform .28s cubic-bezier(.2,.9,.3,1.15); }
+  .overlay.open .panel { transform: none; }
+  .panel h2 { margin: 0 0 4px; font-size: 19px; }
+  .panel .p-sub { color: var(--muted); font-size: 12.5px; margin: 0 0 16px; }
+  .panel .close { position: absolute; top: 18px; right: 22px; background: none; border: none;
+                  font-size: 24px; cursor: pointer; color: var(--muted); line-height: 1; }
+  .panel .close:hover { color: var(--text); }
+  .grid { display: grid; gap: 12px; }
+  .g2 { grid-template-columns: 1fr 1fr; }
+  .g3 { grid-template-columns: 1fr 1fr 1fr; }
+  .g6 { grid-template-columns: repeat(6, 1fr); }
+  .g7 { grid-template-columns: repeat(7, 1fr); }
+  .dcard { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: #fbfcfe;
+           display: flex; flex-direction: column; }
+  .dcard .t { font-weight: 700; font-size: 13.5px; margin-bottom: 5px; }
+  .dcard .d { font-size: 12px; color: #4a5568; line-height: 1.62; }
+  .dcard .f { font-size: 11px; color: #4a90e2; margin-top: auto; padding-top: 6px; font-family: Consolas, monospace; }
+  .note { background: #fff7ea; border: 1px solid #f5c97b; border-radius: 10px; padding: 10px 14px;
+          font-size: 12.5px; color: #7a5a10; margin-top: 14px; line-height: 1.6; }
+  .ok { background: #f0f7ef; border: 1px solid #a8d5a2; border-radius: 10px; padding: 10px 14px;
+        font-size: 12.5px; font-weight: 600; color: #14532d; margin-top: 14px; line-height: 1.6; }
+  .bad { background: #fdf0ee; border: 1px solid #e8a29b; border-radius: 10px; padding: 10px 14px;
+         font-size: 12.5px; color: #8c2f24; margin-top: 14px; line-height: 1.6; }
+  .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; background: #eef1f6;
+          padding: 2px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Triton Agent Optimizer — 交互式讲演（总览 → 点击下钻）</h1>
+  <span class="hint">纯 HTML/CSS/JS · 离线 · 先看整体，再点击任意图块展开细节</span>
+  <span class="legend-right">点击图块展开 · 点空白处 / Esc 关闭</span>
+</header>
+
+<main>
+  <div class="diagram-wrap">
+    <svg id="map" viewBox="0 0 1780 640" width="100%" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#5a6472"/>
+        </marker>
+        <marker id="arrDash" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#8a94a6"/>
+        </marker>
+      </defs>
+
+      <!-- ══ 连线 ══ -->
+      <line class="flow" x1="340" y1="88" x2="396" y2="88" stroke="#5a6472" stroke-width="2" marker-end="url(#arr)"/>
+      <line class="flow" x1="820" y1="88" x2="876" y2="88" stroke="#5a6472" stroke-width="2" marker-end="url(#arr)"/>
+      <line class="flow" x1="1180" y1="88" x2="1236" y2="88" stroke="#5a6472" stroke-width="2" marker-end="url(#arr)"/>
+      <line class="flow" x1="1480" y1="88" x2="1526" y2="88" stroke="#5a6472" stroke-width="2" marker-end="url(#arr)"/>
+      <line x1="610" y1="126" x2="610" y2="172" stroke="#5a6472" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="560" y1="424" x2="560" y2="458" stroke="#5a6472" stroke-width="1.8" marker-end="url(#arr)"/>
+      <line class="flow" x1="1060" y1="505" x2="1106" y2="505" stroke="#5a6472" stroke-width="2" marker-end="url(#arr)"/>
+      <line x1="1520" y1="482" x2="1520" y2="460" stroke="#6b7686" stroke-width="1.6" marker-end="url(#arr)"/>
+
+      <!-- ══ N1 输入 ══ -->
+      <g class="node" data-node="input" style="--i:0">
+        <rect class="card" x="60" y="50" width="280" height="76" rx="12" fill="#eef4ff" stroke="#8ab4ff" stroke-width="2"/>
+        <text x="200" y="82" text-anchor="middle" font-size="16" font-weight="700" fill="#1f2733">输入</text>
+        <text x="200" y="104" text-anchor="middle" font-size="12.5" fill="#4a5568">input/&lt;op&gt;/kernel_op.py 单文件</text>
+      </g>
+
+      <!-- ══ N2 主循环 ══ -->
+      <g class="node" data-node="loop" style="--i:1">
+        <rect class="card" x="400" y="50" width="420" height="76" rx="12" fill="#eef4ff" stroke="#1a6bff" stroke-width="2.2"/>
+        <text x="610" y="82" text-anchor="middle" font-size="16" font-weight="700" fill="#1f2733">Scheduler 主循环 × RoundN</text>
+        <text x="610" y="104" text-anchor="middle" font-size="12.5" fill="#4a5568">采集 → 诊断 → 决策 → 改码 → 验证（每轮闭环）</text>
+      </g>
+
+      <!-- ══ N3 严格最优门 ══ -->
+      <g class="node" data-node="gate" style="--i:2">
+        <rect class="card" x="880" y="50" width="300" height="76" rx="12" fill="#f0f7ef" stroke="#a8d5a2" stroke-width="2"/>
+        <text x="1030" y="82" text-anchor="middle" font-size="16" font-weight="700" fill="#1e6b2f">严格最优门 KEEP / REVERT</text>
+        <text x="1030" y="104" text-anchor="middle" font-size="12.5" fill="#3d6b4a">Event 绝对延迟 &lt; 历史最优才保留</text>
+      </g>
+
+      <!-- ══ N4 层间决策 ══ -->
+      <g class="node" data-node="decide" style="--i:3">
+        <rect class="card" x="1240" y="50" width="240" height="76" rx="12" fill="#fff7ea" stroke="#f5c97b" stroke-width="2"/>
+        <text x="1360" y="82" text-anchor="middle" font-size="16" font-weight="700" fill="#7a5a10">层间决策</text>
+        <text x="1360" y="104" text-anchor="middle" font-size="12.5" fill="#7a5a10">promote / 回退 / 停止</text>
+      </g>
+
+      <!-- ══ N6 最终产物 ══ -->
+      <g class="node" data-node="output" style="--i:4">
+        <rect class="card" x="1530" y="50" width="190" height="76" rx="12" fill="#e7eefc" stroke="#6d8fd8" stroke-width="2"/>
+        <text x="1625" y="82" text-anchor="middle" font-size="15.5" font-weight="700" fill="#1f2733">最终产物</text>
+        <text x="1625" y="104" text-anchor="middle" font-size="12" fill="#3d4a5c">final + 验收</text>
+      </g>
+
+      <!-- ══ Tier 策略组 ══ -->
+      <g class="node" data-node="tiers" style="--i:5">
+        <rect class="card" x="60" y="180" width="400" height="222" rx="12" fill="#fbfcfe" stroke="#d4dae3" stroke-width="1.6" stroke-dasharray="6 4"/>
+        <text x="260" y="206" text-anchor="middle" font-size="14.5" font-weight="700" fill="#1f2733">6 层优化策略（逐层推进）</text>
+        <rect x="80" y="220" width="360" height="26" rx="6" fill="#eef4ff" stroke="#8ab4ff"/>
+        <text x="260" y="238" text-anchor="middle" font-size="13" fill="#1f2733">Tier1 算法 · Tier2 融合 · Tier3 分块</text>
+        <rect x="80" y="254" width="360" height="26" rx="6" fill="#e8f2ff" stroke="#7fa8e0"/>
+        <text x="260" y="272" text-anchor="middle" font-size="13" fill="#1f2733">Tier4 访存 · Tier5 计算 · Tier6 配置</text>
+        <rect x="80" y="288" width="360" height="26" rx="6" fill="#f0f7ef" stroke="#a8d5a2"/>
+        <text x="260" y="306" text-anchor="middle" font-size="13" fill="#1e6b2f">每层一个 Round：当前层五步闭环推进</text>
+        <rect x="80" y="322" width="360" height="26" rx="6" fill="#fff7ea" stroke="#f5c97b"/>
+        <text x="260" y="340" text-anchor="middle" font-size="13" fill="#7a5a10">严格晋升需数据依据 · 可回退 · 防死循环</text>
+        <rect x="80" y="356" width="360" height="26" rx="6" fill="#e7eefc" stroke="#6d8fd8"/>
+        <text x="260" y="374" text-anchor="middle" font-size="13" fill="#1f2733">点击展开每层内容与典型优化</text>
+      </g>
+
+      <!-- ══ N5 数据流条 ══ -->
+      <g class="node" data-node="flow" style="--i:6">
+        <rect class="card" x="60" y="462" width="1000" height="86" rx="12" fill="#e6f7f7" stroke="#7fc9c9" stroke-width="2"/>
+        <text x="560" y="494" text-anchor="middle" font-size="16" font-weight="700" fill="#1f2733">完整数据流 · 7 阶段（谁写谁读）</text>
+        <text x="560" y="518" text-anchor="middle" font-size="12.5" fill="#3d5c5c">采集 → 合并诊断 → 字段筛选 → Planner 决策 → Coder 改码 → Verifier 验证 → 最终产物</text>
+      </g>
+
+      <!-- ══ N7 外部数据底座 ══ -->
+      <g class="node" data-node="ext" style="--i:7">
+        <rect class="card" x="1080" y="462" width="590" height="86" rx="12" fill="#f4f6fa" stroke="#aab6c4" stroke-width="1.8" stroke-dasharray="6 4"/>
+        <text x="1375" y="494" text-anchor="middle" font-size="15.5" font-weight="700" fill="#5a6472">外部数据底座（只读）</text>
+        <text x="1375" y="518" text-anchor="middle" font-size="12" fill="#4a5568">hardware_peak · industrial · pytorch · memory</text>
+        <text x="1375" y="536" text-anchor="middle" font-size="11.5" fill="#8a94a6">校准 roofline · 对比天花板 · 参考线 · 决策参考</text>
+      </g>
+    </svg>
+    <p class="tip">① 先看整体：输入 → 主循环（5 步闭环）→ 严格最优门 → 层间决策（6 层推进）→ 最终产物；底部：数据流 7 阶段 + 外部数据底座<br>② 点击任意图块展开细节，点空白处或 Esc 关闭</p>
+  </div>
+</main>
+
+<div class="overlay" id="overlay">
+  <div class="panel" id="panel"></div>
+</div>
+
+<script>
+const DETAILS = {
+
+  input: {
+    title: "输入 — 单文件 kernel_op.py",
+    sub: "每个算子一个目录，一个文件包含三部分，Planner/Coder/Verifier 全程只改这一个文件",
+    html: `
+      <div class="grid g3">
+        <div class="dcard"><div class="t">① config — 场景配置</div><div class="d">尺寸/精度/分块全部用环境变量定义，可批量换形状测试（如 matmul 的 MATMUL_M/N/K）</div><div class="f">N = int(os.environ.get("MATMUL_N", 2048))</div></div>
+        <div class="dcard"><div class="t">② kernel — 算子实现</div><div class="d">triton.jit kernel 函数，可读、可改、可加注释（优化对象就是这里）</div><div class="f">@triton.jit def mm_kernel(...)</div></div>
+        <div class="dcard"><div class="t">③ test — 测试 main</div><div class="d">分配输入 → 启动 kernel → 同步；KERNEL_LOOP 循环计时，MATMUL_VERIFY=1 对 torch 参考校验</div><div class="f">python3 input/matmul/kernel_op.py</div></div>
+      </div>
+      <div class="note">运行入口：<span class="mono">main.py input/&lt;op&gt; --fresh --max-rounds 30</span>（--fresh 清 outputs 重跑，--resume 断点续跑）</div>`
+  },
+
+  loop: {
+    title: "Scheduler 主循环 — 每轮五步闭环",
+    sub: "每一轮在当前层执行五步；输入链 = input 源 / 上一轮 kernel（promote 轮原样拷贝，链不中断）",
+    html: `
+      <div class="grid" style="grid-template-columns:repeat(5,1fr)">
+        <div class="dcard"><div class="t">① 采集+解析</div><div class="d">通用 msprof + 逐 kernel msprof op（双源），一次采集产出骨架与深层画像</div><div class="f">→ task.json · board_N.json · diagnosis.json</div></div>
+        <div class="dcard"><div class="t">② 分块 sweep</div><div class="d">（Tier3 轮）best_kernel 上枚举全部 L0 合法 BLOCK，Event 实测取最优写回</div><div class="f">→ 09_tier3_sweep/sweep_result.json</div></div>
+        <div class="dcard"><div class="t">③ Planner（LLM）</div><div class="d">读字段+轨迹+手递+优秀案例，输出 changes[]（old→new 精确替换）+ promote 决策</div><div class="f">→ plan.md + 10_tier_handoff.json</div></div>
+        <div class="dcard"><div class="t">④ Coder（确定性）</div><div class="d">old→new 精确替换 + 语法/函数完整校验，LLM 只决策不直接改码</div><div class="f">→ roundN/kernel_op.py + diff.patch</div></div>
+        <div class="dcard"><div class="t">⑤ Verifier</div><div class="d">MATMUL_VERIFY 正确性 + msprof 端到端双口径 + Event 设备侧权威计时</div><div class="f">→ e2e_event_ns + trajectory history</div></div>
+      </div>
+      <div class="ok">核心主张：真机数据驱动（不猜瓶颈）→ 确定性优于生成（LLM 只决策）→ 测量纪律（Event 绝对延迟权威值）</div>`
+  },
+
+  gate: {
+    title: "严格最优门 — KEEP / REVERT",
+    sub: "加速比数字可信的根基：只有真正超越历史最优才进链",
+    html: `
+      <div class="grid g2">
+        <div class="dcard"><div class="t">KEEP — 严格最优</div><div class="d">Event 绝对延迟 &lt; 历史最小才采纳，best_kernel.py 更新并绑定 best_round；Event 缺失（采集异常）不采纳</div></div>
+        <div class="dcard"><div class="t">REVERT — 回滚</div><div class="d">失败/无改进恢复 best_kernel（内容快照），failed_kernel.py 留证，diff.patch 不被失败尝试覆盖</div></div>
+      </div>
+      <div class="note">为什么用 Event：msprof 有 profiler 扰动，Event 是设备侧计时（do_bench 同款：多窗口 median + 输入轮换破 L2 复用）。工业级与我们是同一口径，差异 = 融合/单遍优化收益，对比公平</div>
+      <div class="bad">假小防护：verify 发现循环被改坏（msprof 行数 &lt; LOOP）→ 不测 Event（None）→ 方案不保留，防止虚高加速比骗过门</div>`
+  },
+
+  tiers: {
+    title: "6 层优化策略 — 从算法到配置逐层推进",
+    sub: "每层解决一类瓶颈：数据（诊断）→ 方向（planner）→ 验证（真机）→ 达标才晋升",
+    html: `
+      <div class="grid g6">
+        <div class="dcard"><div class="t">Tier1 算法</div><div class="d">单遍归约 / 因果剪枝 / im2col 走 cube —— 收益最大的一层</div><div class="f">例：conv 外积 → tl.dot</div></div>
+        <div class="dcard"><div class="t">Tier2 融合</div><div class="d">跨 kernel 合并（HIVM MLIR 分析融合机会），减少 kernel 数与中间分配</div><div class="f">例：conv+bias+relu 3→1</div></div>
+        <div class="dcard"><div class="t">Tier3 分块</div><div class="d">sweep 枚举 L0 合法 BLOCK（L0A/B≤64KB、L0C≤128KB），实测择优，不靠猜</div><div class="f">例：(BM,BN,BK) 全枚举</div></div>
+        <div class="dcard"><div class="t">Tier4 访存</div><div class="d">连续化 / 对齐 / burst，让 MTE 搬满带宽</div><div class="f">例：innermost stride=1</div></div>
+        <div class="dcard"><div class="t">Tier5 计算</div><div class="d">指令级改造：除法→rsqrt 乘链、原生指令、精度策略</div><div class="f">例：/sqrt → *rsqrt</div></div>
+        <div class="dcard"><div class="t">Tier6 配置</div><div class="d">调度/流水/资源收尾调优，连续 3 轮无改进则停止</div><div class="f">例：grid 调度调整</div></div>
+      </div>
+      <div class="note">轮次经济：promote 轮不改码且不消耗 max_rounds 配额（按有效优化轮计）；达标（--target）不硬停，继续探后续层确认无更大空间</div>`
+  },
+
+  decide: {
+    title: "层间决策 — 严格晋升 / 回退 / 停止",
+    sub: "带防呆机制的层间迁移，防止死循环与无依据晋升",
+    html: `
+      <div class="grid g3">
+        <div class="dcard"><div class="t">promote → Tier+1</div><div class="d">必须带数据依据（promote_evidence，用诊断数据证明本层无空间），否则本层再优化一轮；手递 handoff 把瓶颈+方向传给目标层</div></div>
+        <div class="dcard"><div class="t">回退 → Tier-1</div><div class="d">planner 判瓶颈属前层且前层有空间（如结构层没做），允许跳回重新诊断</div></div>
+        <div class="dcard"><div class="t">停止</div><div class="d">Tier6 连续 3 轮无改进 / 跑满 max_rounds / 采集连续失败 3 次；无改进兜底：本层连续 3 轮自动晋升</div></div>
+      </div>
+      <div class="grid g2" style="margin-top:12px">
+        <div class="dcard"><div class="t">防死循环</div><div class="d">同一跳转路径（Tier A→B）发生 ≥3 次 → 拒绝跳转，改前向晋升（Tier6 则停止）</div></div>
+        <div class="dcard"><div class="t">环境漂移防护</div><div class="d">每 10 轮 REBASELINE 重测基线校正加速比基数；设备污染（verify 崩 AICore）自动重置再采集，修 msprof 采不到 kernel 级联</div></div>
+      </div>`
+  },
+
+  flow: {
+    title: "完整数据流 — 7 阶段 × 文件产物 × 谁写谁读",
+    sub: "每个文件都有明确产出方与消费方；外部数据（峰值/工业级/案例）只读汇入",
+    html: `
+      <div class="grid" style="grid-template-columns:repeat(4,1fr)">
+        <div class="dcard"><div class="t">1 采集</div><div class="d">run_optimize：warmup + 通用 msprof + 逐 kernel msprof op</div><div class="f">task.json · board_N.json</div></div>
+        <div class="dcard"><div class="t">2 诊断</div><div class="d">integrate 合并骨架+deep，roofline 用实测峰值校准</div><div class="f">diagnosis.json</div></div>
+        <div class="dcard"><div class="t">3 字段</div><div class="d">按当前层筛字段（TIER_FIELDS 58 项），缺字段采集端暴露</div><div class="f">07_tierN_fields/</div></div>
+        <div class="dcard"><div class="t">4 决策</div><div class="d">Planner 读字段+轨迹+手递+案例 → changes[] + promote 证据</div><div class="f">plan.md</div></div>
+        <div class="dcard"><div class="t">5 改码</div><div class="d">Coder 确定性替换 + sweep 实测写回最优块</div><div class="f">kernel_op.py · diff.patch</div></div>
+        <div class="dcard"><div class="t">6 验证</div><div class="d">正确性 + 端到端 + Event；KEEP/REVERT 决策写轨迹</div><div class="f">optimization_trajectory.json</div></div>
+        <div class="dcard"><div class="t">7 产物</div><div class="d">双口径加速比 + vs_industrial 验收 + 讲演报告</div><div class="f">final_summary.json</div></div>
+      </div>
+      <div class="ok">失败路径：REVERT 回滚 best_kernel（内容快照 + failed_kernel.py 留证）；采集失败重试 1 次 → 跳过轮 → 连续 3 次停止</div>`
+  },
+
+  output: {
+    title: "最终产物 — 双口径加速比 + vs_industrial 验收",
+    sub: "每轮可审计、结果可复现、效果可对比工业级天花板",
+    html: `
+      <div class="grid g3">
+        <div class="dcard"><div class="t">final_summary.json</div><div class="d">双口径加速比（msprof 端到端 + Event 设备侧）+ vs_industrial_ratio + 每轮审计留痕</div></div>
+        <div class="dcard"><div class="t">轨迹图 + 报告</div><div class="d">trajectory_chart.png（每轮实际加速比 + REVERT/FAIL 标记）+ rounds.csv + REPORT.md 自动讲演报告</div></div>
+        <div class="dcard"><div class="t">验收</div><div class="d">acceptance_summary.json：我们最优 Event ÷ 工业级最优 Event（≥1 快于，0.8~1 打平，&lt;0.8 有空间）</div></div>
+      </div>
+      <div class="note">14 算子验收平均 1.33×：9 个快于工业级（matmul_transpose 2.88× / rms_norm 2.59× / matmul 1.84×），2 打平，3 有空间（FA 数据异常待重测、conv 结构层未做）</div>`
+  },
+
+  ext: {
+    title: "外部数据底座（只读）— 校准 · 对比 · 参考",
+    sub: "四个外部数据源让优化有标尺：峰值、工业级、PyTorch、经验案例",
+    html: `
+      <div class="grid g2">
+        <div class="dcard"><div class="t">hardware_peak.json</div><div class="d">run_bench.py 实测峰值（cube fp16 294.9 TFLOPS / GM 1638 GB/s 等），校准 roofline —— 不是纸面理论值</div></div>
+        <div class="dcard"><div class="t">industrial_*_tflops.json</div><div class="d">工业级基准：eager（aclnn 厂商 kernel）/ compile（TorchAir 图融合）/ cann-fused（厂商融合算子）/ fa（CANN FA），各 mode Event 取 min（仅真执行）</div></div>
+        <div class="dcard"><div class="t">pytorch_*.json</div><div class="d">PyTorch 参考对照线（轨迹图虚线），缺省自动跑</div></div>
+        <div class="dcard"><div class="t">memory/tierN_cases.json</div><div class="d">优秀案例回灌：单轮相对上一最优 &gt;1.3× 自动入库，后续 Planner 决策时参考</div></div>
+      </div>
+      <div class="note">口径声明：工业级与我们都是"一次完整调用的设备侧耗时"（同工具/同 median/同破 L2），差异 = kernel 数 + gap + 中间分配 → 是真实优化收益，对比公平</div>`
+  },
+};
+
+/* ── 交互：点击下钻 / 关闭 ── */
+const overlay = document.getElementById('overlay');
+const panel = document.getElementById('panel');
+
+function openPanel(nodeId) {
+  const d = DETAILS[nodeId];
+  panel.innerHTML = '<button class="close" onclick="closePanel()" aria-label="关闭">&times;</button>'
+    + '<h2>' + d.title + '</h2><p class="p-sub">' + d.sub + '</p>' + d.html;
+  overlay.classList.add('open');
+  document.body.setAttribute('data-open', '1');
+  document.body.setAttribute('data-open-node', nodeId);
+}
+
+function closePanel() {
+  overlay.classList.remove('open');
+  document.body.removeAttribute('data-open');
+  document.body.removeAttribute('data-open-node');
+}
+
+document.querySelectorAll('.node').forEach(n => {
+  n.addEventListener('click', e => { e.stopPropagation(); openPanel(n.dataset.node); });
+});
+overlay.addEventListener('click', e => { if (e.target === overlay) closePanel(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closePanel(); });
+</script>
+</body>
+</html>

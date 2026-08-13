@@ -43,7 +43,7 @@ BLOCK_OW = 64                            # 输出宽分块
 # 循环窗口 kh/kw 取 max (越界位置贡献 -inf)
 @triton.jit
 def maxpool2d_kernel(x_ptr, y_ptr,
-                     H, W, KH, KW, SH, SW, PAD, OH, OW,
+                     C, H, W, KH, KW, SH, SW, PAD, OH, OW,
                      BLOCK_OW: tl.constexpr):
     pid = tl.program_id(axis=0)
     total_ow = (OW + BLOCK_OW - 1) // BLOCK_OW
@@ -94,7 +94,7 @@ def main():
     # ★KERNEL_LOOP: verify/bench 用它 (一次 msprof 内循环 N 次, 求单次平均; 分配只做一次复用)
     LOOP = int(os.environ.get("KERNEL_LOOP", "1"))
     for _ in range(LOOP):
-        maxpool2d_kernel[grid](x, y, H, W, KH, KW, SH, SW, PAD, OH, OW,
+        maxpool2d_kernel[grid](x, y, C, H, W, KH, KW, SH, SW, PAD, OH, OW,
                                BLOCK_OW=BLOCK_OW)
     torch.npu.synchronize()
     print("[info] maxpool2d launched & synced OK")

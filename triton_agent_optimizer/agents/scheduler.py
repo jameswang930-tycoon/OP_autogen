@@ -1771,9 +1771,18 @@ class Scheduler:
                         if _evt and _best_evt:
                             _adopt = _evt < _best_evt
                             _cmp = f"Event {_evt:.0f}ns {'<' if _adopt else '>='} best {_best_evt:.0f}ns"
-                        elif _evt:                      # 首次有 Event → 建基准, 采纳
-                            _adopt = True
-                            _cmp = f"首次 Event {_evt:.0f}ns (建 best)"
+                        elif _evt:
+                            # ★bug 修复 (2026-08-13): 首次有 Event 必须与基线 Event 对比 (同口径),
+                            #   不得无条件采纳 — 否则 msprof 欠采假快轮 (Event 口径其实没快/更慢) 直接进链,
+                            #   best_speedup = 基线Event/该轮Event < 1 (如 0.953) 且永不更新, 与 history
+                            #   的假 14x 矛盾 (msprof 对短 kernel 欠采 e2e_ns → 假性大加速比).
+                            _evt_base0 = st.get("baseline_e2e_event_ns")
+                            if _evt_base0:
+                                _adopt = _evt < _evt_base0
+                                _cmp = f"Event {_evt:.0f}ns {'<' if _adopt else '>='} 基线 {_evt_base0:.0f}ns (首次对比基线)"
+                            else:
+                                _adopt = True
+                                _cmp = f"首次 Event {_evt:.0f}ns (建 best)"
                         else:                           # ★方案A: Event 缺 (非晋升轮) → 不保留
                             #   coder 改坏 KERNEL_LOOP 循环 / 注入失败 → Event 测不到 (verify 已按
                             #   行数异常跳过 Event). 不退化 msprof (msprof 对坏循环的兜底测量不可信,

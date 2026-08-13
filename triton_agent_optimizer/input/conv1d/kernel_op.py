@@ -47,8 +47,8 @@ def conv1d_kernel(x_ptr, w_ptr, b_ptr, y_ptr,
     total_l = (LOUT + BLOCK_L - 1) // BLOCK_L
     lb = pid % total_l
     tmp = pid // total_l
-    cob = tmp % (triton.cdiv(COUT, BLOCK_CO))
-    n = tmp // (triton.cdiv(COUT, BLOCK_CO))
+    cob = tmp % ((COUT + BLOCK_CO - 1) // BLOCK_CO)
+    n = tmp // ((COUT + BLOCK_CO - 1) // BLOCK_CO)
 
     offs_co = cob * BLOCK_CO + tl.arange(0, BLOCK_CO)
     offs_l = lb * BLOCK_L + tl.arange(0, BLOCK_L)

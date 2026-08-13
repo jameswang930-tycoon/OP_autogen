@@ -67,6 +67,46 @@ def _read_durations(prof_out: Path) -> tuple:
     return target_us, all_us, target_n, all_n
 
 
+def _correctness_check(kernel_op: Path) -> tuple:
+    """正确性校验 (MATMUL_VERIFY=1): 一次子进程, 秒级. 返回 (ok, error)."""
+    import os as _os
+    import subprocess
+    py = "python3"
+    chk_env = dict(_os.environ, KERNEL_LOOP="1", MATMUL_VERIFY="1")
+    try:
+        rc = subprocess.run([py, str(kernel_op)], capture_output=True, text=True,
+                            encoding="utf-8", errors="backslashreplace", timeout=1800, env=chk_env)
+    except Exception as e:
+        return False, f"正确性校验运行失败: {e}"
+    _chk_out = (rc.stdout or "") + (rc.stderr or "")
+    if "result check: PASS" not in _chk_out:
+        # ★2026-08-12 报错分类: HIVM 编译错 (vsel/root alloc) / Python 语法错 / Traceback
+        #   ≠ 数值错误 — 分类后 planner/coder 拿到准确报错 (vsel → 改连续仿射寻址; 数值错 → 改计算逻辑)
+        if re.search(r"error:|Traceback|unsupported op|SyntaxError|not supported|MLIR", _chk_out):
+            return False, f"kernel 编译/运行失败 (非数值错): {_chk_out.strip()[-400:]}"
+        return False, f"正确性未通过 (MATMUL_VERIFY 需输出 result check: PASS): {_chk_out.strip()[-400:]}"
+    return True, ""
+
+
+def verify_fast_gate(kernel_op: Path, round_dir: Path, loop: int = 30) -> dict:
+    """★两段验证·段1: 正确性 + Event 快速门 (无 msprof, ~秒级).
+    AutoKernel 式快速实验循环: 大多数轮次是"不快于 best"的 REVERT 轮,
+    段1 用 Event 绝对延迟直接判死, 省掉 warmup×3 + msprof (几分钟/轮).
+
+    返回:
+      {"ok": False, "error": ...}           → 编译/正确性失败 (回传 coder)
+      {"ok": True, "e2e_event_ns": None}    → Event 不可用 (注入失败/找不到循环)
+                                                → 调用方退化跑全量 msprof
+      {"ok": True, "e2e_event_ns": value}   → 门值: 调用方与 best 比较
+    """
+    import os as _os
+    ok, err = _correctness_check(kernel_op)
+    if not ok:
+        return {"ok": False, "error": err}
+    _evt = _event_e2e_ns(kernel_op, round_dir, loop)
+    return {"ok": True, "e2e_event_ns": _evt}
+
+
 def verify_end_to_end(kernel_op: Path, round_dir: Path,
                       baseline_ns: Optional[float] = None,
                       num_kernels: Optional[int] = None,
@@ -103,20 +143,9 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
     # ★正确性验证 (v4 曾只测性能不测数值): 单独跑一次 MATMUL_VERIFY=1, 结果必须 PASS.
     #   kernel_op.py main() 里 MATMUL_VERIFY=1 时对 torch 参考算 diff, 打印 "result check: PASS/CHECK".
     #   不 PASS(数值错/无校验) → 本轮 FAIL, 防"优化把结果改错还通过".
-    chk_env = dict(_os.environ, KERNEL_LOOP="1", MATMUL_VERIFY="1")
-    try:
-        rc = subprocess.run([py, str(kernel_op)], capture_output=True, text=True,
-                            encoding="utf-8", errors="backslashreplace", timeout=1800, env=chk_env)
-    except Exception as e:
-        return {"ok": False, "error": f"正确性校验运行失败: {e}"}
-    _chk_out = (rc.stdout or "") + (rc.stderr or "")
-    if "result check: PASS" not in _chk_out:
-        # ★2026-08-12 报错分类: HIVM 编译错 (vsel/root alloc) / Python 语法错 / Traceback
-        #   ≠ 数值错误 — 分类后 planner/coder 拿到准确报错 (vsel → 改连续仿射寻址; 数值错 → 改计算逻辑)
-        if re.search(r"error:|Traceback|unsupported op|SyntaxError|not supported|MLIR", _chk_out):
-            return {"ok": False,
-                    "error": f"kernel 编译/运行失败 (非数值错): {_chk_out.strip()[-400:]}"}
-        return {"ok": False, "error": f"正确性未通过 (MATMUL_VERIFY 需输出 result check: PASS): {_chk_out.strip()[-400:]}"}
+    _ok_chk, _err_chk = _correctness_check(kernel_op)
+    if not _ok_chk:
+        return {"ok": False, "error": _err_chk}
     print("    [Verify] ✅ 正确性 PASS (MATMUL_VERIFY)")
 
     # measure: 一次 msprof, app 内部循环 loop 次 → 和 ÷loop = 单次端到端

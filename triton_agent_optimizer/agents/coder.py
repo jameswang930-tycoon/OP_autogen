@@ -474,13 +474,11 @@ class CoderAgent:
         # Step 2: 清理 LLM 输出
         optimized = self._clean_output(optimized, kernel_code)
 
-        # 如果之前有错误，且这次成功了 (代码不同)，记录解决方案
+        # 如果之前有错误，且这次成功了 (代码不同)，回填失败案例库 (solved)
         if previous_error and optimized.strip() != kernel_code.strip():
             try:
-                from memory.codeerror import CodeErrorMemory
-                mem = CodeErrorMemory(os.path.basename(os.getcwd()) or "kernel")
-                mem.record_solution(previous_error[:200],
-                    f"成功修改: {plan_text[:100]}")
+                from memory.failed_cases import mark_solved
+                mark_solved(tier, previous_error, f"成功修改: {plan_text[:200]}")
             except Exception:
                 pass
 
@@ -536,22 +534,15 @@ class CoderAgent:
     def _call_llm(self, kernel_code: str, plan_text: str,
                   previous_error: str, tier: int = 1,
                   kernel_path: Optional[str] = None) -> str:
-        # 查错误记忆 + 记录新错误
+        # 查失败案例库: 记录本次错误 + 检索已知方案 (两级: 指纹精确 + 关键词相似)
         if previous_error:
             try:
-                from memory.codeerror import CodeErrorMemory
-                mem = CodeErrorMemory(os.path.basename(os.getcwd()) or "kernel")
-                # 记录本次错误
-                mem.record_error(previous_error[:200])
-                # 检索已知方案
-                known = mem.find_solution(previous_error)
-                cross = mem.search_all(previous_error)
-                all_fixes = [f for f in [known, cross] if f]
-                if all_fixes:
+                from memory.failed_cases import retrieve as _retr_fc, format_for_coder as _fmt_fc
+                _inj = _fmt_fc(_retr_fc(tier, previous_error, ""), tier)
+                if _inj:
                     # ★2026-08-12: 已知方案是"参考信息" — 弱模型会把这段含 'vsel' 等英文单引号的
                     #   解释文本抄进输出代码 → unterminated string literal 语法错. 明确标注只读.
-                    previous_error = (f"{previous_error}\n\n[已知修复方案 - ★只读参考, 严禁抄进代码, "
-                                      f"只能理解后修改代码]\n" + "\n".join(all_fixes))
+                    previous_error = (f"{previous_error}\n\n{_inj}")
             except Exception:
                 pass
 

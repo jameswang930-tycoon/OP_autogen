@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Triton Agent Optimizer — 就地展开式讲演</title>
+<style>
+  :root {
+    --bg: #f7f8fa; --card: #ffffff; --border: #e2e5ea;
+    --accent: #1a6bff; --text: #1f2733; --muted: #6b7686;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { position: sticky; top: 0; z-index: 50; background: var(--card);
+           border-bottom: 1px solid var(--border); padding: 10px 24px;
+           display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header .hint { color: #4a5568; font-size: 12.5px; }
+  header .legend-right { margin-left: auto; font-size: 12px; color: var(--muted); }
+  main { max-width: 1800px; margin: 0 auto; padding: 16px 24px 40px; }
+  .stage { background: var(--card); border: 1px solid var(--border);
+           border-radius: 12px; padding: 18px; overflow: auto; }
+
+  /* ═══ 总览节点 ═══ */
+  .chain { display: grid; align-items: stretch;
+           grid-template-columns: 1fr auto 1fr auto 1fr auto 1fr auto 1fr;
+           grid-template-areas:
+             "in a1 loop a2 gate a3 decide a4 output"
+             "einput einput einput einput einput einput einput einput einput"
+             "eloop  eloop  eloop  eloop  eloop  eloop  eloop  eloop  eloop"
+             "egate  egate  egate  egate  egate  egate  egate  egate  egate"
+             "edecide edecide edecide edecide edecide edecide edecide edecide edecide"
+             "eoutput eoutput eoutput eoutput eoutput eoutput eoutput eoutput eoutput"; }
+  .node { position: relative; flex: 1 1 180px; min-width: 180px;
+          border-radius: 12px; border: 2px solid; padding: 14px 16px;
+          cursor: pointer; user-select: none;
+          transition: transform .2s, box-shadow .2s; }
+  .node:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(20,40,80,.12); }
+  .node h3 { margin: 0 0 4px; font-size: 15.5px; }
+  .node .s { font-size: 12px; opacity: .75; line-height: 1.45; }
+  .node .badge { position: absolute; top: 8px; right: 10px; width: 22px; height: 22px;
+                 border-radius: 50%; display: flex; align-items: center; justify-content: center;
+                 font-size: 15px; font-weight: 700; color: #fff; line-height: 1;
+                 transition: transform .25s; }
+  .node .badge:hover { transform: scale(1.2); }
+  .node.open .badge { transform: rotate(45deg); }
+  .n-blue   { background: #eef4ff; border-color: #8ab4ff; }
+  .n-blue h3{ color: #173a6e; } .n-blue .badge { background: #1a6bff; }
+  .n-green  { background: #f0f7ef; border-color: #a8d5a2; }
+  .n-green h3{ color: #1e6b2f; } .n-green .badge { background: #2f9e44; }
+  .n-yellow { background: #fff7ea; border-color: #f5c97b; }
+  .n-yellow h3{ color: #7a5a10; } .n-yellow .badge { background: #e8a33d; }
+  .n-deep   { background: #e7eefc; border-color: #6d8fd8; }
+  .n-deep h3{ color: #1f3a6b; } .n-deep .badge { background: #4a70b8; }
+  .n-gray   { background: #f4f6fa; border-color: #aab6c4; }
+  .n-gray h3{ color: #4a5568; } .n-gray .badge { background: #8a94a6; }
+  .n-cyan   { background: #e6f7f7; border-color: #7fc9c9; }
+  .n-cyan h3{ color: #1f5c5c; } .n-cyan .badge { background: #2aa3a3; }
+
+  .arrow { display: flex; align-items: center; padding: 0 10px; font-size: 22px; color: #8a94a6; }
+  .arrow .flow { font-size: 20px; }
+
+  /* ═══ 展开面板（就地展开，推挤式） ═══ */
+  .expand-wrap { max-width: 100%; max-height: 0; opacity: 0; overflow: hidden;
+                 transition: max-height .45s cubic-bezier(.2,.8,.3,1), opacity .35s, margin .45s;
+                 margin: 0; }
+  .expand-wrap.open { max-height: 1200px; opacity: 1; margin: 14px 0; }
+  .expand-inner { display: grid; gap: 12px; padding: 14px; border-radius: 12px;
+                  border: 1.5px dashed var(--border); background: #fbfcfe; }
+  .item { border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px;
+          background: #fff; display: flex; flex-direction: column; }
+  .item .t { font-weight: 700; font-size: 13px; margin-bottom: 3px; }
+  .item .d { font-size: 12px; color: #4a5568; line-height: 1.55; }
+  .item .f { font-size: 11px; color: #4a90e2; margin-top: auto; padding-top: 5px;
+             font-family: Consolas, monospace; overflow-wrap: break-word; }
+  .g5 { grid-template-columns: repeat(5, 1fr); }
+  .g6 { grid-template-columns: repeat(6, 1fr); }
+  .g3 { grid-template-columns: repeat(3, 1fr); }
+  .g2 { grid-template-columns: repeat(2, 1fr); }
+  .g7 { grid-template-columns: repeat(7, 1fr); }
+  .row2 { grid-template-columns: repeat(2, 1fr); }
+  .col { display: flex; flex-direction: column; gap: 12px; }
+  .note { background: #fff7ea; border: 1px solid #f5c97b; border-radius: 10px; padding: 9px 13px;
+          font-size: 12.5px; font-weight: 600; color: #7a5a10; line-height: 1.6; }
+  .ok { background: #f0f7ef; border: 1px solid #a8d5a2; border-radius: 10px; padding: 9px 13px;
+        font-size: 12.5px; font-weight: 600; color: #14532d; line-height: 1.6; }
+  .bad { background: #fdf0ee; border: 1px solid #e8a29b; border-radius: 10px; padding: 9px 13px;
+         font-size: 12.5px; font-weight: 600; color: #8c2f24; line-height: 1.6; }
+  .mono { font-family: Consolas, monospace; font-size: 11.5px; background: #eef1f6;
+          padding: 1px 5px; border-radius: 4px; }
+
+  /* 二级展开（item 内的条可再展开细节） */
+  .item2 { cursor: pointer; }
+  .item2 .t::before { content: "▸ "; color: var(--accent); }
+  .item2.open .t::before { content: "▾ "; }
+  .sub { max-height: 0; opacity: 0; overflow: hidden;
+         transition: max-height .35s ease, opacity .25s; }
+  .item2.open .sub { max-height: 400px; opacity: 1; }
+  .sub ul { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: #4a5568; line-height: 1.7; }
+
+  .tip { text-align: center; color: #4a5568; font-size: 14px; margin: 12px 0 0; }
+  .block-label { font-size: 13px; font-weight: 700; color: var(--muted); margin: 18px 0 8px; }
+  .row2nd { display: grid; grid-template-columns: 2fr 3fr; gap: 14px; align-items: stretch;
+            grid-template-areas: "tiers flow" "etiers etiers" "eflow eflow"; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Triton Agent Optimizer — 就地展开式讲演</h1>
+  <span class="hint">点击块右上角 <b>+</b> 就地展开细节（内容分条），再点收起 · 可同时展开多个</span>
+  <span class="legend-right">展开不弹窗 · 内容在图上展开 · 其余块自动让位</span>
+</header>
+
+<main>
+  <div class="stage">
+
+    <!-- ═══ 主链 ═══ -->
+    <div class="chain">
+      <div class="col" style="grid-area:in">
+        <div class="node n-blue" onclick="toggle('input')">
+          <span class="badge">+</span>
+          <h3>输入</h3>
+          <div class="s">input/&lt;op&gt;/kernel_op.py<br>单文件三段式</div>
+        </div>          </div>
+
+        <div class="expand-wrap" id="e-input" style="grid-area:einput">
+          <div class="expand-inner g3">
+            <div class="item"><div class="t">① config — 场景配置</div><div class="d">尺寸/精度/分块全部用环境变量定义，可批量换形状测试</div><div class="f">N = int(os.environ.get("MATMUL_N", 2048))</div></div>
+            <div class="item"><div class="t">② kernel — 算子实现</div><div class="d">triton.jit kernel 函数，优化对象（可读可改可注释）</div><div class="f">@triton.jit def mm_kernel(...)</div></div>
+            <div class="item"><div class="t">③ test — 测试 main</div><div class="d">分配输入 → 启动 kernel → 同步；KERNEL_LOOP 计时 / MATMUL_VERIFY 校验</div><div class="f">python3 input/matmul/kernel_op.py</div></div>
+          <div class="note" style="margin-top:10px">运行入口：<span class="mono">main.py input/&lt;op&gt; --fresh --max-rounds 30</span>（--resume 断点续跑）</div>
+        </div>
+      </div>
+
+      <div class="arrow" style="grid-area:a1"><span class="flow">→</span></div>
+
+      <div class="col" style="grid-area:loop">
+        <div class="node n-blue" onclick="toggle('loop')">
+          <span class="badge">+</span>
+          <h3>Scheduler 主循环</h3>
+          <div class="s">每轮五步闭环（Round1 → N）<br>采集 → 决策 → 改码 → 验证</div>
+        </div>            </div>
+
+        <div class="expand-wrap" id="e-loop" style="grid-area:eloop">
+          <div class="expand-inner g5">
+            <div class="item item2" onclick="event.stopPropagation();this.classList.toggle('open')">
+              <div class="t">① 采集+解析</div>
+              <div class="d">通用 msprof + 逐 kernel msprof op（双源）</div>
+              <div class="f">→ task.json · board_N.json · diagnosis.json</div>
+              <div class="sub"><ul>
+                <li>骨架：每 kernel 耗时 / launch / api 开销</li>
+                <li>deep：带宽 / L2 / cube·vec 占用 / 冲突</li>
+                <li>roofline 用 hardware_peak.json 实测峰值校准</li>
+              </ul></div>
+            <div class="item item2" onclick="event.stopPropagation();this.classList.toggle('open')">
+              <div class="t">② 分块 sweep（Tier3）</div>
+              <div class="d">best_kernel 上枚举 L0 合法 BLOCK，Event 实测取最优</div>
+              <div class="f">→ 09_tier3_sweep/sweep_result.json</div>
+              <div class="sub"><ul>
+                <li>L0A/B≤64KB、L0C≤128KB、全部 2 的幂</li>
+                <li>BLOCK_K ≥ K_OUT 保底（半吊子块拒收）</li>
+                <li>写回 round_dir 副本（不碰 input 源）</li>
+              </ul></div>
+            </div>
+            <div class="item item2" onclick="event.stopPropagation();this.classList.toggle('open')">
+              <div class="t">③ Planner（LLM）</div>
+              <div class="d">读字段+轨迹+手递+优秀案例 → changes[] + promote 决策</div>
+              <div class="f">→ plan.md + 10_tier_handoff.json</div>
+              <div class="sub"><ul>
+                <li>输出 old→new 精确替换片段（LLM 只决策）</li>
+                <li>promote 必须带数据依据（evidence）</li>
+              </ul></div>
+            </div>
+            <div class="item item2" onclick="event.stopPropagation();this.classList.toggle('open')">
+              <div class="t">④ Coder（确定性）</div>
+              <div class="d">old→new 精确替换 + 语法/函数完整校验</div>
+              <div class="f">→ roundN/kernel_op.py + diff.patch</div>
+              <div class="sub"><ul>
+                <li>确定性字符串替换，杜绝 LLM 乱改</li>
+                <li>失败回传报错给 Planner 同轮再改</li>
+              </ul></div>
+            </div>
+            <div class="item item2" onclick="event.stopPropagation();this.classList.toggle('open')">
+              <div class="t">⑤ Verifier</div>
+              <div class="d">正确性 + msprof 端到端双口径 + Event 设备侧权威计时</div>
+              <div class="f">→ e2e_event_ns + trajectory history</div>
+              <div class="sub"><ul>
+                <li>MATMUL_VERIFY=1 对 torch 参考校验</li>
+                <li>Event 多窗口 median + 输入轮换破 L2</li>
+                <li>循环异常 → 不测 Event → 方案不保留</li>
+              </ul></div>
+            </div>
+          </div>
+          <div class="ok" style="margin-top:10px">核心主张：真机数据驱动 → 确定性优于生成 → 测量纪律（Event 绝对延迟权威值）</div>
+        </div>
+      </div>
+
+      <div class="arrow" style="grid-area:a2"><span class="flow">→</span></div>
+
+      <div class="col" style="grid-area:gate">
+        <div class="node n-green" onclick="toggle('gate')">
+          <span class="badge">+</span>
+          <h3>严格最优门</h3>
+          <div class="s">KEEP / REVERT<br>Event 绝对延迟 &lt; 历史最优才保留</div>
+        </div>            </div>
+
+        <div class="expand-wrap" id="e-gate" style="grid-area:egate">
+          <div class="expand-inner g2">
+            <div class="item item2" onclick="event.stopPropagation();this.classList.toggle('open')">
+              <div class="t">KEEP — 严格最优</div>
+              <div class="d">Event 绝对延迟 &lt; 历史最小才采纳（含首次对比基线），best_kernel.py 更新 + best_round 绑定</div>
+              <div class="sub"><ul>
+                <li>Event 缺失（循环异常）→ 不采纳</li>
+                <li>防 msprof 欠采假快轮进链</li>
+              </ul></div>
+            <div class="item item2" onclick="event.stopPropagation();this.classList.toggle('open')">
+              <div class="t">REVERT — 回滚</div>
+              <div class="d">失败/无改进恢复 best_kernel（内容快照），failed_kernel.py 留证</div>
+              <div class="sub"><ul>
+                <li>diff.patch 不被失败尝试覆盖</li>
+                <li>input 链不中断（轮首快照恢复）</li>
+              </ul></div>
+            </div>
+          </div>
+          <div class="bad" style="margin-top:10px">假小防护：循环被改坏（msprof 行数 &lt; LOOP）→ 不测 Event → 方案不保留</div>
+        </div>
+      </div>
+
+      <div class="arrow" style="grid-area:a3"><span class="flow">→</span></div>
+
+      <div class="col" style="grid-area:decide">
+        <div class="node n-yellow" onclick="toggle('decide')">
+          <span class="badge">+</span>
+          <h3>层间决策</h3>
+          <div class="s">promote / 回退 / 停止<br>6 层策略逐层推进</div>
+        </div>          </div>
+
+        <div class="expand-wrap" id="e-decide" style="grid-area:edecide">
+          <div class="expand-inner g3">
+            <div class="item"><div class="t">promote → Tier+1</div><div class="d">必须带数据依据（promote_evidence），否则本层再优化；手递 handoff 传瓶颈+方向</div></div>
+            <div class="item"><div class="t">回退 → Tier-1</div><div class="d">判瓶颈属前层且有空间 → 跳回重新诊断</div></div>
+            <div class="item"><div class="t">停止</div><div class="d">Tier6 连续 3 轮无改进 / 跑满 max_rounds / 采集连续失败 3 次</div></div>
+          <div class="note" style="margin-top:10px">防呆机制：同跳转路径 ≥3 次拒绝（防死循环）· 每 10 轮 REBASELINE 校正环境漂移 · 设备污染自动重置</div>
+        </div>
+      </div>
+
+      <div class="arrow" style="grid-area:a4"><span class="flow">→</span></div>
+
+      <div class="col" style="grid-area:output">
+        <div class="node n-deep" onclick="toggle('output')">
+          <span class="badge">+</span>
+          <h3>最终产物</h3>
+          <div class="s">final_summary + 轨迹图 + REPORT<br>vs_industrial 验收</div>
+        </div>          </div>
+
+        <div class="expand-wrap" id="e-output" style="grid-area:eoutput">
+          <div class="expand-inner g3">
+            <div class="item"><div class="t">final_summary.json</div><div class="d">双口径加速比（msprof 端到端 + Event）+ vs_industrial_ratio + 每轮审计留痕</div></div>
+            <div class="item"><div class="t">轨迹图 + 报告</div><div class="d">trajectory_chart.png（每轮实际加速比 + REVERT/FAIL 标记）+ rounds.csv + REPORT.md</div></div>
+            <div class="item"><div class="t">验收</div><div class="d">acceptance_summary.json：我们最优 Event ÷ 工业级最优 Event（≥1 快于，0.8~1 打平，&lt;0.8 有空间）</div></div>
+          <div class="note" style="margin-top:10px">14 算子验收平均 1.33×：9 个快于工业级（matmul_transpose 2.88× / rms_norm 2.59×），2 打平，3 有空间</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ 第二行：策略组 + 数据流 + 底座 ═══ -->
+    <div class="block-label">优化策略与数据底座（点击展开）</div>
+    <div class="row2nd">
+      <div class="col" style="grid-area:tiers">
+        <div class="node n-blue" onclick="toggle('tiers')">
+          <span class="badge">+</span>
+          <h3>6 层优化策略</h3>
+          <div class="s">Tier1 算法 → Tier6 配置 · 每层一个 Round 五步闭环</div>
+        </div>          </div>
+
+        <div class="expand-wrap" id="e-tiers" style="grid-area:etiers">
+          <div class="expand-inner g6">
+            <div class="item"><div class="t">Tier1 算法</div><div class="d">单遍 / 剪枝 / im2col 走 cube（收益最大）</div><div class="f">例：conv 外积 → tl.dot</div></div>
+            <div class="item"><div class="t">Tier2 融合</div><div class="d">跨 kernel 合并（HIVM MLIR 分析）</div><div class="f">例：conv+bias+relu 3→1</div></div>
+            <div class="item"><div class="t">Tier3 分块</div><div class="d">sweep 枚举 L0 合法 BLOCK 实测择优</div><div class="f">例：(BM,BN,BK) 全枚举</div></div>
+            <div class="item"><div class="t">Tier4 访存</div><div class="d">连续化 / 对齐 / burst</div><div class="f">例：innermost stride=1</div></div>
+            <div class="item"><div class="t">Tier5 计算</div><div class="d">指令级：除法→rsqrt 乘链</div><div class="f">例：/sqrt → *rsqrt</div></div>
+            <div class="item"><div class="t">Tier6 配置</div><div class="d">调度/流水/资源收尾，3 轮无改进停止</div><div class="f">例：grid 调度</div></div>
+          <div class="note" style="margin-top:10px">轮次经济：promote 轮不改码且不耗 max_rounds 配额；达标（--target）不硬停，继续探层</div>
+        </div>
+      </div>
+
+      <div class="col" style="grid-area:flow">
+        <div class="node n-cyan" onclick="toggle('flow')">
+          <span class="badge">+</span>
+          <h3>完整数据流 · 7 阶段</h3>
+          <div class="s">采集 → 诊断 → 字段 → 决策 → 改码 → 验证 → 产物（谁写谁读）</div>
+        </div>          </div>
+
+        <div class="expand-wrap" id="e-flow" style="grid-area:eflow">
+          <div class="expand-inner g7">
+            <div class="item"><div class="t">1 采集</div><div class="d">warmup + msprof 双源</div><div class="f">task.json · board_N.json</div></div>
+            <div class="item"><div class="t">2 诊断</div><div class="d">integrate 合并 + roofline</div><div class="f">diagnosis.json</div></div>
+            <div class="item"><div class="t">3 字段</div><div class="d">按层筛 58 项字段</div><div class="f">07_tierN_fields/</div></div>
+            <div class="item"><div class="t">4 决策</div><div class="d">Planner → changes[] + 证据</div><div class="f">plan.md</div></div>
+            <div class="item"><div class="t">5 改码</div><div class="d">Coder 替换 + sweep 写回</div><div class="f">kernel_op.py · diff.patch</div></div>
+            <div class="item"><div class="t">6 验证</div><div class="d">正确性 + 端到端 + Event</div><div class="f">optimization_trajectory.json</div></div>
+            <div class="item"><div class="t">7 产物</div><div class="d">加速比 + 验收 + 报告</div><div class="f">final_summary.json</div></div>
+          <div class="ok" style="margin-top:10px">失败路径：REVERT 回滚 best_kernel（内容快照 + 留证）；采集失败重试 1 次 → 跳轮 → 连续 3 次停止</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="block-label" style="margin-top:14px">外部数据底座（只读）</div>
+    <div class="node n-gray" onclick="toggle('ext')" style="max-width:100%">
+      <span class="badge">+</span>
+      <h3>外部数据底座</h3>
+      <div class="s">hardware_peak（实测峰值）· industrial（工业级基准）· pytorch（对照）· memory（案例回灌）</div>
+    </div>      </div>
+
+    <div class="expand-wrap" id="e-ext" style="grid-area:eext">
+      <div class="expand-inner g2">
+        <div class="item"><div class="t">hardware_peak.json</div><div class="d">run_bench.py 实测峰值（cube fp16 294.9 TFLOPS / GM 1638 GB/s），校准 roofline</div></div>
+        <div class="item"><div class="t">industrial_*_tflops.json</div><div class="d">eager / compile / cann-fused / fa 各 mode Event 取 min（仅真执行）—— 优化天花板</div></div>
+        <div class="item"><div class="t">pytorch_*.json</div><div class="d">PyTorch 参考对照线（轨迹图虚线）</div></div>
+        <div class="item"><div class="t">memory/tierN_cases.json</div><div class="d">优秀案例回灌（单轮 &gt;1.3× 自动入库，Planner 参考）</div></div>
+      <div class="note" style="margin-top:10px">口径声明：工业级与我们同为"一次完整调用的设备侧耗时"（同工具/同 median/同破 L2），差异 = 融合收益，对比公平</div>
+    </div>
+
+    <p class="tip">① 先看整体（8 个块）→ ② 点块右上角 <b>+</b> 就地展开细节（分条卡片）→ ③ 点条内的 <b>▸</b> 再展开二级细节 → ④ 再点 <b>+</b>（变 −）收起</p>
+  </div>
+</main>
+
+<script>
+  function toggle(id) {
+    const w = document.getElementById('e-' + id);
+    const node = w.parentElement.querySelector('.node');
+    w.classList.toggle('open');
+    if (node) node.classList.toggle('open');
+  }
+</script>
+</body>
+</html>

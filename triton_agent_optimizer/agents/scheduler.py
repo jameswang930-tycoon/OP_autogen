@@ -376,6 +376,59 @@ def _fnum(v):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  ★跨轮诊断快照 (缺口1 修复, 2026-08-13): 每轮把 per-kernel 关键指标存下来 —
+#    planner 通过 history 的紧凑串看趋势 (改法→指标变化→结果 的因果链),
+#    全量快照写 diag_snapshots.jsonl 供审计/报告 (不入 context, 防膨胀).
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _diag_snapshot(diagnosis: dict) -> dict:
+    """每轮诊断全量快照: {kernel_name: {pct, bn, cu, mu, l2, redun, eng top2}}. 永不抛."""
+    out = {}
+    try:
+        ks = diagnosis.get("kernels") or []
+        total_us = ((diagnosis.get("summary") or {}).get("total_ns") or 0) / 1000
+        for k in ks:
+            dur = ((k.get("task") or {}).get("task_duration_us")) or 0
+            launch = k.get("launch_count") or 1
+            pct = round(dur * launch / total_us * 100, 1) if (dur and total_us) else None
+            d = k.get("deep") or {}
+            rl = d.get("roofline") or {}
+            eng = d.get("engine_utilization") or {}
+            eng_top = sorted(((kk, vv) for kk, vv in eng.items()
+                              if isinstance(vv, (int, float))), key=lambda x: -x[1])[:2]
+            out[k.get("kernel_name", "?")] = {
+                "pct": pct,
+                "bn": rl.get("bottleneck_type"),
+                "cu": rl.get("compute_utilization"),
+                "mu": rl.get("memory_utilization"),
+                "l2": d.get("l2_hit_rate"),
+                "redun": rl.get("traffic_redundancy_read"),
+                "eng": {kk: vv for kk, vv in eng_top},
+            }
+    except Exception:
+        pass
+    return out
+
+
+def _diag_compact(snap: dict) -> str:
+    """快照 → 紧凑串 (planner history 用, ~120 字符): top2 kernel 的关键值.
+    ★取 top2: top1 字段缺失 (欠采) 时 top2 可能字段更全, 趋势不丢."""
+    try:
+        if not snap:
+            return ""
+        rows = sorted(snap.items(), key=lambda kv: -(kv[1].get("pct") or 0))[:2]
+        parts = []
+        for name, v in rows:
+            eng = ";".join(f"{k}={_fnum(x)}" for k, x in (v.get("eng") or {}).items())
+            parts.append(f"{name}:bn={v.get('bn') or '?'} cu={_fnum(v.get('cu'))} "
+                         f"mu={_fnum(v.get('mu'))} l2={_fnum(v.get('l2'))} "
+                         f"redun={_fnum(v.get('redun'))} [{eng}]")
+        return " | ".join(parts)
+    except Exception:
+        return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  工业级基准 — 读取最优 + 缺省自动跑 (与 bench_all.py 同口径)
 #  ★口径: bench_industrial.py 每次测量输出 time_us = median (多窗口 Event median,
 #    与 verify 的 e2e_event_ns 完全同口径, 抗单次抖动) — 不用 mean (离群敏感) / min (单次运气值);
@@ -497,6 +550,7 @@ def _compact_history(history: list, n: int = 20) -> list:
             "decision": h.get("decision"), "result": h.get("result"),
             "error": (h.get("error") or "")[:60],
             "e2e_event_ns": h.get("e2e_event_ns"),
+            "diag": (h.get("diag") or "")[:200],   # ★跨轮诊断趋势 (改法→指标变化→结果)
         })
     return out
 
@@ -864,6 +918,31 @@ class Scheduler:
         kernel_code = self.current_kernel.read_text(encoding="utf-8") if self.current_kernel.exists() else ""
         skill = (_PROJECT / "skills" / "triton-op-planner" / "SKILL.md")
         cfg = _extract_config_constants(kernel_code)
+        # ★Amdahl 显式编排: 每轮把 per-kernel 耗时占比排序喂 planner —
+        #   先打占比最大的 kernel (端到端收益 ≈ 占比×加速比), 动小 kernel 必须给理由
+        #   (如跨 kernel 融合)。多 kernel 算子 (attention_mlp/conv_bias_relu) 尤其关键.
+        try:
+            _total_us = (diagnosis.get("summary") or {}).get("total_ns")
+            _total_us = (_total_us / 1000) if _total_us else None
+            _krows = []
+            for _k in (diagnosis.get("kernels") or []):
+                _dur = (_k.get("task") or {}).get("task_duration_us")
+                _launch = _k.get("launch_count") or 1
+                _dtot = (_dur * _launch) if _dur else None
+                _pct = (_dtot / _total_us * 100) if (_dtot and _total_us) else None
+                if _pct is not None:
+                    _krows.append((_pct, _k.get("kernel_name", "?")))
+            if len(_krows) > 1:
+                _krows.sort(key=lambda x: -x[0])
+                _chain = " → ".join(f"{n} ({p:.1f}%)" for p, n in _krows)
+                _top = _krows[0][1]
+                _amdahl = (f"# ══ Amdahl 优化优先级 (端到端收益 ≈ 占比×加速比, 先打占比最大的 kernel) ══\n"
+                           f"{_chain}\n"
+                           f"★本轮优先优化占比最大的 kernel「{_top}」; 动其他 kernel 必须给出理由 "
+                           f"(如跨 kernel 融合/消除重复搬运).\n")
+                extracted = _amdahl + extracted
+        except Exception:
+            pass
         # ★B1: 本轮新扫的 sweep 结果打 fresh 标记 → planner_context 与 _plan 提示都能区分"本轮实测"
         #   (缓存结果不标记, 保持 from_round 供过期判断)
         if tier3_sweep and tier3_sweep.get("available") and sweep_status == "ran_this_round":
@@ -1694,6 +1773,14 @@ class Scheduler:
             _t0 = time.time()
             t_code = t_verify = 0.0
             prev_err, new_code = "", ""
+            # ★失败案例库: 轮内重试历史 (每次尝试的 改动方案+报错) → 传给修复器
+            attempt_log = []
+            change_s = _summarize_changes(plan) if plan else ""
+            try:
+                from memory.failed_cases import build_retry_context, classify_error as _cls_err
+            except Exception:
+                build_retry_context = lambda *a, **k: "\n".join(str(x) for x in a)
+                _cls_err = lambda *a, **k: "?"
             round_kernel = round_dir / "kernel_op.py"
             prev_speedup = st.get("current_speedup", 1.0)   # 上一轮已接受 kernel 的加速比 (基线=1.0)
             kept = False                                      # 本轮是否被采纳进 kernel 链
@@ -1742,12 +1829,50 @@ class Scheduler:
                     if not code_ok:
                         # ★B2: coder 应用失败(old_code没匹配/语法错/超时/no-op) → 错误进 prev_err → history →
                         #   planner 下轮可见; 不测假加速比, 重试(下次带错误走 LLM 修复)
-                        prev_err = code_err
+                        # ★2026-08-13 失败案例库: 重试上下文 = 前几次(方案+报错)全序列 + 本次报错
+                        #   + 失败库检索注入 (solved方案/stuck黑名单/已试方案) + 禁止原样重试
+                        prev_err = build_retry_context(
+                            attempt_log, code_err, tier, self.kernel_name, "code", rn)
+                        attempt_log.append({"n": len(attempt_log) + 1,
+                                            "change": change_s, "err": code_err[:300]})
                         print(f"  ⚠ coder 未成功应用(第{attempt+1}次): {code_err[:160]}...")
                         continue
-                    # ⑥ 验证 (只 msprof 端到端, 验证本轮新 kernel)
+                    # ⑥ 验证 — ★两段验证 (TWO_PHASE_VERIFY=1 默认, 0 关闭退全量):
+                    #   段1 = verify_fast_gate: 正确性 + Event 快测 (秒级, 无 msprof)
+                    #     → Event 不快于 best → 直接 REVERT (省 warmup×3+msprof 几分钟/轮)
+                    #     → Event 快于 best / Event 不可用 → 段2 全量 msprof (确认+诊断字段)
                     _tv = time.time()
-                    v = self._verify(round_dir, st.get("baseline_ns"))
+                    if os.environ.get("TWO_PHASE_VERIFY", "1") == "1" and self.use_llm:
+                        try:
+                            from agents.verifier import verify_fast_gate
+                            _fast = verify_fast_gate(round_kernel, round_dir,
+                                                     int(os.environ.get("VERIFY_LOOP", "30")))
+                        except Exception as e:
+                            print(f"  [Verify] 快测异常 ({e}), 退化全量")
+                            _fast = {"ok": False, "error": f"快测异常: {str(e)[:120]}"}
+                        if not _fast.get("ok"):
+                            # 快测失败 (编译/正确性) → 同现有 FAIL 路径, 回传 coder
+                            v = {"ok": False, "error": _fast.get("error", "快测失败")}
+                        else:
+                            _fast_evt = _fast.get("e2e_event_ns")
+                            _best_evt0 = st.get("best_e2e_event_ns")
+                            if _fast_evt and _best_evt0 and _fast_evt >= _best_evt0:
+                                # ★快测已证不快于 best → 直接 REVERT, 不跑 msprof (省整轮)
+                                #   speedup 用 Event 口径派生 (baseline/best 同源, 真实快慢)
+                                _evt_b0 = st.get("baseline_e2e_event_ns")
+                                v = {"ok": True, "ns": None, "e2e_ns": None,
+                                     "speedup": (round(_evt_b0 / _fast_evt, 4)
+                                                 if _evt_b0 else 1.0),
+                                     "e2e_event_ns": _fast_evt, "fast_gate": True}
+                                print(f"  [Verify] ⚡快测门: Event {_fast_evt:.0f}ns >= best "
+                                      f"{_best_evt0:.0f}ns → 直接 REVERT (省 msprof)")
+                            else:
+                                # 过门 (或 Event 不可用) → 全量 msprof 确认 + 诊断字段
+                                v = self._verify(round_dir, st.get("baseline_ns"))
+                                if v.get("ok") and not v.get("e2e_event_ns") and _fast_evt:
+                                    v["e2e_event_ns"] = _fast_evt   # ★msprof 轮 Event 缺失 → 快测值兜底
+                    else:
+                        v = self._verify(round_dir, st.get("baseline_ns"))
                     t_verify += time.time() - _tv
                     if v.get("ok"):
                         # msprof speedup (仅记录/显示用; 不再做 KEEP 主依据 — 见下 Event 决策)
@@ -1803,10 +1928,23 @@ class Scheduler:
                             print(f"  ↩ 回退: {_cmp} — 未超越历史最优, 沿用 best kernel")
                         # ★bug 修复: 本轮成功 (即便前几次 coder 失败过) → 清空 prev_err,
                         #   否则 hist["error"] 记的是之前 coder 失败的旧错误, planner 误以为成功轮有错
+                        # ★2026-08-13: 清空前把本轮成功解决的失败回填 solved (方案=plan 摘要)
+                        if kept and attempt_log:
+                            try:
+                                from memory.failed_cases import mark_solved
+                                mark_solved(tier, attempt_log[-1].get("err", ""),
+                                            change_s or (getattr(plan, "expected_impact", "") or ""))
+                            except Exception:
+                                pass
                         prev_err = ""
                         self._save_traj()
                         break
-                    prev_err = v.get("error", "unknown error")
+                    _err_txt = v.get("error", "unknown error")
+                    # ★2026-08-13 失败案例库: verify 失败同样累积重试上下文 + 检索注入
+                    prev_err = build_retry_context(
+                        attempt_log, _err_txt, tier, self.kernel_name, "verify", rn)
+                    attempt_log.append({"n": len(attempt_log) + 1,
+                                        "change": change_s, "err": _err_txt[:300]})
                     # ★verify 崩了 AICore (设备级错误) → 标记设备污染, 下轮采集前重置
                     #   (否则下轮 msprof 在污染设备上"找不到 kernel" → 莫名采集失败链)
                     if _is_device_error(prev_err):
@@ -1856,7 +1994,8 @@ class Scheduler:
             _be = st.get("baseline_ns")
             _evt_s = f" Event={_evt_ns}ns" if _evt_ns else " Event=无"
             print(f"  加速比: {speedup:.3f}x (端到端口径; 纯kernel基线 {_be}ns / 端到端基线 {_be2e}ns; "
-                  f"本轮 纯kernel={ns}ns e2e(msprof)={_e2e}ns{_evt_s}; 上一轮 {prev_speedup:.3f}x)"
+                  f"本轮 纯kernel={ns if ns is not None else '?'}ns "
+                  f"e2e(msprof)={_e2e if _e2e is not None else '?'}ns{_evt_s}; 上一轮 {prev_speedup:.3f}x)"
                   + ("  ✅采纳" if kept else "  ↩未采纳"))
             t_round = time.time() - round_start
             print(f"  ⏱ ⑤Coder: {t_code:.1f}s")
@@ -1904,8 +2043,13 @@ class Scheduler:
                     # ★sweep 状态 (每轮记): 是否跑了 sweep / 是否采纳 sweep 测的最优块
                     "sweep_ran": _sweep_ran, "sweep_adopted": _sweep_adopted,
                     "sweep_status": _sweep_status,
-                    "error": ((prev_err[:120] if prev_err else "")
-                              + (" | " + _cmp_extra if _cmp_extra else ""))}
+                    "error": ((prev_err[:300] if prev_err else "")
+                              + (" | " + _cmp_extra if _cmp_extra else "")),
+                    # ★失败分类 (统一入口): env/code_compile/code_numeric/code_runtime — planner 可见
+                    "error_class": (_cls_err(prev_err) if prev_err else ""),
+                    # ★跨轮诊断快照: 紧凑串进 history (planner 看趋势), 全量写 JSONL (审计/讲演)
+                    "diag": _diag_compact(_diag_snapshot(diagnosis)),
+            }
             # ★F3: 每轮真实 tflops (kernel 结构变化后 FLOPs 变, 轨迹图用 hist 值, 不再 initial×speedup 失真)
             _cf = sum((k.get("deep") or {}).get("compute", {}).get("cube_fops") or 0
                       for k in (diagnosis.get("kernels") or []))
@@ -1969,6 +2113,16 @@ class Scheduler:
                 except Exception:
                     pass
             self.traj["history"].append(hist)
+            # ★全量诊断快照 → diag_snapshots.jsonl (JSONL 追加, 审计/讲演用; 不入 context)
+            try:
+                _snap = _diag_snapshot(diagnosis)
+                if _snap:
+                    with open(self.kernel_dir / "diag_snapshots.jsonl", "a", encoding="utf-8") as _sf:
+                        _sf.write(json.dumps({"round": rn, "tier": tier,
+                                              "decision": decision, "speedup": round(speedup, 4),
+                                              "snapshot": _snap}, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
 
             # 晋升决策: planner.promote (读瓶颈判断) + 连续3轮无改进兜底 + 达标/到Tier6停止
             # ★P1: 严格晋升(需依据) + 可回退 + 防死循环 + 跳转手递 — 抽成 _decide_tier (可单测各场景)

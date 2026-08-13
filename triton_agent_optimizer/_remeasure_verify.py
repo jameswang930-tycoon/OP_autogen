@@ -86,4 +86,37 @@ check("V6: --op 只测指定算子", len(calls2) == 2, len(calls2))  # cold+hot 
 with mock.patch.object(RB, "_PROJECT_DIR", tmp / "empty"):
     check("V6: 无 outputs 退出 1", RB.main() == 1)
 
+# ★V6b: --l2 模式 — mock msprof op 产出 L2Cache.csv (冷 0.2 / 热 0.9) → json 含命中率
+import csv as _csv
+def _fake_run_l2(cmd, *a, **kw):
+    from types import SimpleNamespace
+    if cmd[0] == "python3":   # Event 计时
+        tag = "cold" if "cold" in str(cmd[1]) else "hot"
+        us = 500.0 if tag == "cold" else 210.0
+        return SimpleNamespace(stdout=f"EVENT_E2E_US:{us:.2f}\n", stderr="")
+    # msprof op: 写假 L2Cache.csv
+    outdir = Path(cmd[cmd.index("--output=") + 1]) if "--output=" in cmd else None
+    o = Path([c for c in cmd if c.startswith("--output=")][0].split("=", 1)[1])
+    opprof = o / "OPPROF_1"
+    opprof.mkdir(parents=True, exist_ok=True)
+    hit = 0.2 if "cold" in str(cmd[-1]) else 0.9
+    with open(opprof / "L2Cache.csv", "w", encoding="utf-8", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(["block_id", "aic_total_hit_rate(%)"])
+        w.writerow(["0", f"{hit * 100:.1f}"])
+    return SimpleNamespace(stdout="ok", stderr="")
+
+# 删掉之前 mock 生成的 json, 让 --l2 重新测
+import shutil as _sh
+_sh.rmtree(out_root / "matmul" / "final_output", ignore_errors=True)
+with mock.patch("subprocess.run", new=_fake_run_l2), \
+     mock.patch.object(RB, "_PROJECT_DIR", tmp), \
+     mock.patch.object(sys, "argv", ["remeasure_best.py", "--op", "matmul", "--l2"]):
+    rc = RB.main()
+check("V6b: --l2 退出码 0", rc == 0)
+rs3 = json.loads((out_root / "matmul" / "final_output" / "remeasure_best.json").read_text(encoding="utf-8"))
+check("V6b: json 含冷命中率 0.2", rs3.get("l2_hit_rate_cold") == 0.2, rs3.get("l2_hit_rate_cold"))
+check("V6b: json 含热命中率 0.9", rs3.get("l2_hit_rate_hot") == 0.9, rs3.get("l2_hit_rate_hot"))
+check("V6b: 命中率列保留耗时/虚高", rs3.get("cold_l2_us_industrial") == 500.0)
+
 print("\n═══ V6 (remeasure_best) 全部通过 ═══")

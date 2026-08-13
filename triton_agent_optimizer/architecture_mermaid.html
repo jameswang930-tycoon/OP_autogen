@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>架构设计 — Mermaid</title>
+<style>
+  body { font-family: "Microsoft YaHei", sans-serif; margin: 24px; background: #fafafa; }
+  h1 { font-size: 20px; color: #C7000B; }
+  h2 { font-size: 16px; color: #333; border-left: 4px solid #C7000B; padding-left: 8px; margin-top: 28px; }
+  .mermaid { background: #fff; border: 1px solid #e1e4e8; border-radius: 6px; padding: 16px; margin: 8px 0 20px; overflow-x: auto; }
+  .note { color: #888; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Triton Agent Optimizer 架构设计（最简）</h1>
+<p class="note">渲染引擎: 本地 mermaid.min.js（离线可用）· 源文件: ARCHITECTURE_DESIGN.md</p>
+
+<h2>1. 优化闭环</h2>
+<div class="mermaid">
+flowchart TD
+    A[输入 kernel_op.py] --> B[msprof 采集 + 分层诊断]
+    B --> C[Planner LLM<br/>6 层策略: 算法→融合→分块→访存→计算→架构]
+    C --> D[Coder 确定性改码]
+    D --> E[验证: 正确性 + Event 快测<br/>过门才 msprof 全量]
+    E --> F{Event 快于历史最优?}
+    F -- 是 --> G[采纳进链]
+    F -- 否 --> H[回退, 沿用最优]
+    G --> I{还有轮次?}
+    H --> I
+    I -- 是 --> B
+    I -- 否 --> J[最终产物<br/>最优 kernel + vs 工业级报告]
+    G -. 记录 .-> K[(优秀案例<br/>失败案例库)]
+    K -. 检索参考 .-> C
+</div>
+
+<h2>2. 分层架构</h2>
+<div class="mermaid">
+flowchart LR
+    subgraph 输入层
+        A[input/op/kernel_op.py]
+    end
+    subgraph 分析层
+        B[msprof 双源采集] --> C[diagnosis.json<br/>roofline/带宽/引擎/冲突]
+    end
+    subgraph 智能体层
+        D[Planner LLM 定策略] --> E[Coder 确定性改码]
+        E --> F[Verifier 两段验证]
+    end
+    subgraph 记忆层
+        G[优秀案例库] & H[失败案例库]
+    end
+    subgraph 输出层
+        I[final_output: 最优 kernel + 轨迹图 + 报告]
+    end
+    A --> B --> D --> E --> F --> I
+    G -. 参考 .-> D
+    H -. 修复注入 .-> E
+</div>
+
+<h2>3. 完整优化流程（自上而下）</h2>
+<div class="mermaid">
+flowchart TD
+    A["算子源文件<br/>kernel_op.py"]:::input
+
+    B1["通用 msprof 采集<br/>骨架: 耗时/launch/API"]:::diag
+    B2["msprof op 逐 kernel 采集<br/>深层: 带宽/引擎/冲突"]:::diag
+    A --> B1
+    A --> B2
+
+    C["整合 diagnosis.json"]:::diag
+    B1 --> C
+    B2 --> C
+
+    D1["sweep 分块枚举实测<br/>（可选）"]:::diag
+    D2["hivmir 融合分析<br/>（可选）"]:::diag
+    B1 -.-> D1
+    B2 -.-> D2
+
+    E["整合 planner_context.json"]:::diag
+    C --> E
+    D1 --> E
+    D2 --> E
+
+    P1["planner skill<br/>playbook 分层优化文档<br/>整体流程文档"]:::doc -.-> P
+    P["Planner LLM 制定策略"]:::llm
+    E --> P
+    A -.-> P
+
+    PL["plan.md<br/>优化指导手册 changes[]"]:::out
+    P --> PL
+
+    CD["Coder 修改代码"]:::llm
+    PL --> CD
+    C1["coder skill<br/>coding_guide"]:::doc -.-> CD
+
+    NC["修改后的代码"]:::out
+    CD --> NC
+
+    V{"verify<br/>正确性验证"}:::decide
+    NC --> V
+    V -- "失败 → 打回重改" --> CD
+    MEM[("memory<br/>错误案例库")]:::doc -. "检索学习<br/>+报错信息" .-> CD
+
+    M["msprof 测量 kernel 耗时<br/>口径: 数据搬运起止<br/>不含启动开销"]:::diag
+    V -- "通过" --> M
+
+    CMP{"加速比 > baseline?"}:::decide
+    M --> CMP
+    K["保留进链"]:::ok
+    R["回退"]:::fail
+    CMP -- 是 --> K
+    CMP -- 否 --> R
+
+    TR[("轨迹记录<br/>保留/回退都记")]:::doc
+    K --> TR
+    R --> TR
+
+    L{"六层策略执行完?<br/>算法→融合→分块→访存→计算→架构"}:::decide
+    TR --> L
+    L -- "否 → 下一轮" --> C
+
+    O1["优化后的算子"]:::out
+    O2["采用的优化策略"]:::out
+    O3["优化效果结果"]:::out
+    L -- 是 --> O1
+    L -- 是 --> O2
+    L -- 是 --> O3
+
+    classDef input fill:#e3f2fd,stroke:#1e88e5,stroke-width:2px
+    classDef diag fill:#f5f5f5,stroke:#9e9e9e
+    classDef llm fill:#fff3e0,stroke:#fb8c00,stroke-width:2px
+    classDef doc fill:#f3e5f5,stroke:#ab47bc
+    classDef decide fill:#fff8e1,stroke:#fbc02d,stroke-width:2px
+    classDef ok fill:#e8f5e9,stroke:#43a047
+    classDef fail fill:#fdecea,stroke:#e53935
+    classDef out fill:#e8f5e9,stroke:#43a047,stroke-width:2px
+</div>
+
+<script src="mermaid.min.js"></script>
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'default',
+    flowchart: { htmlLabels: true, nodeSpacing: 40, rankSpacing: 50 } });
+</script>
+</body>
+</html>

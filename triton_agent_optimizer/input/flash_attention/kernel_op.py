@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══════════════════════════════════════════════════════════════════════════════
-#  单文件 kernel_op.py — Multi-Head Flash Attention (online softmax 融合, 因果 mask) (v4)
+#  单文件 kernel_op.py — Multi-Head Flash Attention (online softmax 融合, 因果 mask) (v4.5)
 #  ★ 优化循环里 coder 只改这一个文件; 读取/运行/测试都只看这一个文件
 #  分三个区: ① 场景 config  ② 算子 kernel  ③ 测试 main
 #
@@ -10,7 +10,8 @@
 #    P[h] = softmax(S[h] + causal_mask, dim=-1)   (因果: 只关注 key≤query)
 #    O[h] = P[h]@V[h]
 #  单 kernel 融合全部: 每个 (头, 查询块) 一个 program, loop 所有 key 块, 边算 S 边更新 m/l/acc.
-#  (Tier1 算法层: online softmax 避免物化 O(seq²×heads) 中间张量 — flash attention 核心)
+#  标准 FA 实现 (中上水平基线): online softmax 避免物化 O(seq²×heads) 中间张量;
+#    scale 预乘进 Q; K 预转置保证 inner-loop 连续访存; P 转 fp16 进 dot, acc/m/l 保持 fp32
 # ═══════════════════════════════════════════════════════════════════════════════
 import os
 import sys
@@ -31,7 +32,7 @@ DIM = int(os.environ.get("FA_DIM", 64))         # 头维 (head_dim)
 #   累加 acc/m_i/l_i 保持 fp32 (FA 标准, 精度不丢)
 DTYPE = torch.float16
 SCALE = 1.0 / (DIM ** 0.5)
-BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64          # 查询块/键块/头维块
+BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 64         # 查询块/键块/头维块
 # 注意: 不传 num_warps/num_stages — triton-ascend 禁止 tune 这两个参数, 自动管理 tiling/流水
 
 
@@ -61,6 +62,7 @@ def flash_attn_mha_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
     # Q[h, m, k]: h*(seq*dim) + m*dim + k  (布局 [nheads, seq, dim])
     q_ptrs = q_ptr + head * (seq * dim) + offs_m[:, None] * dim + offs_k[None, :]
     q = tl.load(q_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+    q = q * scale                                   # ★scale 预乘进 Q (省每块一次乘)
 
     acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
     m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
@@ -73,7 +75,7 @@ def flash_attn_mha_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
         #   (K_t = 每头 K^T 预转置, 和 attention_mlp 的 attention_scores 同款修法)
         k_ptrs = k_ptr + head * (dim * seq) + offs_k[:, None] * seq + offs_n[None, :]
         kk = tl.load(k_ptrs, mask=n_mask[None, :] & k_mask[:, None], other=0.0)
-        s = tl.dot(q, kk) * scale                  # S = Q@K^T·scale [BLOCK_M, BLOCK_N]
+        s = tl.dot(q, kk)                            # S = Q·scale @ K^T [BLOCK_M, BLOCK_N]
 
         # ★因果 mask: key n 只允许 ≤ query m
         causal = offs_n[None, :] <= offs_m[:, None]

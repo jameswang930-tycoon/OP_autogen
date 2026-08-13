@@ -34,8 +34,10 @@ PAD = int(os.environ.get("CONV_P", 1))        # padding
 OH = (H + 2 * PAD - R) // 1 + 1               # 输出高
 OW = (W + 2 * PAD - S) // 1 + 1               # 输出宽
 DTYPE = torch.float32
+CRS = C_IN * R * S                            # GEMM K 维 = 滤波 tap × 输入通道
 BLOCK_K = 32                                  # 输出通道块
 BLOCK_OW = 64                                 # 空间块
+BLOCK_CRS = 128                               # ≥CRS(72) 的 2 幂 (tl.arange 要求)
 BLOCK_EL = 1024                               # 逐元素分块
 # 注意: 不传 num_warps/num_stages — triton-ascend 禁止 tune 这两个参数, 自动管理 tiling/流水
 
@@ -44,11 +46,12 @@ BLOCK_EL = 1024                               # 逐元素分块
 #  ② 算子 kernel (3 个分离 kernel)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ① Conv2d: 每 program 算 (n, oh) 的 [BLOCK_K 通道 × BLOCK_OW 空间] 块, loop c/r/s 外积累加
+# ① Conv2d (软件 im2col implicit GEMM, 走 cube): 每 program 算 (n, oh) 的 [K × OW] 块,
+#    patch[crs, ow] = X[n, c, ih, iw]  (padding/越界 → 0), 一次 tl.dot
 @triton.jit
 def conv2d_kernel(x_ptr, w_ptr, y_ptr,
                   N, H, W, K, OH, OW,
-                  BLOCK_K: tl.constexpr, BLOCK_OW: tl.constexpr,
+                  BLOCK_K: tl.constexpr, BLOCK_OW: tl.constexpr, BLOCK_CRS: tl.constexpr,
                   C: tl.constexpr, R: tl.constexpr, S: tl.constexpr, PAD: tl.constexpr):
     pid = tl.program_id(axis=0)
     total_ow = (OW + BLOCK_OW - 1) // BLOCK_OW
@@ -59,24 +62,28 @@ def conv2d_kernel(x_ptr, w_ptr, y_ptr,
 
     offs_k = tl.arange(0, BLOCK_K)
     offs_ow = owb * BLOCK_OW + tl.arange(0, BLOCK_OW)
-    k_mask = offs_k < K
-    ow_mask = offs_ow < OW
+    offs_crs = tl.arange(0, BLOCK_CRS)          # ≥C*R*S 的 2 幂 (72 → 128)
+    c = offs_crs // (R * S)
+    r = (offs_crs % (R * S)) // S
+    s = offs_crs % S
+    ih = oh + r - PAD                            # [CRS]
+    iw = offs_ow[None, :] + s[:, None] - PAD     # [CRS, OW]
+
+    # 软件 im2col: patch[crs, ow] = X[n, c, ih, iw]; padding/越界 → 0
+    valid = (offs_crs[:, None] < C * R * S) & (ih[:, None] >= 0) & (ih[:, None] < H) \
+            & (iw >= 0) & (iw < W)
+    patch = tl.load(x_ptr + n * C * H * W + c[:, None] * H * W + ih[:, None] * W + iw,
+                    mask=valid, other=0.0)        # [CRS, OW]  innermost(ow) stride=1 连续
+
+    # W 拍平 [K, C*R*S]: wtile[k, crs] = W[k, c, r, s]
+    wtile = tl.load(w_ptr + offs_k[:, None] * (C * R * S) + offs_crs[None, :],
+                    mask=(offs_crs[None, :] < C * R * S) & (offs_k[:, None] < K),
+                    other=0.0)                    # [K, CRS]
 
     acc = tl.zeros((BLOCK_K, BLOCK_OW), dtype=tl.float32)
-    for c in range(C):
-        for r in range(R):
-            for s in range(S):
-                ih = oh + r - PAD
-                iw = offs_ow + s - PAD
-                valid = (ih >= 0) & (ih < H) & (iw >= 0) & (iw < W) & ow_mask
-                xv = tl.load(x_ptr + n * C * H * W + c * H * W + ih * W + iw,
-                             mask=valid, other=0.0)                      # [BLOCK_OW]
-                wv = tl.load(w_ptr + offs_k * C * R * S + c * R * S + r * S + s,
-                             mask=k_mask, other=0.0)                     # [BLOCK_K]
-                acc += wv[:, None] * xv[None, :]                          # 外积累加
-
+    acc = tl.dot(wtile, patch, acc)               # [K,CRS]@[CRS,OW]→[K,OW]
     y_ptrs = y_ptr + n * K * OH * OW + offs_k[:, None] * OH * OW + oh * OW + offs_ow[None, :]
-    tl.store(y_ptrs, acc, mask=k_mask[:, None] & ow_mask[None, :])
+    tl.store(y_ptrs, acc, mask=(offs_k[:, None] < K) & (offs_ow[None, :] < OW))
 
 
 # ② Bias: y[i] = x[i] + bias[channel], channel = (i // (OH*OW)) % K
@@ -130,7 +137,7 @@ def main():
     LOOP = int(os.environ.get("KERNEL_LOOP", "1"))
     for _ in range(LOOP):
         conv2d_kernel[grid_conv](x, w, yc, N_B, H, W, K_OUT, OH, OW,
-                                 BLOCK_K=BLOCK_K, BLOCK_OW=BLOCK_OW,
+                                 BLOCK_K=BLOCK_K, BLOCK_OW=BLOCK_OW, BLOCK_CRS=BLOCK_CRS,
                                  C=C_IN, R=R, S=S, PAD=PAD)
         bias_kernel[grid_el](yc, bias, yb, n_el, K_OUT, OH, OW, BLOCK=BLOCK_EL)
         relu_kernel[grid_el](yb, y, n_el, BLOCK=BLOCK_EL)

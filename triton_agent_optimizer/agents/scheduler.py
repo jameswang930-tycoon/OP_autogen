@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""Scheduler — v4 状态机: 读 diagnosis.json → 提取当前 tier 字段 → 驱动 Planner→Coder→验证→晋升。
+"""Scheduler — v4.5 状态机: 读 diagnosis.json → 提取当前 tier 字段 → 驱动 Planner→Coder→验证→晋升。
 
-v4 流程 (每轮):
+v4.5 流程 (每轮):
   ① run_optimize.sh <input_dir> <round_dir> [M N K]  → 采集+解析 → diagnosis.json
-  ② _diagnose: 按当前 tier 筛字段 → 07_tier{N}_fields/
+  ② _diagnose: 按当前 tier 筛字段 → 07_tier{N}_fields/ (+ ★Amdahl 优先级行: per-kernel 占比排序喂 planner)
   ③ (tier2) _run_fusion: 编译 HIVM MLIR → 08_fusion/ (仅多 kernel 算子)
-  ④ sweep (round1 或 tier3+hash 变): 程序化枚举 BLOCK 候选, 真机实测 → 09_tier3_sweep/
+  ④ sweep (round1 或每个 tier3 round): 程序化枚举 BLOCK 候选, 真机实测 → 09_tier3_sweep/
      → 最优 BLOCK 写入 round_dir/kernel_op.py → current_kernel 指向它
      → 结果持久化 st["last_sweep_result"], 每轮传给 planner (含 sweep_status)
-  ⑤ Planner: 07字段 + planner_context.json + 轨迹 + 手递 + sweep数据 + 优秀案例 → plan.md
+  ⑤ Planner: 07字段 + Amdahl 优先级 + planner_context.json + 轨迹(含★跨轮诊断快照 diag) + 手递
+     + sweep数据 + 优秀案例 → plan.md
   ⑥ Coder: 读 plan changes[] → 确定性替换 (Step0) 或 LLM (Step1) → round_dir/kernel_op.py
      → Unicode 脏字符自动清洗 (_sanitize_unicode) + Python 语法校验
-  ⑦ Verify: 正确性校验 (MATMUL_VERIFY) → msprof 端到端 → 加速比
+     → ★失败案例库 (memory/failed_cases.py): 失败时累积重试上下文 (前几次 方案+报错 全序列
+       + 库检索注入 solved方案/stuck黑名单/已试方案 + 禁止原样重试), 成功轮 solved 回填
+  ⑦ Verify — ★两段验证 (TWO_PHASE_VERIFY=1 默认, 0 关闭):
+     段1 verify_fast_gate: 正确性 + Event 快测 (秒级, 无 msprof) → Event 不快于 best → 直接 REVERT (省 msprof 分钟级)
+     段2 verify_end_to_end: 过门才跑 msprof 全量 (正确性+warmup+msprof 双口径+Event) → 确认 + 诊断字段
   ⑧ 记录 + 晋升/回退/停止:
      - 严格晋升 (需 promote_evidence)
      - 可回退 (防死循环: 同路径≥3次拒绝)
      - 跳转手递 (10_tier_handoff.json)
      - 优秀案例自动记录 (memory/tier{N}_cases.json, 阈值1.3×)
+     - ★失败案例自动记录 (memory/tier{N}_failed_cases.json: 指纹去重/attempted_solutions/stuck 状态机)
+     - ★hist 记 error_class 四分类 (env/code_compile/code_numeric/code_runtime) + diag 诊断快照紧凑串
+     - ★全量诊断快照 → diag_snapshots.jsonl (每轮 per-kernel 关键指标, 审计/讲演, 不入 context)
       - 自动跑 PyTorch bench (AUTO_RUN_PT_BENCH) + ★自动跑工业级基准 (AUTO_RUN_IND_BENCH,
         缺 industrial json 时逐个 mode 跑 bench_industrial.py; 口径: mode 内 median、mode 间取最小、仅真执行)
         + 自动生成轨迹图 (AUTO_CHART)

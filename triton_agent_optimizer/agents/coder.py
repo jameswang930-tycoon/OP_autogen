@@ -7,6 +7,9 @@ Coder Agent — 读 Plan + 当前代码 → 做最小化代码改动。
     → _sanitize_unicode 清洗 new_code 的 Unicode 脏字符 → _validate_python 语法校验
   Step 1 (兜底, LLM): Step 0 失败/有 previous_error 时调 LLM 改码
     → _clean_output (去 BOM/前导垃圾/markdown/Unicode 脏字符) → _validate_python
+    → ★失败案例库 (memory/failed_cases.py): previous_error 时两级检索注入
+      (指纹精确+关键词相似; solved 方案/stuck 黑名单/已试方案, 只读参考严禁抄写)
+    → 修复成功 (output 与原码不同) → mark_solved 回填失败库
 
 Unicode 脏字符清洗 (_sanitize_unicode):
   - 15+ 类替换: 中文标点/箭头/dash/引号/数学符号/省略号/空格 → ASCII 等价

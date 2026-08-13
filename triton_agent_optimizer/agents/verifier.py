@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""Verifier Agent (v4) — 端到端验证: 正确性校验 + msprof 耗时 → 加速比.
+"""Verifier Agent (v4.5) — 端到端验证: 正确性校验 + msprof 耗时 → 加速比.
 
-流程:
+★两段验证:
+  段1 verify_fast_gate (秒级, 无 msprof): _correctness_check + _event_e2e_ns
+    → scheduler 用它做快速门: Event 不快于 best 直接 REVERT (省 msprof 分钟级/轮)
+  段2 verify_end_to_end (全量): 过门才跑 — warmup + msprof 双口径 + Event 确认
+
+verify_end_to_end 流程:
   ① warmup × VERIFY_WARMUP (默认3): 裸跑 kernel 预热 JIT/cache
-  ② 正确性校验: MATMUL_VERIFY=1 → kernel 对 torch 参考算 diff → 必须 "result check: PASS"
+  ② 正确性校验 (_correctness_check): MATMUL_VERIFY=1 → 必须 "result check: PASS"
      (不 PASS → 本轮 FAIL, 回传 coder 修; 在 msprof 之前, 防"改错结果还通过")
   ③ msprof 测时: 一次 msprof 内 KERNEL_LOOP=30 遍 → op_summary 求和 ÷ loop = 单次端到端 ns
   ④ H1 循环检测: 源码找 `for _ in range(LOOP):` → 找不到则用实测遍数 (防 coder 弄丢循环)
   ⑤ msprof_0 目录每次先 rmtree (防重试残留旧 CSV)
+  ⑥ ★Event 设备侧 (_event_e2e_ns): 注入 warmup + 多窗口 (KERNEL_EVENT_REPS=5) median,
+     每窗口输入重建破 L2 — 与工业级基准同口径; 循环异常 (行数<loop) 不测 Event (None)
 """
 from __future__ import annotations
 

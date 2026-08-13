@@ -1,8 +1,15 @@
-# Triton Agent Optimizer v4 — 架构设计（按当前实现）
+# Triton Agent Optimizer v4.5 — 架构设计（按当前实现）
 
-> **核心思路**: 不靠盲试（AutoKernel 300~400 轮），而是用 **真机 msprof 双源采集（通用 msprof + msprof op）** 精确诊断每个 kernel 的耗时/带宽/算力/瓶颈 → 6 层优化策略逐层推进 → 每轮**正确性校验 + msprof 端到端实测（纯 kernel+端到端双口径）+ Event 设备侧计时**，**严格最优 KEEP（Event 绝对延迟 < 历史最小才进链）**决定保留/回退，并以**工业级最优**（eager/compile/cann-fused/fa 各 mode Event 取 min）为对比天花板，最终算 **vs 工业级比值**看优化效果。
+> **核心思路**: 不靠盲试（AutoKernel 300~400 轮），而是用 **真机 msprof 双源采集（通用 msprof + msprof op）** 精确诊断每个 kernel 的耗时/带宽/算力/瓶颈 → 6 层优化策略逐层推进 → 每轮**两段验证（段1 正确性+Event 快测秒级 → 不快于 best 直接 REVERT; 段2 过门才 msprof 全量确认）**，**严格最优 KEEP（Event 绝对延迟 < 历史最小才进链）**决定保留/回退，并以**工业级最优**（eager/compile/cann-fused/fa 各 mode Event 取 min）为对比天花板，最终算 **vs 工业级比值**看优化效果。
 >
 > **环境**: Ascend 910B3 (NPU) + CANN 8.5.1 + triton-ascend 3.2.0 + torch_npu 2.9.0 + nga (本地 LLM codeagent)
+> **更新**: 2026-08-13 — v4.5 记忆+效率轮 (提交 ac526da, 全部有回归测试守护):
+>   ① 失败案例库 memory/failed_cases.py (按 tier 分文件: 归一化指纹去重/两级检索/attempted_solutions 方案收敛守卫/open→solved|stuck 状态机/负正闭环/LRU; scheduler 轮内重试累积上下文+库注入; coder 检索注入+solved 回填; hist 记 error_class 四分类)
+>   ② 两段验证 TWO_PHASE_VERIFY (段1 verify_fast_gate 正确性+Event 快测秒级 → 不快于 best 直接 REVERT 省 msprof; 段2 过门才全量)
+>   ③ Amdahl 显式编排 (每轮 planner 注入 per-kernel 占比排序, 先打占比最大 kernel)
+>   ④ 跨轮诊断快照 (hist 记 top2 kernel 紧凑串 bn/cu/mu/l2/redun/引擎 → planner 看因果链; 全量写 diag_snapshots.jsonl)
+>   ⑤ v3 就地展开式讲演页 feedback/pipeline_diagrams_v3.html
+>
 > **更新**: 2026-08-12 — v4.4 修复轮（全部有回归测试 `_sim_fix_regression.py` 31 项断言守护）:
 >   ① sweep 轮 verify 失败回滚只回路径引用 → kernel 链污染 → 内容快照恢复 + failed_kernel.py 留证
 >   ② promote 无依据被拒后轮次白耗 + promote_budget 无限膨胀 → max_rounds 失效 → 晋升门前置（被拒转正常优化轮）+ 有效轮计数
@@ -34,11 +41,13 @@
 ```
 输入单个 kernel_op.py（config+kernel+test 一体）
   → 采集+解析出 diagnosis.json（骨架+deep+roofline）
-  → 按当前 tier 筛字段喂 Planner(LLM)
+  → 按当前 tier 筛字段 + Amdahl 优先级喂 Planner(LLM)
   → Planner 出 changes[]（old_code→new_code 精确替换）+ promote 决策
-  → Coder 确定性应用 changes[] → 本轮 kernel_op.py
-  → 端到端实测: msprof（纯kernel+端到端双口径, 诊断用）+ Event（设备侧权威绝对值, `e2e_event_ns`）
+  → Coder 确定性应用 changes[]（失败→重试上下文累积+失败案例库注入）→ 本轮 kernel_op.py
+  → ★两段验证: 段1 正确性+Event 快测(秒级) → 不快于 best 直接 REVERT (省 msprof);
+    过门才段2 msprof 全量（纯kernel+端到端双口径, 诊断用）+ Event（设备侧权威绝对值, `e2e_event_ns`）
   → 严格最优 KEEP: Event 绝对延迟 < 历史最小才进链（绑定 best_kernel/best_round; Event缺不采纳）
+  → 记忆: 优秀案例(成功>1.3×) + 失败案例(指纹去重/stuck黑名单) + 跨轮诊断快照(diag)
   → 最终算 vs_industrial 比值（我们最优 Event / 工业级最优 Event）看优化效果
   → 对比上一轮决定 KEEP / REVERT / 晋升 / 回退 / 停止
 ```
@@ -78,28 +87,38 @@ Scheduler (agents/scheduler.py) — 状态机主循环 (tier 1~6 × round N)
    │
    ├─③ Planner  _plan()  (agents/planner.py generate_v4)
    │    读: skills/triton-op-planner/SKILL.md + docx/playbook_tier<N>.md + 当前 kernel_op.py
-   │        + 07 字段 + planner_context.json(每kernel全量task/deep+占比+Top耗时) + trajectory(各层进度)
-   │        + 历史梗概(前层进度) + 手递handoff + 优秀案例(memory/tier{N}_cases.json) [+ 融合分析 + sweep结论]
+   │        + 07 字段 + ★Amdahl 优先级(per-kernel 占比排序) + planner_context.json(每kernel全量task/deep+占比+Top耗时)
+   │        + trajectory(各层进度, 含★diag 跨轮诊断快照) + 历史梗概(前层进度) + 手递handoff
+   │        + 优秀案例(memory/tier{N}_cases.json) [+ 融合分析 + sweep结论]
    │    出: roundN/plan.md  (JSON: strategy, changes[], promote, promote_to, promote_evidence, handoff)
    │
    ├─④ Coder  _code()  (agents/coder.py apply)
    │    确定性应用 changes[] (old_code→new_code 逐字符替换全部出现处) + 语法检查
-   │    出错/LLM 超时 → 带错误回传 LLM 修复 (≤3 次)
+   │    出错/LLM 超时 → ★失败案例库: 重试上下文 = 前几次(方案+报错)全序列 + 失败库检索注入
+   │      (solved方案/stuck黑名单/已试方案 + 禁止原样重试) → 回传 LLM 修复 (≤3 次)
+   │    修复成功 → mark_solved 回填失败库; hist 记 error_class 四分类
    │    出: roundN/kernel_op.py + diff.patch
    │
-   ├─⑤ 验证  _verify()  (agents/verifier.py verify_end_to_end)
-   │    正确性校验(MATMUL_VERIFY) + warmup(3) + 一次 msprof 内循环 KERNEL_LOOP(30) 次
-   │    读全部 op_summary*.csv 合并 → 同一次同算两种口径 ÷ 实测遍数:
-   │      纯kernel ns = Σ非aclnn行; 端到端 e2e_ns = Σ全部行(含框架kernel)
-   │    + ★Event 设备侧计时 (e2e_event_ns, 工业级权威绝对值, 无 profiler 扰动):
-   │      改写 kernel_op 注入 warmup + KERNEL_EVENT_REPS(5) 个独立窗口 → median → EVENT_E2E_US
-   │    (源码无 KERNEL_LOOP 循环 → 自动改除实测遍数, 防虚高)
+   ├─⑤ 验证 — ★两段验证 (TWO_PHASE_VERIFY=1 默认; 0 关闭退全量; stub 自动禁用)
+   │    段1 verify_fast_gate (agents/verifier.py, 秒级, 无 msprof):
+   │      正确性校验(_correctness_check) + Event 快测(_event_e2e_ns)
+   │      → Event ≥ best → 直接 REVERT (省 warmup×3+msprof 几分钟/轮; speedup 用 Event 口径派生)
+   │    段2 verify_end_to_end (过门才跑, 全量确认+诊断字段):
+   │      正确性校验(MATMUL_VERIFY) + warmup(3) + 一次 msprof 内循环 KERNEL_LOOP(30) 次
+   │      读全部 op_summary*.csv 合并 → 同一次同算两种口径 ÷ 实测遍数:
+   │        纯kernel ns = Σ非aclnn行; 端到端 e2e_ns = Σ全部行(含框架kernel)
+   │      + ★Event 设备侧计时 (e2e_event_ns, 工业级权威绝对值, 无 profiler 扰动):
+   │        改写 kernel_op 注入 warmup + KERNEL_EVENT_REPS(5) 个独立窗口 → median → EVENT_E2E_US
+   │      (源码无 KERNEL_LOOP 循环 → 自动改除实测遍数, 防虚高; msprof 轮 Event 缺失用段1快测值兜底)
    │
    ├─⑥ 决策  ★严格最优 KEEP: 本轮 Event 绝对延迟 < 历史最小 best_e2e_event_ns 才进链
    │    (设备侧无 profiler 扰动, 免 msprof 欠采毒 best; Event 缺则方案A: 不采纳)
    │    采纳时同步 best_kernel/best_round + 复制 outputs/<op>/best_kernel.py
    │    未采纳/失败 → current_kernel 回滚轮首快照 (★内容快照恢复, 防 sweep 轮链污染; 失败代码另存 failed_kernel.py)
-   │    记录 history[] {..., ns, e2e_ns(msprof), e2e_event_ns(Event), sweep_ran, sweep_adopted, ...}
+   │    记录 history[] {..., ns, e2e_ns(msprof), e2e_event_ns(Event), sweep_ran, sweep_adopted,
+   │                    error_class(四分类), diag(跨轮诊断快照紧凑串)}
+   │    ★失败案例: 失败轮自动入库 (指纹去重/attempted_solutions/stuck); 成功轮 solved 回填
+   │    ★全量诊断快照: 每轮写 diag_snapshots.jsonl (per-kernel 关键指标, 审计/讲演, 不入 context)
    │    (每 REBASELINE_EVERY=10 轮: 环境漂移重基准 — 重测原始 baseline + 当前 kernel, 同步 best_e2e_event_ns)
    │    (优秀案例: 本轮相对上一最优 >1.3× → 自动记 memory/tier{N}_cases.json)
    │    (每轮产出策略摘要: strategy_summary.py → final_output/{all,successful}_strategies.md)
@@ -374,10 +393,13 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
   - round_dir/plan.md 的 changes[]            要应用的 old_code→new_code
   - 当前 kernel_op.py (current_kernel)        原始代码
   - skills/triton-op-coder/SKILL.md           改码铁律 (ASCII/不改函数名/...)
-  - previous_error                            上轮报错(有则走 LLM 修复; 查 memory/codeerror 已知方案)
+  - previous_error (累积重试上下文)           上轮报错(有则走 LLM 修复)
+  - ★memory/failed_cases.py (tier{N}_failed_cases.json)   失败库检索注入 (两级检索)
 执行:
   - 无错: 确定性 code.replace(old_code, new_code) (替换全部出现处, 最稳)
-  - 有错: nga run 调 coder skill 带错误修复
+  - 有错: ★重试上下文 = 前几次尝试(方案+报错)全序列 + 本次报错 + 失败库注入
+          (solved 方案/stuck 黑名单/已试方案, ★只读参考严禁抄写; 禁止原样重试已失败方案)
+          → nga run 调 coder skill 带错误修复; 修复成功 → mark_solved 回填失败库
   - Python 语法(报错带行内容) + 函数完整性 + no-op 校验
   - ★Unicode 清洗: 千分位归一(1，024→1024) / 全角数字转ASCII / markdown剥壳 / 智能引号(定界符换·内容删) / 兜底二次验证
 写: round_dir/kernel_op.py   (本轮新代码, ★不碰源 input/)
@@ -387,13 +409,20 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
                     ▼
 
 ═══════════════════════════════════════════════════════════════════════
- 阶段 5 │ Verifier  (agents/verifier.py verify_end_to_end)
+ 阶段 5 │ Verifier  (agents/verifier.py)  —— ★两段验证
 ═══════════════════════════════════════════════════════════════════════
+══ 段1 verify_fast_gate (秒级, 无 msprof):
+读: round_dir/kernel_op.py
+执行: _correctness_check (MATMUL_VERIFY=1, 必须 "result check: PASS") + _event_e2e_ns (Event 快测)
+传: {"ok": bool, "e2e_event_ns": float|None}
+    → scheduler 判门: Event ≥ best → 直接 REVERT (省 warmup×3+msprof 几分钟/轮)
+    → 过门 / Event 不可用 → 段2 全量
+
+══ 段2 verify_end_to_end (全量, 过门才跑):
 读: round_dir/kernel_op.py (验证 coder 的新输出)
 执行 (三步):
   ① warmup × VERIFY_WARMUP(3)  裸跑预热 JIT/cache
-  ② 正确性校验  MATMUL_VERIFY=1 跑一次 → 必须 stdout 含 "result check: PASS"
-                 (不过 → 本轮 FAIL, 错误回传 Coder 同轮重试 ≤3 次)
+  ② 正确性校验  _correctness_check (同上; 不过 → 本轮 FAIL, 错误回传 Coder 同轮重试 ≤3 次)
   ③ msprof 测时  一次 msprof, app 内 KERNEL_LOOP(30) 遍
   ④ ★Event 设备侧 (多窗口 median): 注入 KERNEL_EVENT_REPS(5) 个独立 Event 窗口
      (每窗口包 LOOP 次, 设备流水连续最后 sync) → 取 median → e2e_event_ns
@@ -402,6 +431,7 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
        纯 kernel ns = Σ 非 aclnn 行;   端到端 e2e_ns = Σ 全部行(含框架)
 写: round_dir/msprof_0/  (msprof 原始产物)
 传 (返回 dict, 不写业务文件): {ok, ns(纯), e2e_ns(端到端), e2e_event_ns(★Event 设备侧), speedup, loop, rows}
+    (msprof 轮 Event 缺失 → scheduler 用段1快测值兜底)
                     │
                     ▼
 
@@ -419,12 +449,19 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
     → 校正 baseline_ns/baseline_e2e_ns/baseline_e2e_event_ns + current_speedup, ★同步 best_e2e_event_ns
     (用 best_kernel.py 新环境复测; 否则新环境改进轮永远比不过旧 best → 卡死 REVERT)
   - (优秀案例) 本轮相对上一最优 > EXCELLENT_THRESHOLD(1.3×) → 自动记 memory/tier{N}_cases.json
+  - ★(失败案例) 失败轮自动入库 memory/tier{N}_failed_cases.json: 归一化签名指纹去重 + attempts+1
+    + attempted_solutions 方案历史 (同方案不重复记); attempts≥3 → stuck (封原方案, 不封新方案);
+    成功轮 mark_solved 回填 (方案 + fix_diff); solved 再现 → 自动降级重计
+  - ★(error_class) hist 记失败四分类: env / code_compile / code_numeric / code_runtime
+  - ★(诊断快照) hist 记 top2 kernel 紧凑串 (bn/cu/mu/l2/redun/引擎) → planner 看"改法→指标变化→结果";
+    全量 per-kernel 快照写 diag_snapshots.jsonl (审计/讲演, 不入 context)
   - (每轮) strategy_summary.py → final_output/{all,successful}_strategies.md
  写: outputs/<op>/optimization_trajectory.json
     ├ state 更新 (tier/round/current_speedup/current_kernel/best_speedup/best_e2e_event_ns/sweep/...)
     └ history 追加一条 {round,tier,strategy,change,changes_full,
                          speedup(e2e),kernel_speedup(纯),ns,e2e_ns,e2e_event_ns,
-                         decision(KEEP/REVERT/FAIL),result(OK/NOOP/FAIL),error,tflops,sweep_ran,sweep_adopted}
+                         decision(KEEP/REVERT/FAIL),result(OK/NOOP/FAIL),error,error_class,
+                         diag(诊断快照),tflops,sweep_ran,sweep_adopted}
                     │
                     ▼  回【阶段 1】跑下一轮 (tier/round 推进)
                        直到有效轮跑满 max_rounds / Tier6 连续无改进 / 连续3次采集失败 → 出循环
@@ -512,7 +549,9 @@ triton_agent_optimizer/
 │   ├── scheduler.py               # ★调度状态机 (核心): 驱动每轮 采集→诊断→Planner→Coder→Verify→决策→晋升;
 │   │                              #   round1 设基准(纯kernel+端到端+Event+工业级); KEEP 决策=Event 绝对延迟(方案A: Event缺不采纳);
 │   │                              #   晋升门前置(无依据转正常轮)+有效轮计数(max_rounds 硬上限); 回滚内容快照(failed_kernel 留证);
-│   │                              #   rebaseline 同步 best Event; extract_tier_fields 筛字段; sweep 触发; 优秀案例; 最终产物 final_output/
+│   │                              #   rebaseline 同步 best Event; extract_tier_fields 筛字段(+Amdahl 优先级行);
+│   │                              #   两段验证接入(段1 Event 快测门); 失败案例库接入(重试上下文+solved 回填+error_class);
+│   │                              #   跨轮诊断快照(hist diag + diag_snapshots.jsonl); sweep 触发; 优秀案例; 最终产物 final_output/
 │   ├── planner.py                 # Planner (LLM): 读 SKILL+playbook+07字段+planner_context+轨迹+手递 → plan.md (changes[]+promote)
 │   ├── coder.py                   # Coder (确定性改码+LLM修复): 应用 changes[] 逐字符替换 → roundN/kernel_op.py + diff.patch
 │   │                              #   语法(报错带行内容)/函数完整性/no-op 校验; Unicode 清洗(千分位/全角/markdown/引号两难/兜底二次验证)
@@ -596,11 +635,18 @@ triton_agent_optimizer/
 │   │                              #   (加速比曲线+各tier色带+KEEP/REVERT点+PyTorch虚线+工业级红线, Event-vs-Event 同口径)
 │   ├── strategy_summary.py        # ★策略摘要: 每轮自动产 final_output/{all,successful}_strategies.md
 │   │                              #   (successful 仅 KEEP+严格超越上一轮; 排除 promote/REVERT/FAIL/采集失败)
+│   ├── pipeline_diagrams.html     # 讲演页 v1: 静态 SVG 双图 (闭环架构 + 完整数据流)
+│   ├── pipeline_diagrams_v2.html  # 讲演页 v2: 弹出式下钻
+│   ├── pipeline_diagrams_v3.html  # 讲演页 v3: 就地展开式 (点击块内 + 就地展开面板, CSS grid 固定主链一行, 零依赖)
 │   └── __init__.py
 
 ├── memory/                        # ── 记忆层 ──
 │   ├── excellent_cases.py         # 优秀案例自动记录/检索 (EXCELLENT_THRESHOLD=1.3×, planner 优化前参考)
-│   ├── codeerror/                 # 已知代码错误修复方案 (softmax.json / triton_agent_optimizer.json)
+│   ├── failed_cases.py            # ★失败案例库 (按 tier 分文件 tier{N}_failed_cases.json):
+│   │                              #   归一化签名指纹去重 + 两级检索(指纹精确+关键词相似) + attempted_solutions
+│   │                              #   方案收敛守卫 + open→solved|stuck 状态机 + 负正闭环 + LRU 上限
+│   │                              #   coder 修复注入 / scheduler 重试上下文累积 / 成功 solved 回填
+│   ├── codeerror/                 # 早期 coder 错误修复记录 (按 kernel 分, 已废弃由 failed_cases 取代)
 │   └── __init__.py
 
 ├── knowledge/                     # ── 领域知识 ──
@@ -645,6 +691,18 @@ triton_agent_optimizer/
 - **每轮产物** (round_dir): `kernel_op.py` + `diff.patch`（★只在 coder 成功时写, 失败尝试不覆盖真实 diff）+ `plan.md` + `07_tier<N>_fields/` + `msprof_0/` (验证) + `event_kernel.py` (Event 计时注入) + (失败时) `failed_kernel.py`
 - **轨迹**: `outputs/<op>/optimization_trajectory.json`（每轮落盘, 可 `--resume` 续跑）
 - **采集链演进**: round1 采集源目录 → 之后采集上一轮输出目录 (current_kernel.parent), kernel 链连续
+- **★Amdahl 显式编排 (2026-08-13)**: `_plan` 每轮从 diagnosis 算 per-kernel 耗时占比（×launch_count 加权）,
+  多 kernel 时注入"优化优先级: A (60%) → B (25%) → C (15%), 本轮优先动占比最大 kernel, 动其他必须给理由"
+- **★失败案例库接入 (2026-08-13)**: 轮内 coder/verify 失败 → `build_retry_context`（前几次 方案+报错 全序列
+  + 本次报错 + 失败库检索注入 + 禁止原样重试）→ 回传 coder; 成功轮 `mark_solved` 回填; hist 记 `error_class` 四分类
+  （env/code_compile/code_numeric/code_runtime, 统一入口 `memory.failed_cases.classify_error`）
+- **★跨轮诊断快照 (2026-08-13)**: hist 记 `diag`（top2 kernel 紧凑串: bn/cu/mu/l2/redun/引擎）
+  → planner 通过 history 看"改法→指标变化→结果"因果链; 全量 per-kernel 快照每轮追加写
+  `diag_snapshots.jsonl`（审计/讲演用, 不入 context 防膨胀）
+- **★两段验证接入 (2026-08-13)**: `TWO_PHASE_VERIFY=1`（默认, 0 关闭; stub 自动禁用）—
+  段1 `verify_fast_gate` 秒级（正确性+Event 快测）→ Event ≥ best 直接 REVERT（快测轮 speedup 用
+  Event 口径派生, 决策走现有"Event ≥ best → REVERT"分支）; 过门才段2 msprof 全量;
+  msprof 轮 Event 缺失用段1值兜底
 
 ### 4.2 采集链 (run_optimize.sh)
 - **双数据源**: 通用 msprof（骨架，task.json） + 逐 kernel msprof op（deep，board_<i>.json）
@@ -669,9 +727,11 @@ triton_agent_optimizer/
   ```
 - 铁律: `old_code` 逐字符匹配; `tier` = 当前层; 先做前层优先检查; changes 只属本层; `promote_to` 支持回退
 
-### 4.4 Coder (确定性改码 + LLM 修复)
+### 4.4 Coder (确定性改码 + LLM 修复 + 失败案例库)
 - **Step 0**: 无 previous_error 时，确定性 `code.replace(old_code, new_code)`（替换全部出现处）→ 不靠 LLM 最稳
-- **Step 1**: 有报错时，走 LLM 带错误修复（查 memory.codeerror 已知方案）
+- **Step 1**: 有报错时，走 LLM 带错误修复（★失败案例库 `memory/failed_cases.py` 两级检索注入:
+  指纹精确命中必中 + 关键词交集近似; 注入 solved 方案 / stuck 黑名单 / 已试方案, ★只读参考严禁抄写;
+  修复成功且代码有变 → `mark_solved` 回填失败库）
 - 校验: Python 语法 + 函数完整性（防截断）+ no-op 检测 → diff.patch（★只在成功时写）
 - **★Unicode 清洗**（用户高频报障 "syntaxerror/非法字符但看文件没有" 的根因治理）:
   - **千分位逗号**: LLM 输出 `1，024`(全角逗号) 被表替换转成 `,` 后变 `1,024` → Python 报 leading zeros/invalid decimal literal → 千分位归一 `\b\d{1,3}(,\d{3})+\b`→去逗号（不误伤 `2048,1024`、`range(0,100,16)` 等合法写法）
@@ -680,9 +740,9 @@ triton_agent_optimizer/
   - **智能引号两难**: 定界符场景要换 ASCII（`print(“x”)`），字符串内容场景要删（`print("他说“好”")`）→ 试删/试换取第一个编译通过者
   - 兜底逐行清洗后二次 compile 验证; `_validate_python` 报错**带出错行真实内容**(repr) — 消除"看代码没有非法字符"的困惑
 
-### 4.5 Verifier (正确性校验 + msprof 双口径 + Event 设备侧计时)
-- 先跑 MATMUL_VERIFY=1 正确性校验 (必须输出 `result check: PASS`; 否则本轮 FAIL 回传 coder 修)
-- `verify_end_to_end`: warmup(VERIFY_WARMUP=3) + 一次 msprof 内 kernel 循环 KERNEL_LOOP(VERIFY_LOOP=30) 次
+### 4.5 Verifier (两段验证: 正确性 + Event 快测门 + msprof 双口径 + Event 设备侧计时)
+- ★**段1 `verify_fast_gate`**（2026-08-13, 秒级, 无 msprof）: `_correctness_check`（MATMUL_VERIFY 必须输出 `result check: PASS`）+ `_event_e2e_ns`（Event 快测）→ scheduler 判门: Event ≥ best → 直接 REVERT（省 warmup×3+msprof 几分钟/轮）; 过门/Event 不可用 → 段2
+- ★**段2 `verify_end_to_end`**（全量, 过门才跑）: 先 `_correctness_check`（不过 → 本轮 FAIL 回传 coder 修）+ warmup(VERIFY_WARMUP=3) + 一次 msprof 内 kernel 循环 KERNEL_LOOP(VERIFY_LOOP=30) 次
 - `_read_durations`: 读**全部 op_summary*.csv 合并**, 同一次同算两种口径之和 → 纯kernel(Σ非aclnn) + 端到端(Σ全部含框架)
 - ★`_event_e2e_ns` (2026-08-12 改多窗口 median): 改写 kernel_op 注入 warmup + KERNEL_EVENT_REPS(默认5) 个独立 Event 窗口 (每窗口包 LOOP 次) → 取 median → `e2e_event_ns` (设备侧权威绝对值, 工业级, 无 profiler 扰动; 单窗口 ÷N 只有 1 个样本, median 抗抖动)
 - 返回 {ok, ns(msprof纯), e2e_ns(msprof端到端), e2e_event_ns(Event, median), speedup, loop, rows, duration_us}

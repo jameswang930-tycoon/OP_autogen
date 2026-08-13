@@ -190,12 +190,14 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
 #        跑一遍 → 解析 stdout 的 EVENT_E2E_US → ns. 失败返回 None (不阻断主流程).
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _inject_event_timing(src: str) -> str:
+def _inject_event_timing(src: str, rebuild_inputs: bool = True) -> str:
     """把 kernel_op.py 的 `for X in range(LOOP): <body>` 循环前注入 Event 计时分支.
     KERNEL_EVENT_TIME=1 时: warmup W 次 + ★KERNEL_EVENT_REPS 个独立 Event 窗口 (每窗口包 LOOP 次)
     → 取 median 打印 EVENT_E2E_US, return. 否则原样跑 (不影响正常/msprof 路径).
     ★2026-08-12: 单窗口 ÷LOOP 只有 1 个样本 → 改多窗口 median (与 bench measure_event 同款,
-    抗单次抖动, KEEP 决策更稳). 14 个算子 main() 都是同一个标准模式 → 通用."""
+    抗单次抖动, KEEP 决策更稳). 14 个算子 main() 都是同一个标准模式 → 通用.
+    ★rebuild_inputs=True (默认): 每窗口前重放输入分配 (新地址) 破 L2 — 与工业级基准同口径;
+    False → 热 L2 (量化 L2 复用虚高用, feedback/remeasure_best.py)."""
     import re as _re
     lines = src.splitlines(keepends=True)
     for_idx = None
@@ -208,6 +210,16 @@ def _inject_event_timing(src: str) -> str:
             break
     if for_idx is None:
         return ""   # 找不到标准循环 → 调用方放弃
+    # ★2026-08-12 输入轮换 (破 L2, 与 bench_common.measure_event / triton do_bench 同口径):
+    #   注入的 Event 窗口若一直用同一批输入, 工作集 < 192MB(L2) 时后 N 次全 L2 命中 → 端到端虚高
+    #   (假快) → vs_industrial 比值偏乐观. Ascend 无清 L2 API → do_bench 的 cache 清空用
+    #   "每窗口前重放输入分配 (新地址)" 替代: 扫描 for LOOP 之前的 torch 张量分配行,
+    #   重放进每个 rep 窗口内 → 每窗口全新输入, 与工业级基准 (fn(i) 轮换 32 组) 同口径.
+    #   分配行都在 main 的循环前 (14 个算子统一模式, 单行); 提取不到 → 不重建 (退化为热 L2, 不报错).
+    _alloc_lines = []
+    for _ln in lines[:for_idx]:
+        if re.match(r"^\s{4,}\w+\s*=\s*torch\.(randn?|rand|empty|zeros|ones)\(", _ln):
+            _alloc_lines.append(_ln.rstrip("\n"))
     # 收集循环体: for_idx 之后缩进 > base_indent 的行 (含空行)
     body_start = for_idx + 1
     body_end = body_start
@@ -229,6 +241,11 @@ def _inject_event_timing(src: str) -> str:
     # ★多窗口 rep 循环内再深 4 格 (两层 for: rep → LOOP → body)
     body_deep2 = "".join(("    " + ln if ln.strip() else ln) for ln in body_deep.splitlines(keepends=True))
     ind = " " * base_indent
+    # ★输入重建块 (缩进到 rep 内层 12 空格, 与 _ev_s 同级): 每窗口前重新分配输入 → 新地址 → 破 L2 复用
+    #   rebuild_inputs=False → 不重建 (热 L2, 量化虚高用)
+    _alloc_block = ""
+    if rebuild_inputs and _alloc_lines:
+        _alloc_block = "".join(("            " + _ln.lstrip() + "\n") for _ln in _alloc_lines)
     # 注入块: 在原 for 之前插入 (原 for+body 保留在后, 仅非 Event 模式走)
     inject = (
         f"{ind}# ★工业级 Event 计时 (注入; KERNEL_EVENT_TIME 触发, 不影响正常/msprof 路径)\n"
@@ -239,8 +256,8 @@ def _inject_event_timing(src: str) -> str:
         f"{ind}    _REPS = int(os.environ.get('KERNEL_EVENT_REPS', '5'))\n"
         f"{ind}    _ts = []\n"
         f"{ind}    for _r in range(_REPS):\n"
-        f"{ind}        _ev_s = torch.npu.Event(enable_timing=True)\n"
-        f"{ind}        _ev_e = torch.npu.Event(enable_timing=True)\n"
+        f"{_alloc_block}"                                      # ★每窗口前重建输入 (破 L2)
+        f"{ind}        _ev_s = torch.npu.Event(enable_timing=True)\n"        f"{ind}        _ev_e = torch.npu.Event(enable_timing=True)\n"
         f"{ind}        _ev_s.record()\n"
         f"{ind}        for _ in range(LOOP):\n{body_deep2}"
         f"{ind}        _ev_e.record()\n"

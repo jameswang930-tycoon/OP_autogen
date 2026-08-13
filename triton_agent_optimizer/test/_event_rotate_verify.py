@@ -2,7 +2,7 @@
 """V5: Event 注入输入轮换 (破 L2) — 14 个算子注入产物 compile 校验 + 分配行重建断言."""
 import re, sys
 from pathlib import Path
-sys.path.insert(0, ".")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from agents.verifier import _inject_event_timing
 
 def check(name, cond, detail=""):

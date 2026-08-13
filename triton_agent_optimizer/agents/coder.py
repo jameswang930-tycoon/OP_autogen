@@ -68,7 +68,9 @@ def _build_system_prompt(plan_text: str = "", tier: int = 1) -> str:
     parts = []
     parts.append("你是 Triton kernel 代码修改者。优先按 changes[] 精确替换; 需要修报错时才自行改码。")
     parts.append(f"## 读改码教程: {docx / 'CODING_GUIDE.md'} (前1200字符)")
-    parts.append(f"## 读当前 tier({tier}) 策略: {docx / tier_files.get(tier, '')} (前1500字符)")
+    parts.append(f"## 读当前 tier({tier}) 策略: {docx / tier_files.get(tier, '')} (前1500字符速查卡; "
+                 f"★若本次改动涉及算法/结构 (im2col/剪枝/单遍/online softmax), 必读该文档文末『结构层优化执行教学』"
+                 f"的教学1/2/3完整代码, 照抄正确实现, 不要凭记忆重写)")
     parts.append("""## IRON RULES (违反 = 失败)
 1. 只改 prompt 给的当前 kernel 文件, 不碰其他文件 (尤其不碰 input/<op>/kernel_op.py 源文件)
 2. 不把 num_warps/num_stages 写进 @triton.jit() (triton-ascend 自动管理)

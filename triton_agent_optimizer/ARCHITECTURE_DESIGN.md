@@ -549,6 +549,7 @@ triton_agent_optimizer/
 │   ├── bench_pytorch_attention.py # 自注意力+MLP 基准 (attention_mlp 对照)
 │   ├── bench_pytorch_flash_attention.py   # CANN FA 基准 (flash_attention 对照)
 │   ├── bench_pytorch_conv2d.py / bench_pytorch_conv_bias_relu.py   # 卷积基准
+│   │                              # ★新算子 (conv1d/batchnorm2d/maxpool2d) 无 pytorch 基准 → 图不画 PT 虚线, 不阻塞
 │   ├── bench_pytorch_matmul_relu.py / bench_pytorch_matmul_transpose.py   # matmul 变体基准
 │   ├── bench_pytorch_rms_norm.py / bench_pytorch_layernorm.py / bench_pytorch_sigmoid.py   # 归一化/逐元素基准
 │   ├── bench_config.py            # 变体注册表 + 静态 bytes/flops 计算 + PT_BENCH_MAP (算子→pytorch json 映射)
@@ -567,6 +568,9 @@ triton_agent_optimizer/
 │   ├── flash_attention/   kernel_op.py   # FlashAttention (K 预转置)
 │   ├── conv2d/            kernel_op.py   # 卷积
 │   ├── conv_bias_relu/    kernel_op.py   # 卷积 + bias + ReLU
+│   ├── conv1d/            kernel_op.py   # 1D 卷积 (外积版, Tier1 im2col 教学)
+│   ├── batchnorm2d/       kernel_op.py   # BatchNorm2d 推理 (按通道归约)
+│   ├── maxpool2d/         kernel_op.py   # MaxPool2d 窗口最大池化
 │   ├── rms_norm/          kernel_op.py   # 行级 RMSNorm
 │   ├── rms_norm_residual/ kernel_op.py   # RMSNorm + 残差
 │   ├── layernorm/         kernel_op.py   # LayerNorm
@@ -714,7 +718,12 @@ triton_agent_optimizer/
 - **★bench 测量纪律 (2026-08-12 修复, 对齐 triton testing.do_bench)**:
   - **多窗口 median**: 先 5 次估时长 → warmup/rep 次数按 ms 预算自适应 (快 kernel 自动加次) → n_rep 个**独立 Event 对** → 取 median (另报 min/mean)。旧"单窗口 ÷N"只有 1 个样本。
   - **★输入轮换破 L2**: 连续 forward 同一批张量, 工作集 <192MB(L2) 时后 N 次全 L2 命中 → 测到 L2 带宽 (数字虚高); Ascend 无清 L2 API → n_buf 组输入轮换 (组数×单组工作集 > L2) 等效 do_bench 的 clear_cache。json 记 `n_buf`。
-  - **口径声明**: 工业级基准 = torch 全流程 (含 host 调度/内存分配); 我们 verify 的 Event = triton 纯 kernel launch 链。大算子 (ms 级) 差异可忽略; 小算子 (逐元素/归约, us 级) 我们占便宜 → 报告同时给 `time_us_min/mean`, 对比时声明。
+  - **口径声明**（2026-08-13 逐行核对）: 两边 Event 都是**一次完整调用的设备侧耗时**（输入均预创建不在窗口内）——
+    工业级 = torch forward（多 kernel 链 + kernel 间 host 下发 gap + forward 内部**中间张量分配**，均在窗口内）;
+    我们 verify Event = kernel_op.py 循环体（融合/单遍后 **kernel 数更少** + 连续 launch gap≈0 + 中间结果预分配）。
+    计时方法完全一致（Event + 多窗口 median + 破 L2）; **kernel 数/gap/中间分配的差异 = 融合优化的真实收益,
+    不是测量差异** — 对比公平。大算子 (ms 级) 差异可忽略; 小算子 (us 级) 我们天然占优（正是融合/单遍优化目标）→
+    报告同时给 `time_us_min/mean`, 对比时声明。
 - **主加速比（显示口径）= baseline_e2e_ns / e2e_ns**（端到端, msprof）; **best_speedup = baseline_e2e_event_ns / best_e2e_event_ns**（Event 派生）
 - **★严格最优保留判定 = Event 绝对延迟**: 本轮 `e2e_event_ns < best_e2e_event_ns`（历史最小）才 KEEP 进链 — 设备侧无 profiler 欠采, 免 msprof 小 kernel 假性 200x 毒 best; **Event 缺失(非晋升轮) → 方案A 不采纳**（不退化 msprof, 堵假值后门）
 - **工业级对比**: round1 读 `bench_910b3/outputs/industrial_<op>_<mode>_tflops.json`（Event 测），各 mode 取 time_us 最小者（**仅真正执行**, actual_mode==mode） = industrial_time_us
@@ -1319,7 +1328,7 @@ cat outputs/<op>/optimization.log
 | flash_attention | seq2048×8h | | | | | | |
 | conv2d | 64×64 | | | | | | |
 | rms_norm | 2048×2048 | | | | | | |
-| ... (14 算子) | | | | | | | |
+| ... (17 算子, 含 conv1d/batchnorm2d/maxpool2d) | | | | | | | |
 
 **讲结果时的口径要点**（防止被追问翻车）:
 - 加速比口径: 端到端（含框架 kernel），同口径对比；**绝对延迟用 Event**（无 profiler 扰动）
@@ -1394,3 +1403,67 @@ cat outputs/matmul/optimization_trajectory.json            # 全局状态+全his
 | nga run | 服务器本地 LLM codeagent 调用命令（保密服务器无外网 API, 用 `echo <prompt> \| nga run`） |
 | AutoKernel | 对照方案: 盲目枚举调参（300~400 轮）——本项目用"真机诊断 + 6 层策略"替代盲试 |
 | sweep | 程序化枚举全部 L0 合法 BLOCK 候选 + 真机 Event 实测, 替代 LLM 猜分块（分块层地基） |
+
+---
+
+### 15.1 工业级最优端到端耗时（industrial_time_us）
+
+**工业级 = 昇腾上真正的工业实现，共 4 种 mode**（bench_910b3/bench_industrial.py 逐个测）：
+
+| mode | 被测实现 | 代表什么 |
+|---|---|---|
+| eager | torch 直接调 CANN aclnn vendor kernel | 厂商手写算子（matmul/conv/norm 单算子天花板） |
+| compile | torch.compile + TorchAir 图模式（GE 图融合） | 自动算子融合链（MLP/attention） |
+| cann-fused | aclnnFusedMatmul / FusedConvBiasRelu 直接调用 | 厂商融合算子（matmul+epilogue 一次算完） |
+| fa | torch_npu.npu_prompt_flash_attention | CANN FlashAttention（attention 专用） |
+
+**每个算子测哪些 mode**：有厂商融合算子的（matmul/matmul_relu/conv_bias_relu）测 eager+compile+cann-fused 三种；
+flash_attention 只测 fa；其余算子测 eager+compile 两种。
+
+**测量工具**：torch.npu.Event（设备侧计时），被测对象 = 每种 mode 的一次真实 torch forward。
+
+**测量步骤**（每个 mode 各测一遍）：
+1. 构造该 mode 的 forward（如 matmul 的 eager = torch.matmul(F.gelu(x@w1+b1), w2)），预创建 32 组输入
+2. 先跑 5 次 forward，测出单次耗时估算值 est
+3. 按时间预算折算测量次数：warmup 次数 = 25ms/est，测量次数 = 100ms/est（限 5~50 次）
+4. 跑 warmup 次（不计时，消化 JIT/编译/冷 cache）
+5. 正式测量：对每个测量窗口，Event 记录开始 → 跑 1 次 forward（每窗口换一组输入破 L2 复用）→ Event 记录结束
+6. 所有窗口取中位数 median → 该 mode 的端到端耗时
+
+**计算步骤（怎么从各 mode 找到"工业级最优"）**：
+1. 每个窗口耗时 = 结束 Event 与开始 Event 之间的设备侧耗时（含该次 forward 内全部 kernel 执行、
+   kernel 间下发间隙、中间张量分配）
+2. 每个 mode 的端到端 = median(全部窗口耗时)，写入 industrial_<op>_<mode>_tflops.json
+3. 选优（_load_industrial_best）：各 mode 的端到端中取最小者 = 工业级最优；
+   **只认真正执行的 mode**——compile 若因 torchair 不可用回退成 eager（actual_mode≠mode），
+   该 mode 的重复测量不参与选优，防止回退值顶替成最优
+4. 结果存 st["industrial_time_us"]（含来源文件 industrial_<op>_<mode>_tflops.json 供追溯）
+
+### 15.2 我们优化算子的端到端耗时（best Event）
+
+**测量工具**：torch.npu.Event（设备侧计时），被测对象 = kernel_op.py 里 KERNEL_LOOP 循环体
+（我们优化后的全部 kernel launch）。
+
+**测量步骤**：
+1. 把 kernel_op.py 的 `for _ in range(LOOP): <循环体>` 整体注入进 Event 计时分支
+   （KERNEL_EVENT_TIME 环境变量触发，不影响正常/msprof 路径）
+2. 先跑 5 次循环体（不计时，warmup）
+3. 正式测量：5 个独立窗口，每个窗口 Event 记录开始 → 跑 30 次完整循环 → Event 记录结束；
+   每窗口前重建输入（新地址，破 L2 复用）
+4. 5 个窗口取中位数，再除以 30 = 单次循环耗时
+
+**计算步骤**：
+1. 每个窗口耗时 = 结束与开始 Event 之间的设备侧耗时（30 次循环内全部 kernel 执行，gap≈0，无中间分配）
+2. 单次端到端 us = median(5 窗口耗时) / 30
+3. 每轮得到该轮的端到端；**只保留小于历史最小的轮次**（KEEP），历史最小那轮的
+   端到端 = 我们最优（best_e2e_event_ns）
+4. 循环异常（msprof 实测行数 < LOOP，说明循环被改坏）→ 该轮不测 Event，直接不保留
+
+### 15.3 验收计算
+
+```
+验收 = 工业级最优(us) ÷ 我们最优(us)
+     = st["industrial_time_us"] ÷ (best_e2e_event_ns / 1000)
+```
+
+配套：feedback/acceptance_report.py 批量算全部算子；feedback/remeasure_best.py 重测单个算子。

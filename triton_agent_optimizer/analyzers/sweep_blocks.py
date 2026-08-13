@@ -57,6 +57,9 @@ SWEEP_META = {
     "matmul_transpose":{"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": False},
     "conv2d":          {"vars": ("BLOCK_K", "BLOCK_OW"),           "type": "conv2d", "multi": False},
     "conv_bias_relu":  {"vars": ("BLOCK_K", "BLOCK_OW"),           "type": "conv2d", "multi": True},
+    "conv1d":          {"vars": ("BLOCK_CO", "BLOCK_L"),           "type": "conv2d", "multi": False},
+    "batchnorm2d":     None,   # 逐元素(按通道), BLOCK_SIZE 固定, 无自由分块参数
+    "maxpool2d":       None,   # 窗口访存, BLOCK_OW 由 OW 推导, 无自由分块参数
     "rms_norm":        None,   # 行级 kernel, BLOCK_N 由 N 推导 (2 幂), 无自由分块参数
     "layernorm":       None,   # 行级归约, BLOCK_N 由 N 推导 (2 幂), 无自由分块参数
     "sigmoid":         None,   # 纯逐元素, 无 matmul 分块参数
@@ -592,6 +595,23 @@ def _generate_conv2d_runner(op_dir: Path, candidates: List[Tuple],
             bias_kernel[grid_el](yc, bias, yb, n_el, K_OUT, OH, OW, BLOCK=BLOCK_EL)
             relu_kernel[grid_el](yb, y, n_el, BLOCK=BLOCK_EL)
         """)
+
+    elif op == "conv1d":
+        setup = textwrap.dedent("""\
+        # ── Tensor setup (conv1d) ──
+        DTYPE = torch.float32
+        device = torch.device("npu")
+        LOUT = L - KL + 1
+        x = (torch.randn(N, CIN, L, dtype=DTYPE, device=device)) * 0.1
+        w = (torch.randn(COUT, CIN, KL, dtype=DTYPE, device=device)) * 0.1
+        b = (torch.randn(COUT, dtype=DTYPE, device=device)) * 0.1
+        y = torch.empty(N, COUT, LOUT, dtype=DTYPE, device=device)
+
+        def run_one(bco, bl):
+            grid = (N * triton.cdiv(COUT, bco) * triton.cdiv(LOUT, bl),)
+            conv1d_kernel[grid](x, w, b, y, L, CIN, COUT, KL, LOUT,
+                BLOCK_CO=bco, BLOCK_L=bl)
+        """)
     else:
         raise ValueError(f"未知 conv2d 型算子: {op}")
 
@@ -731,9 +751,15 @@ def sweep(op_dir: Path, quick: bool = False, out_dir: Optional[Path] = None,
         else:
             candidates = generate_matmul_candidates(M=M, N=N, K=K)
     elif meta["type"] == "conv2d":
-        OH = params.get("OH", 64)
-        OW = params.get("OW", 64)
-        K_OUT = params.get("K_OUT", 32)
+        if op == "conv1d":
+            # conv1d: 无 OH/OW/K_OUT 变量 → 映射 (BLOCK_CO≥COUT 保底同 conv2d; OW=LOUT)
+            OH = 1
+            OW = params.get("L", 256) - params.get("KL", 3) + 1
+            K_OUT = params.get("COUT", 32)
+        else:
+            OH = params.get("OH", 64)
+            OW = params.get("OW", 64)
+            K_OUT = params.get("K_OUT", 32)
         candidates = generate_conv2d_candidates(OH=OH, OW=OW, K_OUT=K_OUT)
 
     if quick:

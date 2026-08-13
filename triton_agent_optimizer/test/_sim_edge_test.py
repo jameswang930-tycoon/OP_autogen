@@ -5,7 +5,7 @@
 import json, os, re, shutil, subprocess, sys, types
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _sim_flow_test import canned_diagnosis, FAKE_KERNEL, setup, teardown, OP, OUT
 from agents.scheduler import Scheduler, TIER_NAMES
 from agents.planner import RoundPlan, PlannerAgent

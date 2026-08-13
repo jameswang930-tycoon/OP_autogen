@@ -96,6 +96,24 @@ def _shapes(op):
                                         R=int(os.environ.get("CONV_R", 3)),
                                         Sd=int(os.environ.get("CONV_S", 3)),
                                         P=int(os.environ.get("CONV_P", 1))),
+        "batchnorm2d":     lambda: dict(N=int(os.environ.get("BN_N", 1)),
+                                        C=int(os.environ.get("BN_C", 8)),
+                                        H=int(os.environ.get("BN_H", 64)),
+                                        W=int(os.environ.get("BN_W", 64))),
+        "maxpool2d":       lambda: dict(N=int(os.environ.get("MP_N", 1)),
+                                        C=int(os.environ.get("MP_C", 8)),
+                                        H=int(os.environ.get("MP_H", 64)),
+                                        W=int(os.environ.get("MP_W", 64)),
+                                        KH=int(os.environ.get("MP_KH", 3)),
+                                        KW=int(os.environ.get("MP_KW", 3)),
+                                        SH=int(os.environ.get("MP_SH", 2)),
+                                        SW=int(os.environ.get("MP_SW", 2)),
+                                        PAD=int(os.environ.get("MP_PAD", 1))),
+        "conv1d":          lambda: dict(N=int(os.environ.get("C1_N", 1)),
+                                        CIN=int(os.environ.get("C1_CIN", 8)),
+                                        L=int(os.environ.get("C1_L", 256)),
+                                        COUT=int(os.environ.get("C1_COUT", 32)),
+                                        KL=int(os.environ.get("C1_KL", 3))),
     }
     return S[op]()
 
@@ -241,11 +259,40 @@ def _make_forward(op, sh, n_buf=32):
         NB, C, H, W, K, R, Sd, P = (sh["NB"], sh["C"], sh["H"], sh["W"],
                                      sh["K"], sh["R"], sh["Sd"], sh["P"])
         def mk():
-            return ((torch.randn(NB, C, H, W, device=npu, dtype=DT)) * 0.1,
-                    (torch.randn(K, C, R, Sd, device=npu, dtype=DT)) * 0.1,
+            return ((torch.randn(NB, C, H, W, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(K, C, R, Sd, device=npu, dtype=DT) * 0.1),
                     (torch.randn(K, device=npu, dtype=DT)) * 0.1)
         def fwd(x, w, b):
             return F.relu(F.conv2d(x, w, b, stride=1, padding=P))
+        return fwd, [mk() for _ in range(n)]
+    if op == "batchnorm2d":                # ★新算子: BatchNorm2d 推理 (按通道归一化, 与 input/batchnorm2d 对齐)
+        N, C, H, W = sh["N"], sh["C"], sh["H"], sh["W"]
+        eps = 1e-5
+        def mk():
+            return ((torch.randn(N, C, H, W, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(C, device=npu, dtype=DT) * 0.1),
+                    (torch.rand(C, device=npu, dtype=DT) * 0.5 + 0.5),
+                    (torch.randn(C, device=npu, dtype=DT) * 0.1 + 1.0),
+                    (torch.randn(C, device=npu, dtype=DT) * 0.1))
+        def fwd(x, rm, rv, g, b):
+            return F.batch_norm(x, rm, rv, g, b, training=False, momentum=0.0, eps=eps)
+        return fwd, [mk() for _ in range(n)]
+    if op == "maxpool2d":                  # ★新算子: MaxPool2d (窗口 max, 与 input/maxpool2d 对齐)
+        N, C, H, W = sh["N"], sh["C"], sh["H"], sh["W"]
+        KH, KW, SH, SW, PAD = (sh["KH"], sh["KW"], sh["SH"], sh["SW"], sh["PAD"])
+        def mk():
+            return ((torch.randn(N, C, H, W, device=npu, dtype=DT) * 0.1),)
+        def fwd(x):
+            return F.max_pool2d(x, (KH, KW), stride=(SH, SW), padding=PAD)
+        return fwd, [mk() for _ in range(n)]
+    if op == "conv1d":                     # ★新算子: Conv1d (valid, 与 input/conv1d 对齐)
+        N, CIN, L, COUT, KL = sh["N"], sh["CIN"], sh["L"], sh["COUT"], sh["KL"]
+        def mk():
+            return ((torch.randn(N, CIN, L, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(COUT, CIN, KL, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(COUT, device=npu, dtype=DT) * 0.1))
+        def fwd(x, w, b):
+            return F.conv1d(x, w, b)
         return fwd, [mk() for _ in range(n)]
     raise ValueError(f"未知算子: {op}")
 
@@ -350,6 +397,16 @@ def _flops(op, sh):
         OW = (sh["W"] + 2 * sh["P"] - sh["Sd"]) // 1 + 1
         f = 2 * sh["NB"] * sh["K"] * OH * OW * sh["C"] * sh["R"] * sh["Sd"]
         return f + (2 * sh["NB"] * sh["K"] * OH * OW if op == "conv_bias_relu" else 0)
+    if op == "batchnorm2d":
+        return 6 * sh["N"] * sh["C"] * sh["H"] * sh["W"]   # 减/除/乘/加 ×2 元素
+    if op == "maxpool2d":
+        return (sh["KH"] * sh["KW"] - 1) * sh["N"] * sh["C"] * \
+            (((sh["H"] + 2 * sh["PAD"] - sh["KH"]) // sh["SH"] + 1) *
+             ((sh["W"] + 2 * sh["PAD"] - sh["KW"]) // sh["SW"] + 1))   # 每次 max 比较
+    if op == "conv1d":
+        LOUT = sh["L"] - sh["KL"] + 1
+        return 2 * sh["N"] * sh["COUT"] * LOUT * sh["CIN"] * sh["KL"] + \
+            2 * sh["N"] * sh["COUT"] * LOUT   # MAC + bias
     return None
 
 

@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """验证 coder 抄写防御: prompt 禁止指令 + 语法校验拦截 + 注释不误伤."""
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from agents.coder import _build_user_prompt, _validate_python
 
 # 1) prompt 含禁止抄写指令

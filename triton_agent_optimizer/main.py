@@ -40,9 +40,13 @@ LLM 调用（服务器无 Claude API, 用本地 codeagent）:
      LLM_CLI_COMMAND="nga run" python3 main.py input/sigmoid --fresh --max-rounds 30           # 纯逐元素 sigmoid (Tier5 原生指令)
      LLM_CLI_COMMAND="nga run" python3 main.py input/vector_add --fresh --max-rounds 30        # 逐元素加法 (Tier4 连续化/Tier5)
      LLM_CLI_COMMAND="nga run" python3 main.py input/fused_add_mul --fresh --max-rounds 30     # (x+z)*w 逐元素链 (Tier2 融合/Tier5)
-     # ── 卷积族 (算法 im2col + 融合) ──
-     LLM_CLI_COMMAND="nga run" python3 main.py input/conv2d --fresh --max-rounds 30            # 卷积 (Tier1 im2col 走 cube)
-     LLM_CLI_COMMAND="nga run" python3 main.py input/conv_bias_relu --fresh --max-rounds 30    # conv+bias+relu 3kernel (Tier2 融合)
+      # ── 卷积族 (算法 im2col + 融合) ──
+      LLM_CLI_COMMAND="nga run" python3 main.py input/conv2d --fresh --max-rounds 30            # 卷积 (Tier1 im2col 走 cube)
+      LLM_CLI_COMMAND="nga run" python3 main.py input/conv_bias_relu --fresh --max-rounds 30    # conv+bias+relu 3kernel (Tier2 融合)
+      # ── ★新算子 (2026-08-13, 复杂算子补充) ──
+      LLM_CLI_COMMAND="nga run" python3 main.py input/batchnorm2d --fresh --max-rounds 30       # BatchNorm2d 推理 (通道归约, Tier1 rsqrt 乘链/Tier2 融合)
+      LLM_CLI_COMMAND="nga run" python3 main.py input/maxpool2d --fresh --max-rounds 30         # MaxPool2d 窗口访存 (Tier4 连续化/Tier5 max 链)
+      LLM_CLI_COMMAND="nga run" python3 main.py input/conv1d --fresh --max-rounds 30            # Conv1d (Tier1 im2col 走 cube, 同 conv2d 教学)
      # 每轮: 采集→07字段→planner→coder→正确性校验→msprof端到端→加速比
      # 从头开始(清 outputs/<op> + 重置): 加 --fresh
      # 续跑(从上次 round 继续, 不清旧产物): 不加 --fresh

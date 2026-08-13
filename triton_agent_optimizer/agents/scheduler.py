@@ -1005,6 +1005,9 @@ class Scheduler:
         "flash_attention": ["FA_SEQ"],
         "conv2d": ["CONV_H", "CONV_W"],
         "conv_bias_relu": ["CONV_H", "CONV_W"],
+        "batchnorm2d": ["BN_H", "BN_W"],
+        "maxpool2d": ["MP_H", "MP_W"],
+        "conv1d": ["C1_L"],
     }
 
     def _sanity_verify(self, kernel_path: Path):
@@ -1019,7 +1022,8 @@ class Scheduler:
         if op == "matmul" and base:
             dim_val = base[0]
         else:
-            dim_val = {"conv2d": 64, "conv_bias_relu": 64}.get(op, 2048)
+            dim_val = {"conv2d": 64, "conv_bias_relu": 64, "maxpool2d": 64,
+                       "batchnorm2d": 64, "conv1d": 256}.get(op, 2048)
         for scale, label in ((0.5, "半"), (2, "双")):
             new_dim = int(round(dim_val * scale / 16) * 16)   # 保持 16 倍数
             if new_dim <= 0 or new_dim == dim_val:
@@ -1210,6 +1214,11 @@ class Scheduler:
                 st["best_e2e_event_ns"] = round(_best_evt_new, 1)
                 if _eb_evt:
                     st["best_speedup"] = round(_eb_evt / _best_evt_new, 4)
+            elif _best_evt_new and st.get("baseline_e2e_ns") and cur.get("e2e_ns"):
+                # ★bug 修复 (2026-08-13): Event 基线缺失时同样兜底用 msprof 口径派生 best_speedup
+                #   (否则 best_speedup 停留初始 1.0, 与 history 实际加速比矛盾)
+                st["best_e2e_event_ns"] = round(_best_evt_new, 1)
+                st["best_speedup"] = round(st["baseline_e2e_ns"] / cur["e2e_ns"], 4)
             st["last_rebase_round"] = rn
             # ★不进 history (避免与正常轮同 round 号, trajectory 图点重叠):
             #   REBASELINE 是测量事件不是优化轮, 只更新 state; 换基后后续轮 speedup 用新基准.
@@ -1936,6 +1945,12 @@ class Scheduler:
                 st["best_e2e_event_ns"] = _evt_ns
                 if _bevt_base and _evt_ns:
                     st["best_speedup"] = round(_bevt_base / _evt_ns, 4)   # 派生显示用 (Event 口径)
+                elif st.get("baseline_e2e_ns") and _e2e:
+                    # ★bug 修复 (2026-08-13): Event 基线缺失 (首轮 verify 未测到 Event: 失败走诊断兜底/
+                    #   注入失败/VERIFY_BASELINE=0) → 原逻辑 best_speedup 永远停留初始 1.0, 而 history
+                    #   每轮 speedup 都有实际值 → trajectory 最前 best 1.0 与后面数据矛盾.
+                    #   兜底用 msprof 端到端口径派生 (与 history speedup 同口径, 仅显示用).
+                    st["best_speedup"] = round(st["baseline_e2e_ns"] / _e2e, 4)
                 st["best_kernel"] = str(round_kernel)
                 st["best_round"] = rn
                 st["best_e2e_ns"] = _e2e

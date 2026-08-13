@@ -6,13 +6,13 @@
 import json, os, re, sys, shutil
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from agents.scheduler import Scheduler, TIER_NAMES
 from agents.planner import RoundPlan, PlannerAgent
 import agents.scheduler as S_mod
 import agents.verifier as V_mod
 
-PROJ = Path(__file__).resolve().parent
+PROJ = Path(__file__).resolve().parent.parent
 OP = PROJ / "input" / "_sim_op"
 OUT = PROJ / "outputs" / "_sim_op"
 N_FAIL_START = 8          # round>=8 模拟采集失败

@@ -3,7 +3,7 @@
 import json, os, shutil, sys, tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 def write_csv(p, headers, rows):
     import csv

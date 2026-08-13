@@ -3,7 +3,7 @@
 import json, os, sys, tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 def check(name, cond, detail=""):
     print(f"  {'OK ' if cond else 'FAIL'} {name} {detail}")

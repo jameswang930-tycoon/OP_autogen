@@ -33,6 +33,7 @@
 >
 > **禁止（违反=失败）**：num_warps/num_stages 传参、@triton.autotune、tl.erf、`input_precision="tf32"`、acc/归约用 fp16、非 16 倍数分块、**跨层改动**（Tier1 只改算法/精度/kernel 重组；改 BLOCK 是 Tier3、融合是 Tier2）。
 > **★验证命令（改完必跑）**：`MATMUL_VERIFY=1`（不是 MATMUL_VERIFY），kernel 必须输出 `result check: PASS` 才算过；fp16/bf16 输入 + fp32 累加时阈值 ~1e-2，**参考侧升 fp32 计算**（torch 参考 `.float()` 后再算，避免 fp16 参考误差干扰判定）。
+> **★离层前必读**：文末「结构层优化执行教学」——**结构层（走 cube/剪枝/单遍）必须先做完再做参数层**：教学1 因果剪枝（情况B 扩展）、教学2 im2col 走 cube（情况G）、教学3 结构改动标准流程（校验→sweep 重扫→验收）；promote 前对照 8 项检查清单逐项打勾。
 
 ---
 
@@ -251,6 +252,73 @@ for start in range(0, kv_hi, BLOCK_N):           # ✅ 对角线上方的 key �
 - ★当前 `input/flash_attention` 的 KV 循环**仍是全量 loop**（块内 mask）——**本层直接可做**；改后 `MATMUL_VERIFY=1` 重验 + 真机 msprof 确认收益
 - 这是我们 flash_attn 的**直接可做优化**（改 loop 上界一行 + 用 m_block 算 kv_hi）
 
+### ★完整改造教学（从当前 input/flash_attention/kernel_op.py 出发，三步）
+
+**改造目标**：把 KV 循环从"永远扫全部 32 块"改为"每 query 块只扫到对角块"。kernel 已定义了
+`m_block = pid % num_m`（第几个 query 块）和 `offs_m = m_block*BLOCK_M + tl.arange(0, BLOCK_M)`——
+`kv_hi` 直接由它们算出，不需要新变量。
+
+**改前（当前代码，kernel 内 KV 循环）**：
+```python
+    # 循环前已有: offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    for start in range(0, seq, BLOCK_N):          # ❌ 无因果上界: 每个 query 块扫全部 key 块
+        offs_n = start + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < seq
+        k_ptrs = k_ptr + head * (dim * seq) + offs_k[:, None] * seq + offs_n[None, :]
+        kk = tl.load(k_ptrs, mask=n_mask[None, :] & k_mask[:, None], other=0.0)
+        s = tl.dot(q, kk) * scale
+        causal = offs_n[None, :] <= offs_m[:, None]   # 上三角块全被 mask 成 -inf, 但已付出完整计算
+        s = tl.where(causal, s, float("-inf"))
+        m_curr = tl.maximum(tl.max(s, axis=1), m_i)
+        p = tl.exp(s - m_curr[:, None]).to(tl.float16)
+        alpha = tl.exp(m_i - m_curr)
+        l_i = alpha * l_i + tl.sum(p.to(tl.float32), axis=1)
+        v_ptrs = v_ptr + head * (seq * dim) + offs_n[:, None] * dim + offs_k[None, :]
+        vv = tl.load(v_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+        acc = acc * alpha[:, None] + tl.dot(p, vv)
+        m_i = m_curr
+```
+
+**改后（只动两处：循环前加 kv_hi 定义 + 循环上界；循环体一行不改）**：
+```python
+    # ① 循环前加一行: 本 query 块允许的最大 key 下标 = 块末位 (含对角块, 它部分有贡献)
+    kv_hi = min(seq, m_block * BLOCK_M + BLOCK_M)
+    # ② 循环上界 seq → kv_hi: 对角线上方的 key 块直接跳过 (不再 mask 后白算)
+    for start in range(0, kv_hi, BLOCK_N):
+        offs_n = start + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < seq
+        k_ptrs = k_ptr + head * (dim * seq) + offs_k[:, None] * seq + offs_n[None, :]
+        kk = tl.load(k_ptrs, mask=n_mask[None, :] & k_mask[:, None], other=0.0)
+        s = tl.dot(q, kk) * scale
+        causal = offs_n[None, :] <= offs_m[:, None]   # ✅ 对角块内部仍需 mask (部分 key ≤ query)
+        s = tl.where(causal, s, float("-inf"))
+        m_curr = tl.maximum(tl.max(s, axis=1), m_i)
+        p = tl.exp(s - m_curr[:, None]).to(tl.float16)
+        alpha = tl.exp(m_i - m_curr)
+        l_i = alpha * l_i + tl.sum(p.to(tl.float32), axis=1)
+        v_ptrs = v_ptr + head * (seq * dim) + offs_n[:, None] * dim + offs_k[None, :]
+        vv = tl.load(v_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+        acc = acc * alpha[:, None] + tl.dot(p, vv)
+        m_i = m_curr
+```
+
+**为什么循环体一行都不用改**：剪枝只跳过"整块都无效"的 key 块；对角块内部依然有有效 key
+（key ≤ query），原有 `causal` mask 逻辑继续正确工作。`n_mask`（offs_n < seq）保留不动——
+kv_hi 已 ≤ seq，但保留它防御 kv_hi 取到 seq 时的尾部越界。
+
+**改造后必须做的验证**（缺一不可）：
+1. `MATMUL_VERIFY=1` 跑一遍 → `result check: PASS`（结果应与剪枝前**逐位一致**——数学上剪枝
+   只跳过被 mask 成全 -inf 的块，softmax 分母不受影响；若 PASS 判定用相对误差，数值应完全不变）
+2. 结构变化 → **sweep 会自动重扫**（调度器 round1 + 每个 tier3 round 都跑）→ 重扫后 BLOCK 可能
+   变化（循环变短后更大 BLOCK 更划算），以 sweep 结果为准
+3. 真机确认收益：`KERNEL_LOOP=30 python3 input/flash_attention/kernel_op.py` 前后对比端到端，
+   或跑 `feedback/remeasure_best.py --op flash_attention` 看工业级口径数字
+
+**常见错**：
+- `kv_hi = m_block * BLOCK_M + BLOCK_M` 忘加 `min(seq, ...)` → 最后一个 query 块越界读
+- 用全局 `seq` 当上界（没剪）→ 白改
+- 把对角块的 `causal` mask 删了 → 对角块无效 key 污染 max/softmax（结果错）
+
 ---
 
 ## 情况C：QKV 三合一（多个同结构 matmul → 一个 GEMM）
@@ -464,3 +532,55 @@ def conv2d_im2col_kernel(x_ptr, w_ptr, y_ptr,
 | 用 `input_precision="tf32"` | triton-ascend 未必支持 | 降精度走 DTYPE (fp16/bf16) + fp32 累加 |
 | 用 tl.erf | 编译失败 | 换 tl.math.tanh |
 | 算法改完不重调后续 | 收益被掩盖 | 回 Tier2/3 重做 |
+
+---
+
+## ★结构层优化执行教学（Tier1 离层前必做，2026-08-13）
+
+> **这节教"怎么做"**：Tier1 的优化分两类——**结构层**（换算法/走 cube/剪枝，收益 2~30×）和
+> **参数层**（BLOCK/精度微调，收益 10~30%）。**结构层必须最先做完**，否则参数层优化全白费。
+> 下面按"当前算子上实际怎么改"教结构层三件事，每件都有完整做法，不要跳过。
+
+### 教学1：因果剪枝（KV 循环加动态上界）— 完整做法见「情况B 扩展」
+
+因果 attention 的 kernel 里，只要 KV 循环是 `for start in range(0, seq, BLOCK_N):`（全量扫），
+就按情况B 扩展的三步改：循环前加 `kv_hi = min(seq, m_block * BLOCK_M + BLOCK_M)` → 循环上界
+改成 `range(0, kv_hi, BLOCK_N)` → 循环体一行不动（对角块内部 causal mask 保留）。
+**改完必须**：`MATMUL_VERIFY=1` 跑 PASS + 确认 sweep 重扫后的 BLOCK。
+
+### 教学2：卷积走 cube（软件 im2col + tl.dot）— 完整做法见「情况G」
+
+conv 类 kernel 的判断标准：**kernel 里有没有 `tl.dot`**。没有 = 在 vector 上模拟，算力只剩
+cube 的 1/4~1/10，**任何其他层的优化都救不回来**。做法（情况G 有完整可替换代码）：
+1. 重写成 GEMM 视角：`M=输出空间, N=输出通道, K=C*R*S`
+2. `BLOCK_CRS = next_pow2(C*R*S)`（tl.arange 要 2 幂；本例 C=8,R=S=3 → 128）
+3. 软件 im2col：`patch[crs, ow] = X[n, c, ih, iw]`，padding/越界置 0（`mask=valid, other=0.0`）
+4. 权重拍平 `wtile[k, crs]`，一次 `tl.dot(wtile, patch, acc)` 走 cube
+5. 按情况G 的 L0 核验公式核对 BLOCK（L0A=BLOCK_K×BLOCK_CRS×4 ≤ 64KB 等）
+6. conv_bias_relu 同款替换 + bias/relu 留在 epilogue（回 Tier2 再融合）
+
+### 教学3：结构改动后的标准流程（每次结构层改动后照做）
+
+```
+① 改代码（只改 kernel 区，不动 main/验证块）
+② MATMUL_VERIFY=1 数值校验 → 必须 result check: PASS
+③ 交给下一轮迭代：sweep 会在 round1/每个 tier3 round 自动重扫 BLOCK
+   （结构变化后 BLOCK 最优解可能变，以重扫结果为准，不要沿用旧 BLOCK）
+④ 每层做完 / 优化结束时跑 feedback/acceptance_report.py 看验收比值
+   （验收 = 工业级最优 ÷ 我们最优 Event，两端同口径；比值偏低先查结构层
+     有没有漏做——不是盲目加轮数调参数）
+```
+
+### Tier1 离层检查清单（promote 前逐项打勾，缺任何一项都先做掉再走）
+
+```
+[ ] 有矩阵运算的 kernel（matmul/conv/attention）→ 有 tl.dot
+    （conv 必须 im2col 走 cube，禁止 vector 外积模拟 —— 教学2 + 情况G）
+[ ] 因果 attention → KV 循环有 kv_hi 动态上界（不是全量 loop + 块内 mask —— 教学1 + 情况B 扩展）
+[ ] online softmax → acc/l_row 都乘 alpha 重标度；mask 先于 tl.max；K 越界 other=-inf
+[ ] 归约类（rms_norm/softmax）→ 已单遍（一次 load 同时累 sum/sum_sq）
+[ ] 多同结构 matmul（QKV/MLP 两段）→ 已评估 QKV 三合一/融合（回 Tier2）
+[ ] 算法级改动已 MATMUL_VERIFY=1 数值校验（教学3 流程②）
+[ ] 结构改动后 sweep 已重扫（BLOCK 以重扫为准，教学3 流程③）
+[ ] 优化结束已跑 acceptance_report.py，验收偏低时回查结构层（教学3 流程④）
+```

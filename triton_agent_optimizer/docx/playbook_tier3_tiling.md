@@ -375,8 +375,9 @@ tl.store(out_ptr + offs, x * 2.0, mask=mask)               # store 也 mask → 
 **sweep 跑什么**：
 - matmul 族（matmul/attention_mlp/flash_attention/**matmul_relu/matmul_transpose**）：枚举 `(BM,BN,BK)`，约束 = L0A/B≤64KB、L0C≤128KB、UB≤192KB（全部 ×0.9 余量）、**全部 2 的幂**、grid∈[16,3000]
 - conv 族（conv2d/conv_bias_relu）：枚举 `(BLOCK_K,BLOCK_OW)`，**BLOCK_K ≥ K_OUT**（否则只算一半通道，见 tier4 案例3）
+- conv1d：同 conv2d 型，枚举 `(BLOCK_CO,BLOCK_L)`，**BLOCK_CO ≥ COUT**（无通道分块循环，同保底）
 - **flash_attention 特殊**：BK 上限 = 头维 dim（BK>64 无意义，K 循环就 64 长）；★`bk_min = ceil_pow2(dim)`（BK<dim 只算部分头维 → 分数/输出数值错且计时偏快可能被误选）；grid = ceil(seq/BM)×nheads
-- rms_norm/layernorm/rms_norm_residual/sigmoid/vector_add/fused_add_mul/softmax：**无自由分块参数**（行级/逐元素）→ sweep 跳过，无 BLOCK 可改 → 直接 promote
+- rms_norm/layernorm/rms_norm_residual/sigmoid/vector_add/fused_add_mul/softmax/batchnorm2d/maxpool2d：**无自由分块参数**（行级/逐元素/窗口固定）→ sweep 跳过，无 BLOCK 可改 → 直接 promote
 
 **怎么读 `round_dir/09_tier3_sweep/sweep_result.json`**：
 ```json

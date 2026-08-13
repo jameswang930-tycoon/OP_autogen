@@ -70,7 +70,12 @@ main.py input/matmul [--fresh] [--resume] [--max-rounds N] [--target X]
 **★bench 测量纪律 (2026-08-12, 对齐 triton testing.do_bench)**:
 - **多窗口 median**: 先 5 次估时长 → warmup/rep 次数按 ms 预算自适应 (快 kernel 自动加次) → n_rep 个**独立 Event 对** → 取 median (另报 min/mean)。旧"一次窗口包 30 次 ÷30"只有 1 个样本, 快 kernel 噪声大。
 - **★输入轮换破 L2**: 连续 forward 同一批张量, 工作集 <192MB(L2) 时后 N 次全 L2 命中 → 测到 L2 带宽 (数字虚高); Ascend 无清 L2 API → 每 rep 轮换 n_buf 组输入 (组数×单组工作集 > L2) 等效 do_bench 的 clear_cache。★verify 的 Event 注入同法: 每窗口前重放 main 的张量分配 (新地址) 破 L2 — 与工业级基准同口径, vs_industrial 比值才可比。
-- **口径声明**: 工业级基准 = torch 全流程 (含 host 调度/内存分配); 我们 verify 的 Event = triton 纯 kernel launch 链。大算子 (ms 级) 差异可忽略; 小算子 (逐元素/归约, us 级) 我们占便宜 → 报告同时给 `time_us_min/mean` + 说明。
+- **口径声明**（2026-08-13 逐行核对）: 两边 Event 都是**一次完整调用的设备侧耗时**（输入均预创建不在窗口内）——
+  工业级 = torch forward（多 kernel 链 + kernel 间 host 下发 gap + forward 内部**中间张量分配**，均在窗口内）;
+  我们 verify Event = kernel_op.py 循环体（**融合/单遍后 kernel 数更少** + 连续 launch gap≈0 + 中间结果预分配）。
+  计时方法完全一致（Event 设备侧 + 多窗口 median + 破 L2）；**kernel 数/gap/中间分配的差异 = 融合优化的真实收益，
+  不是测量差异**——对比公平。大算子 (ms 级) 差异可忽略; 小算子 (逐元素/归约, us 级) 我们天然占优（这正是
+  融合/单遍优化的目标）→ 报告同时给 `time_us_min/mean` + 说明。
 
 **为什么 Event 是工业级主测?** msprof 带 profiler 挂载开销(绝对值偏高, 但跨轮一致→相对 speedup 用它); `torch.npu.Event` 是设备侧事件计时(无扰动, 官方/NVIDIA/vLLM-Ascend 标准), 最终报告绝对 latency 用它。两者并存: msprof 拆解, Event 权威。
 

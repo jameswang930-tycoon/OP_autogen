@@ -50,6 +50,9 @@ OP_MODES = {
     "flash_attention": ["fa"],
     "conv2d": ["eager", "compile"],
     "conv_bias_relu": ["eager", "compile", "cann-fused"],
+    "batchnorm2d": ["eager", "compile"],
+    "maxpool2d": ["eager", "compile"],
+    "conv1d": ["eager", "compile"],
 }
 
 

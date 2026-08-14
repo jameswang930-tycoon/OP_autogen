@@ -32,7 +32,8 @@ DIM = int(os.environ.get("FA_DIM", 64))         # 头维 (head_dim)
 #   累加 acc/m_i/l_i 保持 fp32 (FA 标准, 精度不丢)
 DTYPE = torch.float16
 SCALE = 1.0 / (DIM ** 0.5)
-BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 64         # 查询块/键块/头维块
+# ★BLOCK_M=64: 910B3 UB 192KB 限制 — 128 时 Q/S/P/acc + 流水缓冲 224KB 溢出 (实测 HIVM 编译报 UB overflow)
+BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64         # 查询块/键块/头维块
 # 注意: 不传 num_warps/num_stages — triton-ascend 禁止 tune 这两个参数, 自动管理 tiling/流水
 
 

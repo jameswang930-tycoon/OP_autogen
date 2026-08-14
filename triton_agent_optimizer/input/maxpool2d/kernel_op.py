@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══════════════════════════════════════════════════════════════════════════════
-#  单文件 kernel_op.py — MaxPool2d (2D 最大池化, stride/padding) (v4)
+#  单文件 kernel_op.py — MaxPool2d (2D 最大池化, stride/padding) (v4.5)
 #  ★ 优化循环里 coder 只改这一个文件; 读取/运行/测试都只看这一个文件
 #  分三个区: ① 场景 config  ② 算子 kernel  ③ 测试 main
 #
 #  运算链 (NCHW):
 #    y[n,c,oh,ow] = max_{kh,kw} x[n,c, oh*stride_h+kh-pad_h, ow*stride_w+kw-pad_w]
 #    H_out = (H + 2*pad - kH) // stride + 1
-#  优化提示: Tier4 访存连续化 (ow 方向输入 stride=1 连续突发, 已保持);
+#  算法: main 里 F.pad 预处理输入 (-inf 填充 padding 区域, 一次性, 测量窗口外)
+#        → kernel 内无边界 mask, 寻址完全规则 — 规避 HIVM root alloc 对复杂 mask
+#          gather load 的分析失败 (实测编译报 "hivm.hir.load op unsupported")
+#  优化空间: Tier4 访存连续化 (ow 方向 stride=1 连续突发, 已保持);
 #            Tier5 max 链用 tl.maximum 合并; 窗口内共用地址 (kh 方向) 可优化加载次数
 # ═══════════════════════════════════════════════════════════════════════════════
 import os
@@ -40,10 +43,12 @@ BLOCK_OW = 64                            # 输出宽分块
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # MaxPool2d: 每个 program 处理一个 (n,c,oh) 行的 BLOCK_OW 个输出宽,
-# 循环窗口 kh/kw 取 max (越界位置贡献 -inf)
+# 输入已 pad (-inf), 无边界 mask, 寻址规则: ih = oh*SH+kh, iw = ow*SW+kw
 @triton.jit
 def maxpool2d_kernel(x_ptr, y_ptr,
-                     C, H, W, KH, KW, SH, SW, PAD, OH, OW,
+                     HP, WP, OH, OW,
+                     KH: tl.constexpr, KW: tl.constexpr,
+                     SH: tl.constexpr, SW: tl.constexpr,
                      BLOCK_OW: tl.constexpr):
     pid = tl.program_id(axis=0)
     total_ow = (OW + BLOCK_OW - 1) // BLOCK_OW
@@ -58,15 +63,12 @@ def maxpool2d_kernel(x_ptr, y_ptr,
     ow_mask = offs_ow < OW
     acc = tl.full((BLOCK_OW,), float("-inf"), dtype=tl.float32)
 
-    base = x_ptr + n * C * H * W + c * H * W + oh * SH - PAD
+    base = x_ptr + n * C * HP * WP + c * HP * WP
     for kh in range(KH):
-        ih = oh * SH + kh - PAD
-        ih_ok = (ih >= 0) & (ih < H)
-        row = base + ih * W
+        row = base + (oh * SH + kh) * WP
         for kw in range(KW):
-            iw = offs_ow * SW + kw - PAD
-            valid = ow_mask & ih_ok & (iw >= 0) & (iw < W)
-            v = tl.load(row + iw, mask=valid, other=float("-inf"))
+            iw = offs_ow * SW + kw
+            v = tl.load(row + iw, mask=ow_mask, other=float("-inf"))
             acc = tl.maximum(acc, v)
 
     y_ptrs = y_ptr + n * C * OH * OW + c * OH * OW + oh * OW + offs_ow
@@ -80,28 +82,31 @@ def main():
     if not torch.npu.is_available():
         raise SystemExit("[FATAL] torch.npu 不可用, 请检查 CANN/torch_npu/驱动 (/dev/davinci0)")
 
+    import torch.nn.functional as F
     npu = torch.device("npu")
     OH = (H + 2 * PAD - KH) // SH + 1
     OW = (W + 2 * PAD - KW) // SW + 1
-    x = (torch.randn(N, C, H, W, dtype=DTYPE, device=npu) * 0.1)
+    HP, WP = H + 2 * PAD, W + 2 * PAD
+    x = (torch.randn(N, C, H, W, dtype=DTYPE, device=npu)) * 0.1
+    # ★pad 预处理 (-inf 填充 padding 区域, 一次性, 测量窗口外) → kernel 无边界 mask
+    xp = F.pad(x, (PAD, PAD, PAD, PAD), value=float("-inf")).contiguous()   # [N, C, HP, WP]
     y = torch.empty(N, C, OH, OW, dtype=DTYPE, device=npu)
 
     total_ow = triton.cdiv(OW, BLOCK_OW)
     grid = (N * C * OH * total_ow,)
     print(f"[info] MaxPool2d N={N} C={C} H={H} W={W}  K={KH}x{KW} S={SH}x{SW} PAD={PAD} "
-          f"→ OH={OH} OW={OW} grid={grid[0]} block_ow={BLOCK_OW}")
+          f"→ OH={OH} OW={OW} grid={grid[0]} block_ow={BLOCK_OW} (pad 预处理)")
 
     # ★KERNEL_LOOP: verify/bench 用它 (一次 msprof 内循环 N 次, 求单次平均; 分配只做一次复用)
     LOOP = int(os.environ.get("KERNEL_LOOP", "1"))
     for _ in range(LOOP):
-        maxpool2d_kernel[grid](x, y, C, H, W, KH, KW, SH, SW, PAD, OH, OW,
-                               BLOCK_OW=BLOCK_OW)
+        maxpool2d_kernel[grid](xp, y, HP, WP, OH, OW,
+                               KH=KH, KW=KW, SH=SH, SW=SW, BLOCK_OW=BLOCK_OW)
     torch.npu.synchronize()
     print("[info] maxpool2d launched & synced OK")
 
     # 正确性校验 (默认关, verify 设 MATMUL_VERIFY=1 自动跑; 对 torch 参考)
     if os.environ.get("MATMUL_VERIFY", "0") == "1":
-        import torch.nn.functional as F
         y_ref = F.max_pool2d(x, (KH, KW), stride=(SH, SW), padding=PAD)
         abs_diff = (y - y_ref).abs().max().item()
         rel_diff = abs_diff / (y_ref.abs().max().item() + 1e-6)

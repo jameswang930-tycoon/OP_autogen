@@ -17,6 +17,7 @@
 
 <h2>1. 优化闭环</h2>
 <div class="mermaid">
+%%{init: {'flowchart': {'curve': 'monotoneX', 'nodeSpacing': 50, 'rankSpacing': 55}}}%%
 flowchart TD
     A[输入 kernel_op.py] --> B[msprof 采集 + 分层诊断]
     B --> C[Planner LLM<br/>6 层策略: 算法→融合→分块→访存→计算→架构]
@@ -35,6 +36,7 @@ flowchart TD
 
 <h2>2. 分层架构</h2>
 <div class="mermaid">
+%%{init: {'flowchart': {'curve': 'monotoneX'}}}%%
 flowchart LR
     subgraph 输入层
         A[input/op/kernel_op.py]
@@ -42,56 +44,44 @@ flowchart LR
     subgraph 分析层
         B[msprof 双源采集] --> C[diagnosis.json<br/>roofline/带宽/引擎/冲突]
     end
+    subgraph 记忆层
+        G[优秀案例库] & H[失败案例库]
+    end
     subgraph 智能体层
         D[Planner LLM 定策略] --> E[Coder 确定性改码]
         E --> F[Verifier 两段验证]
     end
-    subgraph 记忆层
-        G[优秀案例库] & H[失败案例库]
-    end
     subgraph 输出层
         I[final_output: 最优 kernel + 轨迹图 + 报告]
     end
-    A --> B --> D --> E --> F --> I
-    G -. 参考 .-> D
-    H -. 修复注入 .-> E
+    A --> B --> C --> D --> E --> F --> I
+    D -. 检索参考 .-> G
+    E -. 查询修复 .-> H
 </div>
 
 <h2>3. 完整优化流程（自上而下）</h2>
 <div class="mermaid">
+%%{init: {'flowchart': {'curve': 'monotoneX', 'nodeSpacing': 45, 'rankSpacing': 50}}}%%
 flowchart TD
-    A["算子源文件<br/>kernel_op.py"]:::input
+    A["算子源文件<br/>kernel_op.py"]:::input --> B1["通用 msprof 采集<br/>骨架: 耗时/launch/API"]:::diag
+    A --> B2["msprof op 逐 kernel 采集<br/>深层: 带宽/引擎/冲突"]:::diag
 
-    B1["通用 msprof 采集<br/>骨架: 耗时/launch/API"]:::diag
-    B2["msprof op 逐 kernel 采集<br/>深层: 带宽/引擎/冲突"]:::diag
-    A --> B1
-    A --> B2
-
-    C["整合 diagnosis.json"]:::diag
-    B1 --> C
+    B1 --> C["整合 diagnosis.json"]:::diag
     B2 --> C
 
-    D1["sweep 分块枚举实测<br/>（可选）"]:::diag
-    D2["hivmir 融合分析<br/>（可选）"]:::diag
-    B1 -.-> D1
-    B2 -.-> D2
+    D1["sweep 分块枚举实测<br/>（可选）"]:::diag -.-> E
+    D2["hivmir 融合分析<br/>（可选）"]:::diag -.-> E
 
-    E["整合 planner_context.json"]:::diag
-    C --> E
-    D1 --> E
-    D2 --> E
+    C --> E["整合 planner_context.json"]:::diag
 
-    P1["planner skill<br/>playbook 分层优化文档<br/>整体流程文档"]:::doc -.-> P
     P["Planner LLM 制定策略"]:::llm
     E --> P
-    A -.-> P
 
     PL["plan.md<br/>优化指导手册 changes[]"]:::out
     P --> PL
 
     CD["Coder 修改代码"]:::llm
     PL --> CD
-    C1["coder skill<br/>coding_guide"]:::doc -.-> CD
 
     NC["修改后的代码"]:::out
     CD --> NC

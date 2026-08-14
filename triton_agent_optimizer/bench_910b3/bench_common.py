@@ -259,11 +259,16 @@ def measure_pytorch_msprof(app_cmd: str, out_json: Path, flops: float,
 # ═══════════════════════════════════════════════════════════════════════
 
 def measure_event(fn, warmup_ms: int = 25, rep_ms: int = 100,
-                  max_rep: int = 50, min_rep: int = 5) -> dict:
+                  max_rep: int = 50, min_rep: int = 5,
+                  pipelined_n: int = 0) -> dict:
     """★工业级 Event 设备侧计时 (do_bench 同款):
        fn(i) = 第 i 次 forward — 调用方按 i % n_buf 轮换输入 buffer (破 L2 复用).
        流程: 5 次估时长 → n_warmup/n_rep 按时间预算自适应 → warmup → n_rep 个独立 Event 对
        (每 rep: record → fn(i) → record, 不逐个 sync, 设备流水连续) → 最后 sync.
+       ★pipelined_n > 1: 流水化模式 — 每窗口内连续调用 fn N 次, Event 对包整个窗口 ÷N.
+         host 下发开销被连续 launch 流水隐藏 → 近似"纯设备时间" (第一个 kernel 起~最后一个 kernel 止,
+         含 kernel 间 gap, 不含 host 调度等待). 与 verifier 的 ÷LOOP 口径同构.
+         注意: 该口径下破 L2 按 rep 粒度轮换 (窗口内 N 次同 buffer, L2 热 — 与优化侧一致).
        返回 {median_us, min_us, mean_us, rep, warmup, est_us, times_us} (us 为单次)."""
     import statistics
     import torch
@@ -285,6 +290,9 @@ def measure_event(fn, warmup_ms: int = 25, rep_ms: int = 100,
         n_rep = max(min_rep, min(max_rep, int(rep_ms / est_ms)))
     else:
         n_warmup, n_rep = 25, min_rep
+    # ★流水化: 每窗口 N 次, 总时长 ×N → rep 数按预算折算 (别超预算太多)
+    if pipelined_n and pipelined_n > 1:
+        n_rep = max(min_rep, min(n_rep, int(rep_ms / (est_ms * pipelined_n))))
     # ── warmup (破坏性 JIT/图编译/冷 cache 在此消化, 不计时) ──
     for _ in range(n_warmup):
         fn(0)
@@ -293,9 +301,15 @@ def measure_event(fn, warmup_ms: int = 25, rep_ms: int = 100,
     times = []
     for i in range(n_rep):
         s.record()
-        fn(i)
-        e.record()
-        times.append(s.elapsed_time(e))
+        if pipelined_n and pipelined_n > 1:
+            for _ in range(pipelined_n):
+                fn(i)
+            e.record()
+            times.append(s.elapsed_time(e) / pipelined_n)
+        else:
+            fn(i)
+            e.record()
+            times.append(s.elapsed_time(e))
     torch.npu.synchronize()
     us = [t * 1000.0 for t in times]
     return {"median_us": round(statistics.median(us), 1),
@@ -303,6 +317,7 @@ def measure_event(fn, warmup_ms: int = 25, rep_ms: int = 100,
             "mean_us": round(statistics.mean(us), 1),
             "rep": n_rep, "warmup": n_warmup,
             "est_us": round(est_ms * 1000.0, 1),
+            "pipelined_n": pipelined_n,
             "times_us": [round(x, 1) for x in us]}
 
 

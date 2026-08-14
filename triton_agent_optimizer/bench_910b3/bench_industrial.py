@@ -439,6 +439,9 @@ def main():
                    help="测量时间预算 (ms, do_bench 同款; 折算成 n_rep 个独立 Event 对)")
     p.add_argument("--n-buf", type=int, default=32,
                    help="轮换输入 buffer 组数 (破 L2 复用; 组数×单组工作集应 > L2 192MB)")
+    p.add_argument("--pipelined", type=int, default=10, metavar="N",
+                   help="流水化模式: 每窗口连续调用 N 次 ÷N (隐藏 host 下发开销, 近似纯设备时间; "
+                        "与 verify/measure_final_event 同口径); 0=单次含 host 开销")
     args = p.parse_args()
     sh = _shapes(args.op)
     flops = _flops(args.op, sh)
@@ -466,7 +469,8 @@ def main():
     # ── ★Event 设备侧计时 (do_bench 同款): 时间预算自适应 + 多窗口 median + 轮换破 L2 ──
     from bench_910b3.bench_common import measure_event
     m = measure_event(lambda i: fn(*bufs[i % len(bufs)]),
-                      warmup_ms=args.warmup_ms, rep_ms=args.rep_ms)
+                      warmup_ms=args.warmup_ms, rep_ms=args.rep_ms,
+                      pipelined_n=args.pipelined)
     e2e_us = m["median_us"]
     data = {
         "tflops": round(flops / 1e12 / (e2e_us / 1e6), 2) if flops else None,
@@ -474,15 +478,18 @@ def main():
         "time_us_min": m["min_us"], "time_us_mean": m["mean_us"],
         "rep": m["rep"], "warmup": m["warmup"], "n_buf": len(bufs),
         "kernel_time_us": None,                          # Event 给不出纯kernel拆解 (要拆解走 msprof 诊断)
-        "method": "event",                                # ★Event 设备侧 (工业级)
+        "method": "event-pipelined" if args.pipelined and args.pipelined > 1 else "event",
+        "pipelined_n": m["pipelined_n"],                 # 0=单次含 host; >1=流水化 ÷N
         "actual_mode": actual,                            # 实际执行 (compile 是否回退 eager)
         "op": args.op, "mode": args.mode,
-        "note": "Event 多窗口median+输入轮换破L2(do_bench同款); 含 torch host 调度 "
-                "(vs triton 纯kernel 口径偏严, 详见 ARCHITECTURE_DESIGN §6)",
+        "note": "Event 多窗口median+输入轮换破L2(do_bench同款); "
+                + ("pipelined=流水化÷N 近似纯设备时间(含kernel间gap, 不含host调度等待)"
+                   if args.pipelined and args.pipelined > 1
+                   else "含 torch host 调度 (vs triton 纯kernel 口径偏严, 详见 ARCHITECTURE_DESIGN §6)"),
     }
     out_json.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"[industrial] {args.op}/{args.mode} (Event) → {out_json.name}: "
-          f"e2e(median)={round(e2e_us,1)}us min={m['min_us']}us "
+    print(f"[industrial] {args.op}/{args.mode} (Event{' pipelined÷' + str(args.pipelined) if args.pipelined else ''}) "
+          f"→ {out_json.name}: e2e(median)={round(e2e_us,1)}us min={m['min_us']}us "
           f"rep={m['rep']} n_buf={len(bufs)} actual={actual}")
 
 

@@ -91,13 +91,16 @@ def _read_json(op, mode):
         return None
 
 
-def _run_one(op, mode, rep_ms):
+def _run_one(op, mode, rep_ms, pipelined):
     """跑 bench_industrial.py <op> --mode <mode> → 返回结果 dict 或 None.
     ★2026-08-12 同步: bench_industrial 已改 Event 时间预算测量 (--warmup-ms/--rep-ms),
-      不再有 --measure 次数参数 — 传 --rep-ms 时间预算 (do_bench 同款自适应次数)."""
+      不再有 --measure 次数参数 — 传 --rep-ms 时间预算 (do_bench 同款自适应次数).
+    ★pipelined>1: 流水化 ÷N (隐藏 host 开销, 近似纯设备时间)."""
     script = _BENCH_DIR / "bench_industrial.py"
     cmd = [sys.executable or "python3", str(script), op, "--mode", mode,
            "--rep-ms", str(rep_ms)]
+    if pipelined and pipelined > 1:
+        cmd += ["--pipelined", str(pipelined)]
     print(f"\n══ {op} [{mode}] ══", flush=True)
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200,
                        encoding="utf-8", errors="backslashreplace")
@@ -117,6 +120,10 @@ def main():
                    help="已有 json 的模式不重跑 (缺的才跑)")
     p.add_argument("--rep-ms", type=int, default=100,
                    help="每个候选测量时间预算 ms (传给 bench_industrial, do_bench 同款按估时长折算次数)")
+    p.add_argument("--pipelined", type=int, default=10, metavar="N",
+                   help="流水化模式 (传给 bench_industrial): 每窗口连续调用 N 次 ÷N, "
+                        "隐藏 host 下发开销 ≈纯设备时间 (与 verify/measure_final_event 同口径); "
+                        "0=单次含 host")
     p.add_argument("--list", action="store_true", help="只列出算子×模式, 不跑")
     p.add_argument("--clean", action="store_true",
                    help="清理 bench_910b3/outputs/ 全部产物 (json/txt/msprof临时) 后退出")
@@ -156,7 +163,7 @@ def main():
             if args.skip_existing and j and j.get("time_us") and j.get("method"):
                 print(f"  ⏭ {op}[{mode}] 已有 json, 跳过 (--skip-existing)")
             else:
-                j = _run_one(op, mode, args.rep_ms)
+                j = _run_one(op, mode, args.rep_ms, args.pipelined)
             if j and j.get("time_us"):
                 _actual = j.get("actual_mode", mode)   # 实际执行模式 (compile 是否回退)
                 cands.append({"mode": mode, "time_us": j["time_us"],

@@ -68,8 +68,10 @@ _WORK = Path(os.environ.get("FINAL_EVENT_WORK", Path(__file__).resolve().parent 
 _TIMEOUT = int(os.environ.get("FINAL_EVENT_TIMEOUT", "1800"))
 
 
-def _inject(src: str, warmup: int, reps: int) -> str:
-    """在 kernel_op.py 的 for LOOP 循环处注入"严格单次" Event 计时块 (窗口包 1 次完整链路).
+def _inject(src: str, warmup: int, reps: int, pipelined: int = 1) -> str:
+    """在 kernel_op.py 的 for LOOP 循环处注入 Event 计时块.
+    pipelined=1: 每窗口 1 次完整链路 (含 host 下发开销, 与工业级单次同构);
+    pipelined>1: 每窗口连续 P 次 ÷P (host 开销被流水隐藏 ≈纯设备时间, 与 bench --pipelined 同构).
     失败返回 "" (找不到标准循环 → 调用方跳过该算子)."""
     lines = src.splitlines(keepends=True)
     for_idx = None
@@ -97,6 +99,8 @@ def _inject(src: str, warmup: int, reps: int) -> str:
     if not body.strip():
         return ""
     body_deep = "".join(("    " + ln if ln.strip() else ln) for ln in body.splitlines(keepends=True))
+    # 流水化: 窗口内再套一层 for _p in range(_PIPE) (深 4 格)
+    body_pipe = "".join(("    " + ln if ln.strip() else ln) for ln in body_deep.splitlines(keepends=True))
     ind = " " * base_indent
     # 循环前的 torch 直接分配行 (重建破 L2)
     alloc_lines = []
@@ -108,14 +112,25 @@ def _inject(src: str, warmup: int, reps: int) -> str:
     alloc_block = "".join((ind + "        " + a.lstrip() + "\n") for a, _ in alloc_lines)
     names = ", ".join(n for _, n in alloc_lines)
     keep_block = f"{ind}        _keep.append(({names}))\n" if names else ""
-    ind = " " * base_indent
+    # 窗口体: 单次 or 流水化 (P 次 ÷P)
+    if pipelined and pipelined > 1:
+        window_body = (f"{ind}        for _p in range(_PIPE):\n{body_pipe}"
+                       f"{ind}        _ev_e.record()\n"
+                       f"{ind}        _ts.append(_ev_s.elapsed_time(_ev_e) / _PIPE * 1000.0)\n")
+        pipe_env = f"{ind}    _PIPE = int(os.environ.get('FINAL_EVENT_PIPE', '{pipelined}'))\n"
+    else:
+        window_body = (f"{body_deep}"
+                       f"{ind}        _ev_e.record()\n"
+                       f"{ind}        _ts.append(_ev_s.elapsed_time(_ev_e) * 1000.0)\n")
+        pipe_env = ""
     inject = (
-        f"{ind}# ★严格单次 Event 计时 (注入; FINAL_EVENT_TIME 触发)\n"
+        f"{ind}# ★Event 计时 (注入; FINAL_EVENT_TIME 触发)\n"
         f"{ind}if os.environ.get('FINAL_EVENT_TIME'):\n"
         f"{ind}    _W = int(os.environ.get('FINAL_EVENT_WARMUP', '{warmup}'))\n"
         f"{ind}    for _ in range(_W):\n{body_deep}"
         f"{ind}    torch.npu.synchronize()\n"
         f"{ind}    _REPS = int(os.environ.get('FINAL_EVENT_REPS', '{reps}'))\n"
+        f"{pipe_env}"
         f"{ind}    _ts = []\n"
         f"{ind}    _keep = []\n"
         f"{ind}    for _r in range(_REPS):\n"
@@ -124,12 +139,10 @@ def _inject(src: str, warmup: int, reps: int) -> str:
         f"{ind}        _ev_s = torch.npu.Event(enable_timing=True)\n"
         f"{ind}        _ev_e = torch.npu.Event(enable_timing=True)\n"
         f"{ind}        _ev_s.record()\n"
-        f"{body_deep}"
-        f"{ind}        _ev_e.record()\n"
-        f"{ind}        _ts.append(_ev_s.elapsed_time(_ev_e))\n"
+        f"{window_body}"
         f"{ind}    torch.npu.synchronize()\n"
         f"{ind}    _ts.sort()\n"
-        f"{ind}    print('FINAL_EVENT_E2E_US:%.2f' % (_ts[len(_ts) // 2] * 1000.0))\n"
+        f"{ind}    print('FINAL_EVENT_E2E_US:%.2f' % _ts[len(_ts) // 2])\n"
         f"{ind}    raise SystemExit(0)\n"
     )
     out = "".join(lines[:for_idx]) + inject + "".join(lines[for_idx:])
@@ -138,20 +151,20 @@ def _inject(src: str, warmup: int, reps: int) -> str:
     return out
 
 
-def _measure(op: str, path: Path, warmup: int, reps: int):
+def _measure(op: str, path: Path, warmup: int, reps: int, pipelined: int = 1):
     """对单个算子跑 Event 计时 → 返回 (median_us, err) 或 (None, err)."""
     try:
         src = path.read_text(encoding="utf-8")
     except OSError as e:
         return None, f"读不了: {e}"
-    injected = _inject(src, warmup, reps)
+    injected = _inject(src, warmup, reps, pipelined)
     if not injected:
         return None, "找不到标准 for LOOP 循环"
     evt_kernel = _WORK / f"{op}_event.py"
     _WORK.mkdir(parents=True, exist_ok=True)
     evt_kernel.write_text(injected, encoding="utf-8")
     env = dict(os.environ, FINAL_EVENT_TIME="1", FINAL_EVENT_WARMUP=str(warmup),
-               FINAL_EVENT_REPS=str(reps), KERNEL_LOOP="1")
+               FINAL_EVENT_REPS=str(reps), FINAL_EVENT_PIPE=str(pipelined), KERNEL_LOOP="1")
     r = subprocess.run([sys.executable or "python3", str(evt_kernel)],
                        capture_output=True, text=True, encoding="utf-8",
                        errors="backslashreplace", timeout=_TIMEOUT, env=env)
@@ -195,6 +208,9 @@ def main():
     p = argparse.ArgumentParser(description="最终算子 Event 端到端耗时 (工业级同构方法)")
     p.add_argument("--rep", type=int, default=30, help="测量 Event 对个数 (默认 30)")
     p.add_argument("--warmup", type=int, default=10, help="预热完整链路次数 (默认 10)")
+    p.add_argument("--pipelined", type=int, default=10, metavar="N",
+                   help="流水化模式: 每窗口连续调用 N 次 ÷N (隐藏 host 开销 ≈纯设备时间, "
+                        "与 verify/bench_all 同口径; 默认 10); 0=单次含 host 开销")
     p.add_argument("--no-write", action="store_true", help="只测不写回 bench_all.py")
     args = p.parse_args()
 
@@ -203,12 +219,14 @@ def main():
               "(绝对路径 或 相对 triton_agent_optimizer/ 的相对路径)")
         sys.exit(1)
 
-    print(f"══ 最终算子 Event 测量 (严格单次链路, warmup={args.warmup}, reps={args.rep}) ══\n")
+    pipe = args.pipelined if args.pipelined and args.pipelined > 1 else 1
+    mode_s = f"流水化 ÷{pipe} (近似纯设备)" if pipe > 1 else "严格单次 (含 host)"
+    print(f"══ 最终算子 Event 测量 ({mode_s}, warmup={args.warmup}, reps={args.rep}) ══\n")
     rows = []
     for op, p_str in OP_PATHS.items():
         path = _resolve(p_str)
         print(f"⏱  {op}: {path}")
-        us, err = _measure(op, path, args.warmup, args.rep)
+        us, err = _measure(op, path, args.warmup, args.rep, pipe)
         if us is not None:
             print(f"   ✅ FINAL_EVENT_E2E_US = {us:.2f} (median of {args.rep})")
         else:
@@ -216,7 +234,7 @@ def main():
         rows.append((op, us, err))
 
     print("\n" + "═" * 72)
-    print(f"  最终算子对比 (单位 us, Event 设备侧单次完整链路 median)   [工业级同尺]")
+    print(f"  最终算子对比 (单位 us, Event median{f' 流水化÷{pipe}' if pipe > 1 else ' 单次完整链路'})")
     print("═" * 72)
     print(f"  {'算子':<20}{'e2e_event(us)':>14}   状态")
     print("  " + "-" * 70)

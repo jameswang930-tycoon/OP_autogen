@@ -131,6 +131,31 @@ def _shapes(op):
                                         M=int(os.environ.get("BMM_M", 512)),
                                         K=int(os.environ.get("BMM_K", 512)),
                                         N=int(os.environ.get("BMM_N", 512))),
+        # ★工业界经典长链 (2026-08-14 新增第 2 批)
+        "gqa_attention":   lambda: dict(S=int(os.environ.get("GQA_SEQ", 2048)),
+                                        D=int(os.environ.get("GQA_DIM", 1024)),
+                                        H=int(os.environ.get("GQA_HEADS", 16)),
+                                        HD=int(os.environ.get("GQA_HDIM", 64)),
+                                        KV=int(os.environ.get("GQA_KV", 4))),
+        "mamba_block":     lambda: dict(L=int(os.environ.get("MB_LEN", 1024)),
+                                        D=int(os.environ.get("MB_DIM", 1024)),
+                                        N=int(os.environ.get("MB_SSM", 16)),
+                                        ED=int(os.environ.get("MB_ED", 1024)),
+                                        K=int(os.environ.get("MB_KC", 4))),
+        "vit_block":       lambda: dict(S=int(os.environ.get("VIT_SEQ", 197)),
+                                        D=int(os.environ.get("VIT_DIM", 768)),
+                                        H=int(os.environ.get("VIT_HEADS", 12)),
+                                        HD=int(os.environ.get("VIT_HDIM", 64)),
+                                        FFN=int(os.environ.get("VIT_FFN", 3072))),
+        "bert_block":      lambda: dict(S=int(os.environ.get("BERT_SEQ", 512)),
+                                        D=int(os.environ.get("BERT_DIM", 768)),
+                                        H=int(os.environ.get("BERT_HEADS", 12)),
+                                        HD=int(os.environ.get("BERT_HDIM", 64)),
+                                        FFN=int(os.environ.get("BERT_FFN", 3072))),
+        "mixture_of_experts": lambda: dict(S=int(os.environ.get("MOE_SEQ", 1024)),
+                                           D=int(os.environ.get("MOE_DIM", 1024)),
+                                           E=int(os.environ.get("MOE_NEXP", 8)),
+                                           FFN=int(os.environ.get("MOE_FFN", 2048))),
     }
     return S[op]()
 
@@ -392,6 +417,146 @@ def _make_forward(op, sh, n_buf=32):
         def fwd(a, b):
             return torch.bmm(a, b)
         return fwd, [mk() for _ in range(n)]
+    if op == "gqa_attention":
+        # ★GQA + RoPE (LLaMA/DeepSeek 系推理核心): QKV投影 → RoPE → 分组注意力 → O投影 → 残差
+        S, D, H, HD, KV = sh["S"], sh["D"], sh["H"], sh["HD"], sh["KV"]
+        scale = 1.0 / (HD ** 0.5)
+        _freq = 1.0 / (10000 ** (torch.arange(0, HD, 2, device=npu).float() / HD))
+        _t = torch.arange(S, device=npu).float()
+        _cos = torch.cos(_t[:, None] * _freq[None, :]).repeat(1, 2)
+        _sin = torch.sin(_t[:, None] * _freq[None, :]).repeat(1, 2)
+        def _rope(x, cos, sin):
+            x1 = x[..., : HD // 2]
+            x2 = x[..., HD // 2:]
+            return x * cos[:, None, :] + torch.cat([-x2, x1], dim=-1) * sin[:, None, :]
+        def mk():
+            return ((torch.randn(S, D, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, H * HD, device=npu, dtype=DT) * 0.1),   # wq
+                    (torch.randn(D, KV * HD, device=npu, dtype=DT) * 0.1),  # wk
+                    (torch.randn(D, KV * HD, device=npu, dtype=DT) * 0.1),  # wv
+                    (torch.randn(H * HD, D, device=npu, dtype=DT) * 0.1),   # wo
+                    _cos, _sin)
+        def fwd(x, wq, wk, wv, wo, cos, sin):
+            q = (x @ wq).view(S, H, HD)
+            k = (x @ wk).view(S, KV, HD)
+            v = (x @ wv).view(S, KV, HD)
+            q = _rope(q, cos, sin)
+            k = _rope(k, cos, sin)
+            k = k.repeat_interleave(H // KV, dim=1)     # GQA: 每组 KV 复制给 H/KV 个 Q 头
+            v = v.repeat_interleave(H // KV, dim=1)
+            s = (q @ k.transpose(-1, -2)) * scale
+            p = torch.softmax(s, dim=-1)
+            return (p @ v).reshape(S, H * HD) @ wo + x   # 残差
+        return fwd, [mk() for _ in range(n)]
+    if op == "mamba_block":
+        # ★Mamba 块 (KernelBench L3 点名): 门控投影 → 深度卷积 → SSM 时序扫描 → 输出投影 → 残差
+        L, D, N, ED, K = sh["L"], sh["D"], sh["N"], sh["ED"], sh["K"]
+        DTS = N + N                                   # dt + B + C 段宽 (简化: dt 与 B 共用 2N)
+        def mk():
+            return ((torch.randn(L, D, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, ED + 3 * N, device=npu, dtype=DT) * 0.1),   # in_proj
+                    (torch.randn(3 * N, 1, K, device=npu, dtype=DT) * 0.1),     # conv_w (depthwise)
+                    (torch.randn(3 * N, device=npu, dtype=DT) * 0.1),           # conv_b
+                    (torch.randn(N, device=npu, dtype=DT) * 0.1 - 3.0),         # A_log (负)
+                    (torch.randn(N, device=npu, dtype=DT) * 0.1),               # dt_bias
+                    (torch.randn(ED + N, device=npu, dtype=DT) * 0.1),          # D 乘性
+                    (torch.randn(ED, D, device=npu, dtype=DT) * 0.1))           # out_proj
+        def _scan(dA, dB):
+            # 对角 SSM 关联扫描 (log 域, clamp 防溢出): h_t = dA_t·h_{t-1} + dB_t
+            log_dA = torch.log(dA.clamp_min(1e-8))
+            logP = torch.cumsum(log_dA, dim=0)
+            w = torch.cumsum(dB * torch.exp((-logP).clamp_min(-30)), dim=0) \
+                * torch.exp(logP.clamp_max(30))
+            return w
+        def fwd(x, in_proj, conv_w, conv_b, A_log, dt_bias, Dm, out_proj):
+            z_and_x = x @ in_proj                       # [L, ED + 3N]
+            z = z_and_x[:, :ED]
+            xb = z_and_x[:, ED:]
+            xb = F.conv1d(xb.unsqueeze(0).transpose(1, 2), conv_w, conv_b,
+                          groups=3 * N, padding=K - 1)[..., :L].transpose(1, 2).squeeze(0)
+            dt = F.softplus(xb[:, :N] + dt_bias)        # [L, N]
+            B = xb[:, N:2 * N]
+            C = xb[:, 2 * N:]
+            A = -torch.exp(A_log)                       # [N]
+            dA = torch.exp(dt * A)                      # [L, N] 每步衰减
+            dB = dt * B
+            h = _scan(dA, dB)                           # [L, N]
+            y = (h * C).sum(-1, keepdim=True) * Dm[:N].sum(-1, keepdim=True) + z   # 乘性 D + 门控
+            return y @ out_proj + x[:, :ED]             # 残差
+        return fwd, [mk() for _ in range(n)]
+    if op == "vit_block":
+        # ★ViT encoder 块: LN → MHA → 残差 → LN → GELU MLP → 残差
+        S, D, H, HD, FFN = sh["S"], sh["D"], sh["H"], sh["HD"], sh["FFN"]
+        scale = 1.0 / (HD ** 0.5)
+        def mk():
+            return ((torch.randn(S, D, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, H * HD, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, H * HD, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, H * HD, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(H * HD, D, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, FFN, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(FFN, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(FFN, D, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, device=npu, dtype=DT) * 0.1))
+        def fwd(x, wq, wk, wv, wo, w1, b1, w2, b2):
+            h = F.layer_norm(x, [D])
+            q = (h @ wq).view(S, H, HD)
+            k = (h @ wk).view(S, H, HD)
+            v = (h @ wv).view(S, H, HD)
+            s = (q @ k.transpose(-1, -2)) * scale
+            p = torch.softmax(s, dim=-1)
+            o = (p @ v).reshape(S, H * HD) @ wo + x
+            h2 = F.layer_norm(o, [D])
+            return F.gelu(h2 @ w1 + b1) @ w2 + o
+        return fwd, [mk() for _ in range(n)]
+    if op == "bert_block":
+        # ★BERT encoder 块 (post-LN): MHA → LN → GELU MLP → LN → 残差 (BERT 原始结构)
+        S, D, H, HD, FFN = sh["S"], sh["D"], sh["H"], sh["HD"], sh["FFN"]
+        scale = 1.0 / (HD ** 0.5)
+        def mk():
+            return ((torch.randn(S, D, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, H * HD, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, H * HD, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, H * HD, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(H * HD, D, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, FFN, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(FFN, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(FFN, D, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, device=npu, dtype=DT) * 0.1))
+        def fwd(x, wq, wk, wv, wo, w1, b1, w2, b2):
+            q = (x @ wq).view(S, H, HD)
+            k = (x @ wk).view(S, H, HD)
+            v = (x @ wv).view(S, H, HD)
+            s = (q @ k.transpose(-1, -2)) * scale
+            p = torch.softmax(s, dim=-1)
+            a = (p @ v).reshape(S, H * HD) @ wo
+            h1 = F.layer_norm(x + a, [D])
+            m = F.gelu(h1 @ w1 + b1) @ w2 + b2
+            return F.layer_norm(m + h1, [D])
+        return fwd, [mk() for _ in range(n)]
+    if op == "mixture_of_experts":
+        # ★MoE 块: router topk → E 个 expert FFN (SwiGLU) → topk 加权合并
+        S, D, E, FFN = sh["S"], sh["D"], sh["E"], sh["FFN"]
+        TOPK = 2
+        def mk():
+            return ((torch.randn(S, D, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, E, device=npu, dtype=DT) * 0.1),        # router
+                    (torch.randn(D, E * FFN, device=npu, dtype=DT) * 0.1),  # w1f (up)
+                    (torch.randn(D, E * FFN, device=npu, dtype=DT) * 0.1),  # w2f (gate)
+                    (torch.randn(E, FFN, D, device=npu, dtype=DT) * 0.1))   # w3 (down) [E,FFN,D]
+        def fwd(x, router_w, w1f, w2f, w3):
+            logits = x @ router_w                        # [S, E]
+            topk_val, topk_idx = logits.topk(TOPK, dim=-1)
+            w = F.softmax(topk_val, dim=-1)              # [S, TOPK]
+            u = (x @ w1f).view(S, E, FFN)
+            g = (x @ w2f).view(S, E, FFN)
+            act = F.silu(u) * g
+            # ★每 expert 独立 down 投影: [E,S,FFN] @ [E,FFN,D] → [E,S,D] → [S,E,D]
+            y = torch.bmm(act.transpose(0, 1), w3).transpose(0, 1)
+            idx = topk_idx.unsqueeze(-1).expand(-1, -1, D)
+            y_topk = torch.gather(y, 1, idx)             # [S, TOPK, D]
+            return (y_topk * w.unsqueeze(-1)).sum(1)     # topk 加权合并
+        return fwd, [mk() for _ in range(n)]
     raise ValueError(f"未知算子: {op}")
 
 
@@ -523,6 +688,27 @@ def _flops(op, sh):
         return f
     if op == "batched_matmul":
         return 2 * sh["B"] * sh["M"] * sh["K"] * sh["N"]
+    if op == "gqa_attention":
+        s, d, h, hd, kv = sh["S"], sh["D"], sh["H"], sh["HD"], sh["KV"]
+        return (2 * s * (d * h * hd + 2 * d * kv * hd + h * hd * d)   # QKV + O 投影
+                + 4 * s * s * h * hd)                                 # S + PV
+    if op == "mamba_block":
+        l, d, n, ed, k = sh["L"], sh["D"], sh["N"], sh["ED"], sh["K"]
+        return (2 * l * d * (ed + 3 * n)      # in_proj
+                + 2 * l * 3 * n * k           # depthwise conv
+                + 4 * l * n                   # scan
+                + 2 * l * ed * d)             # out_proj
+    if op == "vit_block":
+        s, d, h, hd, ffn = sh["S"], sh["D"], sh["H"], sh["HD"], sh["FFN"]
+        return 2 * s * (4 * d * h * hd) + 4 * s * s * h * hd \
+            + 2 * s * (d * ffn + ffn * d) + 6 * s * d * 2
+    if op == "bert_block":
+        s, d, h, hd, ffn = sh["S"], sh["D"], sh["H"], sh["HD"], sh["FFN"]
+        return 2 * s * (4 * d * h * hd) + 4 * s * s * h * hd \
+            + 2 * s * (d * ffn + ffn * d) + 6 * s * d * 2
+    if op == "mixture_of_experts":
+        s, d, e, ffn = sh["S"], sh["D"], sh["E"], sh["FFN"]
+        return 2 * s * d * e + 2 * s * e * (2 * d * ffn + ffn * d)   # router + E 个 SwiGLU FFN
     return None
 
 

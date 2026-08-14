@@ -54,6 +54,12 @@ OP_MODES = {
     "swiglu_mlp": ["eager", "compile"],
     "resnet_block": ["eager", "compile"],
     "batched_matmul": ["eager", "compile"],
+    # ★工业界经典长链 (2026-08-14 第 2 批)
+    "gqa_attention": ["eager", "compile"],
+    "mamba_block": ["eager", "compile"],
+    "vit_block": ["eager", "compile"],
+    "bert_block": ["eager", "compile"],
+    "mixture_of_experts": ["eager", "compile"],
 }
 MODES = ["eager", "compile", "fa"]   # 表格可显示的方法 (fa 仅 flash_attention)
 

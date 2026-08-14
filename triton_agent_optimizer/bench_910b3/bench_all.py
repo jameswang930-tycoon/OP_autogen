@@ -22,17 +22,25 @@
   python3 bench_all.py --op transformer_decoder_block,swiglu_mlp,resnet_block,batched_matmul
   #    ↑ 一次跑全部 4 个复杂算子 (每个 eager+compile, Event 流水化 ÷10, 几分钟~几十分钟)
   python3 bench_all.py --op transformer_decoder_block    # 单个复杂算子 (LLaMA decoder layer)
+  # ── ★工业界经典长链 (2026-08-14 第 2 批, 9 个复杂算子全跑) ──
+  python3 bench_all.py --op transformer_decoder_block,swiglu_mlp,resnet_block,batched_matmul,\
+gqa_attention,mamba_block,vit_block,bert_block,mixture_of_experts
+  python3 bench_all.py --op mixture_of_experts   # 单个 (MoE, 全量 experts, 103 GFLOP 最大链)
   # ── 单独出对比表 (不重跑测量) ──
   python3 make_summary_table.py              # 读 outputs/*.json + OUR_RESULTS_US → industrial_summary_table.md
   # ── 单算子单模式底层命令 ──
   python3 bench_industrial.py <op> --mode eager|compile|fa [--msprof] [--pipelined N] [--measure N]
 
-═══ 算子清单 (17 基础 + 4 复杂多算子链) ═══
+═══ 算子清单 (17 基础 + 9 复杂多算子链) ═══
   基础: matmul(MLP链) attention_mlp matmul_relu matmul_transpose rms_norm rms_norm_residual
         layernorm sigmoid softmax vector_add fused_add_mul flash_attention(fa)
         conv2d conv_bias_relu batchnorm2d maxpool2d conv1d
-  复杂 (KernelBench L2/L3 风格, 2026-08-14 新增): transformer_decoder_block(LLaMA decoder layer)
-        swiglu_mlp(LLaMA FFN) resnet_block(ResNet 残差块) batched_matmul(BMM)
+  复杂 (KernelBench L2/L3 风格, 2026-08-14 新增):
+    transformer_decoder_block(LLaMA decoder layer) swiglu_mlp(LLaMA FFN)
+    resnet_block(ResNet 残差块) batched_matmul(BMM)
+  工业界经典长链 (第 2 批):
+    gqa_attention(GQA+RoPE, LLaMA/DeepSeek 推理核心) mamba_block(Mamba SSM 块)
+    vit_block(ViT encoder) bert_block(BERT encoder) mixture_of_experts(MoE topk, 最大链 103GFLOP)
   ★我们结果填写区: 本文件顶部 OUR_RESULTS_US (或 measure_final_event 自动写回)
 
 ═══ 输出 ═══
@@ -90,6 +98,12 @@ OP_MODES = {
     "swiglu_mlp": ["eager", "compile"],
     "resnet_block": ["eager", "compile"],
     "batched_matmul": ["eager", "compile"],
+    # ★工业界经典长链 (2026-08-14 第 2 批)
+    "gqa_attention": ["eager", "compile"],
+    "mamba_block": ["eager", "compile"],
+    "vit_block": ["eager", "compile"],
+    "bert_block": ["eager", "compile"],
+    "mixture_of_experts": ["eager", "compile"],
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════

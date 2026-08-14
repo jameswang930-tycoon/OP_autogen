@@ -559,29 +559,39 @@ def _generate_conv2d_runner(op_dir: Path, candidates: List[Tuple],
     vars_ = op_meta["vars"]
 
     if op == "conv2d":
+        # ★2026-08-14: kernel 已改 host im2col (unfold) + 标准 GEMM 版 —
+        #   签名 (x_col, w_flat, y, N, K, LOUT, OW, BLOCK_K, BLOCK_OW, BLOCK_CRS, CRS)
+        #   setup 同步 unfold 数据准备; 旧调用 (x,w,y + C/R/S/PAD) 会参数错位 →
+        #   BLOCK_K 被位置参数填充 + 关键字重复 → "got multiple values for argument 'BLOCK_K'"
         setup = textwrap.dedent("""\
-        # ── Tensor setup (conv2d) ──
+        # ── Tensor setup (conv2d, host im2col) ──
+        import torch.nn.functional as F
         DTYPE = torch.float32
         device = torch.device("npu")
         x = (torch.randn(N_B, C_IN, H, W, dtype=DTYPE, device=device)) * 0.1
         w = (torch.randn(K_OUT, C_IN, R, S, dtype=DTYPE, device=device)) * 0.1
+        x_col = F.unfold(x, (R, S), padding=PAD).contiguous()   # [N, CRS, LOUT]
+        w_flat = w.reshape(K_OUT, C_IN * R * S).contiguous()    # [K, CRS]
         y = torch.empty(N_B, K_OUT, OH, OW, dtype=DTYPE, device=device)
 
         def run_one(bk, bow):
             grid = (N_B * OH * triton.cdiv(OW, bow),)
-            conv2d_kernel[grid](x, w, y, N_B, H, W, K_OUT, OH, OW,
-                BLOCK_K=bk, BLOCK_OW=bow,
-                C=C_IN, R=R, S=S, PAD=PAD)
+            conv2d_kernel[grid](x_col, w_flat, y, N_B, K_OUT, LOUT, OW,
+                BLOCK_K=bk, BLOCK_OW=bow, BLOCK_CRS=BLOCK_CRS, CRS=CRS)
         """)
 
     elif op == "conv_bias_relu":
+        # ★2026-08-14: conv kernel 已改 host im2col 版 (签名同上); bias/relu 签名未变
         setup = textwrap.dedent("""\
-        # ── Tensor setup (conv_bias_relu) ──
+        # ── Tensor setup (conv_bias_relu, host im2col) ──
+        import torch.nn.functional as F
         DTYPE = torch.float32
         device = torch.device("npu")
         x = (torch.randn(N_B, C_IN, H, W, dtype=DTYPE, device=device)) * 0.1
         w = (torch.randn(K_OUT, C_IN, R, S, dtype=DTYPE, device=device)) * 0.1
         bias = (torch.randn(K_OUT, dtype=DTYPE, device=device)) * 0.1
+        x_col = F.unfold(x, (R, S), padding=PAD).contiguous()   # [N, CRS, LOUT]
+        w_flat = w.reshape(K_OUT, C_IN * R * S).contiguous()    # [K, CRS]
         yc = torch.empty(N_B, K_OUT, OH, OW, dtype=DTYPE, device=device)
         yb = torch.empty(N_B, K_OUT, OH, OW, dtype=DTYPE, device=device)
         y  = torch.empty(N_B, K_OUT, OH, OW, dtype=DTYPE, device=device)
@@ -590,8 +600,8 @@ def _generate_conv2d_runner(op_dir: Path, candidates: List[Tuple],
         def run_one(bk, bow):
             grid_conv = (N_B * OH * triton.cdiv(OW, bow),)
             grid_el   = (triton.cdiv(n_el, BLOCK_EL),)
-            conv2d_kernel[grid_conv](x, w, yc, N_B, H, W, K_OUT, OH, OW,
-                BLOCK_K=bk, BLOCK_OW=bow, C=C_IN, R=R, S=S, PAD=PAD)
+            conv2d_kernel[grid_conv](x_col, w_flat, yc, N_B, K_OUT, LOUT, OW,
+                BLOCK_K=bk, BLOCK_OW=bow, BLOCK_CRS=BLOCK_CRS, CRS=CRS)
             bias_kernel[grid_el](yc, bias, yb, n_el, K_OUT, OH, OW, BLOCK=BLOCK_EL)
             relu_kernel[grid_el](yb, y, n_el, BLOCK=BLOCK_EL)
         """)

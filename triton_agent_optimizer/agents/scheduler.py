@@ -819,8 +819,10 @@ class Scheduler:
         ★M/N/K 从当前 kernel 的 config 提取并传给 run_optimize (它设 MATMUL_M/N/K env):
           否则 run_optimize 默认 512 会覆盖 kernel_op.py 里的默认值 → baseline 尺寸与 verify 不一致,
           speedup 严重失真 (512³ 的 FLOPs 只有 2048³ 的 1/64).
-        TIER 环境变量传给 run_optimize, 让它解析完自动产出 07_tier<N>_fields。"""
-        run_sh = (_PROJECT / "analyzers" / "run_optimize.sh").as_posix()
+        TIER 环境变量传给 run_optimize, 让它解析完自动产出 07_tier<N>_fields。
+        ★路径可用 env RUN_OPTIMIZE_SH 覆盖 (默认 analyzers/run_optimize.sh)。"""
+        run_sh = os.environ.get("RUN_OPTIMIZE_SH",
+                                (_PROJECT / "analyzers" / "run_optimize.sh").as_posix())
         input_dir = self.current_kernel.parent    # round1=源目录; 后续=上一轮输出目录
         cmd = ["bash", run_sh, str(input_dir), str(round_dir)]
         mnk = _extract_mnk(self.current_kernel.read_text(encoding="utf-8")

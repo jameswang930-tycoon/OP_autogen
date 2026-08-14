@@ -126,8 +126,9 @@ def main():
         cands = []
         for mode in OP_MODES[op]:
             j = _read_json(op, mode)
-            # ★默认重跑(覆盖旧结果); --skip-existing 才对已有有效 json 跳过(只补缺的)
-            if args.skip_existing and j and j.get("time_us"):
+            # ★默认重跑(覆盖旧结果); --skip-existing 才对已有**有效** json 跳过(只补缺的)
+            #   有效 = 有 method 字段 (无 method 的旧占位/假数据不顶替, 会重跑)
+            if args.skip_existing and j and j.get("time_us") and j.get("method"):
                 print(f"  ⏭ {op}[{mode}] 已有 json, 跳过 (--skip-existing)")
             else:
                 j = _run_one(op, mode, args.rep_ms)

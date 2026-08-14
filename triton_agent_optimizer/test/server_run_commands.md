@@ -22,10 +22,11 @@ python3 --version
 python3 -c "import torch; print(torch.__version__)"
 # 3. torch_npu 版本
 python3 -c "import torch_npu; print(torch_npu.__version__)"
-# 4. CANN 版本
-cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg 2>/dev/null \
-  || cat /usr/local/Ascend/ascend-toolkit/latest/version.info 2>/dev/null \
-  || ls /usr/local/Ascend/ascend-toolkit/latest/
+# 4. CANN 版本 (version.cfg 不一定存在; 用目录名/version.info/install.info/npu-smi 兜底)
+ls /usr/local/Ascend/ascend-toolkit/                       # 目录名直接带版本 (如 8.5.1)
+cat /usr/local/Ascend/ascend-toolkit/latest/version.info 2>/dev/null
+cat /usr/local/Ascend/ascend-toolkit/latest/ascend_toolkit_install.info 2>/dev/null
+npu-smi info 2>/dev/null | head -8                          # 也能看驱动版本
 # 5. 服务器架构 (x86_64 / aarch64)
 uname -m
 # 6. 系统 (欧拉/麒麟/Ubuntu)

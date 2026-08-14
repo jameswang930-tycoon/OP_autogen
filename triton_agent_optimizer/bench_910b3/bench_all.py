@@ -18,6 +18,10 @@
   python3 bench_all.py --op transformer_decoder_block --msprof   # 只跑复杂多算子链
   python3 bench_all.py --list                # 列出算子×模式, 不跑
   python3 bench_all.py --clean               # 清理 outputs/ 全部产物
+  # ── ★复杂算子 eager vs compile 直接对比 (Event 口径, 不用 msprof/measure) ──
+  python3 bench_all.py --op transformer_decoder_block,swiglu_mlp,resnet_block,batched_matmul
+  #    ↑ 一次跑全部 4 个复杂算子 (每个 eager+compile, Event 流水化 ÷10, 几分钟~几十分钟)
+  python3 bench_all.py --op transformer_decoder_block    # 单个复杂算子 (LLaMA decoder layer)
   # ── 单独出对比表 (不重跑测量) ──
   python3 make_summary_table.py              # 读 outputs/*.json + OUR_RESULTS_US → industrial_summary_table.md
   # ── 单算子单模式底层命令 ──
@@ -154,7 +158,8 @@ def _run_one(op, mode, rep_ms, pipelined, msprof, measure):
 
 def main():
     p = argparse.ArgumentParser(description="全部算子工业级基准 + 自动取最优")
-    p.add_argument("--op", type=str, default=None, help="只跑指定算子 (缺省=全部)")
+    p.add_argument("--op", type=str, default=None,
+                   help="只跑指定算子 (逗号分隔可多个, 如 transformer_decoder_block,swiglu_mlp; 缺省=全部)")
     p.add_argument("--skip-existing", action="store_true",
                    help="已有 json 的模式不重跑 (缺的才跑)")
     p.add_argument("--rep-ms", type=int, default=100,
@@ -183,7 +188,8 @@ def main():
             print(f"  ⚠ 清理失败: {e}")
         return
 
-    ops = [args.op] if args.op else list(OP_MODES)
+    # ★--op 支持逗号分隔多算子 (如 --op a,b,c)
+    ops = [o.strip() for o in args.op.split(",") if o.strip()] if args.op else list(OP_MODES)
     modes_of = {}
     for op in ops:
         if op not in OP_MODES:

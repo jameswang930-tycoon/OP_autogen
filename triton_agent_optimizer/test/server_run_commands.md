@@ -13,17 +13,38 @@ cd ~/OP_autogen && git pull origin hjkc
 
 ---
 
-## 第 1 步: 环境检查 (把输出全部贴回来)
+## 第 1 步: 环境检查 (定 torchair/桥库安装版本 — 把输出按 1~8 编号全部贴回来)
 
 ```bash
-pip list | grep -iE "torchair|torch-air|torch_npu|npu_ops|cann_ops|triton"
-python3 -c "import torchair" 2>&1 | head -1
-python3 -c "import npu_ops_transformer" 2>&1 | head -1
-python3 -c "import cann_ops_transformer" 2>&1 | head -1
-ls /usr/local/Ascend/ascend-toolkit/latest/ 2>/dev/null | head -30
-python3 -c "import torch_npu; print('torch_npu', torch_npu.__version__)"
-python3 -c "import torch; print('torch', torch.__version__)"
+# 1. python 版本
+python3 --version
+# 2. torch 版本
+python3 -c "import torch; print(torch.__version__)"
+# 3. torch_npu 版本
+python3 -c "import torch_npu; print(torch_npu.__version__)"
+# 4. CANN 版本
+cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg 2>/dev/null \
+  || cat /usr/local/Ascend/ascend-toolkit/latest/version.info 2>/dev/null \
+  || ls /usr/local/Ascend/ascend-toolkit/latest/
+# 5. 服务器架构 (x86_64 / aarch64)
+uname -m
+# 6. 系统 (欧拉/麒麟/Ubuntu)
+grep -E "^(NAME|VERSION)=" /etc/os-release
+# 7. triton / 已装相关包
+pip list 2>/dev/null | grep -iE "triton|npu|cann|air"
+# 8. pip 能否联网 (能连→出错误信息里带 999 找不到; 连不上→超时/网络错误)
+pip download torchair==999 2>&1 | head -2
 ```
+
+**各项用途 (定版本依据)**:
+| # | 决定什么 |
+|---|---|
+| 1~3 | torchair 版本对 **torch 小版本 + torch_npu 版本** 有硬性配对 (错一个 import 即崩) |
+| 4 | CANN 版本 → 配套 torchair 大版本 |
+| 5 | x86_64 / aarch64 决定下载哪个 whl 平台包 |
+| 6 | 华为官网按 OS (欧拉/麒麟/Ubuntu) 分包 |
+| 7 | 有没有 triton-ascend (装 torchair 时的依赖冲突排查) |
+| 8 | 服务器能否联网 pip — 不通就走离线 whl 上传路线 |
 
 **判定**:
 - 有 `torchair` → 跳过第 2 步的 torchair 安装

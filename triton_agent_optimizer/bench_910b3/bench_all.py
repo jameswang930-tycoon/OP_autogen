@@ -32,13 +32,13 @@ _PROJ = _BENCH_DIR.parent
 if str(_PROJ) not in sys.path:
     sys.path.insert(0, str(_PROJ))   # ★供 from bench_910b3.bench_common import ...
 
-# 与 input/ 算子对齐; flash_attention 只跑 fa (CANN FA);
-# matmul/matmul_relu/conv_bias_relu 有 CANN 融合算子 (aclnnFusedMatmul/FusedConvBiasRelu) → 加 cann-fused
-# 其余 eager+compile (compile 的 GE 图融合也会生成 CANN 融合 kernel)
+# 与 input/ 算子对齐; flash_attention 只跑 fa (CANN FA, torch_npu 自带, 无需桥库);
+# 其余 eager+compile (compile 的 GE 图融合生成 CANN 融合 kernel)
+# ★cann-fused 已移除: 依赖 cann_ops_transformer/npu_ops_transformer 桥库, 服务器装不上 → 回退
 OP_MODES = {
-    "matmul": ["eager", "compile", "cann-fused"],
+    "matmul": ["eager", "compile"],
     "attention_mlp": ["eager", "compile"],
-    "matmul_relu": ["eager", "compile", "cann-fused"],
+    "matmul_relu": ["eager", "compile"],
     "matmul_transpose": ["eager", "compile"],
     "rms_norm": ["eager", "compile"],
     "rms_norm_residual": ["eager", "compile"],
@@ -49,7 +49,7 @@ OP_MODES = {
     "fused_add_mul": ["eager", "compile"],
     "flash_attention": ["fa"],
     "conv2d": ["eager", "compile"],
-    "conv_bias_relu": ["eager", "compile", "cann-fused"],
+    "conv_bias_relu": ["eager", "compile"],
     "batchnorm2d": ["eager", "compile"],
     "maxpool2d": ["eager", "compile"],
     "conv1d": ["eager", "compile"],

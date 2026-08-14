@@ -95,7 +95,7 @@ def _run_one(op, mode, rep_ms, pipelined, msprof, measure):
     """跑 bench_industrial.py <op> --mode <mode> → 返回结果 dict 或 None.
     ★2026-08-12 同步: bench_industrial 已改 Event 时间预算测量 (--warmup-ms/--rep-ms),
       不再有 --measure 次数参数 — 传 --rep-ms 时间预算 (do_bench 同款自适应次数).
-    ★pipelined>1: 流水化 ÷N (隐藏 host 开销, 近似纯设备时间).
+    ★pipelined>1: 流水化 /N (隐藏 host 开销, 近似纯设备时间).
     ★msprof=True: msprof 纯 kernel 求和口径 (与 verify ns 同源)."""
     script = _BENCH_DIR / "bench_industrial.py"
     cmd = [sys.executable or "python3", str(script), op, "--mode", mode,
@@ -124,15 +124,15 @@ def main():
     p.add_argument("--rep-ms", type=int, default=100,
                    help="每个候选测量时间预算 ms (传给 bench_industrial, do_bench 同款按估时长折算次数)")
     p.add_argument("--pipelined", type=int, default=10, metavar="N",
-                   help="流水化模式 (传给 bench_industrial): 每窗口连续调用 N 次 ÷N, "
-                        "隐藏 host 下发开销 ≈纯设备时间 (与 verify/measure_final_event 同口径); "
+                   help="流水化模式 (传给 bench_industrial): 每窗口连续调用 N 次 /N, "
+                        "隐藏 host 下发开销 ~纯设备时间 (与 verify/measure_final_event 同口径); "
                         "0=单次含 host")
     p.add_argument("--msprof", action="store_true",
                    help="★msprof 纯 kernel 口径 (传给 bench_industrial): op_summary Task Duration "
-                        "求和 ÷次数, 不含 host launch — 与我们 verify 的 ns 同源, 小算子可比")
+                        "求和 /次数, 不含 host launch — 与我们 verify 的 ns 同源, 小算子可比")
     p.add_argument("--measure", type=int, default=100,
                    help="msprof 模式: app 内部 forward 循环次数 (默认 100)")
-    p.add_argument("--list", action="store_true", help="只列出算子×模式, 不跑")
+    p.add_argument("--list", action="store_true", help="只列出算子x模式, 不跑")
     p.add_argument("--clean", action="store_true",
                    help="清理 bench_910b3/outputs/ 全部产物 (json/txt/msprof临时) 后退出")
     args = p.parse_args()
@@ -176,7 +176,7 @@ def main():
                 _actual = j.get("actual_mode", mode)   # 实际执行模式 (compile 是否回退)
                 cands.append({"mode": mode, "time_us": j["time_us"],
                               "kernel_us": j.get("kernel_time_us"),
-                              "kpi": j.get("kernels_per_iter"),          # 每遍 kernel 数 (≈1=融合)
+                              "kpi": j.get("kernels_per_iter"),          # 每遍 kernel 数 (~1=融合)
                               "actual": _actual})
                 t = j["time_us"]
                 # ★最优只从"真正执行"的方法里选 (回退的是别的方法的重复测量, 不该顶替成最优)
@@ -194,7 +194,7 @@ def main():
         _fb = actual.split("→")[-1]
         return f"⚠ 未真正执行 (回退 {_fb})"
     print("\n" + "═" * 96)
-    print("  工业级基准明细 (kernels/遍: ≈1=已融合; 执行状态: 是否真正跑了该方法)   [单位: us]")
+    print("  工业级基准明细 (kernels/遍: ~1=已融合; 执行状态: 是否真正跑了该方法)   [单位: us]")
     print("═" * 96)
     print(f"  {'算子':<18}{'模式':<13}{'端到端':>10}{'纯kernel':>12}{'kernels/遍':>11}   {'执行状态':<18}   来源")
     print("  " + "-" * 94)

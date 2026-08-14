@@ -22,7 +22,7 @@
     - 时间预算自适应: 先 5 次估时长 → warmup 25ms / rep 100ms 折算次数
     - 多窗口 median: n_rep 个独立 Event 对 (设备流水连续, 最后 sync) → median
     - ★输入轮换破 L2: 连续 forward 同一批张量, 工作集<192MB(L2) 时后 N 次全 L2 命中虚高;
-      Ascend 无清 L2 API → n_buf 组输入轮换 (组数×单组工作集 > L2) 等效 do_bench clear_cache
+      Ascend 无清 L2 API → n_buf 组输入轮换 (组数x单组工作集 > L2) 等效 do_bench clear_cache
   口径声明: 工业级 = torch 全流程 (含 host 调度/内存分配); 我们 verify 的 Event = triton 纯
   kernel launch 链 → 大算子 (ms 级) 差异可忽略, 小算子 (us 级) 我们占便宜, 对比时声明.
 """
@@ -398,7 +398,7 @@ def _flops(op, sh):
         f = 2 * sh["NB"] * sh["K"] * OH * OW * sh["C"] * sh["R"] * sh["Sd"]
         return f + (2 * sh["NB"] * sh["K"] * OH * OW if op == "conv_bias_relu" else 0)
     if op == "batchnorm2d":
-        return 6 * sh["N"] * sh["C"] * sh["H"] * sh["W"]   # 减/除/乘/加 ×2 元素
+        return 6 * sh["N"] * sh["C"] * sh["H"] * sh["W"]   # 减/除/乘/加 x2 元素
     if op == "maxpool2d":
         return (sh["KH"] * sh["KW"] - 1) * sh["N"] * sh["C"] * \
             (((sh["H"] + 2 * sh["PAD"] - sh["KH"]) // sh["SH"] + 1) *
@@ -438,13 +438,13 @@ def main():
     p.add_argument("--rep-ms", type=int, default=int(os.environ.get("BENCH_REP_MS", "100")),
                    help="测量时间预算 (ms, do_bench 同款; 折算成 n_rep 个独立 Event 对)")
     p.add_argument("--n-buf", type=int, default=32,
-                   help="轮换输入 buffer 组数 (破 L2 复用; 组数×单组工作集应 > L2 192MB)")
+                   help="轮换输入 buffer 组数 (破 L2 复用; 组数x单组工作集应 > L2 192MB)")
     p.add_argument("--pipelined", type=int, default=10, metavar="N",
-                   help="流水化模式: 每窗口连续调用 N 次 ÷N (隐藏 host 下发开销, 近似纯设备时间; "
+                   help="流水化模式: 每窗口连续调用 N 次 /N (隐藏 host 下发开销, 近似纯设备时间; "
                         "与 verify/measure_final_event 同口径); 0=单次含 host 开销")
     p.add_argument("--msprof", action="store_true",
                    help="★msprof 纯 kernel 模式: 包 msprof 跑 app → op_summary 全部行 Task Duration "
-                        "求和 ÷次数 = 纯 kernel 时间 (不含 host launch; 与我们 verify 的 ns 口径同源); "
+                        "求和 /次数 = 纯 kernel 时间 (不含 host launch; 与我们 verify 的 ns 口径同源); "
                         "time_us 写纯 kernel 值, kernel_time_us 同值, method=msprof-kernel")
     p.add_argument("--measure", type=int, default=100,
                    help="msprof 模式: app 内部 forward 循环次数 (默认 100, 越多越稳)")
@@ -472,7 +472,7 @@ def main():
     elif args.mode == "fa":
         actual = "fa"
 
-    # ── ★msprof 纯 kernel 模式 (与 verify 的 ns 口径同源: Task Duration 求和 ÷N) ──
+    # ── ★msprof 纯 kernel 模式 (与 verify 的 ns 口径同源: Task Duration 求和 /N) ──
     if args.msprof:
         from bench_910b3.bench_common import measure_pytorch_msprof
         _app_dir = _BENCH_DIR / "outputs"
@@ -508,7 +508,7 @@ def main():
                   f"回退 Event 口径")
         else:
             print(f"[industrial] {args.op}/{args.mode} (msprof 纯 kernel) → {out_json.name}: "
-                  f"kernel={m['kernel_time_us']:.1f}us ÷{m['measure']} rows={m.get('rows_measured')} "
+                  f"kernel={m['kernel_time_us']:.1f}us /{m['measure']} rows={m.get('rows_measured')} "
                   f"kernels/遍={m.get('kernels_per_iter')} actual={actual}")
             return
     # ── ★Event 设备侧计时 (do_bench 同款): 时间预算自适应 + 多窗口 median + 轮换破 L2 ──
@@ -524,16 +524,16 @@ def main():
         "rep": m["rep"], "warmup": m["warmup"], "n_buf": len(bufs),
         "kernel_time_us": None,                          # Event 给不出纯kernel拆解 (要拆解走 msprof 诊断)
         "method": "event-pipelined" if args.pipelined and args.pipelined > 1 else "event",
-        "pipelined_n": m["pipelined_n"],                 # 0=单次含 host; >1=流水化 ÷N
+        "pipelined_n": m["pipelined_n"],                 # 0=单次含 host; >1=流水化 /N
         "actual_mode": actual,                            # 实际执行 (compile 是否回退 eager)
         "op": args.op, "mode": args.mode,
         "note": "Event 多窗口median+输入轮换破L2(do_bench同款); "
-                + ("pipelined=流水化÷N 近似纯设备时间(含kernel间gap, 不含host调度等待)"
+                + ("pipelined=流水化/N 近似纯设备时间(含kernel间gap, 不含host调度等待)"
                    if args.pipelined and args.pipelined > 1
                    else "含 torch host 调度 (vs triton 纯kernel 口径偏严, 详见 ARCHITECTURE_DESIGN §6)"),
     }
     out_json.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"[industrial] {args.op}/{args.mode} (Event{' pipelined÷' + str(args.pipelined) if args.pipelined else ''}) "
+    print(f"[industrial] {args.op}/{args.mode} (Event{' pipelined/' + str(args.pipelined) if args.pipelined else ''}) "
           f"→ {out_json.name}: e2e(median)={round(e2e_us,1)}us min={m['min_us']}us "
           f"rep={m['rep']} n_buf={len(bufs)} actual={actual}")
 

@@ -292,9 +292,13 @@ def main():
         sys.exit(1)
 
     pipe = args.pipelined if args.pipelined and args.pipelined > 1 else 1
-    mode_s = "msprof 纯 kernel" if args.msprof else \
-        (f"流水化 /{pipe} (近似纯设备)" if pipe > 1 else "严格单次 (含 host)")
-    print(f"══ 最终算子测量 ({mode_s}{f', loop={args.loop}' if args.msprof else f', warmup={args.warmup}, reps={args.rep}'}) ══\n")
+    if args.msprof:
+        mode_s = "msprof 纯 kernel"
+        param_s = "loop=%d" % args.loop
+    else:
+        mode_s = "流水化 P=%d (近似纯设备)" % pipe if pipe > 1 else "严格单次 (含 host)"
+        param_s = "warmup=%d, reps=%d" % (args.warmup, args.rep)
+    print(f"══ 最终算子测量 ({mode_s}, {param_s}) ══\n")
     rows = []
     for op, p_str in OP_PATHS.items():
         path = _resolve(p_str)
@@ -309,8 +313,12 @@ def main():
             print(f"   ❌ {err}")
         rows.append((op, us, err))
 
+    if args.msprof:
+        tail_s = "msprof 纯 kernel"
+    else:
+        tail_s = "Event median" + (" 流水化P=%d" % pipe if pipe > 1 else " 单次完整链路")
     print("\n" + "═" * 72)
-    print(f"  最终算子对比 (单位 us{', msprof 纯 kernel' if args.msprof else f', Event median{f' 流水化/{pipe}' if pipe > 1 else ' 单次完整链路'}'})")
+    print(f"  最终算子对比 (单位 us, {tail_s})")
     print("═" * 72)
     print(f"  {'算子':<20}{'e2e_event(us)':>14}   状态")
     print("  " + "-" * 70)

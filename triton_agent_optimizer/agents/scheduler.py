@@ -54,6 +54,27 @@ _PROJECT = Path(__file__).resolve().parent.parent
 if str(_PROJECT) not in sys.path:
     sys.path.insert(0, str(_PROJECT))
 
+# ★统一配置 (config.py; 触发 .env 加载; no_improve/revert 阈值等)
+try:
+    from config import config as _cfg
+except Exception:
+    _cfg = None
+
+def _tier_promote_threshold() -> int:
+    """本 tier 连续无改进 → 晋升 的阈值 (config.optim.tier_promotion_threshold, 默认 3)."""
+    try:
+        return int(_cfg.optim.tier_promotion_threshold) if _cfg else 3
+    except Exception:
+        return 3
+
+
+def _max_consecutive_reverts() -> int:
+    """连续 REVERT 超过此值 → 停止 (config.optim.max_consecutive_reverts, 默认 5)."""
+    try:
+        return int(_cfg.optim.max_consecutive_reverts) if _cfg else 5
+    except Exception:
+        return 5
+
 TIER_NAMES = {
     1: "01_algorithmic_structure", 2: "02_operator_fusion",
     3: "03_tiling_block_config", 4: "04_memory_access",
@@ -960,6 +981,18 @@ class Scheduler:
         ctx_path = build_planner_context(
             diagnosis, tier, self.traj["state"], self.traj.get("history", []),
             kernel_code, round_dir, fusion_analysis, tier3_sweep, handoff)
+        # ★token 预算校验: context 超限 → 明确警告 (截断保活策略的可见性检查; 140k=GLM5.1 压缩线)
+        try:
+            _ctx_chars = len(ctx_path.read_text(encoding="utf-8")) if ctx_path.exists() else 0
+            _ctx_tok = int(_ctx_chars / 2)
+            _budget = (_cfg.context.max_context_tokens if _cfg else 800_000)
+            if _ctx_tok > int(_budget * 0.8):
+                print(f"  ⚠ [context] planner_context.json 估算 {_ctx_tok} tok "
+                      f"(>{int(_budget*0.8)} = 80% 预算) — 内容过胖, planner 读文件时可能截断, 需压减")
+            else:
+                print(f"  [context] planner_context.json {_ctx_chars} 字符 ≈ {_ctx_tok} tok")
+        except Exception:
+            pass
         # ★D1: 只把 sweep 结论 (最优 BLOCK + 状态) 追加进 prompt, 完整数据在 09/sweep_result.json
         if tier3_sweep and tier3_sweep.get("available"):
             sw = tier3_sweep
@@ -1339,6 +1372,18 @@ class Scheduler:
             if h.get("speedup", 0) > h.get("prev_speedup", 0) * floor:
                 break
             no_improve += 1
+        # ★max_consecutive_reverts 接入: 连续 REVERT (全局, 不跨 tier 断) 超阈值 → 停止
+        #   (config.optim.max_consecutive_reverts, 默认 5; 防"反复尝试均被回退"的空转)
+        _max_rev = _max_consecutive_reverts()
+        _consec_rev = 0
+        for h in reversed(self.traj["history"]):
+            if h.get("decision") == "REVERT":
+                _consec_rev += 1
+            elif h.get("decision") in ("KEEP", "FAIL"):
+                break
+        if _consec_rev >= _max_rev:
+            print(f"  ⛔ 连续 {_consec_rev} 轮 REVERT ≥ {_max_rev} (max_consecutive_reverts) → 停止")
+            return tier, True
         if self.target_speedup > 0 and speedup >= self.target_speedup:
             # ★D3: 达标不硬停 — 继续探后续层确认无更大空间, 由 no_improve/max_rounds 收尾.
             print(f"  🎯 已达标 {speedup:.3f}x ≥ target {self.target_speedup}x — 继续探后续层找更大空间")
@@ -1399,10 +1444,10 @@ class Scheduler:
                 print(f"  → 晋升 Tier{tier}→Tier{tier+1} (planner: {getattr(plan,'promote_reason','瓶颈不属本tier')})")
                 st["tier"] = tier + 1
                 return tier + 1, False
-        elif no_improve >= 3 or tier >= 6:
+        elif no_improve >= _tier_promote_threshold() or tier >= 6:
             if tier >= 6:
-                if no_improve >= 3:
-                    print("  ⛔ Tier6 连续3轮无改进, 停止")
+                if no_improve >= _tier_promote_threshold():
+                    print(f"  ⛔ Tier6 连续{_tier_promote_threshold()}轮无改进, 停止")
                     return tier, True
                 # ★B1修复: Tier6 有改进 → 继续 (README 写的"连续无改进才停"; 原来一轮即停是 bug)
                 print(f"  → Tier6 有改进(no_improve={no_improve}), 继续")

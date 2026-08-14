@@ -17,7 +17,7 @@
 
 <h2>1. 优化闭环</h2>
 <div class="mermaid">
-%%{init: {'flowchart': {'curve': 'monotoneX', 'nodeSpacing': 50, 'rankSpacing': 55}}}%%
+%%{init: {'flowchart': {'curve': 'monotoneY', 'nodeSpacing': 55, 'rankSpacing': 60}}}%%
 flowchart TD
     A[输入 kernel_op.py] --> B[msprof 采集 + 分层诊断]
     B --> C[Planner LLM<br/>6 层策略: 算法→融合→分块→访存→计算→架构]
@@ -28,8 +28,8 @@ flowchart TD
     F -- 否 --> H[回退, 沿用最优]
     G --> I{还有轮次?}
     H --> I
-    I -- 是 --> B
     I -- 否 --> J[最终产物<br/>最优 kernel + vs 工业级报告]
+    I -- 是 --> B
     G -. 记录 .-> K[(优秀案例<br/>失败案例库)]
     K -. 检索参考 .-> C
 </div>

@@ -1,29 +1,44 @@
 #!/usr/bin/env python3
-"""测量"最终优化完算子"的 Event 端到端耗时 — 严格对齐工业级测量方法.
+"""测量"最终优化完算子"的耗时 — 与工业级同尺 (Event 流水化 或 msprof 纯 kernel).
 
 ══════ 用法 (910B 服务器, 有 NPU) ══════
   1. 把每个算子最终优化完的 kernel_op.py 路径填到下面 OP_PATHS (字典: 算子名 → 路径)
      ★路径: 绝对路径 或 仓库相对路径 (相对 triton_agent_optimizer/, 如 input/matmul/kernel_op.py)
-  2. python3 measure_final_event.py              # 全部测一遍 → 终端表格 + 自动写回
-     python3 measure_final_event.py --rep 50     # 调测量次数 (默认 30)
-     python3 measure_final_event.py --warmup 5   # 调预热次数 (默认 10)
-     python3 measure_final_event.py --no-write   # 只测不写回
+  2. 执行命令:
+     # ── 纯 kernel 口径 (推荐: 不含 host launch, 与工业级 --msprof 同源可比) ──
+     python3 measure_final_event.py --msprof --force
+     #   (msprof 包原文件, 目标 kernel Task Duration 求和 ÷loop; --loop N 调循环数 默认100)
+     # ── Event 口径 (默认流水化 ÷10, 与 verify/bench_all 同口径) ──
+     python3 measure_final_event.py
+     python3 measure_final_event.py --pipelined 10     # 流水化 ÷N (默认 10)
+     python3 measure_final_event.py --pipelined 0      # 单次含 host 开销
+     python3 measure_final_event.py --rep 50           # 调测量次数 (默认 30)
+     python3 measure_final_event.py --warmup 5         # 调预热次数 (默认 10)
+     # ── 写回控制 ──
+     python3 measure_final_event.py --no-write         # 只测不写回
+     python3 measure_final_event.py --force            # 写回时覆盖已有值
+     #   ★默认只替换 None 占位 (防覆盖手动/旧值); 换测量口径重测时必加 --force,
+     #     否则表格里还是旧口径的值!
 
 ══════ 自动写回 ══════
   测量成功的算子 → 结果自动写入 bench_910b3/bench_all.py 顶部的 OUR_RESULTS_US
   ("matmul": None → "matmul": 620.5), 之后跑 bench_all.py 出对比表直接带上我们结果
+  ★不覆盖已有值 (防误覆盖手动/旧值); --force 总是覆盖为最新值
 
 ══════ 测量方法 (与 bench_common.measure_event / 工业级 bench_all 同构) ══════
   - Event 设备侧计时: 每窗口 ev_s.record() → 一次完整 kernel launch 链 → ev_e.record()
-    ★每窗口只测 1 次完整调用 (不 ÷LOOP) — 与工业级每次 fn(i) 完全同构, host 下发开销全额计入
+    ★流水化 ÷N (默认 10): 窗口内连续 N 次 ÷N — host 下发开销被隐藏 ≈纯设备时间
+      (与 verify ÷LOOP / bench_all --pipelined 同口径); --pipelined 0 = 单次含 host
   - 多窗口 median: N 个独立 Event 对, 最后 sync, 取 median (抗单次抖动)
   - 破 L2: 每窗口前重建输入张量 (新地址; Ascend 无清 L2 API, 重建 = n_buf 轮换同效)
   - warmup: W 次完整链路 (JIT 编译/冷 cache 消化, 不计时)
+  - --msprof 模式: 直接 msprof 包原文件 → 目标 kernel (非 aclnn) Task Duration 求和 ÷loop
+    = 纯 kernel 时间 (不含 host launch, 与 verify 的 ns 口径同源; 小算子不受 launch 开销污染)
   ★口径声明: 与工业级同尺 (Event 设备侧端到端), 可直接与 bench_all 结果对比
   ★注意: conv2d/conv_bias_relu 的 unfold 展开张量是派生分配, 不在重建范围 (工作集小, 影响有限)
 
 ══════ 输出 ══════
-  FINAL_EVENT_E2E_US (单次完整链路 median, us) → 终端汇总表 → 写回 OUR_RESULTS_US
+  FINAL_EVENT_E2E_US (单次 median, us) 或 msprof 纯 kernel us → 终端汇总表 → 写回 OUR_RESULTS_US
 """
 import os
 import re
@@ -181,8 +196,9 @@ def _resolve(path_str: str) -> Path:
     return p if p.is_absolute() else _ROOT / p
 
 
-def _write_back(rows) -> int:
-    """测量成功的算子 → 写回 bench_all.py 的 OUR_RESULTS_US ("op": None → "op": 值).
+def _write_back(rows, force: bool = False) -> int:
+    """测量成功的算子 → 写回 bench_all.py 的 OUR_RESULTS_US.
+    默认只替换 None 占位 (防覆盖手动/旧值); force=True → 总是覆盖为最新值.
     返回写回个数."""
     if not _BENCH_ALL.exists():
         print(f"  ⚠ 找不到 {_BENCH_ALL}, 跳过写回")
@@ -192,15 +208,64 @@ def _write_back(rows) -> int:
     for op, us, _err in rows:
         if us is None:
             continue
-        pat = re.compile(rf'("{re.escape(op)}"\s*:\s*)None')
+        if force:
+            # ★force: 覆盖任意旧值 (含手动填的), 以本次测量为准
+            pat = re.compile(rf'("{re.escape(op)}"\s*:\s*)[^,\n]+')
+        else:
+            # 默认: 只替换 None 占位, 已有值不动 (防误覆盖)
+            pat = re.compile(rf'("{re.escape(op)}"\s*:\s*)None')
         new, n = pat.subn(rf"\g<1>{us:g}", src, count=1)
         if n:
             src = new
             updated.append(op)
     if updated:
         _BENCH_ALL.write_text(src, encoding="utf-8")
-        print(f"  ✅ 已写回 {_BENCH_ALL} OUR_RESULTS_US: {', '.join(updated)}")
+        print(f"  ✅ 已写回 {_BENCH_ALL} OUR_RESULTS_US: {', '.join(updated)}"
+              + (" (--force 覆盖)" if force else ""))
     return len(updated)
+
+
+def _measure_msprof(op: str, path: Path, loop: int = 100):
+    """msprof 纯 kernel 模式: 包原 kernel_op.py (KERNEL_LOOP=loop) → op_summary
+    目标 kernel (非 aclnn) Task Duration 求和 ÷loop = 单次纯 kernel 时间 (us).
+    ★与 verify 的 ns 口径同源 (不含 host launch) — 与工业级 --msprof 直接可比."""
+    import csv
+    try:
+        _msprof_out = _WORK / f"{op}_msprof"
+        import shutil as _sh
+        _sh.rmtree(_msprof_out, ignore_errors=True)
+        _msprof_out.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, KERNEL_LOOP=str(loop))
+        cmd = ["msprof", f"--output={_msprof_out}",
+               f"--application={sys.executable or 'python3'} {path}", "--ai-core=on"]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="backslashreplace",
+                           timeout=_TIMEOUT, env=env)
+        summaries = sorted(_msprof_out.rglob("op_summary*.csv"))
+        rows = []
+        for p in summaries:
+            try:
+                with open(p, encoding="utf-8") as f:
+                    rows += list(csv.DictReader(f))
+            except Exception:
+                continue
+        target_us = 0.0
+        n_rows = 0
+        for row in rows:
+            dur = row.get("Task Duration(us)") or row.get("TaskDuration")
+            opn = row.get("Op Name") or row.get("OpName") or ""
+            if dur is None or opn.startswith("aclnn"):
+                continue
+            try:
+                target_us += float(dur)
+                n_rows += 1
+            except ValueError:
+                continue
+        if n_rows < loop:
+            print(f"    ⚠ msprof 只记 {n_rows} 行 < loop({loop}) — 欠采, 结果可能偏大")
+        return round(target_us / loop, 2), None
+    except Exception as e:
+        return None, f"msprof 失败: {str(e)[:120]}"
 
 
 def main():
@@ -211,7 +276,14 @@ def main():
     p.add_argument("--pipelined", type=int, default=10, metavar="N",
                    help="流水化模式: 每窗口连续调用 N 次 ÷N (隐藏 host 开销 ≈纯设备时间, "
                         "与 verify/bench_all 同口径; 默认 10); 0=单次含 host 开销")
+    p.add_argument("--msprof", action="store_true",
+                   help="★msprof 纯 kernel 模式: 包原文件 msprof → 目标 kernel Task Duration 求和 "
+                        "÷N (不含 host launch, 与工业级 --msprof 同源可比); 替代 Event 注入计时")
+    p.add_argument("--loop", type=int, default=100, help="msprof 模式: KERNEL_LOOP 循环次数 (默认 100)")
     p.add_argument("--no-write", action="store_true", help="只测不写回 bench_all.py")
+    p.add_argument("--force", action="store_true",
+                   help="写回时覆盖已有值 (默认只替换 None 占位, 防覆盖手动/旧值; "
+                        "换测量口径重测时用 --force 更新)")
     args = p.parse_args()
 
     if not OP_PATHS:
@@ -220,21 +292,25 @@ def main():
         sys.exit(1)
 
     pipe = args.pipelined if args.pipelined and args.pipelined > 1 else 1
-    mode_s = f"流水化 ÷{pipe} (近似纯设备)" if pipe > 1 else "严格单次 (含 host)"
-    print(f"══ 最终算子 Event 测量 ({mode_s}, warmup={args.warmup}, reps={args.rep}) ══\n")
+    mode_s = "msprof 纯 kernel" if args.msprof else \
+        (f"流水化 ÷{pipe} (近似纯设备)" if pipe > 1 else "严格单次 (含 host)")
+    print(f"══ 最终算子测量 ({mode_s}{f', loop={args.loop}' if args.msprof else f', warmup={args.warmup}, reps={args.rep}'}) ══\n")
     rows = []
     for op, p_str in OP_PATHS.items():
         path = _resolve(p_str)
         print(f"⏱  {op}: {path}")
-        us, err = _measure(op, path, args.warmup, args.rep, pipe)
+        if args.msprof:
+            us, err = _measure_msprof(op, path, args.loop)
+        else:
+            us, err = _measure(op, path, args.warmup, args.rep, pipe)
         if us is not None:
-            print(f"   ✅ FINAL_EVENT_E2E_US = {us:.2f} (median of {args.rep})")
+            print(f"   ✅ FINAL_EVENT_E2E_US = {us:.2f} ({'msprof 纯 kernel' if args.msprof else 'median of ' + str(args.rep)})")
         else:
             print(f"   ❌ {err}")
         rows.append((op, us, err))
 
     print("\n" + "═" * 72)
-    print(f"  最终算子对比 (单位 us, Event median{f' 流水化÷{pipe}' if pipe > 1 else ' 单次完整链路'})")
+    print(f"  最终算子对比 (单位 us{', msprof 纯 kernel' if args.msprof else f', Event median{f' 流水化÷{pipe}' if pipe > 1 else ' 单次完整链路'}'})")
     print("═" * 72)
     print(f"  {'算子':<20}{'e2e_event(us)':>14}   状态")
     print("  " + "-" * 70)
@@ -247,7 +323,7 @@ def main():
     print(f"\n  成功 {ok}/{len(rows)} 个算子.")
 
     if not args.no_write and ok:
-        n = _write_back(rows)
+        n = _write_back(rows, force=args.force)
         if n:
             print("  下次跑 bench_all.py 出的对比表将自动带上我们结果列.")
 

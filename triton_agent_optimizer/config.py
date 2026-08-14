@@ -692,6 +692,54 @@ class ContextParams:
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
+#  LLM 参数 (集中管理模型/temperature/超时 — llm_client 统一读取)
+# ═════════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class LLMParams:
+    """LLM 调用参数 (模型名/temperature/超时/token 上限). 环境变量可覆盖."""
+
+    deepseek_model: str = "deepseek-chat"
+    """DeepSeek API 模型名 (env DEEPSEEK_MODEL)."""
+
+    anthropic_model: str = "claude-sonnet-4-20250514"
+    """Anthropic API 模型名 (env ANTHROPIC_MODEL)."""
+
+    temperature: float = 0.0
+    """采样温度 — 优化决策场景用确定性输出 (env LLM_TEMPERATURE)."""
+
+    api_timeout: float = 120.0
+    """API 调用超时秒 (env LLM_API_TIMEOUT)."""
+
+    max_tokens: int = 2048
+    """单次响应最大 token (env LLM_MAX_TOKENS)."""
+
+    cli_command: str = "nga run"
+    """CLI 模式命令 (env LLM_CLI_COMMAND, 服务器主用)."""
+
+    cli_timeout: int = 3600
+    """CLI 模式超时秒, 默认 1h 防夜间挂跑偶发卡顿 (env LLM_CLI_TIMEOUT)."""
+
+    def __post_init__(self):
+        overrides = {
+            "DEEPSEEK_MODEL": ("deepseek_model", str),
+            "ANTHROPIC_MODEL": ("anthropic_model", str),
+            "LLM_TEMPERATURE": ("temperature", float),
+            "LLM_API_TIMEOUT": ("api_timeout", float),
+            "LLM_MAX_TOKENS": ("max_tokens", int),
+            "LLM_CLI_COMMAND": ("cli_command", str),
+            "LLM_CLI_TIMEOUT": ("cli_timeout", int),
+        }
+        for env_var, (attr_name, converter) in overrides.items():
+            val = os.environ.get(env_var)
+            if val is not None:
+                try:
+                    setattr(self, attr_name, converter(val))
+                except (ValueError, TypeError):
+                    pass
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
 #  日志与输出参数
 # ═════════════════════════════════════════════════════════════════════════════════
 
@@ -766,6 +814,9 @@ class Config:
 
         # ── 上下文管理 ────────────────────────────────────────────────────────
         self.context = ContextParams()
+
+        # ── LLM 参数 ───────────────────────────────────────────────────────────
+        self.llm = LLMParams()
 
         # ── 日志输出 ──────────────────────────────────────────────────────────
         self.output = OutputParams()

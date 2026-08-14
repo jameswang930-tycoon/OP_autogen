@@ -442,6 +442,12 @@ def main():
     p.add_argument("--pipelined", type=int, default=10, metavar="N",
                    help="流水化模式: 每窗口连续调用 N 次 ÷N (隐藏 host 下发开销, 近似纯设备时间; "
                         "与 verify/measure_final_event 同口径); 0=单次含 host 开销")
+    p.add_argument("--msprof", action="store_true",
+                   help="★msprof 纯 kernel 模式: 包 msprof 跑 app → op_summary 全部行 Task Duration "
+                        "求和 ÷次数 = 纯 kernel 时间 (不含 host launch; 与我们 verify 的 ns 口径同源); "
+                        "time_us 写纯 kernel 值, kernel_time_us 同值, method=msprof-kernel")
+    p.add_argument("--measure", type=int, default=100,
+                   help="msprof 模式: app 内部 forward 循环次数 (默认 100, 越多越稳)")
     args = p.parse_args()
     sh = _shapes(args.op)
     flops = _flops(args.op, sh)
@@ -466,6 +472,45 @@ def main():
     elif args.mode == "fa":
         actual = "fa"
 
+    # ── ★msprof 纯 kernel 模式 (与 verify 的 ns 口径同源: Task Duration 求和 ÷N) ──
+    if args.msprof:
+        from bench_910b3.bench_common import measure_pytorch_msprof
+        _app_dir = _BENCH_DIR / "outputs"
+        _app_dir.mkdir(parents=True, exist_ok=True)
+        app_path = _app_dir / f"msprof_app_{args.op}_{args.mode}.py"
+        # ★生成临时 app 脚本: import 本模块的 forward 构造 (闭包无法跨进程, 用模块函数重建)
+        app_path.write_text(
+            "#!/usr/bin/env python3\n"
+            "# Auto-generated msprof app — forward 循环 (warmup + measure)\n"
+            "import os, sys\n"
+            f"sys.path.insert(0, {str(_BENCH_DIR.parent)!r})\n"
+            "from bench_910b3.bench_industrial import _make_forward, _shapes\n"
+            "import torch, torch_npu\n"
+            f"_op = {args.op!r}\n"
+            f"_mode = {args.mode!r}\n"
+            "sh = _shapes(_op)\n"
+            "fn, bufs = _make_forward(_op, sh, n_buf=64)\n"
+            "if _mode == 'compile':\n"
+            "    from bench_910b3.bench_industrial import _compile_torchair\n"
+            "    fn, actual = _compile_torchair(fn, _op, _mode)\n"
+            f"for _ in range(10):\n"
+            "    fn(*bufs[0])\n"
+            "torch.npu.synchronize()\n"
+            f"for _ in range({args.measure}):\n"
+            "    fn(*bufs[_ % len(bufs)])\n"
+            "torch.npu.synchronize()\n",
+            encoding="utf-8")
+        m = measure_pytorch_msprof(
+            f"{sys.executable or 'python3'} {app_path}", out_json, flops,
+            measure=args.measure, warmup=10)
+        if m is None:
+            print(f"[industrial] {args.op}/{args.mode} ⚠ msprof 纯 kernel 测量失败 (欠采/无 kernel) → "
+                  f"回退 Event 口径")
+        else:
+            print(f"[industrial] {args.op}/{args.mode} (msprof 纯 kernel) → {out_json.name}: "
+                  f"kernel={m['kernel_time_us']:.1f}us ÷{m['measure']} rows={m.get('rows_measured')} "
+                  f"kernels/遍={m.get('kernels_per_iter')} actual={actual}")
+            return
     # ── ★Event 设备侧计时 (do_bench 同款): 时间预算自适应 + 多窗口 median + 轮换破 L2 ──
     from bench_910b3.bench_common import measure_event
     m = measure_event(lambda i: fn(*bufs[i % len(bufs)]),

@@ -21,6 +21,14 @@ _PROJECT_DIR = Path(__file__).resolve().parent.parent
 if str(_PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(_PROJECT_DIR))
 
+# ★模型/temperature/超时统一从 config.llm 读取 (config.py LLMParams, env 可覆盖);
+#   模式检测仍看环境变量 (CLI/API key 存在性判断)
+try:
+    from config import config as _cfg
+    _LLM = _cfg.llm
+except Exception:
+    _LLM = None   # 极端情况下 config 不可用 → 退回旧环境变量直读
+
 
 class LLMClient:
     """统一 LLM 调用接口。
@@ -46,8 +54,10 @@ class LLMClient:
             return "api"
         return "stub"
 
-    def chat(self, system: str, user: str, max_tokens: int = 2048) -> str:
-        """发送 chat 请求，返回 LLM 响应文本。"""
+    def chat(self, system: str, user: str, max_tokens: Optional[int] = None) -> str:
+        """发送 chat 请求，返回 LLM 响应文本。max_tokens 缺省用 config.llm.max_tokens."""
+        if max_tokens is None:
+            max_tokens = _LLM.max_tokens if _LLM else 2048
         if self.mode == "api":
             return self._call_api(system, user, max_tokens)
         elif self.mode == "cli":
@@ -60,14 +70,18 @@ class LLMClient:
     def _call_api(self, system: str, user: str, max_tokens: int) -> str:
         deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        model = (_LLM.deepseek_model if _LLM else "deepseek-chat")
+        temp = (_LLM.temperature if _LLM else 0.0)
+        timeout = (_LLM.api_timeout if _LLM else 120.0)
 
         if deepseek_key:
             from openai import OpenAI
             client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com",
-                           timeout=120.0)
+                           timeout=timeout)
             resp = client.chat.completions.create(
-                model="deepseek-chat",
+                model=model if _LLM else "deepseek-chat",
                 max_tokens=max_tokens,
+                temperature=temp,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
@@ -79,8 +93,9 @@ class LLMClient:
             import anthropic
             client = anthropic.Anthropic(api_key=anthropic_key)
             resp = client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model=_LLM.anthropic_model if _LLM else "claude-sonnet-4-20250514",
                 max_tokens=max_tokens,
+                temperature=temp,
                 system=system,
                 messages=[{"role": "user", "content": user}],
             )
@@ -91,8 +106,8 @@ class LLMClient:
     # ── CLI 模式 ──────────────────────────────────────────────────────────────
 
     def _call_cli(self, system: str, user: str) -> str:
-        cmd = os.environ.get("LLM_CLI_COMMAND", "nga run")
-        timeout = int(os.environ.get("LLM_CLI_TIMEOUT", "3600"))   # nga 超时, 默认1h (夜里挂跑防偶发卡顿)
+        cmd = _LLM.cli_command if _LLM else os.environ.get("LLM_CLI_COMMAND", "nga run")
+        timeout = _LLM.cli_timeout if _LLM else int(os.environ.get("LLM_CLI_TIMEOUT", "3600"))
         # 合并 system prompt 和 user prompt 为一个输入
         full_prompt = f"{system}\n\n---\n\n{user}"
 

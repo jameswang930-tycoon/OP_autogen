@@ -30,6 +30,12 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional, Dict
 
+# ★统一配置 (context 预算校验用)
+try:
+    from config import config as _cfg
+except Exception:
+    _cfg = None
+
 _PROJECT_DIR = Path(__file__).resolve().parent.parent
 if str(_PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(_PROJECT_DIR))
@@ -306,6 +312,18 @@ class PlannerAgent:
 
         # v4: 统一走 LLMClient (api / nga run CLI / stub), 并引用 planner skill
         from agents.llm_client import LLMClient, extract_json
+        # ★token 预算校验: 组装后估算 prompt 大小 (tokens ≈ 字符数/2), 超 80% 预算 → 警告
+        try:
+            _tok_est = len(system_prompt) // 2
+            _budget = (_cfg.context.max_context_tokens if _cfg else 800_000)
+            _lim = int(_budget * 0.8)
+            if _tok_est > _lim:
+                print(f"  ⚠ [Planner] user prompt 估算 {_tok_est} tok > {_lim} (80% 预算) — 上下文过胖, "
+                      f"可能被 nga 截断; 建议减小 playbook/历史注入")
+            else:
+                print(f"  [Planner] user prompt {len(system_prompt)} 字符 ≈ {_tok_est} tok")
+        except Exception:
+            pass
         client = LLMClient()
         if self.use_llm and client.mode != "stub":
             system = (f"你是 Triton 优化 Planner。先调用 skill: {skill_path}, "

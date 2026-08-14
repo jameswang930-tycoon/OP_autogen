@@ -33,7 +33,9 @@ DIM = int(os.environ.get("FA_DIM", 64))         # 头维 (head_dim)
 DTYPE = torch.float16
 SCALE = 1.0 / (DIM ** 0.5)
 # ★BLOCK_M=64: 910B3 UB 192KB 限制 — 128 时 Q/S/P/acc + 流水缓冲 224KB 溢出 (实测 HIVM 编译报 UB overflow)
-BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64         # 查询块/键块/头维块
+# ★BLOCK_N=128: 循环 32→16 次, 每块 overhead 减半 (UB 预算: Q8K+K16K+V16K+S16K+P16K+acc16K ≈ 88KB,
+#   +流水缓冲 ~1.5x ≈ 132KB < 192KB 可行; 若实测 UB overflow 回退 64)
+BLOCK_M, BLOCK_N, BLOCK_K = 64, 128, 64        # 查询块/键块/头维块
 # 注意: 不传 num_warps/num_stages — triton-ascend 禁止 tune 这两个参数, 自动管理 tiling/流水
 
 
@@ -59,42 +61,46 @@ def flash_attn_mha_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
     offs_k = tl.arange(0, BLOCK_K)
     m_mask = offs_m < seq
     k_mask = offs_k < dim
+    m0 = m_block * BLOCK_M                         # 块内最小 m (因果剪枝用)
 
     # Q[h, m, k]: h*(seq*dim) + m*dim + k  (布局 [nheads, seq, dim])
     q_ptrs = q_ptr + head * (seq * dim) + offs_m[:, None] * dim + offs_k[None, :]
     q = tl.load(q_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
-    q = q * scale                                   # ★scale 预乘进 Q (省每块一次乘)
+    # ★scale 预乘后转回 fp16: scale 是 fp32 标量, 直接乘会把 Q 提升 fp32 → dot 降级 fp32 (算力 1/4)
+    q = (q * scale).to(tl.float16)
 
     acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
     m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
-    for start in range(0, seq, BLOCK_N):
+    # ★因果 kv_hi 剪枝: 只 loop 到块内最大 m (n ≤ m 才可能有效), 平均省一半循环/计算/访存
+    hi = min(seq, m0 + BLOCK_M)
+    for start in range(0, hi, BLOCK_N):
         offs_n = start + tl.arange(0, BLOCK_N)
         n_mask = offs_n < seq
         # K_t[h, k, n]: h*(dim*seq) + k*seq + n  → innermost(n) stride=1 连续✓
         #   (K_t = 每头 K^T 预转置, 和 attention_mlp 的 attention_scores 同款修法)
         k_ptrs = k_ptr + head * (dim * seq) + offs_k[:, None] * seq + offs_n[None, :]
         kk = tl.load(k_ptrs, mask=n_mask[None, :] & k_mask[:, None], other=0.0)
-        s = tl.dot(q, kk)                            # S = Q·scale @ K^T [BLOCK_M, BLOCK_N]
+        # ★S 直接 fp16 (out_dtype): dot 输出 fp16 — exp/where/转换全在 fp16, vector 引擎开销减半
+        #   (精度: S 值域 ~几十, fp16 相对精度 ~1e-3, 可接受; acc/m/l 仍 fp32)
+        s = tl.dot(q, kk, out_dtype=tl.float16)     # S = Q·scale @ K^T [BLOCK_M, BLOCK_N]
 
-        # ★因果 mask: key n 只允许 ≤ query m
+        # ★因果 mask: 剪枝后只有最后一个块跨对角线 (n > m) 需要处理
         causal = offs_n[None, :] <= offs_m[:, None]
         s = tl.where(causal, s, float("-inf"))
 
         m_curr = tl.maximum(tl.max(s, axis=1), m_i)   # running max [BLOCK_M]
-        # ★P 转 fp16: tl.dot 两个输入必须同 dtype — p 是 exp 结果(fp32), vv 是 fp16 输入,
-        #   dot(fp32, fp16) 会编译失败 → kernel 起不来 → msprof 采不到 kernel 名.
-        #   FA 标准做法: P 矩阵用 fp16 (精度损失可忽略), acc 累加保持 fp32.
-        p = tl.exp(s - m_curr[:, None]).to(tl.float16)  # [BLOCK_M, BLOCK_N]
+        # ★p 已是 fp16 (exp 输入输出 fp16), 无需再转换
+        p = tl.exp(s - m_curr[:, None])               # [BLOCK_M, BLOCK_N]
         alpha = tl.exp(m_i - m_curr)                  # 旧块衰减 [BLOCK_M]
-        # ★l_i 求和用 fp32 (p 已是 fp16, 直接 sum 会 fp16 累加掉精度; FA 标准: 归一化分母保持 fp32)
+        # ★l_i 求和用 fp32 (p 是 fp16, 直接 sum 会 fp16 累加掉精度; FA 标准: 归一化分母保持 fp32)
         l_i = alpha * l_i + tl.sum(p.to(tl.float32), axis=1)  # running sum [BLOCK_M]
 
         # V[h, n, d]: h*(seq*dim) + n*dim + d  → 行跨度=1 (连续✓)
         v_ptrs = v_ptr + head * (seq * dim) + offs_n[:, None] * dim + offs_k[None, :]
         vv = tl.load(v_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-        acc = acc * alpha[:, None] + tl.dot(p, vv)    # O 累加 [BLOCK_M, BLOCK_K]
+        acc = acc * alpha[:, None] + tl.dot(p, vv)    # O 累加 [BLOCK_M, BLOCK_K] (dot fp16×fp16→fp32)
         m_i = m_curr
 
     o = acc / l_i[:, None]                            # 归一化

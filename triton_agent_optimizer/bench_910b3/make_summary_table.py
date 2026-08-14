@@ -49,6 +49,11 @@ OP_MODES = {
     "batchnorm2d": ["eager", "compile"],
     "maxpool2d": ["eager", "compile"],
     "conv1d": ["eager", "compile"],
+    # ★复杂多算子链 (KernelBench L2/L3 风格, 2026-08-14 新增)
+    "transformer_decoder_block": ["eager", "compile"],
+    "swiglu_mlp": ["eager", "compile"],
+    "resnet_block": ["eager", "compile"],
+    "batched_matmul": ["eager", "compile"],
 }
 MODES = ["eager", "compile", "fa"]   # 表格可显示的方法 (fa 仅 flash_attention)
 
@@ -119,8 +124,11 @@ def _fmt(c, is_best):
 
 def build_table(our: dict) -> tuple:
     """读 bench_all 产物 json → 生成对比表. 返回 (lines: list[str], out_md: Path).
-    our: {算子名: 我们耗时 us}; 未提供的算子留空 (手动填)."""
+    our: {算子名: 我们耗时 us}; 未提供的算子留空 (手动填).
+    ★口径自动检测: 读 json.method — msprof=纯kernel求和 / event-pipelined=Event流水化,
+      标题与说明按实际口径生成 (不再写死 Event)."""
     rows = []
+    methods = set()
     for op, modes in OP_MODES.items():
         cell = {}
         for mode in modes:
@@ -129,7 +137,10 @@ def build_table(our: dict) -> tuple:
                 cell[mode] = None
                 continue
             actual = j.get("actual_mode", mode)
-            cell[mode] = {"t": round(j["time_us"], 1), "ok": actual == mode, "actual": actual}
+            _m = j.get("method", "event")
+            methods.add(_m)
+            cell[mode] = {"t": round(j["time_us"], 1), "ok": actual == mode,
+                          "actual": actual, "method": _m}
         # 每算子"最短耗时" (仅真正执行的方法)
         best = None
         for m in modes:
@@ -138,9 +149,17 @@ def build_table(our: dict) -> tuple:
                 best = {"m": m, "t": c["t"]}
         rows.append((op, cell, best))
 
+    # ★口径标注 (按 json.method 实际值, 不写死)
+    if all(m == "msprof" for m in methods) and methods:
+        _calibre = "msprof 纯 kernel (Task Duration 求和, 不含 host launch)"
+    elif methods and methods <= {"event", "event-pipelined"}:
+        _calibre = "Event 设备侧 (流水化 ÷N, 含 kernel 间 gap 不含 host 调度等待)"
+    else:
+        _calibre = f"混合口径: {sorted(methods)} (看各格 method 标注)"
+
     # ── markdown 表格 (7 列) ──
     lines = [
-        "# 工业级基准对比表 (910B3, Event 设备侧端到端 median, 单位 us)",
+        f"# 工业级基准对比表 (910B3, {_calibre}, 单位 us)",
         "",
         "| 算子 | eager (CANN厂商kernel) | compile (TorchAir融合) | fa (CANN FlashAttention) | 最短耗时 | 我们结果 | 对比效果 |",
         "|---|---|---|---|---|---|---|",
@@ -163,6 +182,7 @@ def build_table(our: dict) -> tuple:
     lines += [
         "",
         "说明:",
+        f"- ★当前数值口径: {_calibre}",
         "- **加粗** = 该算子工业级最短; 最短耗时 = 该值 (fa 仅 flash_attention, 为该算子唯一工业级基准)",
         "- ⚠回退 = 该方法未真正执行 (如 torchair 不可用时 compile→eager), 数值是该回退实现的重复测量, 不可当该方法的成绩",
         "- 对比效果 = 最短耗时 ÷ 我们结果: >1 = 我们比工业级最优快 (1.36x = 快 36%), <1 = 慢",

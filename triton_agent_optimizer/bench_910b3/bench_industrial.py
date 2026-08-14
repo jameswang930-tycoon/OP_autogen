@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
-"""工业级基准 — 各算子用"真正的工业级优化实现"测端到端耗时 (★Event 设备侧).
+"""工业级基准 — 各算子用"真正的工业级优化实现"测端到端耗时 (Event 设备侧 或 msprof 纯 kernel).
 
-═══ 为什么 ═══
-  跟 naive torch 比不够 — 要跟工业级天花板比. Ascend 910B 上的工业级实现:
-    - matmul/conv/norm 单算子: torch eager 已走 CANN aclnn vendor kernel (工业级)
-    - 融合链 (MLP/matmul+epilogue/逐元素): torch.compile + TorchAir 图模式 (算子融合)
-    - attention: CANN FlashAttention (torch_npu.npu_prompt_flash_attention)
-  → 我们的 triton kernel 端到端 vs 这些工业级实现的端到端.
-
-═══ 用法 (910B 服务器) ═══
-  python3 bench_industrial.py <op> [--mode eager|compile|fa] [--warmup-ms 25] [--rep-ms 100] [--n-buf 32]
+═══ 用法 (910B 服务器; 完整运行命令见 bench_all.py 顶部) ═══
+  python3 bench_industrial.py <op> [--mode eager|compile|fa] [--warmup-ms 25] [--rep-ms 100]
+                                 [--n-buf 32] [--pipelined 10] [--msprof] [--measure 100]
   例:
     python3 bench_industrial.py matmul --mode compile    # MLP 融合链 compile
     python3 bench_industrial.py flash_attention --mode fa  # CANN FlashAttention
-    python3 bench_industrial.py rms_norm --mode eager
-  输出: bench_910b3/industrial_<op>_<mode>_tflops.json
-        time_us(★median) / time_us_min / time_us_mean / rep / warmup / n_buf / actual_mode
+    python3 bench_industrial.py transformer_decoder_block --mode eager  # 复杂多算子链
+    python3 bench_industrial.py rms_norm --mode eager --msprof   # msprof 纯 kernel 口径
+  输出: bench_910b3/outputs/industrial_<op>_<mode>_tflops.json
+        time_us(★median 或 msprof 纯kernel) / method / actual_mode / pipelined_n / kernel_time_us
 
 ═══ 测量方法 (2026-08-12 对齐 triton testing.do_bench) ═══
   Event 设备侧计时 (无 profiler 扰动), 每候选:
@@ -23,6 +18,10 @@
     - 多窗口 median: n_rep 个独立 Event 对 (设备流水连续, 最后 sync) → median
     - ★输入轮换破 L2: 连续 forward 同一批张量, 工作集<192MB(L2) 时后 N 次全 L2 命中虚高;
       Ascend 无清 L2 API → n_buf 组输入轮换 (组数x单组工作集 > L2) 等效 do_bench clear_cache
+    - ★流水化 --pipelined N (默认10): 每窗口连续 N 次 ÷N → host 开销隐藏 ≈纯设备时间,
+      与 verify/measure_final_event 同口径 (小算子对比用它)
+  msprof 纯 kernel (--msprof): 包 msprof 跑 forward 循环 → op_summary Task Duration 求和 ÷次数
+    = 纯 kernel 执行时间 (不含 host launch, 与 verify 的 ns 同源; 小算子不受 launch 开销污染)
   口径声明: 工业级 = torch 全流程 (含 host 调度/内存分配); 我们 verify 的 Event = triton 纯
   kernel launch 链 → 大算子 (ms 级) 差异可忽略, 小算子 (us 级) 我们占便宜, 对比时声明.
 """
@@ -114,6 +113,24 @@ def _shapes(op):
                                         L=int(os.environ.get("C1_L", 256)),
                                         COUT=int(os.environ.get("C1_COUT", 32)),
                                         KL=int(os.environ.get("C1_KL", 3))),
+        # ★复杂多算子链 (KernelBench L2/L3 风格工业级基准, 2026-08-14 新增)
+        "transformer_decoder_block": lambda: dict(S=int(os.environ.get("TDB_SEQ", 2048)),
+                                                  D=int(os.environ.get("TDB_DIM", 1024)),
+                                                  H=int(os.environ.get("TDB_HEADS", 8)),
+                                                  HD=int(os.environ.get("TDB_HDIM", 64)),
+                                                  FFN=int(os.environ.get("TDB_FFN", 4096))),
+        "swiglu_mlp":      lambda: dict(S=int(os.environ.get("SM_SEQ", 2048)),
+                                        D=int(os.environ.get("SM_DIM", 1024)),
+                                        FFN=int(os.environ.get("SM_FFN", 4096))),
+        "resnet_block":    lambda: dict(N=int(os.environ.get("RB_N", 8)),
+                                        C=int(os.environ.get("RB_C", 64)),
+                                        H=int(os.environ.get("RB_H", 64)),
+                                        W=int(os.environ.get("RB_W", 64)),
+                                        K=int(os.environ.get("RB_K", 64))),
+        "batched_matmul":  lambda: dict(B=int(os.environ.get("BMM_B", 16)),
+                                        M=int(os.environ.get("BMM_M", 512)),
+                                        K=int(os.environ.get("BMM_K", 512)),
+                                        N=int(os.environ.get("BMM_N", 512))),
     }
     return S[op]()
 
@@ -294,6 +311,87 @@ def _make_forward(op, sh, n_buf=32):
         def fwd(x, w, b):
             return F.conv1d(x, w, b)
         return fwd, [mk() for _ in range(n)]
+    if op == "transformer_decoder_block":
+        # ★复杂链 (LLaMA 风格 decoder layer, KernelBench L3 代表):
+        #   RMSNorm → QKV投影 → RoPE → 多头注意力 → O投影 → 残差 → RMSNorm → SwiGLU FFN → 残差
+        S, D, H, HD, FFN = sh["S"], sh["D"], sh["H"], sh["HD"], sh["FFN"]
+        scale = 1.0 / (HD ** 0.5)
+        _freq = 1.0 / (10000 ** (torch.arange(0, HD, 2, device=npu).float() / HD))
+        _t = torch.arange(S, device=npu).float()
+        _cos = torch.cos(_t[:, None] * _freq[None, :]).repeat(1, 2)   # [S, HD]
+        _sin = torch.sin(_t[:, None] * _freq[None, :]).repeat(1, 2)
+        def _rope(x, cos, sin):
+            x1 = x[..., : HD // 2]
+            x2 = x[..., HD // 2:]
+            return x * cos[:, None, :] + torch.cat([-x2, x1], dim=-1) * sin[:, None, :]
+        def mk():
+            return ((torch.randn(S, D, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, H * HD, device=npu, dtype=DT) * 0.1),   # wq
+                    (torch.randn(D, H * HD, device=npu, dtype=DT) * 0.1),   # wk
+                    (torch.randn(D, H * HD, device=npu, dtype=DT) * 0.1),   # wv
+                    (torch.randn(H * HD, D, device=npu, dtype=DT) * 0.1),   # wo
+                    (torch.randn(D, FFN, device=npu, dtype=DT) * 0.1),      # wup
+                    (torch.randn(D, FFN, device=npu, dtype=DT) * 0.1),      # wgate
+                    (torch.randn(FFN, D, device=npu, dtype=DT) * 0.1),      # wdown
+                    _cos, _sin)
+        def fwd(x, wq, wk, wv, wo, wup, wgate, wdown, cos, sin):
+            h = x / torch.sqrt((x * x).mean(-1, keepdim=True) + 1e-6)
+            q = h @ wq; k = h @ wk; v = h @ wv
+            q = q.view(S, H, HD); k = k.view(S, H, HD); v = v.view(S, H, HD)
+            q = _rope(q, cos, sin); k = _rope(k, cos, sin)
+            s = (q @ k.transpose(-1, -2)) * scale
+            p = torch.softmax(s, dim=-1)
+            o = (p @ v).reshape(S, H * HD) @ wo
+            r = x + o
+            h2 = r / torch.sqrt((r * r).mean(-1, keepdim=True) + 1e-6)
+            u = h2 @ wup; g = h2 @ wgate
+            return (F.silu(u) * g) @ wdown + r
+        return fwd, [mk() for _ in range(n)]
+    if op == "swiglu_mlp":
+        # ★SwiGLU 门控 MLP (LLaMA FFN): y = (silu(x@W1) * (x@W2)) @ W3  — 3 matmul + 门控
+        S, D, FFN = sh["S"], sh["D"], sh["FFN"]
+        def mk():
+            return ((torch.randn(S, D, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, FFN, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(D, FFN, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(FFN, D, device=npu, dtype=DT) * 0.1))
+        def fwd(x, w1, w2, w3):
+            return (F.silu(x @ w1) * (x @ w2)) @ w3
+        return fwd, [mk() for _ in range(n)]
+    if op == "resnet_block":
+        # ★ResNet 残差块 (KernelBench L3 代表): Conv+BN+ReLU → Conv+BN → +残差 → ReLU
+        N, C, H, W, K = sh["N"], sh["C"], sh["H"], sh["W"], sh["K"]
+        eps = 1e-5
+        def mk():
+            return ((torch.randn(N, C, H, W, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(K, C, 3, 3, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(K, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(K, K, 3, 3, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(K, device=npu, dtype=DT) * 0.1),
+                    (torch.rand(K, device=npu, dtype=DT) * 0.5 + 0.5),   # g1 (weight1, 正)
+                    (torch.randn(K, device=npu, dtype=DT) * 0.1),        # bn1 (bias1)
+                    (torch.rand(K, device=npu, dtype=DT) * 0.5 + 0.5),   # g2 (weight2, 正)
+                    (torch.randn(K, device=npu, dtype=DT) * 0.1),        # bn2 (bias2)
+                    (torch.rand(K, device=npu, dtype=DT) * 0.5 + 0.5),   # rm1 (mean1)
+                    (torch.rand(K, device=npu, dtype=DT) * 0.5 + 0.5),   # rv1 (var1, ★必须正)
+                    (torch.rand(K, device=npu, dtype=DT) * 0.5 + 0.5),   # rm2 (mean2)
+                    (torch.rand(K, device=npu, dtype=DT) * 0.5 + 0.5))   # rv2 (var2, ★必须正)
+        def fwd(x, w1, b1, w2, b2, g1, bn1, g2, bn2, rm1, rv1, rm2, rv2):
+            y = F.relu(F.batch_norm(F.conv2d(x, w1, b1, padding=1),
+                                    rm1, rv1, g1, bn1, training=False, eps=eps))
+            y = F.batch_norm(F.conv2d(y, w2, b2, padding=1),
+                             rm2, rv2, g2, bn2, training=False, eps=eps)
+            return F.relu(y + x)
+        return fwd, [mk() for _ in range(n)]
+    if op == "batched_matmul":
+        # ★Batched Matmul (工业级多 batch GEMM): c[b] = a[b] @ b[b]
+        B, M, K, N = sh["B"], sh["M"], sh["K"], sh["N"]
+        def mk():
+            return ((torch.randn(B, M, K, device=npu, dtype=DT) * 0.1),
+                    (torch.randn(B, K, N, device=npu, dtype=DT) * 0.1))
+        def fwd(a, b):
+            return torch.bmm(a, b)
+        return fwd, [mk() for _ in range(n)]
     raise ValueError(f"未知算子: {op}")
 
 
@@ -407,6 +505,24 @@ def _flops(op, sh):
         LOUT = sh["L"] - sh["KL"] + 1
         return 2 * sh["N"] * sh["COUT"] * LOUT * sh["CIN"] * sh["KL"] + \
             2 * sh["N"] * sh["COUT"] * LOUT   # MAC + bias
+    if op == "transformer_decoder_block":
+        s, d, h, hd, ffn = sh["S"], sh["D"], sh["H"], sh["HD"], sh["FFN"]
+        return (2 * s * (4 * d * h * hd)            # QKV + O 投影 (4 个 matmul)
+                + 4 * s * s * h * hd                # S = Q@K^T + P@V
+                + 2 * s * (2 * d * ffn + ffn * d)   # SwiGLU: up+gate(d→FFN) + down(FFN→d)
+                + 4 * s * d * 2)                    # 2× RMSNorm (每元素 ~4 flop)
+    if op == "swiglu_mlp":
+        s, d, ffn = sh["S"], sh["D"], sh["FFN"]
+        return 2 * s * d * ffn * 3                 # up/gate/down 三个 matmul
+    if op == "resnet_block":
+        n, c, h, w, k = sh["N"], sh["C"], sh["H"], sh["W"], sh["K"]
+        oh = ow = h                                # padding=1, 3x3, stride=1
+        f = 2 * n * k * oh * ow * (c * 9 + k * 9)  # 两个 conv (3x3)
+        f += 6 * n * k * oh * ow * 2               # 2× BN (推理 ~6 flop/元素)
+        f += 2 * n * k * oh * ow                   # 残差 add + relu
+        return f
+    if op == "batched_matmul":
+        return 2 * sh["B"] * sh["M"] * sh["K"] * sh["N"]
     return None
 
 

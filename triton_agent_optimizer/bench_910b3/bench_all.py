@@ -1,20 +1,48 @@
 #!/usr/bin/env python3
-"""跑全部算子的工业级基准 → 自动取每算子最优 (min 端到端) + 最优来源 → 终端打印汇总表.
+"""跑全部算子的工业级基准 → 自动取每算子最优 + 自动出对比表 (★主入口).
 
-═══ 用法 (910B 服务器) ═══
-  python3 bench_all.py                 # 跑全部算子 (每个: eager+compile, flash: fa) — 需几分钟~几十分钟
-  python3 bench_all.py --op matmul     # 只跑一个算子
-  python3 bench_all.py --skip-existing # 已有 json 的不重跑 (缺的才跑)
-  python3 bench_all.py --rep-ms 100    # 每个候选测量时间预算 (默认 100ms, do_bench 同款自适应次数)
+═══ 运行命令 (910B 服务器) ═══
+  # ── 完整流程 (推荐): 我们侧纯 kernel → 工业级纯 kernel → 出表 ──
+  cd triton_agent_optimizer/bench_910b3
+  python3 ../test/measure_final_event.py --msprof --force   # ① 我们结果 (纯 kernel) → 自动写回 OUR_RESULTS_US
+  python3 bench_all.py --msprof                             # ② 工业级 (纯 kernel 口径) + 自动出对比表
+  cat outputs/industrial_summary_table.md                   # ③ 看结果
+  # ── 全部算子 (默认 Event 流水化 ÷10 口径) ──
+  python3 bench_all.py
+  # ── 测量模式切换 ──
+  python3 bench_all.py --msprof              # msprof 纯 kernel (Task Duration 求和, 与 verify ns 同源)
+  python3 bench_all.py --msprof --measure 200   # 调 msprof 循环次数 (默认 100)
+  python3 bench_all.py --pipelined 0         # Event 单次含 host 开销 (默认流水化 ÷10)
+  # ── 范围控制 ──
+  python3 bench_all.py --op matmul           # 只跑一个算子
+  python3 bench_all.py --op transformer_decoder_block --msprof   # 只跑复杂多算子链
+  python3 bench_all.py --list                # 列出算子×模式, 不跑
+  python3 bench_all.py --clean               # 清理 outputs/ 全部产物
+  # ── 单独出对比表 (不重跑测量) ──
+  python3 make_summary_table.py              # 读 outputs/*.json + OUR_RESULTS_US → industrial_summary_table.md
+  # ── 单算子单模式底层命令 ──
+  python3 bench_industrial.py <op> --mode eager|compile|fa [--msprof] [--pipelined N] [--measure N]
+
+═══ 算子清单 (17 基础 + 4 复杂多算子链) ═══
+  基础: matmul(MLP链) attention_mlp matmul_relu matmul_transpose rms_norm rms_norm_residual
+        layernorm sigmoid softmax vector_add fused_add_mul flash_attention(fa)
+        conv2d conv_bias_relu batchnorm2d maxpool2d conv1d
+  复杂 (KernelBench L2/L3 风格, 2026-08-14 新增): transformer_decoder_block(LLaMA decoder layer)
+        swiglu_mlp(LLaMA FFN) resnet_block(ResNet 残差块) batched_matmul(BMM)
+  ★我们结果填写区: 本文件顶部 OUR_RESULTS_US (或 measure_final_event 自动写回)
 
 ═══ 输出 ═══
   终端表格: 算子 | 最优模式 | 端到端us | 纯kernelus | 来源json
-  并写 bench_910b3/industrial_summary.json (供轨迹图/报告参考)
+  bench_910b3/outputs/industrial_summary.json (供轨迹图/报告参考)
+  bench_910b3/outputs/industrial_summary_table.md (★对比表: eager/compile/fa/最短耗时/我们结果/对比效果)
 
 ═══ 口径 ═══
-  每个候选 = bench_industrial.py (★Event 设备侧, 多窗口 median + 输入轮换破 L2, 见 bench_common.measure_event).
+  每个候选 = bench_industrial.py:
+    - Event 设备侧 (默认, 流水化 ÷10): 多窗口 median + 输入轮换破 L2 + 时间预算自适应 (do_bench 同款)
+    - msprof 纯 kernel (--msprof): Task Duration 求和 ÷次数, 不含 host launch (与 verify ns 同源)
   每算子最优 = 各 mode 的 time_us(median) 最小值 (eager=CANN厂商kernel, compile=TorchAir融合, fa=CANN-FA),
   且只从"真正执行"的方法里选 (actual_mode==mode; 回退的是别的方法的重复测量, 不顶替).
+  ★表格口径自动标注: 标题按 json.method 显示 "msprof 纯 kernel" 或 "Event 设备侧"
 """
 import argparse
 import json
@@ -53,6 +81,11 @@ OP_MODES = {
     "batchnorm2d": ["eager", "compile"],
     "maxpool2d": ["eager", "compile"],
     "conv1d": ["eager", "compile"],
+    # ★复杂多算子链 (KernelBench L2/L3 风格, 2026-08-14 新增)
+    "transformer_decoder_block": ["eager", "compile"],
+    "swiglu_mlp": ["eager", "compile"],
+    "resnet_block": ["eager", "compile"],
+    "batched_matmul": ["eager", "compile"],
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -151,18 +184,23 @@ def main():
         return
 
     ops = [args.op] if args.op else list(OP_MODES)
+    modes_of = {}
     for op in ops:
         if op not in OP_MODES:
             print(f"⚠ 未知算子 {op} (可用: {list(OP_MODES)})")
             sys.exit(1)
-        # ★防御: OP_MODES 值被误伤成非列表时过滤非字符串元素 (防 float mode 崩 subprocess)
+        # ★防御: OP_MODES 值被误伤成非字符串时**真正过滤** (不只警告) —
+        #   否则 float mode 会传进 bench_industrial 报 invalid choice
+        _clean = [m for m in OP_MODES[op] if isinstance(m, str)]
         _bad = [m for m in OP_MODES[op] if not isinstance(m, str)]
         if _bad:
-            print(f"⚠ OP_MODES[{op}] 含非字符串 {_bad} — 已过滤 (OP_MODES 可能被写回误伤, 请检查)")
+            print(f"⚠ OP_MODES[{op}] 含非字符串 {_bad} — 已过滤, 只跑 {_clean} "
+                  f"(OP_MODES 可能被写回误伤, 请检查文件)")
+        modes_of[op] = _clean
 
     if args.list:
         for op in ops:
-            print(f"  {op:20s} → {', '.join(str(m) for m in OP_MODES[op] if isinstance(m, str))}")
+            print(f"  {op:20s} → {', '.join(modes_of[op])}")
         return
 
     # ── 跑 / 收集 (每候选记录 kernels_per_iter + actual_mode, 供融合判定) ──
@@ -171,7 +209,7 @@ def main():
         best_t = best_k = None
         best_mode = best_file = None
         cands = []
-        for mode in OP_MODES[op]:
+        for mode in modes_of[op]:
             j = _read_json(op, mode)
             # ★默认重跑(覆盖旧结果); --skip-existing 才对已有**有效** json 跳过(只补缺的)
             #   有效 = 有 method 字段 (无 method 的旧占位/假数据不顶替, 会重跑)

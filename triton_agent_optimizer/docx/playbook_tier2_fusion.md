@@ -323,6 +323,55 @@ P_tile = tl.exp(S_tile - m_new)
 
 ---
 
+## 情况H：BN 推理并入 conv GEMM epilogue（resnet_block，2026-08-14）
+
+**触发**：ResNet 块的 `conv2d_kernel` 后跟独立 `bn_kernel`（推理, per-channel 仿射）+ `relu_kernel` → BN 中间张量落 GM 又读回。
+**收益**：BN 推理是线性变换 `(x-rm)/sqrt(rv+eps)·g+b` — kernel 内读 rm/rv/g/b 直接算，消除 bn 中间张量 GM 往返 + 1~2 次 launch。
+**怎么查**：搜 "fused conv batchnorm inference kernel"（GPU 界标准做法是把 BN fold 进权重，但我们保持 kernel 内 epilogue 计算，避免 host torch 改动）。
+
+### ❌ 问题示例（独立 BN kernel）
+```python
+# ❌ conv2d_kernel → bn_kernel → relu_kernel 三个独立 kernel, BN 中间 y1 落 GM 又读回
+bn_kernel[grid_el](y1, a1, rm1, rv1, g1, bn1, n_el, K, OH * OW, EPS, BLOCK=BLOCK_EL)
+relu_kernel[grid_el](a1, y1, n_el, BLOCK=BLOCK_EL)
+```
+**出现的问题**：y1 的 N×K×OH×OW GM 写+读全浪费（BN 是纯仿射）。
+
+### ✅ 修改后正确代码（BN+ReLU 并进 conv2d epilogue）
+```python
+# ✅ conv2d_kernel 的 acc 算完后: 
+#   val = (acc - rm[k]) / tl.sqrt(rv[k] + eps) * g[k] + b[k]   # BN 仿射, k=offs_k
+#   tl.store(..., tl.maximum(val, 0.0))                        # ReLU 同块
+# 第二个 conv 的 epilogue 同样并入 BN + 残差 add + ReLU (读 x 加进 acc)
+```
+**约束/坑**：BN 参数按通道 k 索引（`tl.load(bn_ptr + offs_k)`）；残差 add 需要原始 x（同形状）；`MATMUL_VERIFY=1` 校验。
+
+---
+
+## 情况I：SwiGLU 双路门控合并 + 门控 epilogue（swiglu_mlp / transformer_decoder_block / mixture_of_experts，2026-08-14）
+
+**触发**：`(silu(x@W1) * (x@W2)) @ W3` 当前 4 kernel（up matmul + gate matmul + silu_gate + down matmul）→ x 读两次 + act 中间张量落 GM。
+**收益**：up/gate 合并为单 matmul [S,D]@[D,2·FFN]（x 只读一次）+ silu_gate 并入 down 的 epilogue（act 不落 GM）→ 省 x 二次读 + act 往返 + 2 次 launch。
+**怎么查**：搜 "fused swiglu gated mlp triton"（LLaMA 系标准做法：gate/up 拼列一次 GEMM）。
+
+### ❌ 问题示例（4 独立 kernel）
+```python
+# ❌ mm_kernel(x,w1)→u; mm_kernel2(x,w2)→g; silu_gate(u,g)→act; mm_kernel3(act,w3)→y
+#    x 被读两次; act [S,FFN] 落 GM 又被 down 读回
+```
+**出现的问题**：x 二次读取 + act 中间张量 GM 往返 + 2 次 launch。
+
+### ✅ 修改后正确代码（双路合并 + 门控 epilogue）
+```python
+# ✅ ① up/gate 合并: w12 = cat([w1, w2], dim=1) → 单 matmul [S,D]@[D,2·FFN]
+#      kernel 内按列切分: u = acc[:, :FFN], g = acc[:, FFN:]
+#    ✅ ② down 的 epilogue: acc_down 算完后直接乘 silu(u)·g (从 GM 读 u/g 或片上保留)
+#      → act 不再物化, down 输出 = acc_down * silu(u) * g
+```
+**约束/坑**：列切分用 `offs_n < FFN` mask 或两次 store；u/g 若在 down 前需要 GM（kernel 分离时），至少保证 x 只读一次；`MATMUL_VERIFY=1` 校验（silu 公式与 torch `F.silu` 一致）。
+
+---
+
 ## 融合收益/成本模型（★先算值不值得，再决定融不融）
 
 > 不是所有相邻算子都值得融合。先估成本再动手，避免**过度融合**（情况E）和**无效融合**（白融还没收益）。

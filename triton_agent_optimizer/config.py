@@ -717,8 +717,8 @@ class LLMParams:
     cli_command: str = "nga run"
     """CLI 模式命令 (env LLM_CLI_COMMAND, 服务器主用)."""
 
-    cli_timeout: int = 3600
-    """CLI 模式超时秒, 默认 1h 防夜间挂跑偶发卡顿 (env LLM_CLI_TIMEOUT)."""
+    cli_timeout: int = 7200
+    """CLI 模式超时秒, 默认 2h — 复杂长链算子 (TDB/MoE 等) 每轮 nga 思考+输出可能很久 (env LLM_CLI_TIMEOUT)."""
 
     def __post_init__(self):
         overrides = {

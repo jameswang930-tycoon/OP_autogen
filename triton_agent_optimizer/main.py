@@ -47,10 +47,20 @@ LLM 调用（服务器无 Claude API, 用本地 codeagent）:
       LLM_CLI_COMMAND="nga run" python3 main.py input/batchnorm2d --fresh --max-rounds 30       # BatchNorm2d 推理 (通道归约, Tier1 rsqrt 乘链/Tier2 融合)
       LLM_CLI_COMMAND="nga run" python3 main.py input/maxpool2d --fresh --max-rounds 30         # MaxPool2d 窗口访存 (Tier4 连续化/Tier5 max 链)
       LLM_CLI_COMMAND="nga run" python3 main.py input/conv1d --fresh --max-rounds 30            # Conv1d (Tier1 im2col 走 cube, 同 conv2d 教学)
-     # 每轮: 采集→07字段→planner→coder→正确性校验→msprof端到端→加速比
-     # 从头开始(清 outputs/<op> + 重置): 加 --fresh
-     # 续跑(从上次 round 继续, 不清旧产物): 不加 --fresh
-     # 轮数 30 = 每个算子跑满 30 轮看最优 (默认 max_rounds=200, 这里用 30 省时间)
+      # ── ★工业界经典长链 (2026-08-14, 与 bench_910b3 工业级基准一一对应) ──
+      LLM_CLI_COMMAND="nga run" python3 main.py input/batched_matmul --fresh --max-rounds 30    # BMM 多 batch GEMM (Tier1/3/4)
+      LLM_CLI_COMMAND="nga run" python3 main.py input/swiglu_mlp --fresh --max-rounds 30         # LLaMA FFN: up/gate 2matmul+silu 门控+down (Tier2 门控并入/Tier3)
+      LLM_CLI_COMMAND="nga run" python3 main.py input/resnet_block --fresh --max-rounds 30       # ResNet 残差块: conv+BN+relu+残差 (Tier2 BN/relu 并入 conv epilogue)
+      LLM_CLI_COMMAND="nga run" python3 main.py input/vit_block --fresh --max-rounds 30          # ViT encoder: LN→QKV→MHA→GELU MLP (Tier1/2 融合)
+      LLM_CLI_COMMAND="nga run" python3 main.py input/bert_block --fresh --max-rounds 30         # BERT encoder post-LN (Tier1/2)
+      LLM_CLI_COMMAND="nga run" python3 main.py input/gqa_attention --fresh --max-rounds 30      # GQA+RoPE: QKV→RoPE→KV组复制→MHA (Tier1 RoPE 并入/Tier2)
+      LLM_CLI_COMMAND="nga run" python3 main.py input/transformer_decoder_block --fresh --max-rounds 30  # LLaMA decoder 层 (17 kernel, Tier1/2 大融合)
+      LLM_CLI_COMMAND="nga run" python3 main.py input/mamba_block --fresh --max-rounds 30        # Mamba SSM 块 (Tier1 扫描优化/Tier2)
+      LLM_CLI_COMMAND="nga run" python3 main.py input/mixture_of_experts --fresh --max-rounds 30 # MoE topk: router+8 expert SwiGLU (Tier1 稀疏路由/Tier2)
+      # 每轮: 采集→07字段→planner→coder→正确性校验→msprof端到端→加速比
+      # 从头开始(清 outputs/<op> + 重置): 加 --fresh
+      # 续跑(从上次 round 继续, 不清旧产物): 不加 --fresh
+      # 轮数 30 = 每个算子跑满 30 轮看最优 (默认 max_rounds=200, 这里用 30 省时间)
   3. 只采集+解析 (不跑优化):
      bash analyzers/run_optimize.sh input/matmul input/matmul/e2e_run
   4. 只看各 tier 筛字段 (解析完 07 自动产出):

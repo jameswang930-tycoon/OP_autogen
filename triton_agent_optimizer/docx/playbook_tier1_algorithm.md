@@ -508,6 +508,77 @@ def conv2d_im2col_kernel(x_ptr, w_ptr, y_ptr,
 
 ---
 
+## 情况H：GQA KV 组内复制消除（gqa_attention，2026-08-14）
+
+**触发**：GQA（H Q 头 / KV 个 KV 头，KV<H）在 host 用 `repeat_interleave` 把 KV 复制成 [H,S,HD] → 显式复制占内存 + 搬运，scores 每头读重复数据。
+**收益**：省 (H/KV-1) 倍的 KV 复制搬运 + 内存；kernel 内按组索引无复制。
+**怎么查**：搜 kernel 里 host 端 `repeat_interleave`/`expand`；诊断看 main_mem 流量异常大于 2×(Q+K+V) 大小。
+
+### ❌ 问题示例（host 显式复制 KV）
+```python
+# ❌ host 端把 KV 从 [KV,S,HD] 复制成 [H,S,HD] (组内重复) → 内存 ×(H/KV), 搬运浪费
+k_h.copy_(k.view(S, KV, HD).transpose(0, 1).repeat_interleave(H // KV, dim=0))
+```
+**出现的问题**：H=16, KV=4 → KV 被复制 4 份，GM 流量多 3×K+3×V。
+
+### ✅ 修改后正确代码（kernel 内按组索引）
+```python
+# ✅ scores_kernel 的 head 直接映射到 KV 组: group = head // (H // KV)
+#   K/V 指针按 group 偏移, 不物化复制 — 同一组 Q 头共享同一 KV 块 (L2 命中)
+group = head // (H // KV)
+k_ptrs = k_ptr + group * dim * seq + offs_k[:, None] * seq + offs_n[None, :]
+```
+**约束/坑**：组内多 Q 头共享 KV → 相邻 head 的 scores kernel 读同一 KV 块，靠 L2 命中；`MATMUL_VERIFY=1` 校验（组索引映射别写错）。
+
+---
+
+## 情况I：MoE 稀疏路由（mixture_of_experts，2026-08-14）
+
+**触发**：MoE 当前**全量计算 E 个 expert**（up/gate/down 全部跑），但 router 只选 topk 个 → 算力浪费 (E-TOPK)/E。
+**收益**：只算选中 expert → 计算量 ~TOPK/E（E=8,TOPK=2 → 省 4×）。
+**怎么查**：搜 "mixture of experts triton sparse routing grouped gemm"（GPU 界标准做法：按 expert 分组 + grouped GEMM）。
+
+### ❌ 问题示例（全量 experts）
+```python
+# ❌ 全量: [S,D]@[D,E*FFN] 一次算完 8 个 expert (up/gate), down 也全量 bmm
+u = (x @ w1f).view(S, E, FFN)
+```
+**出现的问题**：8 个 expert 全算，实际只用 topk=2 的结果 → 6/8 算力白费（~4× 浪费）。
+
+### ✅ 修改后正确代码（topk 稀疏: 按 expert 分组算）
+```python
+# ✅ ① router topk → 每 expert 的选中行索引 (host gather)
+#   ② up/gate/down GEMM 只对选中行算 (行数 ≈ S*TOPK/E 每 expert, 总计算量 ×TOPK/E)
+#   ③ 结果 scatter 回 [S,D] (host) — kernel 部分仍全 triton, 分组索引见情况H 同款技巧
+```
+**约束/坑**：行数不等 (负载不均衡) 是稀疏路由最大挑战；先做"分 expert 单 GEMM 只算选中行"再谈合并；`MATMUL_VERIFY=1` 校验。
+
+---
+
+## 情况J：Mamba SSM 扫描 triton 化（mamba_block，2026-08-14）
+
+**触发**：Mamba 的时序递推 `h_t = dA_t·h_{t-1} + dB_t` 当前用 torch `cumsum`（body 内, log 域关联扫描）→ 多次 GM 往返 + 无法利用 kernel 内寄存器。
+**收益**：scan 进 triton kernel（分段扫描 chunked scan: 每 chunk 并行前缀 + chunk 间状态传播）→ 消除中间 GM 往返。
+**怎么查**：搜 "associative scan triton flash linear attention"（chunked scan 是 Triton 社区标准做法）。
+
+### ❌ 问题示例（torch cumsum 在 body 里）
+```python
+# ❌ body 内 torch 关联扫描: logP=cumsum(log(dA)); h=cumsum(dB*exp(-logP))*exp(logP)
+#    → 每轮 N 次 torch kernel launch + 中间张量落 GM
+```
+**出现的问题**：scan 部分与 triton kernel 之间反复 GM 往返，L=1024 时 launch 开销可观。
+
+### ✅ 修改后正确代码（chunked scan kernel）
+```python
+# ✅ 每 program 处理一个 chunk (如 128 步): 
+#   ① 块内并行前缀: 计算 chunk 内 h 序列 (寄存器/UB 内)
+#   ② 块间状态传播: 先算 chunk 起点状态 (前缀扫描, 每 chunk 一个 program), 再修正块内结果
+#   等价于 flash-linear-attention 的 chunked scan 结构 (dA 对角 → 元素级可并行)
+```
+**约束/坑**：对角 dA 使前缀可并行（h_t = P_t·Σ(dB_i/P_i)）；chunk 内用 log 域防下溢；先验证 chunked 与 cumsum 数值一致（`MATMUL_VERIFY=1`）。
+
+---
+
 ## 通用算法替换原则
 
 1. **先判瓶颈类型再选算法**：compute_bound → 精度/算法效率；memory_bound → 省访存（online/flash/合并）。

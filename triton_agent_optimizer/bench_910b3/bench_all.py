@@ -98,12 +98,15 @@ def _run_one(op, mode, rep_ms, pipelined, msprof, measure):
     ★pipelined>1: 流水化 /N (隐藏 host 开销, 近似纯设备时间).
     ★msprof=True: msprof 纯 kernel 求和口径 (与 verify ns 同源)."""
     script = _BENCH_DIR / "bench_industrial.py"
-    cmd = [sys.executable or "python3", str(script), op, "--mode", mode,
+    cmd = [sys.executable or "python3", str(script), op, "--mode", str(mode),
            "--rep-ms", str(rep_ms)]
     if pipelined and pipelined > 1:
         cmd += ["--pipelined", str(pipelined)]
     if msprof:
         cmd += ["--msprof", "--measure", str(measure)]
+    # ★防御: 全部转 str — OP_MODES 被写回误伤成数字时, 遍历会拿到 float,
+    #   subprocess._fork_exec 报 "expected str... not float"
+    cmd = [str(c) for c in cmd]
     print(f"\n══ {op} [{mode}] ══", flush=True)
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200,
                        encoding="utf-8", errors="backslashreplace")
@@ -152,10 +155,14 @@ def main():
         if op not in OP_MODES:
             print(f"⚠ 未知算子 {op} (可用: {list(OP_MODES)})")
             sys.exit(1)
+        # ★防御: OP_MODES 值被误伤成非列表时过滤非字符串元素 (防 float mode 崩 subprocess)
+        _bad = [m for m in OP_MODES[op] if not isinstance(m, str)]
+        if _bad:
+            print(f"⚠ OP_MODES[{op}] 含非字符串 {_bad} — 已过滤 (OP_MODES 可能被写回误伤, 请检查)")
 
     if args.list:
         for op in ops:
-            print(f"  {op:20s} → {', '.join(OP_MODES[op])}")
+            print(f"  {op:20s} → {', '.join(str(m) for m in OP_MODES[op] if isinstance(m, str))}")
         return
 
     # ── 跑 / 收集 (每候选记录 kernels_per_iter + actual_mode, 供融合判定) ──

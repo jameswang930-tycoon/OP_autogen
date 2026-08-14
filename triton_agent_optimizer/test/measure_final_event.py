@@ -97,15 +97,17 @@ def _inject(src: str, warmup: int, reps: int) -> str:
     if not body.strip():
         return ""
     body_deep = "".join(("    " + ln if ln.strip() else ln) for ln in body.splitlines(keepends=True))
+    ind = " " * base_indent
     # 循环前的 torch 直接分配行 (重建破 L2)
     alloc_lines = []
     for _ln in lines[:for_idx]:
         m = re.match(r"^\s{4,}(\w+)\s*=\s*torch\.(randn?|rand|empty|zeros|ones)\(", _ln)
         if m:
             alloc_lines.append((_ln.rstrip("\n"), m.group(1)))
-    alloc_block = "".join(("    " + a.lstrip() + "\n") for a, _ in alloc_lines)
+    # ★缩进: 注入块的 for _r 在 ind+4, 体内语句在 ind+8 (12 空格, 与 _ev_s 同级)
+    alloc_block = "".join((ind + "        " + a.lstrip() + "\n") for a, _ in alloc_lines)
     names = ", ".join(n for _, n in alloc_lines)
-    keep_block = f"        _keep.append(({names}))\n" if names else ""
+    keep_block = f"{ind}        _keep.append(({names}))\n" if names else ""
     ind = " " * base_indent
     inject = (
         f"{ind}# ★严格单次 Event 计时 (注入; FINAL_EVENT_TIME 触发)\n"

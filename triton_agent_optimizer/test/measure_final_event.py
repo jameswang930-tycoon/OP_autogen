@@ -208,11 +208,11 @@ def _write_back(rows, force: bool = False) -> int:
     for op, us, _err in rows:
         if us is None:
             continue
+        # ★值模式限定 None 或数字: 绝不匹配列表 (如 OP_MODES 的 ["eager",...]),
+        #   OP_MODES 在 OUR_RESULTS_US 之前, 否则 --force 会破坏它 (expected ':' after dictionary key)
         if force:
-            # ★force: 覆盖任意旧值 (含手动填的), 以本次测量为准
-            pat = re.compile(rf'("{re.escape(op)}"\s*:\s*)[^,\n]+')
+            pat = re.compile(rf'("{re.escape(op)}"\s*:\s*)(None|\d+(?:\.\d+)?)')
         else:
-            # 默认: 只替换 None 占位, 已有值不动 (防误覆盖)
             pat = re.compile(rf'("{re.escape(op)}"\s*:\s*)None')
         new, n = pat.subn(rf"\g<1>{us:g}", src, count=1)
         if n:

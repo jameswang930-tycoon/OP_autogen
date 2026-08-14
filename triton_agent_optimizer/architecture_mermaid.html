@@ -74,11 +74,15 @@ flowchart TD
 
     C --> E["整合 planner_context.json"]:::diag
 
+    PDOC["planner 读取: skill/playbook<br/>07字段/轨迹/优秀案例"]:::doc -.-> P
+
     P["Planner LLM 制定策略"]:::llm
     E --> P
 
     PL["plan.md<br/>优化指导手册 changes[]"]:::out
     P --> PL
+
+    CDOC["coder 读取: skill/coding_guide<br/>失败案例库(指纹+关键词检索)"]:::doc -. "检索学习<br/>+报错信息" .-> CD
 
     CD["Coder 修改代码"]:::llm
     PL --> CD
@@ -89,12 +93,11 @@ flowchart TD
     V{"verify<br/>正确性验证"}:::decide
     NC --> V
     V -- "失败 → 打回重改" --> CD
-    MEM[("memory<br/>错误案例库")]:::doc -. "检索学习<br/>+报错信息" .-> CD
 
-    M["msprof 测量 kernel 耗时<br/>口径: 数据搬运起止<br/>不含启动开销"]:::diag
+    M["验证测量<br/>Event 快测(判门) + msprof 全量<br/>口径: 纯 kernel 时间, 不含启动开销"]:::diag
     V -- "通过" --> M
 
-    CMP{"加速比 > baseline?"}:::decide
+    CMP{"Event 快于历史最优?<br/>(绝对延迟比较)"}:::decide
     M --> CMP
     K["保留进链"]:::ok
     R["回退"]:::fail

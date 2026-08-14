@@ -129,7 +129,7 @@ def _inject(src: str, warmup: int, reps: int) -> str:
         f"{ind}        _ts.append(_ev_s.elapsed_time(_ev_e))\n"
         f"{ind}    torch.npu.synchronize()\n"
         f"{ind}    _ts.sort()\n"
-        f"{ind}    print('FINAL_EVENT_E2E_US:%.2f' % _ts[len(_ts) // 2])\n"
+        f"{ind}    print('FINAL_EVENT_E2E_US:%.2f' % (_ts[len(_ts) // 2] * 1000.0))\n"
         f"{ind}    raise SystemExit(0)\n"
     )
     out = "".join(lines[:for_idx]) + inject + "".join(lines[for_idx:])

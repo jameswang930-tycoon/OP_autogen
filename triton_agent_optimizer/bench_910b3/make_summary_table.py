@@ -103,7 +103,23 @@ def main():
                    help="从文件读我们结果 (每行 op=us, # 开头为注释)")
     args = p.parse_args()
     our = _parse_our(args.our, args.our_file)
+    lines, out_md = build_table(our)
+    print(f"→ {out_md}")
+    print("\n".join(lines))
 
+
+def _fmt(c, is_best):
+    if c is None:
+        return "—"
+    s = f"{c['t']:g}"
+    if not c["ok"]:
+        s += " ⚠回退"
+    return f"**{s}**" if is_best else s
+
+
+def build_table(our: dict) -> tuple:
+    """读 bench_all 产物 json → 生成对比表. 返回 (lines: list[str], out_md: Path).
+    our: {算子名: 我们耗时 us}; 未提供的算子留空 (手动填)."""
     rows = []
     for op, modes in OP_MODES.items():
         cell = {}
@@ -121,14 +137,6 @@ def main():
             if c and c["ok"] and (best is None or c["t"] < best["t"]):
                 best = {"m": m, "t": c["t"]}
         rows.append((op, cell, best))
-
-    def _fmt(c, is_best):
-        if c is None:
-            return "—"
-        s = f"{c['t']:g}"
-        if not c["ok"]:
-            s += " ⚠回退"
-        return f"**{s}**" if is_best else s
 
     # ── markdown 表格 (7 列) ──
     lines = [
@@ -158,13 +166,25 @@ def main():
         "- **加粗** = 该算子工业级最短; 最短耗时 = 该值 (fa 仅 flash_attention, 为该算子唯一工业级基准)",
         "- ⚠回退 = 该方法未真正执行 (如 torchair 不可用时 compile→eager), 数值是该回退实现的重复测量, 不可当该方法的成绩",
         "- 对比效果 = 最短耗时 ÷ 我们结果: >1 = 我们比工业级最优快 (1.36x = 快 36%), <1 = 慢",
-        "- \"我们结果\"列: 填法一 在 outputs/our_results.txt 提前填好 (每行 op=us) 自动读取; "
-        "填法二 `--our matmul=620.5` / `--our-file 文件`",
+        "- \"我们结果\"列: 填法一 bench_all.py 顶部 OUR_RESULTS_US 提前填好自动带; "
+        "填法二 outputs/our_results.txt (每行 op=us) / `--our matmul=620.5`",
         "- 口径对齐: 我们 verify 的 e2e_event_ns (Event 设备侧, 同尺对比)",
     ]
     out_md = _OUT / "industrial_summary_table.md"
     _OUT.mkdir(parents=True, exist_ok=True)
     out_md.write_text("\n".join(lines), encoding="utf-8")
+    return lines, out_md
+
+
+def main():
+    p = argparse.ArgumentParser(description="工业级基准 vs 我们结果对比表")
+    p.add_argument("--our", action="append", default=None,
+                   help='我们结果, 可多次: --our matmul=620.5 --our conv2d=310.2 (单位 us)')
+    p.add_argument("--our-file", type=str, default=None,
+                   help="从文件读我们结果 (每行 op=us, # 开头为注释)")
+    args = p.parse_args()
+    our = _parse_our(args.our, args.our_file)
+    lines, out_md = build_table(our)
     print(f"→ {out_md}")
     print("\n".join(lines))
 

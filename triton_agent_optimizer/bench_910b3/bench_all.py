@@ -55,6 +55,31 @@ OP_MODES = {
     "conv1d": ["eager", "compile"],
 }
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ★我们优化结果填写区 — 单位 us (Event 设备侧端到端 median, 与工业级同尺)
+#    每个算子跑完优化循环后, 把最后一轮 e2e_event 填到对应行 (None 或 0 = 未填, 表格留空)
+#    跑完 bench_all 自动出对比表: outputs/industrial_summary_table.md
+# ═══════════════════════════════════════════════════════════════════════════════
+OUR_RESULTS_US = {
+    "matmul": None,             # 例如 620.5
+    "attention_mlp": None,
+    "matmul_relu": None,
+    "matmul_transpose": None,
+    "rms_norm": None,
+    "rms_norm_residual": None,
+    "layernorm": None,
+    "sigmoid": None,
+    "softmax": None,
+    "vector_add": None,
+    "fused_add_mul": None,
+    "flash_attention": None,
+    "conv2d": None,
+    "conv_bias_relu": None,
+    "batchnorm2d": None,
+    "maxpool2d": None,
+    "conv1d": None,
+}
+
 
 def _read_json(op, mode):
     p = _BENCH_DIR / "outputs" / f"industrial_{op}_{mode}_tflops.json"
@@ -193,6 +218,16 @@ def main():
     (_out_dir / "industrial_summary.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"  汇总 → {_out_dir}/industrial_summary.json")
+
+    # ★自动出对比表 (OUR_RESULTS_US 填了就有我们结果+对比效果; 没填则留空)
+    try:
+        from bench_910b3.make_summary_table import build_table
+        our = {k: v for k, v in OUR_RESULTS_US.items() if v}
+        lines, out_md = build_table(our)
+        print(f"  对比表 → {out_md}")
+        print("\n".join(lines))
+    except Exception as e:
+        print(f"  ⚠ 对比表生成失败: {str(e)[:100]} (可单独运行 make_summary_table.py)")
 
 
 if __name__ == "__main__":

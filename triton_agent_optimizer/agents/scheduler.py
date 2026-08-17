@@ -820,9 +820,9 @@ class Scheduler:
           否则 run_optimize 默认 512 会覆盖 kernel_op.py 里的默认值 → baseline 尺寸与 verify 不一致,
           speedup 严重失真 (512³ 的 FLOPs 只有 2048³ 的 1/64).
         TIER 环境变量传给 run_optimize, 让它解析完自动产出 07_tier<N>_fields。
-        ★路径可用 env RUN_OPTIMIZE_SH 覆盖 (默认 analyzers/run_optimize.sh)。"""
-        run_sh = os.environ.get("RUN_OPTIMIZE_SH",
-                                (_PROJECT / "analyzers" / "run_optimize.sh").as_posix())
+        ★2026-08-17: 硬编码项目自带 analyzers/run_optimize.sh — 移除 RUN_OPTIMIZE_SH env 覆盖
+          (曾因服务器设了指向改版脚本 → 每轮采集全失败)。"""
+        run_sh = (_PROJECT / "analyzers" / "run_optimize.sh").as_posix()
         input_dir = self.current_kernel.parent    # round1=源目录; 后续=上一轮输出目录
         cmd = ["bash", run_sh, str(input_dir), str(round_dir)]
         mnk = _extract_mnk(self.current_kernel.read_text(encoding="utf-8")
@@ -1525,6 +1525,23 @@ class Scheduler:
                     _dev_poisoned = True
                 else:
                     print(f"  [诊断] 采集失败 — warmup/msprof 未见目标 kernel. 可能 kernel 运行时崩溃/msprof 漏采.")
+                # ★msprof 是否真的执行了? 看 05_task 产物 (task_run.txt 存在 = 通用 msprof 跑过;
+                #   op_summary*.csv 存在 = 采到了骨架; task.json 存在 = 解析产物)
+                _t5 = round_dir / "05_task"
+                _has_run = _tf.exists()
+                _osum = list((_t5 / "task_prof").glob("op_summary*.csv")) if (_t5 / "task_prof").exists() else []
+                _has_tj = (_t5 / "task.json" if hasattr(_t5, "__truediv__") else None)
+                _tj = round_dir / "06_diagnosis" / "task.json"
+                if not _has_run:
+                    print(f"  [诊断] ⚠ {_t5}/ 下无 task_run.txt → run_optimize 未执行到通用 msprof "
+                          f"(前置步骤 exit, 看 run_optimize 输出/输入目录是否有 kernel_op.py)")
+                else:
+                    print(f"  [诊断] 05_task 产物: task_run.txt ✓ (msprof 已跑) | "
+                          f"op_summary x{len(_osum)} | task.json "
+                          f"{'✓' if (_tj.exists() or (_t5/'task.json').exists()) else '✗ 未生成(解析失败)'}")
+                    if _osum and not (_tj.exists() or (_t5/'task.json').exists()):
+                        print(f"  [诊断]   ↑ op_summary 有 {len(_osum)} 个但 task.json 没生成 → "
+                              f"pipeline_parse_task.py 解析失败 (看列名/版本)")
                 if _wt.strip():
                     print(f"  ── warmup.txt 尾部 ──\n{_wt.strip()[-300:]}")
                 if _tt.strip():

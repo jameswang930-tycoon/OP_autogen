@@ -204,22 +204,25 @@ def pv_kernel(p_ptr, v_ptr, o_ptr, seq, dim, nheads,
     tl.store(o_ptrs, acc, mask=(offs_m[:, None] < seq) & (offs_d[None, :] < dim))
 
 
-# RoPE 旋转 (cos/sin 表 [S, HD])
+# RoPE 旋转 (cos/sin 表 [S, HD]) — ★v2 无 gather: 每 program 一个 head 段, 连续双段 load 组装
+#   (旧版 offs-d+d2 的 where 向量索引 = 非仿射 gather, triton-ascend 编译/msprof op 深度 profiling 易失败 → 采集链失败)
 @triton.jit
 def rope_kernel(x_ptr, cos_ptr, sin_ptr, y_ptr,
                 seq, dim, hd,
                 BLOCK: tl.constexpr):
-    row = tl.program_id(axis=0)
+    pid = tl.program_id(axis=0)
+    nseg = dim // hd
+    row = pid // nseg
+    seg = pid % nseg
     offs = tl.arange(0, BLOCK)
-    mask = offs < dim
-    x = tl.load(x_ptr + row * dim + offs, mask=mask, other=0.0)
-    d = offs % hd
-    cos = tl.load(cos_ptr + row * hd + d, mask=mask, other=0.0)
-    sin = tl.load(sin_ptr + row * hd + d, mask=mask, other=0.0)
-    d2 = tl.where(d < hd // 2, d + hd // 2, d - hd // 2)
-    x2 = tl.load(x_ptr + row * dim + (offs - d) + d2, mask=mask, other=0.0)
-    sign = tl.where(d < hd // 2, -1.0, 1.0)
-    tl.store(y_ptr + row * dim + offs, x * cos + sign * x2 * sin, mask=mask)
+    mask = offs < hd // 2
+    base = row * dim + seg * hd
+    x1 = tl.load(x_ptr + base + offs, mask=mask, other=0.0)             # 低半 (连续)
+    x2 = tl.load(x_ptr + base + offs + hd // 2, mask=mask, other=0.0)   # 高半 (连续)
+    c = tl.load(cos_ptr + row * hd + offs, mask=mask, other=0.0)        # 段内 cos (各段相同)
+    s = tl.load(sin_ptr + row * hd + offs, mask=mask, other=0.0)
+    tl.store(y_ptr + base + offs, x1 * c - x2 * s, mask=mask)
+    tl.store(y_ptr + base + offs + hd // 2, x2 * c + x1 * s, mask=mask)
 
 
 
@@ -227,17 +230,19 @@ def rope_kernel(x_ptr, cos_ptr, sin_ptr, y_ptr,
 def rope_kernel2(x_ptr, cos_ptr, sin_ptr, y_ptr,
                 seq, dim, hd,
                 BLOCK: tl.constexpr):
-    row = tl.program_id(axis=0)
+    pid = tl.program_id(axis=0)
+    nseg = dim // hd
+    row = pid // nseg
+    seg = pid % nseg
     offs = tl.arange(0, BLOCK)
-    mask = offs < dim
-    x = tl.load(x_ptr + row * dim + offs, mask=mask, other=0.0)
-    d = offs % hd
-    cos = tl.load(cos_ptr + row * hd + d, mask=mask, other=0.0)
-    sin = tl.load(sin_ptr + row * hd + d, mask=mask, other=0.0)
-    d2 = tl.where(d < hd // 2, d + hd // 2, d - hd // 2)
-    x2 = tl.load(x_ptr + row * dim + (offs - d) + d2, mask=mask, other=0.0)
-    sign = tl.where(d < hd // 2, -1.0, 1.0)
-    tl.store(y_ptr + row * dim + offs, x * cos + sign * x2 * sin, mask=mask)
+    mask = offs < hd // 2
+    base = row * dim + seg * hd
+    x1 = tl.load(x_ptr + base + offs, mask=mask, other=0.0)
+    x2 = tl.load(x_ptr + base + offs + hd // 2, mask=mask, other=0.0)
+    c = tl.load(cos_ptr + row * hd + offs, mask=mask, other=0.0)
+    s = tl.load(sin_ptr + row * hd + offs, mask=mask, other=0.0)
+    tl.store(y_ptr + base + offs, x1 * c - x2 * s, mask=mask)
+    tl.store(y_ptr + base + offs + hd // 2, x2 * c + x1 * s, mask=mask)
 
 
 @triton.jit
@@ -290,7 +295,8 @@ def main():
     grid_s = (H * triton.cdiv(S, BLOCK_M) * triton.cdiv(S, BLOCK_N),)
     grid_pv = (H * triton.cdiv(S, BLOCK_M) * triton.cdiv(HD, BLOCK_K),)
     grid_sm = (H * S,)
-    grid_rope = (S,)
+    grid_rope_q = (S * (QD // HD),)               # ★v2: 每 program 一个 head 段
+    grid_rope_k = (S * (KVD // HD),)
     grid_el = (triton.cdiv(S * D, BLOCK_EL),)
     print(f"[info] GQA S={S} D={D} H={H} HD={HD} KV={KV} kernels=9")
 
@@ -309,8 +315,8 @@ def main():
                                x.stride(0), x.stride(1), wv.stride(0), wv.stride(1),
                                v.stride(0), v.stride(1),
                                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K)
-        rope_kernel[grid_rope](q, cos_t, sin_t, q, S, QD, HD, BLOCK=BLOCK_ROPE)
-        rope_kernel2[grid_rope](k, cos_t, sin_t, k, S, KVD, HD, BLOCK=BLOCK_ROPE)
+        rope_kernel[grid_rope_q](q, cos_t, sin_t, q, S, QD, HD, BLOCK=HD)
+        rope_kernel2[grid_rope_k](k, cos_t, sin_t, k, S, KVD, HD, BLOCK=HD)
         # ★GQA 组内复制 (host, body 内): KV 头 → H 头
         k_h.copy_(k.view(S, KV, HD).transpose(0, 1).repeat_interleave(H // KV, dim=0))
         v_h.copy_(v.view(S, KV, HD).transpose(0, 1).repeat_interleave(H // KV, dim=0))

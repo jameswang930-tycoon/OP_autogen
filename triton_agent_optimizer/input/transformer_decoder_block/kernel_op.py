@@ -306,21 +306,25 @@ def rmsnorm_kernel2(x_ptr, w_ptr, y_ptr, rows, cols, eps, BLOCK: tl.constexpr):
 
 
 # RoPE 旋转 (逐位置, 与头无关): cos/sin 表 [S, HD] (freq 按 i%(HD/2))
+# ★v2 无 gather: 每 program 一个 head 段, 连续双段 load 组装 (旧 offs-d+d2 非仿射索引
+#   triton-ascend 编译/msprof op 深度 profiling 易失败 → 采集链失败)
 @triton.jit
 def rope_kernel(x_ptr, cos_ptr, sin_ptr, y_ptr,
                 seq, dim, hd,
                 BLOCK: tl.constexpr):
-    row = tl.program_id(axis=0)
+    pid = tl.program_id(axis=0)
+    nseg = dim // hd
+    row = pid // nseg
+    seg = pid % nseg
     offs = tl.arange(0, BLOCK)
-    mask = offs < dim
-    x = tl.load(x_ptr + row * dim + offs, mask=mask, other=0.0)
-    d = offs % hd
-    cos = tl.load(cos_ptr + row * hd + d, mask=mask, other=0.0)
-    sin = tl.load(sin_ptr + row * hd + d, mask=mask, other=0.0)
-    d2 = tl.where(d < hd // 2, d + hd // 2, d - hd // 2)
-    x2 = tl.load(x_ptr + row * dim + (offs - d) + d2, mask=mask, other=0.0)
-    sign = tl.where(d < hd // 2, -1.0, 1.0)
-    tl.store(y_ptr + row * dim + offs, x * cos + sign * x2 * sin, mask=mask)
+    mask = offs < hd // 2
+    base = row * dim + seg * hd
+    x1 = tl.load(x_ptr + base + offs, mask=mask, other=0.0)
+    x2 = tl.load(x_ptr + base + offs + hd // 2, mask=mask, other=0.0)
+    c = tl.load(cos_ptr + row * hd + offs, mask=mask, other=0.0)
+    s = tl.load(sin_ptr + row * hd + offs, mask=mask, other=0.0)
+    tl.store(y_ptr + base + offs, x1 * c - x2 * s, mask=mask)
+    tl.store(y_ptr + base + offs + hd // 2, x2 * c + x1 * s, mask=mask)
 
 
 # 逐元素: gated = silu(u) * g
@@ -329,17 +333,19 @@ def rope_kernel(x_ptr, cos_ptr, sin_ptr, y_ptr,
 def rope_kernel2(x_ptr, cos_ptr, sin_ptr, y_ptr,
                 seq, dim, hd,
                 BLOCK: tl.constexpr):
-    row = tl.program_id(axis=0)
+    pid = tl.program_id(axis=0)
+    nseg = dim // hd
+    row = pid // nseg
+    seg = pid % nseg
     offs = tl.arange(0, BLOCK)
-    mask = offs < dim
-    x = tl.load(x_ptr + row * dim + offs, mask=mask, other=0.0)
-    d = offs % hd
-    cos = tl.load(cos_ptr + row * hd + d, mask=mask, other=0.0)
-    sin = tl.load(sin_ptr + row * hd + d, mask=mask, other=0.0)
-    d2 = tl.where(d < hd // 2, d + hd // 2, d - hd // 2)
-    x2 = tl.load(x_ptr + row * dim + (offs - d) + d2, mask=mask, other=0.0)
-    sign = tl.where(d < hd // 2, -1.0, 1.0)
-    tl.store(y_ptr + row * dim + offs, x * cos + sign * x2 * sin, mask=mask)
+    mask = offs < hd // 2
+    base = row * dim + seg * hd
+    x1 = tl.load(x_ptr + base + offs, mask=mask, other=0.0)
+    x2 = tl.load(x_ptr + base + offs + hd // 2, mask=mask, other=0.0)
+    c = tl.load(cos_ptr + row * hd + offs, mask=mask, other=0.0)
+    s = tl.load(sin_ptr + row * hd + offs, mask=mask, other=0.0)
+    tl.store(y_ptr + base + offs, x1 * c - x2 * s, mask=mask)
+    tl.store(y_ptr + base + offs + hd // 2, x2 * c + x1 * s, mask=mask)
 
 
 # 逐元素: gated = silu(u) * g
@@ -427,7 +433,7 @@ def main():
     grid_pv = (H * triton.cdiv(S, BLOCK_M) * triton.cdiv(D, BLOCK_K),)
     grid_sm = (H * S,)
     grid_ln = (S,)
-    grid_rope = (S,)
+    grid_rope = (S * (HD_D // HD),)               # ★v2: 每 program 一个 head 段
     grid_el = (triton.cdiv(S * D, BLOCK_EL),)
     grid_el_f = (triton.cdiv(S * FFN, BLOCK_EL),)
     print(f"[info] TDB S={S} D={D} H={H} HD={HD} FFN={FFN} kernels=12")
@@ -448,8 +454,8 @@ def main():
                                h.stride(0), h.stride(1), wv.stride(0), wv.stride(1),
                                v.stride(0), v.stride(1),
                                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K)
-        rope_kernel[grid_rope](q, cos_t, sin_t, q, S, HD_D, HD, BLOCK=BLOCK_ROPE)
-        rope_kernel2[grid_rope](k, cos_t, sin_t, k, S, HD_D, HD, BLOCK=BLOCK_ROPE)
+        rope_kernel[grid_rope](q, cos_t, sin_t, q, S, HD_D, HD, BLOCK=HD)
+        rope_kernel2[grid_rope](k, cos_t, sin_t, k, S, HD_D, HD, BLOCK=HD)
         k_t.copy_(k.view(S, H, HD).permute(1, 2, 0))
         v_hsd.copy_(v.view(S, H, HD).permute(1, 0, 2))
         scores_kernel[grid_s](q, k_t, s, S, HD, H, SCALE,

@@ -949,6 +949,8 @@ cat outputs/<op>/optimization.log
 | `kernels[].deep.roofline.bottleneck_type` | 瓶颈类型 | 一针见血: compute/memory/latency/balanced → 本层是否瓶颈 |
 | `kernels[].task.pipes_us.aiv_vec_time_us` | 向量耗时 (per-kernel) | 向量 kernel (rms_norm/softmax/bias_gelu) 的实际耗时占比 |
 
+
+
 ### 9.2 Tier2 算子融合
 
 **优化什么**: 多 kernel → 单 kernel (逐元素并入 matmul epilogue / 残差 / 冗余 load)。
@@ -966,6 +968,8 @@ cat outputs/<op>/optimization.log
 | `framework_kernels` | 框架 kernel(非目标) | 哪些是 aclnn 数据准备, 是否本可避免 |
 | `kernels[].deep.roofline.compute_utilization` | 算力利用率 (per-kernel) | 低利用率的独立小 kernel = 最该并入的候选 |
 | `kernels[].launch_count` | launch 次数 (per-kernel) | 每 kernel 被 launch 几次, 占比口径 |
+
+
 
 ### 9.3 Tier3 分块配置
 
@@ -985,6 +989,8 @@ cat outputs/<op>/optimization.log
 | `kernels[].task.pipes_us.aic_mte1_time_us` | MTE1(L1→L0A/B)耗时 (per-kernel) | 搬运实际耗时 → BLOCK 该调大/调小 |
 | `kernels[].deep.conflict.bank_cflt_ratio` | bank 冲突 (per-kernel) | 大块时 UB bank 冲突 |
 
+
+
 ### 9.4 Tier4 访存
 
 **优化什么**: GM 带宽 / L2 复用 / 连续化 / 128-bit 对齐 / 流水线。
@@ -1003,6 +1009,8 @@ cat outputs/<op>/optimization.log
 | `kernels[].deep.roofline.arithmetic_intensity` | 算术强度 | 确认访存型 → 本层优化优先 |
 | `kernels[].task.est_bytes_in/out` | 绝对搬运量 (per-kernel) | 冗余搬运判断: 中间 tensor 写 GM 又读回 → L2 复用/降搬运 |
 
+
+
 ### 9.5 Tier5 计算占用
 
 **优化什么**: 向量化 / rsqrt / FMA / ILP / bank 冲突。
@@ -1020,6 +1028,8 @@ cat outputs/<op>/optimization.log
 | `kernels[].deep.conflict.total_cflt_ratio` | vec 总冲突 | 向量总冲突占比 |
 | `kernels[].deep.conflict.wait_ratio` | vec 被阻塞占比 (per-kernel) | 等待/流水气泡 → ILP 提升 |
 
+
+
 ### 9.6 Tier6 架构专属
 
 **优化什么**: 引擎失衡 / wait_ratio / mte 冲突 / 代码风格。
@@ -1035,7 +1045,154 @@ cat outputs/<op>/optimization.log
 | `kernels[].deep.roofline.bottleneck_type` | 瓶颈类型 | 最终确认瓶颈是否属本层 |
 | `kernels[].deep.engine_utilization.cube/vec/mte2/mte3` | 各引擎占比 (per-kernel) | 逐 kernel 引擎分布 → 调访问/代码结构喂平衡 |
 
+
+
 ---
+
+
+## 9A. 六层优化策略：判断瓶颈与针对性修改（独立记录）
+
+> 本节是独立的策略判断块：**读什么字段 → 判断出什么瓶颈 → 针对性改什么**。
+> 与上文 9.1-9.6 的"读取字段"表配套使用（字段含义/路径看上文，这里给判断与动作）。
+> 每个动作标注对应 `docx/playbook_tier<N>_*.md` 的情况编号。
+
+### 9A.1 Tier1 算法结构
+
+**判断瓶颈（读字段 → 判什么）**:
+
+| 字段 | 触发阈值/模式 | 判断出的瓶颈 |
+|---|---|---|
+| `roofline.compute_utilization` | **低 (<0.3)** 且非 memory | 算法选错 → 该换算法 |
+| `compute.cube_fp16_ratio` | 低 且 compute_bound | 精度没吃满 cube fp16 算力 |
+| `roofline.bottleneck_type` | `memory_bound` 且算术强度低 | 冗余访存（如 attention 物化 S[seq²]） |
+| `summary.num_kernels` / `api_overhead_total_us` | 多同结构 matmul / launch 大 | 重复计算 + launch 开销 |
+| `roofline.arithmetic_intensity` | 明显低于平衡点(≈86) | 算法/访存结构问题 |
+
+**针对性修改（判出瓶颈 → 改什么）**:
+- compute_bound + cube_fp16_ratio 低 → **fp16 输入 + fp32 累加**（playbook 情况A；换 DTYPE，别只调参数）
+- memory_bound + 巨大中间张量(S[seq²]) → **Flash Attention**（情况B：online softmax 单 kernel 省 S；rescale 别漏，mask 先于 max）
+- 多个同结构小 matmul 串行（QKV/FFN 两段）→ **合并单 GEMM**（情况C：拼列一次 dot，kernel 内切分）
+- 归约类算子多遍扫数据 → **online/单遍**（情况D：一次 load 同时累 sum/sum_sq）
+- 大 K matmul（K>4096）→ **split-K**（情况E）；小 grid+高 launch → **persistent kernel**（情况F）
+- conv 无 `tl.dot`（向量外积模拟）→ **软件 im2col + tl.dot 走 cube**（情况G，实测慢 PyTorch 12×）
+- GQA 组内复制 → **kernel 内按组索引消复制**（情况H）；MoE 全量 expert → **topk 稀疏**（情况I）；Mamba torch cumsum → **chunked scan**（情况J）
+- 结构改动后必须 `MATMUL_VERIFY=1` 数值校验 + 回 Tier2/3 重做
+
+### 9A.2 Tier2 算子融合
+
+**判断瓶颈（读字段 → 判什么）**:
+
+| 字段 | 触发阈值/模式 | 判断出的瓶颈 |
+|---|---|---|
+| `summary.num_kernels` | >1 且是 matmul→逐元素→matmul 链 | 分离小 kernel 有融合空间 |
+| `summary.api_overhead_total_us` | 大（launch 占端到端比例高） | launch 开销拖累 |
+| `bottleneck_type` (全局) | `memory_bound` 且中间张量大 | 中间 GM 往返浪费 |
+| `main_mem_read/write_gb_s` | 高但算力利用率低 | 中间量在 GM 来回 |
+| `08_fusion/fusion_analysis.json` | `raw_deps` 里 from=cube、to=vector | RAW 链可融合；`war/waw` 决定换 buffer |
+
+**针对性修改（判出瓶颈 → 改什么）**:
+- matmul 后跟独立 bias/激活 → **并进 epilogue**（情况A：省中间 Z 的 GM 往返，GEMM+Bias+ReLU 实测 28~39%）
+- 大 kernel 后跟独立 add(残差) → **并进 epilogue**（情况B）
+- 同一张量读多次（QKV/up/gate）→ **单次 load 复用/拼列合并**（情况C + 情况I：SwiGLU 双路合并、BN 并入 conv epilogue 情况H）
+- attention 内 scale/mask/softmax 独立步骤 → **并入 QK^T/softmax**（情况F）
+- GEMM 输出格式≠下游输入（隐式格式转换）→ **UB 内直接消费**（情况G）
+- 融合前先算收益：中间 kernel 耗时 > 2×launch(~10-40us) 才融；两个都 compute_bound 的大 kernel 别硬融（成本模型）
+- 不可融合边界：跨 GM store/跨迭代/归约/副作用/寄存器溢出 → 不融或拆
+
+### 9A.3 Tier3 分块配置
+
+**判断瓶颈（读字段 → 判什么）**:
+
+| 字段 | 触发阈值/模式 | 判断出的瓶颈 |
+|---|---|---|
+| `task.block_dim` | **< 40**（核没吃满） | 分块太小并行度不足 |
+| `engine_utilization.mte1` | 高（L1→L0 搬运瓶颈） | BLOCK_K 太大 |
+| `engine_utilization.mte2` | 高（GM→L1 瓶颈） | BLOCK_M/N 太小搬运频繁 |
+| `engine_utilization.cube` | 低（cube 没满） | 分块不够大喂不饱 cube |
+| `bandwidth_gb_s.l0a/l0b_read` | 低 | BLOCK 与 L0A/L0B 贴合差 |
+| `roofline.bottleneck_type` | `compute_bound` | 不调分块，回 Tier1/5 |
+| `roofline.compute_utilization` | 极低(<0.3) | 回 Tier1 查算法，不是分块 |
+
+**针对性修改（判出瓶颈 → 改什么）**:
+- block_dim<40 → **减 BLOCK_M/N**（§二-B，核数上去）
+- mte1 高 → **增 BLOCK_K**（§二-A）；mte2 高/cube 低/l0a 低 → **增 BLOCK_M/N**（§二-A）
+- memory_bound → **增 tile + swizzle**（§三）
+- **round1/tier3 自动 sweep 实测最优块**（`sweep_blocks.py`，L0A/B≤64KB、L0C≤128KB、UB 3 缓冲 ≤192KB、2 的幂、grid∈[16,3000]；结构变化后必须重扫）
+- 贴边界候选有 ×0.9 安全余量（防 L0/UB 溢出打崩设备）；寄存器溢出悬崖：tile 过大性能崩塌，以 sweep 数据为准
+
+### 9A.4 Tier4 访存
+
+**判断瓶颈（读字段 → 判什么）**:
+
+| 字段 | 触发阈值/模式 | 判断出的瓶颈 |
+|---|---|---|
+| `main_mem_read/write_gb_s` | 高但算力利用率低 → memory_bound | GM 流量过大 |
+| `gm_to_ub` / `ub_to_gm` | 低（搬运效率差） | 跨步/非连续访问 |
+| `l2_hit_rate` | 低 | L2 复用差 |
+| `task.pipes_us.aic_mte2/mte3_time` | 高（搬运耗时长） | 搬运量大 + 无流水线 |
+| 对齐警告 / `main_mem` 流量异常 | 非 16B 对齐 | 拆分事务浪费带宽 |
+
+**针对性修改（判出瓶颈 → 改什么）**:
+- 有跨步/非连续访问 → **连续化**（情况A：最快维匹配内存布局，DMA 一次搬满；逐元素扁平化 1D）
+- 指针/维度未对齐 → **128-bit 对齐 + padding**（情况B：fp16 N=10 → pad 到 16B 倍数）
+- l2_hit_rate 低 → **L2 复用**（情况C：访问顺序/权重预排/swizzle）
+- mte 忙但 cube 空等 → **流水线/UB 控制**（情况D：load 独立成步骤让编译器双缓冲）
+- 零散小 load → **合并大块搬运**（情况E）；行宽对齐 512B（情况F）；输出转置先在 UB 内转再连续 store（情况G）
+- 中间张量 S/P 落 GM → **UB 内直接消费**（情况H，flash 同源）
+
+### 9A.5 Tier5 计算占用
+
+**判断瓶颈（读字段 → 判什么）**:
+
+| 字段 | 触发阈值/模式 | 判断出的瓶颈 |
+|---|---|---|
+| `aic_scalar_time_us` / `engine_utilization.scalar` | 高（标量拖累） | 指针 div-mod / int64 索引 → 标量降级 |
+| `compute.vector_fops` / `vec` 利用率 | 低 | 逐元素标量加载未向量化 |
+| 数学运算慢（cube 已满） | 1/sqrt、erf 等手动组合 | 没用原生指令 |
+| `conflict.bank_cflt_ratio` | >4~5% | UB bank 冲突 |
+| 性能不升反降 | 寄存器溢出 | 过度展开/ILP 崩塌 |
+| `aic_scalar_time` 高 + 代码含 `x/s` 除法 | 逐元素除法 | 标量除法拖累 |
+| `vec` 高 `cube` 低 + 外积累加 | conv 没上 cube | 3D 广播展开/vector 模拟 |
+
+**针对性修改（判出瓶颈 → 改什么）**:
+- scalar_time/ratio 高 → **消除标量降级**（情况A：指针 div/mod 改 2D 索引、int64 改 int32）
+- 逐元素标量加载 → **向量化**（情况B：一次向量 load）
+- 1/sqrt → `tl.math.rsqrt`；erf → tanh（情况C）；mul+add → 直接 `x*w+b` 让 FMA 融合（情况D）
+- 逐元素 `x/s` 除法 → **倒数+乘法**（情况G）
+- bank_cflt_ratio>4% → **访问调整/swizzle + 尾轴 32B/512B 对齐**（情况F/I）
+- 寄存器溢出/性能反降 → **控制展开/ILP**（情况E）
+- vec 高 cube 低 + 外积累加 → **分块 2D 累加或 tl.dot**（情况H）
+- cube 已满（compute_bound）且 scalar/conflict 不高 → **停手/晋升**（情况J，别再试指令级改动）
+
+### 9A.6 Tier6 架构专属
+
+**判断瓶颈（读字段 → 判什么）**:
+
+| 字段 | 触发阈值/模式 | 判断出的瓶颈 |
+|---|---|---|
+| `conflict.vec_wait_ratio` | 高（vec 被阻塞） | 计算等数据 → 流水线问题 |
+| `conflict.mte_cflt_ratio` | 高 | MTE 搬运冲突 |
+| `conflict.bank_cflt_ratio` | >4% | UB bank 冲突 |
+| `engine_utilization.cube` | 低但任务是 matmul | 没走 cube（vector 模拟） |
+| `engine_utilization` 整体 | cube/vec 严重失衡 | 结构问题 |
+| `task.task_type` | 非 cube 但该算 matmul | 走错引擎 |
+| `task.block_dim` | 远小于 40 | 核没吃满 |
+| grid vs 物理核数 / `api_overhead` | grid 远大于核数 / launch 大 | 调度/核启动开销 |
+| 多核耗时不均 / 计算拖尾 | 尾核空转 | 负载不均衡 |
+| `aic_cube_wait_ratio`/`vec_wait_ratio` | 被阻塞但各 pipe 利用率都不高 | 跨引擎流水气泡 |
+| 纯 vector 算子 `task_type=AIV` | 按 cube 核数定 grid | 向量核少用一半 |
+
+**针对性修改（判出瓶颈 → 改什么）**:
+- vec_wait_ratio 高 / mte_cflt 高 → **回 Tier4（流水线/load 独立）/ Tier3（分块）**
+- cube 利用率低且任务是 matmul → 没用 tl.dot → **用 tl.dot 走 cube**（情况D）；用了仍低 → 回 Tier3/1
+- cube/vec 严重失衡 → **回 Tier2 融合平衡引擎**
+- grid >> 核数 / launch 大 → **grid 固定物理核数 + 核内 stride 循环**（情况G）
+- 多核耗时不均/尾核空转 → **stride 切分**（情况H）
+- cube/vec 被阻塞但 pipe 利用率低（流水线气泡）→ **K 循环分块 + 双缓冲 UB 预算**（情况I）
+- 纯 vector 算子没吃满向量核 → **按引擎选核数 40/20**（情况J）
+- 代码风格 while/动态 shape/非 math 命名空间 → **适配后端最优解析**（情况F）
+
+
 
 ## 10. diagnosis.json 完整结构与字段来源
 

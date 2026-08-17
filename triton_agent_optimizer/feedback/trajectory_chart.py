@@ -134,13 +134,25 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     import matplotlib.pyplot as plt
     import matplotlib.ticker as mticker
 
-    # 尝试中文字体
+    # 中文字体 (标准做法: font.sans-serif 候选列表, matplotlib 按顺序选可用字体;
+    # ★服务器 Ubuntu 缺 CJK 字体会 fallback DejaVu → 中文变方块, 英文正常 — 就是乱码根源)
     try:
         import matplotlib.font_manager as fm
-        for f in fm.fontManager.ttflist:
-            if "SimHei" in f.name or "Microsoft YaHei" in f.name or "Noto Sans CJK" in f.name:
-                plt.rcParams["font.family"] = f.name; break
-    except: pass
+        _avail = {f.name for f in fm.fontManager.ttflist}
+        _cjk = [n for n in (
+            "Noto Sans CJK SC", "Noto Sans CJK TC", "Noto Sans CJK JP",
+            "WenQuanYi Zen Hei", "WenQuanYi Micro Hei", "Droid Sans Fallback",
+            "Source Han Sans SC", "Source Han Sans CN", "AR PL UMing CN",
+            "SimHei", "Microsoft YaHei", "SimSun", "PingFang SC",
+        ) if n in _avail]
+        plt.rcParams["font.sans-serif"] = _cjk + ["DejaVu Sans"]
+        plt.rcParams["font.family"] = "sans-serif"
+        if not _cjk:
+            print("[chart] ⚠ 未找到中文字体 (服务器 Ubuntu 装: "
+                  "apt-get install fonts-noto-cjk) — 中文标签可能乱码")
+    except Exception:
+        pass
+    plt.rcParams["axes.unicode_minus"] = False
 
     plt.rcParams.update({"font.size":11, "axes.titlesize":13, "axes.labelsize":12, "figure.dpi":150})
     fig, ax = plt.subplots(figsize=(22, 10))

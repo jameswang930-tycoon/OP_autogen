@@ -153,7 +153,7 @@ def scores_kernel(q_ptr, k_ptr, s_ptr, seq, dim, nheads, scale,
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
-    q_ptrs = q_ptr + head * seq * dim + offs_m[:, None] * dim + offs_k[None, :]
+    q_ptrs = q_ptr + offs_m[:, None] * (nheads * dim) + head * dim + offs_k[None, :]
     k_ptrs = k_ptr + head * dim * seq + offs_k[:, None] * seq + offs_n[None, :]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, dim, BLOCK_K):

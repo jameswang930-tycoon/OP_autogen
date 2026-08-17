@@ -58,6 +58,17 @@ SWEEP_META = {
     "conv2d":          {"vars": ("BLOCK_K", "BLOCK_OW"),           "type": "conv2d", "multi": False},
     "conv_bias_relu":  {"vars": ("BLOCK_K", "BLOCK_OW"),           "type": "conv2d", "multi": True},
     "conv1d":          {"vars": ("BLOCK_CO", "BLOCK_L"),           "type": "conv2d", "multi": False},
+    # ★9 个复杂算子 (2026-08-14 补充, 与 bench_910b3 工业级基准对齐):
+    #   matmul 型 (扫主 GEMM 的 BM/BN/BK, 全链计时); resnet 走 conv2d 型 (BLOCK_K/BLOCK_OW)
+    "batched_matmul":  {"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": False},
+    "swiglu_mlp":      {"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": True},
+    "resnet_block":    {"vars": ("BLOCK_K", "BLOCK_OW"),           "type": "conv2d", "multi": True},
+    "vit_block":       {"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": True},
+    "bert_block":      {"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": True},
+    "gqa_attention":   {"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": True},
+    "transformer_decoder_block": {"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": True},
+    "mamba_block":     {"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": True},
+    "mixture_of_experts": {"vars": ("BLOCK_M", "BLOCK_N", "BLOCK_K"), "type": "matmul", "multi": True},
     "batchnorm2d":     None,   # 逐元素(按通道), BLOCK_SIZE 固定, 无自由分块参数
     "maxpool2d":       None,   # 窗口访存, BLOCK_OW 由 OW 推导, 无自由分块参数
     "rms_norm":        None,   # 行级 kernel, BLOCK_N 由 N 推导 (2 幂), 无自由分块参数
@@ -538,8 +549,477 @@ def _generate_matmul_runner(op_dir: Path, candidates: List[Tuple],
                 c.stride(0), c.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
         """)
 
-    else:
-        raise ValueError(f"未知 matmul 型算子: {op}")
+    elif op == "batched_matmul":
+        # ── BMM 单 kernel (全链) ──
+        b1 = params.get("B", 16); m1 = params.get("M", 512)
+        k1 = params.get("K", 512); n1 = params.get("N", 512)
+        setup = textwrap.dedent(f"""\
+        # ── Tensor setup (batched_matmul) ──
+        B, M, K, N = {b1}, {m1}, {k1}, {n1}
+        DTYPE = torch.float32
+        device = torch.device("npu")
+        a = (torch.randn(B, M, K, dtype=DTYPE, device=device) * 0.1)
+        b = (torch.randn(B, K, N, dtype=DTYPE, device=device) * 0.1)
+        c = torch.empty(B, M, N, dtype=DTYPE, device=device)
+
+        def run_one(bm, bn, bk):
+            grid = (B * triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+            bmm_kernel[grid](a, b, c, B, M, K, N,
+                a.stride(1), a.stride(2), b.stride(1), b.stride(2),
+                c.stride(1), c.stride(2), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+        """)
+
+    elif op == "swiglu_mlp":
+        s1 = params.get("S", 2048); d1 = params.get("D", 1024); f1 = params.get("FFN", 4096)
+        setup = textwrap.dedent(f"""\
+        # ── Tensor setup (swiglu_mlp 4 kernel 全链) ──
+        S, D, FFN = {s1}, {d1}, {f1}
+        DTYPE = torch.float32
+        device = torch.device("npu")
+        x = (torch.randn(S, D, dtype=DTYPE, device=device) * 0.1)
+        w1 = (torch.randn(D, FFN, dtype=DTYPE, device=device) * 0.1)
+        w2 = (torch.randn(D, FFN, dtype=DTYPE, device=device) * 0.1)
+        w3 = (torch.randn(FFN, D, dtype=DTYPE, device=device) * 0.1)
+        u = torch.empty(S, FFN, dtype=DTYPE, device=device)
+        g = torch.empty(S, FFN, dtype=DTYPE, device=device)
+        act = torch.empty(S, FFN, dtype=DTYPE, device=device)
+        y = torch.empty(S, D, dtype=DTYPE, device=device)
+
+        def run_one(bm, bn, bk):
+            grid_mm = (triton.cdiv(S, bm) * triton.cdiv(FFN, bn),)
+            grid_dn = (triton.cdiv(S, bm) * triton.cdiv(D, bn),)
+            grid_el = (triton.cdiv(S * FFN, BLOCK_EL),)
+            mm_kernel[grid_mm](x, w1, u, S, FFN, D,
+                x.stride(0), x.stride(1), w1.stride(0), w1.stride(1),
+                u.stride(0), u.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            mm_kernel2[grid_mm](x, w2, g, S, FFN, D,
+                x.stride(0), x.stride(1), w2.stride(0), w2.stride(1),
+                g.stride(0), g.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            silu_gate_kernel[grid_el](u, g, act, S * FFN, BLOCK=BLOCK_EL)
+            mm_kernel3[grid_dn](act, w3, y, S, D, FFN,
+                act.stride(0), act.stride(1), w3.stride(0), w3.stride(1),
+                y.stride(0), y.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+        """)
+
+    elif op == "vit_block":
+        s1 = params.get("S", 197); d1 = params.get("D", 768)
+        h1 = params.get("H", 12); hd1 = params.get("HD", 64)
+        f1 = params.get("FFN", 3072)
+        setup = textwrap.dedent(f"""\
+        # ── Tensor setup (vit_block 全链: LN→QKV→MHA→残差→LN→MLP→残差) ──
+        S, D, H, HD, FFN = {s1}, {d1}, {h1}, {hd1}, {f1}
+        HD_D = H * HD
+        SCALE = 1.0 / (HD ** 0.5)
+        EPS = 1e-6
+        DTYPE = torch.float32
+        device = torch.device("npu")
+        x = (torch.randn(S, D, dtype=DTYPE, device=device) * 0.1)
+        wq = (torch.randn(D, HD_D, dtype=DTYPE, device=device) * 0.1)
+        wk = (torch.randn(D, HD_D, dtype=DTYPE, device=device) * 0.1)
+        wv = (torch.randn(D, HD_D, dtype=DTYPE, device=device) * 0.1)
+        wo = (torch.randn(HD_D, D, dtype=DTYPE, device=device) * 0.1)
+        w1 = (torch.randn(D, FFN, dtype=DTYPE, device=device) * 0.1)
+        b1 = (torch.randn(FFN, dtype=DTYPE, device=device) * 0.1)
+        w2 = (torch.randn(FFN, D, dtype=DTYPE, device=device) * 0.1)
+        b2 = (torch.randn(D, dtype=DTYPE, device=device) * 0.1)
+        wln = torch.ones(D, dtype=DTYPE, device=device)
+        bln = torch.zeros(D, dtype=DTYPE, device=device)
+        h = torch.empty(S, D, dtype=DTYPE, device=device)
+        q = torch.empty(S, HD_D, dtype=DTYPE, device=device)
+        k = torch.empty(S, HD_D, dtype=DTYPE, device=device)
+        v = torch.empty(S, HD_D, dtype=DTYPE, device=device)
+        k_t = torch.empty(H, HD, S, dtype=DTYPE, device=device)
+        v_hsd = torch.empty(H, S, HD, dtype=DTYPE, device=device)
+        s = torch.empty(H, S, S, dtype=DTYPE, device=device)
+        p = torch.empty(H, S, S, dtype=DTYPE, device=device)
+        o = torch.empty(H, S, HD, dtype=DTYPE, device=device)
+        oo = torch.empty(S, HD_D, dtype=DTYPE, device=device)
+        r = torch.empty(S, D, dtype=DTYPE, device=device)
+        h2 = torch.empty(S, D, dtype=DTYPE, device=device)
+        m = torch.empty(S, FFN, dtype=DTYPE, device=device)
+        y = torch.empty(S, D, dtype=DTYPE, device=device)
+
+        def run_one(bm, bn, bk):
+            grid_mm = (triton.cdiv(S, bm) * triton.cdiv(D, bn),)
+            grid_mm_f = (triton.cdiv(S, bm) * triton.cdiv(FFN, bn),)
+            grid_mm_d = (triton.cdiv(S, bm) * triton.cdiv(D, bn),)
+            grid_s = (H * triton.cdiv(S, bm) * triton.cdiv(S, bn),)
+            grid_pv = (H * triton.cdiv(S, bm) * triton.cdiv(HD, bk),)
+            grid_sm = (H * S,)
+            grid_ln = (S,)
+            grid_el = (triton.cdiv(S * D, BLOCK_EL),)
+            grid_el_f = (triton.cdiv(S * FFN, BLOCK_EL),)
+            layernorm_kernel[grid_ln](x, wln, bln, h, S, D, EPS, BLOCK=BLOCK_LN)
+            matmul_kernel[grid_mm](h, wq, q, S, HD_D, D,
+                h.stride(0), h.stride(1), wq.stride(0), wq.stride(1),
+                q.stride(0), q.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            matmul_kernel2[grid_mm](h, wk, k, S, HD_D, D,
+                h.stride(0), h.stride(1), wk.stride(0), wk.stride(1),
+                k.stride(0), k.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            matmul_kernel3[grid_mm](h, wv, v, S, HD_D, D,
+                h.stride(0), h.stride(1), wv.stride(0), wv.stride(1),
+                v.stride(0), v.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            k_t.copy_(k.view(S, H, HD).permute(1, 2, 0))
+            v_hsd.copy_(v.view(S, H, HD).permute(1, 0, 2))
+            scores_kernel[grid_s](q, k_t, s, S, HD, H, SCALE,
+                BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            softmax_kernel[grid_sm](s, p, H * S, S, BLOCK=BLOCK_S)
+            pv_kernel[grid_pv](p, v_hsd, o, S, HD, H,
+                BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            oo.copy_(o.permute(1, 0, 2).contiguous().view(S, HD_D))
+            matmul_kernel4[grid_mm_d](oo, wo, r, S, D, HD_D,
+                oo.stride(0), oo.stride(1), wo.stride(0), wo.stride(1),
+                r.stride(0), r.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            add_kernel[grid_el](r, x, r, S * D, BLOCK=BLOCK_EL)
+            layernorm_kernel2[grid_ln](r, wln, bln, h2, S, D, EPS, BLOCK=BLOCK_LN)
+            mlp_gelu_kernel[grid_mm_f](h2, w1, b1, m, S, FFN, D,
+                h2.stride(0), h2.stride(1), w1.stride(0), w1.stride(1),
+                m.stride(0), m.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            matmul_kernel5[grid_mm_d](m, w2, y, S, D, FFN,
+                m.stride(0), m.stride(1), w2.stride(0), w2.stride(1),
+                y.stride(0), y.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            add_kernel2[grid_el](y, r, y, S * D, BLOCK=BLOCK_EL)
+        """)
+
+    elif op == "bert_block":
+        s1 = params.get("S", 512); d1 = params.get("D", 768)
+        h1 = params.get("H", 12); hd1 = params.get("HD", 64)
+        f1 = params.get("FFN", 3072)
+        setup = textwrap.dedent(f"""\
+        # ── Tensor setup (bert_block 全链: QKV→MHA→残差→LN→MLP→残差→LN) ──
+        S, D, H, HD, FFN = {s1}, {d1}, {h1}, {hd1}, {f1}
+        HD_D = H * HD
+        SCALE = 1.0 / (HD ** 0.5)
+        EPS = 1e-6
+        DTYPE = torch.float32
+        device = torch.device("npu")
+        x = (torch.randn(S, D, dtype=DTYPE, device=device) * 0.1)
+        wq = (torch.randn(D, HD_D, dtype=DTYPE, device=device) * 0.1)
+        wk = (torch.randn(D, HD_D, dtype=DTYPE, device=device) * 0.1)
+        wv = (torch.randn(D, HD_D, dtype=DTYPE, device=device) * 0.1)
+        wo = (torch.randn(HD_D, D, dtype=DTYPE, device=device) * 0.1)
+        w1 = (torch.randn(D, FFN, dtype=DTYPE, device=device) * 0.1)
+        b1 = (torch.randn(FFN, dtype=DTYPE, device=device) * 0.1)
+        w2 = (torch.randn(FFN, D, dtype=DTYPE, device=device) * 0.1)
+        b2x = torch.empty(S, D, dtype=DTYPE, device=device)
+        b2x.copy_((torch.randn(D, dtype=DTYPE, device=device) * 0.1).unsqueeze(0).expand(S, D))
+        wln = torch.ones(D, dtype=DTYPE, device=device)
+        bln = torch.zeros(D, dtype=DTYPE, device=device)
+        h1 = torch.empty(S, D, dtype=DTYPE, device=device)
+        q = torch.empty(S, HD_D, dtype=DTYPE, device=device)
+        k = torch.empty(S, HD_D, dtype=DTYPE, device=device)
+        v = torch.empty(S, HD_D, dtype=DTYPE, device=device)
+        k_t = torch.empty(H, HD, S, dtype=DTYPE, device=device)
+        v_hsd = torch.empty(H, S, HD, dtype=DTYPE, device=device)
+        s = torch.empty(H, S, S, dtype=DTYPE, device=device)
+        p = torch.empty(H, S, S, dtype=DTYPE, device=device)
+        o = torch.empty(H, S, HD, dtype=DTYPE, device=device)
+        oo = torch.empty(S, HD_D, dtype=DTYPE, device=device)
+        a = torch.empty(S, D, dtype=DTYPE, device=device)
+        m = torch.empty(S, FFN, dtype=DTYPE, device=device)
+        h2 = torch.empty(S, D, dtype=DTYPE, device=device)
+        y = torch.empty(S, D, dtype=DTYPE, device=device)
+
+        def run_one(bm, bn, bk):
+            grid_mm = (triton.cdiv(S, bm) * triton.cdiv(D, bn),)
+            grid_mm_f = (triton.cdiv(S, bm) * triton.cdiv(FFN, bn),)
+            grid_s = (H * triton.cdiv(S, bm) * triton.cdiv(S, bn),)
+            grid_pv = (H * triton.cdiv(S, bm) * triton.cdiv(HD, bk),)
+            grid_sm = (H * S,)
+            grid_ln = (S,)
+            grid_el = (triton.cdiv(S * D, BLOCK_EL),)
+            grid_el_f = (triton.cdiv(S * FFN, BLOCK_EL),)
+            matmul_kernel[grid_mm](x, wq, q, S, HD_D, D,
+                x.stride(0), x.stride(1), wq.stride(0), wq.stride(1),
+                q.stride(0), q.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            matmul_kernel2[grid_mm](x, wk, k, S, HD_D, D,
+                x.stride(0), x.stride(1), wk.stride(0), wk.stride(1),
+                k.stride(0), k.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            matmul_kernel3[grid_mm](x, wv, v, S, HD_D, D,
+                x.stride(0), x.stride(1), wv.stride(0), wv.stride(1),
+                v.stride(0), v.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            k_t.copy_(k.view(S, H, HD).permute(1, 2, 0))
+            v_hsd.copy_(v.view(S, H, HD).permute(1, 0, 2))
+            scores_kernel[grid_s](q, k_t, s, S, HD, H, SCALE,
+                BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            softmax_kernel[grid_sm](s, p, H * S, S, BLOCK=BLOCK_S)
+            pv_kernel[grid_pv](p, v_hsd, o, S, HD, H,
+                BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            oo.copy_(o.permute(1, 0, 2).contiguous().view(S, HD_D))
+            matmul_kernel4[grid_mm](oo, wo, a, S, D, HD_D,
+                oo.stride(0), oo.stride(1), wo.stride(0), wo.stride(1),
+                a.stride(0), a.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            add_kernel[grid_el](x, a, a, S * D, BLOCK=BLOCK_EL)
+            layernorm_kernel[grid_ln](a, wln, bln, h1, S, D, EPS, BLOCK=BLOCK_LN)
+            mlp_gelu_kernel[grid_mm_f](h1, w1, b1, m, S, FFN, D,
+                h1.stride(0), h1.stride(1), w1.stride(0), w1.stride(1),
+                m.stride(0), m.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            matmul_kernel5[grid_mm](m, w2, h2, S, D, FFN,
+                m.stride(0), m.stride(1), w2.stride(0), w2.stride(1),
+                h2.stride(0), h2.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            add_kernel2[grid_el](h2, b2x, h2, S * D, BLOCK=BLOCK_EL)
+            add_kernel3[grid_el](h2, h1, y, S * D, BLOCK=BLOCK_EL)
+            layernorm_kernel2[grid_ln](y, wln, bln, y, S, D, EPS, BLOCK=BLOCK_LN)
+        """)
+
+    elif op == "gqa_attention":
+        s1 = params.get("S", 2048); d1 = params.get("D", 1024)
+        h1 = params.get("H", 16); hd1 = params.get("HD", 64)
+        kv1 = params.get("KV", 4)
+        setup = textwrap.dedent(f"""\
+        # ── Tensor setup (gqa_attention 全链: QKV->RoPE->GQA复制->MHA->O投影->残差) ──
+        S, D, H, HD, KV = {s1}, {d1}, {h1}, {hd1}, {kv1}
+        QD = H * HD; KVD = KV * HD
+        SCALE = 1.0 / (HD ** 0.5)
+        DTYPE = torch.float32
+        device = torch.device("npu")
+        x = (torch.randn(S, D, dtype=DTYPE, device=device) * 0.1)
+        wq = (torch.randn(D, QD, dtype=DTYPE, device=device) * 0.1)
+        wk = (torch.randn(D, KVD, dtype=DTYPE, device=device) * 0.1)
+        wv = (torch.randn(D, KVD, dtype=DTYPE, device=device) * 0.1)
+        wo = (torch.randn(QD, D, dtype=DTYPE, device=device) * 0.1)
+        _freq = 1.0 / (10000 ** (torch.arange(0, HD // 2, dtype=torch.float32, device=device) / (HD // 2)))
+        _t = torch.arange(S, dtype=torch.float32, device=device)
+        _ang = _t[:, None] * _freq[None, :]
+        cos_t = torch.cos(_ang).repeat(1, 2); sin_t = torch.sin(_ang).repeat(1, 2)
+        q = torch.empty(S, QD, dtype=DTYPE, device=device)
+        k = torch.empty(S, KVD, dtype=DTYPE, device=device)
+        v = torch.empty(S, KVD, dtype=DTYPE, device=device)
+        k_h = torch.empty(H, S, HD, dtype=DTYPE, device=device)
+        v_h = torch.empty(H, S, HD, dtype=DTYPE, device=device)
+        k_t = torch.empty(H, HD, S, dtype=DTYPE, device=device)
+        v_hsd = torch.empty(H, S, HD, dtype=DTYPE, device=device)
+        s = torch.empty(H, S, S, dtype=DTYPE, device=device)
+        p = torch.empty(H, S, S, dtype=DTYPE, device=device)
+        o = torch.empty(H, S, HD, dtype=DTYPE, device=device)
+        oo = torch.empty(S, QD, dtype=DTYPE, device=device)
+        y = torch.empty(S, D, dtype=DTYPE, device=device)
+
+        def run_one(bm, bn, bk):
+            grid_mm = (triton.cdiv(S, bm) * triton.cdiv(D, bn),)
+            grid_s = (H * triton.cdiv(S, bm) * triton.cdiv(S, bn),)
+            grid_pv = (H * triton.cdiv(S, bm) * triton.cdiv(HD, bk),)
+            grid_sm = (H * S,)
+            grid_rope = (S,)
+            grid_el = (triton.cdiv(S * D, BLOCK_EL),)
+            matmul_kernel[grid_mm](x, wq, q, S, QD, D,
+                x.stride(0), x.stride(1), wq.stride(0), wq.stride(1),
+                q.stride(0), q.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            matmul_kernel2[grid_mm](x, wk, k, S, KVD, D,
+                x.stride(0), x.stride(1), wk.stride(0), wk.stride(1),
+                k.stride(0), k.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            matmul_kernel3[grid_mm](x, wv, v, S, KVD, D,
+                x.stride(0), x.stride(1), wv.stride(0), wv.stride(1),
+                v.stride(0), v.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            rope_kernel[grid_rope](q, cos_t, sin_t, q, S, QD, HD, BLOCK=BLOCK_ROPE)
+            rope_kernel2[grid_rope](k, cos_t, sin_t, k, S, KVD, HD, BLOCK=BLOCK_ROPE)
+            k_h.copy_(k.view(S, KV, HD).transpose(0, 1).repeat_interleave(H // KV, dim=0))
+            v_h.copy_(v.view(S, KV, HD).transpose(0, 1).repeat_interleave(H // KV, dim=0))
+            k_t.copy_(k_h.permute(0, 2, 1))
+            v_hsd.copy_(v_h)
+            scores_kernel[grid_s](q, k_t, s, S, HD, H, SCALE,
+                BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            softmax_kernel[grid_sm](s, p, H * S, S, BLOCK=BLOCK_S)
+            pv_kernel[grid_pv](p, v_hsd, o, S, HD, H,
+                BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            oo.copy_(o.permute(1, 0, 2).contiguous().view(S, QD))
+            matmul_kernel4[grid_mm](oo, wo, y, S, D, QD,
+                oo.stride(0), oo.stride(1), wo.stride(0), wo.stride(1),
+                y.stride(0), y.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            add_kernel[grid_el](y, x, y, S * D, BLOCK=BLOCK_EL)
+        """)
+
+    elif op == "transformer_decoder_block":
+        s1 = params.get("S", 2048); d1 = params.get("D", 1024)
+        h1 = params.get("H", 16); hd1 = params.get("HD", 64)
+        f1 = params.get("FFN", 4096)
+        setup = textwrap.dedent(f"""\
+        # ── Tensor setup (transformer_decoder_block 全链) ──
+        S, D, H, HD, FFN = {s1}, {d1}, {h1}, {hd1}, {f1}
+        HD_D = H * HD
+        SCALE = 1.0 / (HD ** 0.5)
+        EPS = 1e-6
+        DTYPE = torch.float32
+        device = torch.device("npu")
+        x = (torch.randn(S, D, dtype=DTYPE, device=device) * 0.1)
+        wq = (torch.randn(D, HD_D, dtype=DTYPE, device=device) * 0.1)
+        wk = (torch.randn(D, HD_D, dtype=DTYPE, device=device) * 0.1)
+        wv = (torch.randn(D, HD_D, dtype=DTYPE, device=device) * 0.1)
+        wo = (torch.randn(HD_D, D, dtype=DTYPE, device=device) * 0.1)
+        wup = (torch.randn(D, FFN, dtype=DTYPE, device=device) * 0.1)
+        wgate = (torch.randn(D, FFN, dtype=DTYPE, device=device) * 0.1)
+        wdown = (torch.randn(FFN, D, dtype=DTYPE, device=device) * 0.1)
+        rms_w = torch.ones(D, dtype=DTYPE, device=device)
+        _freq = 1.0 / (10000 ** (torch.arange(0, HD // 2, dtype=torch.float32, device=device) / (HD // 2)))
+        _t = torch.arange(S, dtype=torch.float32, device=device)
+        _ang = _t[:, None] * _freq[None, :]
+        cos_t = torch.cos(_ang).repeat(1, 2); sin_t = torch.sin(_ang).repeat(1, 2)
+        h = torch.empty(S, D, dtype=DTYPE, device=device)
+        q = torch.empty(S, HD_D, dtype=DTYPE, device=device)
+        k = torch.empty(S, HD_D, dtype=DTYPE, device=device)
+        v = torch.empty(S, HD_D, dtype=DTYPE, device=device)
+        k_t = torch.empty(H, HD, S, dtype=DTYPE, device=device)
+        v_hsd = torch.empty(H, S, HD, dtype=DTYPE, device=device)
+        s = torch.empty(H, S, S, dtype=DTYPE, device=device)
+        p = torch.empty(H, S, S, dtype=DTYPE, device=device)
+        o = torch.empty(H, S, HD, dtype=DTYPE, device=device)
+        oo = torch.empty(S, HD_D, dtype=DTYPE, device=device)
+        r = torch.empty(S, D, dtype=DTYPE, device=device)
+        h2 = torch.empty(S, D, dtype=DTYPE, device=device)
+        u = torch.empty(S, FFN, dtype=DTYPE, device=device)
+        g = torch.empty(S, FFN, dtype=DTYPE, device=device)
+        act = torch.empty(S, FFN, dtype=DTYPE, device=device)
+        y = torch.empty(S, D, dtype=DTYPE, device=device)
+
+        def run_one(bm, bn, bk):
+            grid_mm = (triton.cdiv(S, bm) * triton.cdiv(D, bn),)
+            grid_mm_f = (triton.cdiv(S, bm) * triton.cdiv(FFN, bn),)
+            grid_s = (H * triton.cdiv(S, bm) * triton.cdiv(S, bn),)
+            grid_pv = (H * triton.cdiv(S, bm) * triton.cdiv(HD, bk),)
+            grid_sm = (H * S,)
+            grid_ln = (S,)
+            grid_rope = (S,)
+            grid_el = (triton.cdiv(S * D, BLOCK_EL),)
+            grid_el_f = (triton.cdiv(S * FFN, BLOCK_EL),)
+            rmsnorm_kernel[grid_ln](x, rms_w, h, S, D, EPS, BLOCK=BLOCK_LN)
+            matmul_kernel[grid_mm](h, wq, q, S, HD_D, D,
+                h.stride(0), h.stride(1), wq.stride(0), wq.stride(1),
+                q.stride(0), q.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            matmul_kernel2[grid_mm](h, wk, k, S, HD_D, D,
+                h.stride(0), h.stride(1), wk.stride(0), wk.stride(1),
+                k.stride(0), k.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            matmul_kernel3[grid_mm](h, wv, v, S, HD_D, D,
+                h.stride(0), h.stride(1), wv.stride(0), wv.stride(1),
+                v.stride(0), v.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            rope_kernel[grid_rope](q, cos_t, sin_t, q, S, HD_D, HD, BLOCK=BLOCK_ROPE)
+            rope_kernel2[grid_rope](k, cos_t, sin_t, k, S, HD_D, HD, BLOCK=BLOCK_ROPE)
+            k_t.copy_(k.view(S, H, HD).permute(1, 2, 0))
+            v_hsd.copy_(v.view(S, H, HD).permute(1, 0, 2))
+            scores_kernel[grid_s](q, k_t, s, S, HD, H, SCALE,
+                BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            softmax_kernel[grid_sm](s, p, H * S, S, BLOCK=BLOCK_S)
+            pv_kernel[grid_pv](p, v_hsd, o, S, HD, H,
+                BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            oo.copy_(o.permute(1, 0, 2).contiguous().view(S, HD_D))
+            matmul_kernel4[grid_mm](oo, wo, r, S, D, HD_D,
+                oo.stride(0), oo.stride(1), wo.stride(0), wo.stride(1),
+                r.stride(0), r.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            add_kernel[grid_el](r, x, r, S * D, BLOCK=BLOCK_EL)
+            rmsnorm_kernel2[grid_ln](r, rms_w, h2, S, D, EPS, BLOCK=BLOCK_LN)
+            matmul_kernel5[grid_mm_f](h2, wup, u, S, FFN, D,
+                h2.stride(0), h2.stride(1), wup.stride(0), wup.stride(1),
+                u.stride(0), u.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            matmul_kernel6[grid_mm_f](h2, wgate, g, S, FFN, D,
+                h2.stride(0), h2.stride(1), wgate.stride(0), wgate.stride(1),
+                g.stride(0), g.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            silu_gate_kernel[grid_el_f](u, g, act, S * FFN, BLOCK=BLOCK_EL)
+            matmul_kernel7[grid_mm](act, wdown, y, S, D, FFN,
+                act.stride(0), act.stride(1), wdown.stride(0), wdown.stride(1),
+                y.stride(0), y.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            add_kernel2[grid_el](y, r, y, S * D, BLOCK=BLOCK_EL)
+        """)
+
+    elif op == "mamba_block":
+        l1 = params.get("L", 1024); d1 = params.get("D", 1024)
+        n1 = params.get("N", 16); ed1 = params.get("ED", 1024)
+        setup = textwrap.dedent(f"""\
+        # ── Tensor setup (mamba_block 全链: in_proj->conv->softplus->scan->gate->out_proj) ──
+        L, D, N, ED = {l1}, {d1}, {n1}, {ed1}
+        C3N = 3 * N; KC = 4
+        DTYPE = torch.float32
+        device = torch.device("npu")
+        x = (torch.randn(L, D, dtype=DTYPE, device=device) * 0.1)
+        x_ed = x[:, :ED].contiguous()
+        in_proj = (torch.randn(D, ED + 3 * N, dtype=DTYPE, device=device) * 0.1)
+        conv_w = (torch.randn(3 * N, 1, KC, dtype=DTYPE, device=device) * 0.1)
+        conv_b = (torch.randn(3 * N, dtype=DTYPE, device=device) * 0.1)
+        a_log = (torch.randn(N, dtype=DTYPE, device=device) * 0.1 - 3.0)
+        dt_bias = (torch.randn(N, dtype=DTYPE, device=device) * 0.1)
+        dm = (torch.randn(ED + N, dtype=DTYPE, device=device) * 0.1)
+        out_proj = (torch.randn(ED, D, dtype=DTYPE, device=device) * 0.1)
+        zx = torch.empty(L, ED + 3 * N, dtype=DTYPE, device=device)
+        z = torch.empty(L, ED, dtype=DTYPE, device=device)
+        xb = torch.empty(L, 3 * N, dtype=DTYPE, device=device)
+        xc = torch.empty(L, 3 * N, dtype=DTYPE, device=device)
+        dt = torch.empty(L, N, dtype=DTYPE, device=device)
+        b = torch.empty(L, N, dtype=DTYPE, device=device)
+        c = torch.empty(L, N, dtype=DTYPE, device=device)
+        dA = torch.empty(L, N, dtype=DTYPE, device=device)
+        dB = torch.empty(L, N, dtype=DTYPE, device=device)
+        h = torch.empty(L, N, dtype=DTYPE, device=device)
+        gy = torch.empty(L, ED, dtype=DTYPE, device=device)
+        y = torch.empty(L, D, dtype=DTYPE, device=device)
+
+        def run_one(bm, bn, bk):
+            grid_mm = (triton.cdiv(L, bm) * triton.cdiv(ED + 3 * N, bn),)
+            grid_mm_o = (triton.cdiv(L, bm) * triton.cdiv(D, bn),)
+            grid_cv = (3 * N * triton.cdiv(L, BLOCK_L),)
+            grid_sp = (L,)
+            grid_gate = (L,)
+            grid_el = (triton.cdiv(L * D, BLOCK_EL),)
+            matmul_kernel[grid_mm](x, in_proj, zx, L, ED + 3 * N, D,
+                x.stride(0), x.stride(1), in_proj.stride(0), in_proj.stride(1),
+                zx.stride(0), zx.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            z.copy_(zx[:, :ED]); xb.copy_(zx[:, ED:])
+            conv1d_dw_kernel[grid_cv](xb, conv_w, conv_b, xc, L, 3 * N, KC,
+                BLOCK_L=BLOCK_L, BLOCK_C=BLOCK_C)
+            split_softplus_kernel[grid_sp](xc, dt_bias, dt, b, c, L, N, BLOCK=BLOCK_C)
+            A = -torch.exp(a_log)
+            dA = torch.exp(dt * A); dB = dt * b
+            _logP = torch.cumsum(torch.log(dA.clamp_min(1e-8)), dim=0)
+            h = torch.cumsum(dB * torch.exp((-_logP).clamp_min(-30)), dim=0) * torch.exp(_logP.clamp_max(30))
+            mamba_gate_kernel[grid_gate](h, c, z, dm, gy, L, N, ED, BLOCK=BLOCK_C)
+            matmul_kernel2[grid_mm_o](gy, out_proj, y, L, D, ED,
+                gy.stride(0), gy.stride(1), out_proj.stride(0), out_proj.stride(1),
+                y.stride(0), y.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            add_kernel[grid_el](y, x_ed, y, L * D, BLOCK=BLOCK_EL)
+        """)
+
+    elif op == "mixture_of_experts":
+        s1 = params.get("S", 512); d1 = params.get("D", 1024)
+        e1 = params.get("E", 8); f1 = params.get("FFN", 2048)
+        setup = textwrap.dedent(f"""\
+        # ── Tensor setup (mixture_of_experts 全链: router->topk->up/gate->silu->bmm->加权) ──
+        S, D, E, FFN = {s1}, {d1}, {e1}, {f1}
+        TOPK = 2
+        DTYPE = torch.float32
+        device = torch.device("npu")
+        import torch.nn.functional as F
+        x = (torch.randn(S, D, dtype=DTYPE, device=device) * 0.1)
+        router_w = (torch.randn(D, E, dtype=DTYPE, device=device) * 0.1)
+        w1f = (torch.randn(D, E * FFN, dtype=DTYPE, device=device) * 0.1)
+        w2f = (torch.randn(D, E * FFN, dtype=DTYPE, device=device) * 0.1)
+        w3 = (torch.randn(E, FFN, D, dtype=DTYPE, device=device) * 0.1)
+        logits = torch.empty(S, E, dtype=DTYPE, device=device)
+        u = torch.empty(S, E * FFN, dtype=DTYPE, device=device)
+        g = torch.empty(S, E * FFN, dtype=DTYPE, device=device)
+        act = torch.empty(S, E * FFN, dtype=DTYPE, device=device)
+        act_t = torch.empty(E, S, FFN, dtype=DTYPE, device=device)
+        y_esd = torch.empty(S, E, D, dtype=DTYPE, device=device)
+        y = torch.empty(S, D, dtype=DTYPE, device=device)
+
+        def run_one(bm, bn, bk):
+            grid_mm_e = (triton.cdiv(S, bm) * triton.cdiv(E * FFN, bn),)
+            grid_mm_r = (triton.cdiv(S, bm) * triton.cdiv(E, bn),)
+            grid_el = (triton.cdiv(S * E * FFN, BLOCK_EL),)
+            matmul_kernel[grid_mm_r](x, router_w, logits, S, E, D,
+                x.stride(0), x.stride(1), router_w.stride(0), router_w.stride(1),
+                logits.stride(0), logits.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            _tv, _ti = torch.topk(logits, TOPK, dim=-1)
+            w = F.softmax(_tv, dim=-1)
+            matmul_kernel2[grid_mm_e](x, w1f, u, S, E * FFN, D,
+                x.stride(0), x.stride(1), w1f.stride(0), w1f.stride(1),
+                u.stride(0), u.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            matmul_kernel3[grid_mm_e](x, w2f, g, S, E * FFN, D,
+                x.stride(0), x.stride(1), w2f.stride(0), w2f.stride(1),
+                g.stride(0), g.stride(1), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+            silu_gate_kernel[grid_el](u, g, act, S * E * FFN, BLOCK=BLOCK_EL)
+            act_t.copy_(act.view(S, E, FFN).transpose(0, 1).contiguous())
+            y_e = torch.bmm(act_t, w3)
+            y_esd.copy_(y_e.transpose(0, 1).contiguous())
+            _idx = _ti.unsqueeze(-1).expand(-1, -1, D)
+            y = (torch.gather(y_esd, 1, _idx) * w.unsqueeze(-1)).sum(1)
+        """)
 
     # ★修 indentation bug: 统一走 _build_runner_body (整体 dedent + module_code/setup 重缩进)
     return _build_runner_body(module_code, setup, cands_json, vars_,
@@ -622,6 +1102,51 @@ def _generate_conv2d_runner(op_dir: Path, candidates: List[Tuple],
             conv1d_kernel[grid](x, w, b, y, L, CIN, COUT, KL, LOUT,
                 BLOCK_CO=bco, BLOCK_L=bl)
         """)
+
+    elif op == "resnet_block":
+        # ── resnet: host im2col + 全链 (2 conv + bn/relu/add) ──
+        setup = textwrap.dedent(f"""\
+        # ── Tensor setup (resnet_block 全链: conv1->BN->ReLU->conv2->BN->+x->ReLU) ──
+        import torch.nn.functional as F
+        N_B = int(os.environ.get("RB_N", 8)); C_IN = int(os.environ.get("RB_C", 64))
+        H_ = int(os.environ.get("RB_H", 64)); W_ = int(os.environ.get("RB_W", 64))
+        K = int(os.environ.get("RB_K", 64)); R_, S_, PAD = 3, 3, 1
+        OH = H_; OW = W_; LOUT = OH * OW
+        DTYPE = torch.float32
+        device = torch.device("npu")
+        x = (torch.randn(N_B, C_IN, H_, W_, dtype=DTYPE, device=device) * 0.1)
+        w1 = (torch.randn(K, C_IN, R_, S_, dtype=DTYPE, device=device) * 0.1)
+        b1 = (torch.randn(K, dtype=DTYPE, device=device) * 0.1)
+        w2 = (torch.randn(K, K, R_, S_, dtype=DTYPE, device=device) * 0.1)
+        b2 = (torch.randn(K, dtype=DTYPE, device=device) * 0.1)
+        g1 = (torch.rand(K, dtype=DTYPE, device=device) * 0.5 + 0.5); bn1 = (torch.randn(K, dtype=DTYPE, device=device) * 0.1)
+        g2 = (torch.rand(K, dtype=DTYPE, device=device) * 0.5 + 0.5); bn2 = (torch.randn(K, dtype=DTYPE, device=device) * 0.1)
+        rm1 = (torch.rand(K, dtype=DTYPE, device=device) * 0.5 + 0.5); rv1 = (torch.rand(K, dtype=DTYPE, device=device) * 0.5 + 0.5)
+        rm2 = (torch.rand(K, dtype=DTYPE, device=device) * 0.5 + 0.5); rv2 = (torch.rand(K, dtype=DTYPE, device=device) * 0.5 + 0.5)
+        x_col = F.unfold(x, (R_, S_), padding=PAD).contiguous()
+        w1_flat = w1.reshape(K, C_IN * R_ * S_).contiguous()
+        w2_flat = w2.reshape(K, K * R_ * S_).contiguous()
+        y1 = torch.empty(N_B, K, OH, OW, dtype=DTYPE, device=device)
+        a1 = torch.empty(N_B, K, OH, OW, dtype=DTYPE, device=device)
+        y2 = torch.empty(N_B, K, OH, OW, dtype=DTYPE, device=device)
+        a2 = torch.empty(N_B, K, OH, OW, dtype=DTYPE, device=device)
+        y = torch.empty(N_B, K, OH, OW, dtype=DTYPE, device=device)
+        n_el = N_B * K * OH * OW
+
+        def run_one(bk, bow):
+            grid_c = (N_B * OH * triton.cdiv(OW, bow),)
+            grid_el = (triton.cdiv(n_el, BLOCK_EL),)
+            conv2d_kernel[grid_c](x_col, w1_flat, y1, N_B, K, LOUT, OW,
+                BLOCK_K=bk, BLOCK_OW=bow, BLOCK_CRS=BLOCK_CRS, CRS=C_IN * R_ * S_)
+            bn_kernel[grid_el](y1, a1, rm1, rv1, g1, bn1, n_el, K, OH * OW, EPS, BLOCK=BLOCK_EL)
+            relu_kernel[grid_el](a1, y1, n_el, BLOCK=BLOCK_EL)
+            conv2d_kernel2[grid_c](y1, w2_flat, y2, N_B, K, LOUT, OW,
+                BLOCK_K=bk, BLOCK_OW=bow, BLOCK_CRS=BLOCK_CRS, CRS=K * R_ * S_)
+            bn_kernel2[grid_el](y2, a2, rm2, rv2, g2, bn2, n_el, K, OH * OW, EPS, BLOCK=BLOCK_EL)
+            add_kernel[grid_el](a2, x, y, n_el, BLOCK=BLOCK_EL)
+            relu_kernel2[grid_el](y, y, n_el, BLOCK=BLOCK_EL)
+        """)
+
     else:
         raise ValueError(f"未知 conv2d 型算子: {op}")
 

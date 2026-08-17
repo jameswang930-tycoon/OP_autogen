@@ -177,7 +177,7 @@ def scores_kernel(q_ptr, k_ptr, s_ptr, seq, dim, nheads, scale,
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
-    q_ptrs = q_ptr + head * seq * dim + offs_m[:, None] * dim + offs_k[None, :]
+    q_ptrs = q_ptr + offs_m[:, None] * (nheads * dim) + head * dim + offs_k[None, :]
     k_ptrs = k_ptr + head * dim * seq + offs_k[:, None] * seq + offs_n[None, :]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, dim, BLOCK_K):
@@ -341,6 +341,8 @@ def main():
     b1 = (torch.randn(FFN, dtype=DTYPE, device=npu) * 0.1)
     w2 = (torch.randn(FFN, D, dtype=DTYPE, device=npu) * 0.1)
     b2 = (torch.randn(D, dtype=DTYPE, device=npu) * 0.1)
+    b2x = torch.empty(S, D, dtype=DTYPE, device=npu)
+    b2x.copy_(b2.unsqueeze(0).expand(S, D))   # ★行广播展开 (add_kernel 展平逐元素, b2 仅 [D])
     wln = torch.ones(D, dtype=DTYPE, device=npu)
     bln = torch.zeros(D, dtype=DTYPE, device=npu)
 
@@ -406,7 +408,7 @@ def main():
                                m.stride(0), m.stride(1), w2.stride(0), w2.stride(1),
                                h2.stride(0), h2.stride(1),
                                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K)
-        add_kernel2[grid_el](h2, b2, h2, S * D, BLOCK=BLOCK_EL)
+        add_kernel2[grid_el](h2, b2x, h2, S * D, BLOCK=BLOCK_EL)
         add_kernel3[grid_el](h2, h1, y, S * D, BLOCK=BLOCK_EL)
         layernorm_kernel2[grid_ln](y, wln, bln, y, S, D, EPS, BLOCK=BLOCK_LN)
     torch.npu.synchronize()

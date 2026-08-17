@@ -133,28 +133,39 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.ticker as mticker
+    # ★CJK 字体普遍无 bold/italic 变体 → matplotlib 找 bold 失败刷警告 (无害但烦人), 抑制
+    try:
+        import logging
+        logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
+    except Exception:
+        pass
 
     # 中文字体: ★按字形覆盖检测 (扫描每个字体的 cmap 是否真含中文码点), 不是按名字猜 —
     #   名字匹配不可靠 (服务器字体名千奇百怪, 装了也叫不到); 选第一个覆盖中文的.
     #   font.family 直接设具体字体名 (不走 sans-serif 列表 → 避免 bold/italic 时 fallback).
+    #   ★Last Resort 是 matplotlib 自带"最后手段"占位字体: 对所有码点都有占位 glyph,
+    #     get_char_index 一定非 0 → 会误选, 渲染成方块带字 — 必须排除.
+    #     (名字 "Last Resort High-Efficiency" / 文件 lastResort.ttf, 两处都要查)
+    def _cjk_covers(fe):
+        if "last resort" in fe.name.lower() or "lastresort" in fe.fname.lower():
+            return False
+        try:
+            f = ft2font.FT2Font(fe.fname)
+            # '你' U+4F60 + 常用 CJK 区边界 U+9FA5: 都覆盖才认
+            return f.get_char_index(0x4F60) != 0 and f.get_char_index(0x9FA5) != 0
+        except Exception:
+            return False
+
     try:
         import matplotlib.font_manager as fm
         from matplotlib import ft2font
 
-        def _cjk_covers(fname):
-            try:
-                f = ft2font.FT2Font(fname)
-                # '你' U+4F60 + 常用 CJK 区边界 U+9FA5: 都覆盖才认
-                return f.get_char_index(0x4F60) != 0 and f.get_char_index(0x9FA5) != 0
-            except Exception:
-                return False
-
-        _cjk_fonts = [f for f in fm.fontManager.ttflist if _cjk_covers(f.fname)]
+        _cjk_fonts = [f for f in fm.fontManager.ttflist if _cjk_covers(f)]
         if not _cjk_fonts:
             # ★字体可能是装 matplotlib 缓存之后才装的 → 强制重扫系统字体再测
             try:
                 fm._load_fontmanager(try_read_cache=False)
-                _cjk_fonts = [f for f in fm.fontManager.ttflist if _cjk_covers(f.fname)]
+                _cjk_fonts = [f for f in fm.fontManager.ttflist if _cjk_covers(f)]
             except Exception:
                 pass
         if _cjk_fonts:
@@ -167,7 +178,7 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
             print(f"[chart] 中文字体: {_cjk_fonts[0].name}")
         else:
             plt.rcParams["font.family"] = "DejaVu Sans"
-            print("[chart] ⚠ 无任何含中文形体的字体 (中文会变方块)! 服务器装:\n"
+            print("[chart] ⚠ 未找到真实中文字体 (中文会变方块)! 服务器装:\n"
                   "      apt-get install fonts-noto-cjk\n"
                   "      装完若仍乱码: rm -rf ~/.cache/matplotlib (字体缓存)")
     except Exception as e:

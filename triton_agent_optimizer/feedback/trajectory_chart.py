@@ -259,8 +259,8 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
                              edgecolors="white", linewidth=0.5, zorder=5,
                              label=f"FAIL ({fl.sum()})")
 
-    # ═══ Annotations (标注用实际 speedup — REVERT/FAIL 掉速才看得见; ★防文字重叠:
-    #   已占位置记录, 新标注冲突就垂直上移找空位; 文本截短 — 中文 18 字符 ≈ 9 个汉字) ═══
+    # ═══ Annotations (防重叠: KEEP 只标每 tier 内 speedup 最高的轮 — 完整记录在 rounds.csv;
+    #   文本截短; _free_y 垂直错开) ═══
     _used_spots = []
     def _free_y(x, y, step=0.04):
         while any(abs(x - u) < 1.3 and abs(y - v) < 0.065 for u, v in _used_spots):
@@ -268,41 +268,53 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
         _used_spots.append((x, y))
         return y
 
+    # 每 tier 只标 speedup 最大的 KEEP 轮 (i 是 rounds 索引, history 索引 = i-1)
+    _best_keep = set()
+    for _t, _s, _e in tier_ranges:
+        _cand = [i for i in range(_s, _e + 1)
+                 if i + 1 < len(decisions) and decisions[i + 1] == "KEEP"]
+        if _cand:
+            _best_keep.add(max(_cand, key=lambda i: speeds[i + 1]) + 1)
+
     for i in range(1, len(rounds)):
-        if decisions[i]=="KEEP" and speeds[i] > 1.07:
-            ax.annotate(strategies[i][:18],
+        if decisions[i]=="KEEP" and i in _best_keep and speeds[i] > 1.07:
+            ax.annotate(strategies[i][:14],
                 xy=(rounds[i], speeds[i]),
                 xytext=(rounds[i]+0.4, _free_y(rounds[i], speeds[i]+0.07)),
-                fontsize=7.0, color="#1565c0",
-                arrowprops=dict(arrowstyle="->", color="#1565c0", lw=1, alpha=0.6),
-                bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, ec="#1565c0", lw=0.7),
+                fontsize=6.8, color="#1565c0",
+                arrowprops=dict(arrowstyle="->", color="#1565c0", lw=0.8, alpha=0.6),
+                bbox=dict(boxstyle="round,pad=0.22", fc="white", alpha=0.85, ec="#1565c0", lw=0.6),
                 zorder=10)
         if decisions[i]=="REVERT" and speeds[i] < 0.97:
-            ax.annotate(reasons[i][:20],
+            ax.annotate(reasons[i][:16],
                 xy=(rounds[i], speeds[i]),
                 xytext=(rounds[i]+0.5, _free_y(rounds[i], speeds[i]-0.06)),
-                fontsize=6.8, color="#c62828",
+                fontsize=6.6, color="#c62828",
                 arrowprops=dict(arrowstyle="->", color="#c62828", lw=0.7, alpha=0.5),
-                bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, ec="#c62828", lw=0.6),
+                bbox=dict(boxstyle="round,pad=0.22", fc="white", alpha=0.85, ec="#c62828", lw=0.6),
                 zorder=9)
         if decisions[i]=="FAIL":
-            ax.annotate("×采集/验证失败",
+            ax.annotate("×失败",
                 xy=(rounds[i], speeds[i]),
                 xytext=(rounds[i]+0.3, _free_y(rounds[i], speeds[i]-0.05)),
                 fontsize=6.5, color="#b9770e",
                 arrowprops=dict(arrowstyle="->", color="#f39c12", lw=0.6, alpha=0.6),
                 zorder=9)
 
-    # ═══ Phase labels (top) — ★段太短(<3轮)只留背景色, 不标文字防重叠 ═══
+    # ═══ Phase labels (top) — ★短段也标 (只标 T{n} 编号防重叠), 不丢任何 tier ═══
     ylim = ax.get_ylim()
     for tier, start, end in tier_ranges:
-        if start < end and (end - start) >= 3:
+        if start < end:
             mid = (start+end)/2
-            ax.text(mid, ylim[1]*0.975, f"T{tier}: {TIER_NAME[tier-1]}",
-                    fontsize=9.5, fontweight="bold", color=TIER_FG[(tier-1)%6],
+            if (end - start) >= 4:
+                _pl, _py, _ps = f"T{tier}: {TIER_NAME[tier-1]}", ylim[1]*0.975, 9.5
+            else:
+                _pl, _py, _ps = f"T{tier}", ylim[1]*0.96, 8.0   # ★短段: 只画编号, 塞得下不重叠
+            ax.text(mid, _py, _pl,
+                    fontsize=_ps, fontweight="bold", color=TIER_FG[(tier-1)%6],
                     ha="center", va="top",
-                    bbox=dict(boxstyle="round,pad=0.35", fc=TIER_BG[(tier-1)%6],
-                              alpha=0.85, ec=TIER_FG[(tier-1)%6], lw=1.2),
+                    bbox=dict(boxstyle="round,pad=0.3", fc=TIER_BG[(tier-1)%6],
+                              alpha=0.85, ec=TIER_FG[(tier-1)%6], lw=1.0),
                     zorder=20)
 
     # ═══ Right Y: TFLOPS (只有有意义的 initial_tflops 才画 — 访存型算子无 → 不画误导轴) ═══
@@ -339,13 +351,13 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
         if _ind_us and _final_us:
             _vs_pt += (f"  |  vs Industrial({_ind_us:.0f}us): "
                        f"{_final_us/_ind_us*100:.0f}%")
-    title = (
-        f"Optimization Trajectory: {kernel_dir.name}     "
-        f"Rounds: {total_rounds}  |  "
-        f"TFLOPS: {_tf_s}  |  "
-        f"Speedup: {final_s:.2f}x{_abs_s}{_vs_pt}"
-    )
-    ax.set_title(title, fontsize=13, fontweight="bold", pad=22)
+    # ★title 拆两行 (一行塞不下会顶到图外/挤压): 主行 = 轨迹信息, 次行 = 对比口径
+    _title_1 = (f"Optimization Trajectory: {kernel_dir.name}   "
+                f"Rounds: {total_rounds}  |  TFLOPS: {_tf_s}  |  "
+                f"Speedup: {final_s:.2f}x{_abs_s}")
+    _title_2 = _vs_pt.strip()
+    title = _title_1 + (f"\n{_title_2}" if _title_2 else "")
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=20)
     ax.set_ylabel("Cumulative Speedup (x)", fontsize=13, color="#1565c0")
     ax.set_xlabel("Optimization Round", fontsize=13)
     ax.set_xlim(-0.8, len(rounds)-0.2)
@@ -358,7 +370,12 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     ax.set_axisbelow(True)
     ax.legend(loc="lower right", fontsize=9, framealpha=0.9)
 
-    plt.tight_layout()
+    # ★两行 title 下 tight_layout 常失败 ("top/bottom margins cannot be made large enough")
+    #   → 显式留顶部空间 (title 两行) + 底部 x 轴
+    try:
+        fig.subplots_adjust(top=0.86, bottom=0.09, left=0.055, right=0.98)
+    except Exception:
+        pass
     out = output_path or (kernel_dir / "final_output" / "trajectory_chart.png")
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(out), dpi=150, bbox_inches="tight", facecolor="white")

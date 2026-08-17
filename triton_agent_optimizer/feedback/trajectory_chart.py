@@ -134,24 +134,44 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     import matplotlib.pyplot as plt
     import matplotlib.ticker as mticker
 
-    # 中文字体 (标准做法: font.sans-serif 候选列表, matplotlib 按顺序选可用字体;
-    # ★服务器 Ubuntu 缺 CJK 字体会 fallback DejaVu → 中文变方块, 英文正常 — 就是乱码根源)
+    # 中文字体: ★按字形覆盖检测 (扫描每个字体的 cmap 是否真含中文码点), 不是按名字猜 —
+    #   名字匹配不可靠 (服务器字体名千奇百怪, 装了也叫不到); 选第一个覆盖中文的.
+    #   font.family 直接设具体字体名 (不走 sans-serif 列表 → 避免 bold/italic 时 fallback).
     try:
         import matplotlib.font_manager as fm
-        _avail = {f.name for f in fm.fontManager.ttflist}
-        _cjk = [n for n in (
-            "Noto Sans CJK SC", "Noto Sans CJK TC", "Noto Sans CJK JP",
-            "WenQuanYi Zen Hei", "WenQuanYi Micro Hei", "Droid Sans Fallback",
-            "Source Han Sans SC", "Source Han Sans CN", "AR PL UMing CN",
-            "SimHei", "Microsoft YaHei", "SimSun", "PingFang SC",
-        ) if n in _avail]
-        plt.rcParams["font.sans-serif"] = _cjk + ["DejaVu Sans"]
-        plt.rcParams["font.family"] = "sans-serif"
-        if not _cjk:
-            print("[chart] ⚠ 未找到中文字体 (服务器 Ubuntu 装: "
-                  "apt-get install fonts-noto-cjk) — 中文标签可能乱码")
-    except Exception:
-        pass
+        from matplotlib import ft2font
+
+        def _cjk_covers(fname):
+            try:
+                f = ft2font.FT2Font(fname)
+                # '你' U+4F60 + 常用 CJK 区边界 U+9FA5: 都覆盖才认
+                return f.get_char_index(0x4F60) != 0 and f.get_char_index(0x9FA5) != 0
+            except Exception:
+                return False
+
+        _cjk_fonts = [f for f in fm.fontManager.ttflist if _cjk_covers(f.fname)]
+        if not _cjk_fonts:
+            # ★字体可能是装 matplotlib 缓存之后才装的 → 强制重扫系统字体再测
+            try:
+                fm._load_fontmanager(try_read_cache=False)
+                _cjk_fonts = [f for f in fm.fontManager.ttflist if _cjk_covers(f.fname)]
+            except Exception:
+                pass
+        if _cjk_fonts:
+            # 黑体(sans)优先, 排序稳定
+            _pref = ["Noto Sans CJK", "WenQuanYi", "SimHei", "Microsoft YaHei",
+                     "Source Han", "Droid Sans Fallback"]
+            _cjk_fonts.sort(key=lambda f: next(
+                (i for i, k in enumerate(_pref) if k in f.name), 99))
+            plt.rcParams["font.family"] = _cjk_fonts[0].name
+            print(f"[chart] 中文字体: {_cjk_fonts[0].name}")
+        else:
+            plt.rcParams["font.family"] = "DejaVu Sans"
+            print("[chart] ⚠ 无任何含中文形体的字体 (中文会变方块)! 服务器装:\n"
+                  "      apt-get install fonts-noto-cjk\n"
+                  "      装完若仍乱码: rm -rf ~/.cache/matplotlib (字体缓存)")
+    except Exception as e:
+        print(f"[chart] 中文字体检测异常: {e}")
     plt.rcParams["axes.unicode_minus"] = False
 
     plt.rcParams.update({"font.size":11, "axes.titlesize":13, "axes.labelsize":12, "figure.dpi":150})
@@ -180,9 +200,9 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
         if pytorch_speedup:
             ax.axhline(y=pytorch_speedup, color="gray", linestyle="--", linewidth=2.5,
                        alpha=0.8, zorder=1)
-            ax.text(len(rounds)-1, pytorch_speedup + 0.03,
+            ax.text(rounds[0]+0.5, pytorch_speedup + 0.03,
                     f"PyTorch ({pytorch_time_us:.0f}us, Event)\n口径: 双端 Event 设备侧",
-                    fontsize=9, color="gray", ha="right", va="bottom",
+                    fontsize=9, color="gray", ha="left", va="bottom",
                     bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
 
     # ═══ Industrial baseline (工业级天花板: torch.compile/TorchAir 或 CANN-FA) — 第二条虚线 ═══
@@ -228,35 +248,44 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
                              edgecolors="white", linewidth=0.5, zorder=5,
                              label=f"FAIL ({fl.sum()})")
 
-    # ═══ Annotations (标注用实际 speedup — REVERT/FAIL 掉速才看得见) ═══
+    # ═══ Annotations (标注用实际 speedup — REVERT/FAIL 掉速才看得见; ★防文字重叠:
+    #   已占位置记录, 新标注冲突就垂直上移找空位; 文本截短 — 中文 18 字符 ≈ 9 个汉字) ═══
+    _used_spots = []
+    def _free_y(x, y, step=0.04):
+        while any(abs(x - u) < 1.3 and abs(y - v) < 0.065 for u, v in _used_spots):
+            y += step
+        _used_spots.append((x, y))
+        return y
+
     for i in range(1, len(rounds)):
         if decisions[i]=="KEEP" and speeds[i] > 1.07:
-            ax.annotate(strategies[i][:30],
+            ax.annotate(strategies[i][:18],
                 xy=(rounds[i], speeds[i]),
-                xytext=(rounds[i]+0.4, speeds[i]+0.07),
-                fontsize=7.5, color="#1565c0",
+                xytext=(rounds[i]+0.4, _free_y(rounds[i], speeds[i]+0.07)),
+                fontsize=7.0, color="#1565c0",
                 arrowprops=dict(arrowstyle="->", color="#1565c0", lw=1, alpha=0.6),
-                bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85, ec="#1565c0", lw=0.7),
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, ec="#1565c0", lw=0.7),
                 zorder=10)
         if decisions[i]=="REVERT" and speeds[i] < 0.97:
-            ax.annotate(reasons[i][:35],
+            ax.annotate(reasons[i][:20],
                 xy=(rounds[i], speeds[i]),
-                xytext=(rounds[i]+0.5, speeds[i]-0.06),
-                fontsize=7, color="#c62828",
+                xytext=(rounds[i]+0.5, _free_y(rounds[i], speeds[i]-0.06)),
+                fontsize=6.8, color="#c62828",
                 arrowprops=dict(arrowstyle="->", color="#c62828", lw=0.7, alpha=0.5),
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, ec="#c62828", lw=0.6),
                 zorder=9)
         if decisions[i]=="FAIL":
-            ax.annotate("✗采集/验证失败",
+            ax.annotate("×采集/验证失败",
                 xy=(rounds[i], speeds[i]),
-                xytext=(rounds[i]+0.3, speeds[i]-0.05),
+                xytext=(rounds[i]+0.3, _free_y(rounds[i], speeds[i]-0.05)),
                 fontsize=6.5, color="#b9770e",
                 arrowprops=dict(arrowstyle="->", color="#f39c12", lw=0.6, alpha=0.6),
                 zorder=9)
 
-    # ═══ Phase labels (top) ═══
+    # ═══ Phase labels (top) — ★段太短(<3轮)只留背景色, 不标文字防重叠 ═══
     ylim = ax.get_ylim()
     for tier, start, end in tier_ranges:
-        if start < end:
+        if start < end and (end - start) >= 3:
             mid = (start+end)/2
             ax.text(mid, ylim[1]*0.975, f"T{tier}: {TIER_NAME[tier-1]}",
                     fontsize=9.5, fontweight="bold", color=TIER_FG[(tier-1)%6],
@@ -312,9 +341,11 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     ax.set_ylim(0.88, max(running_best)*1.12)
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2fx"))
     ax.tick_params(axis="y", labelcolor="#1565c0")
+    # ★轮次多时 x 刻度稀疏 (防 round 数字挤在一起): 最多 ~16 个刻度
+    ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True, nbins=16))
     ax.grid(True, alpha=0.15, linestyle="--")
     ax.set_axisbelow(True)
-    ax.legend(loc="upper left", fontsize=9, framealpha=0.9)
+    ax.legend(loc="lower right", fontsize=9, framealpha=0.9)
 
     plt.tight_layout()
     out = output_path or (kernel_dir / "final_output" / "trajectory_chart.png")

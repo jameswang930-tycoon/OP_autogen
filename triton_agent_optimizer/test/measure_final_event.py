@@ -32,8 +32,9 @@
   - 多窗口 median: N 个独立 Event 对, 最后 sync, 取 median (抗单次抖动)
   - 破 L2: 每窗口前重建输入张量 (新地址; Ascend 无清 L2 API, 重建 = n_buf 轮换同效)
   - warmup: W 次完整链路 (JIT 编译/冷 cache 消化, 不计时)
-  - --msprof 模式: 直接 msprof 包原文件 → 目标 kernel (非 aclnn) Task Duration 求和 /loop
-    = 纯 kernel 时间 (不含 host launch, 与 verify 的 ns 口径同源; 小算子不受 launch 开销污染)
+   - --msprof 模式: msprof 包 kernel_op.py → 目标 kernel (非 aclnn) Task Duration 求和 /loop
+     = 纯 kernel 时间 (不含 host launch, 与 verify 的 ns 口径同源; 小算子不受 launch 开销污染)
+     ★每轮重建输入破 L2 (与工业级轮换 buffer 同口径, 冷 L2 纯 kernel 时间)
   ★口径声明: 与工业级同尺 (Event 设备侧端到端), 可直接与 bench_all 结果对比
   ★注意: conv2d/conv_bias_relu 的 unfold 展开张量是派生分配, 不在重建范围 (工作集小, 影响有限)
 
@@ -53,6 +54,8 @@ except Exception:
 
 # ★项目根: test/ 的上一级 (相对路径从这里解析)
 _ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))   # ★供 from agents.verifier import _inject_l2_rebuild
 # ★bench_all.py 位置 (写回 OUR_RESULTS_US 的目标)
 _BENCH_ALL = _ROOT / "bench_910b3" / "bench_all.py"
 
@@ -226,8 +229,10 @@ def _write_back(rows, force: bool = False) -> int:
 
 
 def _measure_msprof(op: str, path: Path, loop: int = 100):
-    """msprof 纯 kernel 模式: 包原 kernel_op.py (KERNEL_LOOP=loop) → op_summary
+    """msprof 纯 kernel 模式: 包 kernel_op.py (KERNEL_LOOP=loop) → op_summary
     目标 kernel (非 aclnn) Task Duration 求和 /loop = 单次纯 kernel 时间 (us).
+    ★2026-08-17 冷 L2 对齐: 注入"每轮重建输入"(新地址破 L2, host 分配不产生 kernel 行,
+    不污染求和) — 与工业级 --msprof (每轮轮换 64 组 buffer) 同口径; 注入失败回退原文件.
     ★与 verify 的 ns 口径同源 (不含 host launch) — 与工业级 --msprof 直接可比."""
     import csv
     try:
@@ -235,9 +240,18 @@ def _measure_msprof(op: str, path: Path, loop: int = 100):
         import shutil as _sh
         _sh.rmtree(_msprof_out, ignore_errors=True)
         _msprof_out.mkdir(parents=True, exist_ok=True)
+        _app = path
+        try:
+            from agents.verifier import _inject_l2_rebuild
+            _inj = _inject_l2_rebuild(path.read_text(encoding="utf-8"))
+            if _inj:
+                _app = _WORK / f"{op}_msprof_app.py"
+                _app.write_text(_inj, encoding="utf-8")
+        except Exception:
+            pass
         env = dict(os.environ, KERNEL_LOOP=str(loop))
         cmd = ["msprof", f"--output={_msprof_out}",
-               f"--application={sys.executable or 'python3'} {path}", "--ai-core=on"]
+               f"--application={sys.executable or 'python3'} {_app}", "--ai-core=on"]
         r = subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="backslashreplace",
                            timeout=_TIMEOUT, env=env)

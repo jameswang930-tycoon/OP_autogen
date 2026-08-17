@@ -162,8 +162,19 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
     msprof_out = round_dir / "msprof_0"
     _shutil.rmtree(msprof_out, ignore_errors=True)
     msprof_out.mkdir(parents=True, exist_ok=True)
+    # ★2026-08-17 冷 L2 对齐 (与工业级 msprof 每轮轮换 buffer 同口径):
+    #   注入"每轮重建输入"再包 msprof — 重建是 host 分配, 不产生 op_summary 行,
+    #   不污染 Task Duration 求和; 注入失败/无分配行 → 回退原文件.
+    _app = kernel_op
+    try:
+        _inj = _inject_l2_rebuild(kernel_op.read_text(encoding="utf-8"))
+        if _inj:
+            _app = round_dir / "msprof_app.py"
+            _app.write_text(_inj, encoding="utf-8")
+    except Exception:
+        _app = kernel_op
     cmd = ["msprof", f"--output={msprof_out}",
-           f"--application={py} {kernel_op}", "--ai-core=on"]
+           f"--application={py} {_app}", "--ai-core=on"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="backslashreplace", timeout=7200, env=env)
@@ -256,7 +267,7 @@ def _inject_event_timing(src: str, rebuild_inputs: bool = True) -> str:
     #   分配行都在 main 的循环前 (14 个算子统一模式, 单行); 提取不到 → 不重建 (退化为热 L2, 不报错).
     _alloc_lines = []
     for _ln in lines[:for_idx]:
-        _am = re.match(r"^\s{4,}(\w+)\s*=\s*torch\.(randn?|rand|empty|zeros|ones)\(", _ln)
+        _am = re.match(r"^\s{4,}(\w+)\s*=\s*\(?torch\.(randn?|rand|empty|zeros|ones)\(", _ln)
         if _am:
             _alloc_lines.append((_ln.rstrip("\n"), _am.group(1)))
     # 收集循环体: for_idx 之后缩进 > base_indent 的行 (含空行)
@@ -316,6 +327,45 @@ def _inject_event_timing(src: str, rebuild_inputs: bool = True) -> str:
     # ★保险: 注入块引用 os.environ — 若源文件顶部没有 import os (未来新算子), 补上防 NameError
     #   (Event 测不到 → 方案A 永不采纳 → 误 REVERT)
     if not re.search(r"^\s*import\s+os\b", out, re.M):
+        out = "import os\n" + out
+    return out
+
+
+def _inject_l2_rebuild(src: str) -> str:
+    """把 for LOOP 循环内注入"每轮重建输入"(新地址破 L2) — msprof 冷 L2 对齐 (2026-08-17).
+    与 _inject_event_timing 同法: 扫描循环前 torch 直接分配行, 在循环体顶部逐轮重建,
+    _msprof_keep 持有防 GC 地址复用 (否则 caching allocator 复用刚释放地址 → L2 又命中).
+    重建是 host 端分配, 不产生 op_summary 行, 不污染 Task Duration 求和.
+    ★与工业级 msprof (app 每轮轮换 n_buf 组 buffer) 同口径 — 两边都是冷 L2 纯 kernel 时间.
+    找不到标准循环/分配行 → 返回 "" (调用方回退原文件)."""
+    import re as _re
+    lines = src.splitlines(keepends=True)
+    for_idx = None
+    base_indent = 0
+    for i, ln in enumerate(lines):
+        m = _re.match(r'(\s*)for\s+\w+\s+in\s+range\(\s*LOOP\s*\)\s*:', ln)
+        if m:
+            for_idx, base_indent = i, len(m.group(1))
+            break
+    if for_idx is None:
+        return ""
+    alloc_lines = []
+    for _ln in lines[:for_idx]:
+        _am = _re.match(r"^\s{4,}(\w+)\s*=\s*\(?torch\.(randn?|rand|empty|zeros|ones)\(", _ln)
+        if _am:
+            alloc_lines.append((_ln.rstrip("\n"), _am.group(1)))
+    if not alloc_lines:
+        return ""
+    ind = " " * base_indent
+    rebuild = "".join((ind + "    " + _a.lstrip() + "\n") for _a, _ in alloc_lines)
+    _names = ", ".join(_n for _, _n in alloc_lines)
+    pre = (f"{ind}_msprof_keep = []\n"
+           f"{ind}# ★msprof 冷 L2 注入: 每轮重建输入 (新地址破 L2; host 分配不产生 kernel 行)\n")
+    body_inject = (f"{rebuild}"
+                   f"{ind}    _msprof_keep.append(({_names}))\n")
+    out = ("".join(lines[:for_idx]) + pre + "".join(lines[for_idx])
+           + body_inject + "".join(lines[for_idx + 1:]))
+    if not _re.search(r"^\s*import\s+os\b", out, _re.M):
         out = "import os\n" + out
     return out
 

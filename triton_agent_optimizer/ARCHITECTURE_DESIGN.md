@@ -814,7 +814,9 @@ outputs/<op>/
     "pytorch_time_us": 45.0,           // PyTorch 基准端到端 us (Event 测, 轨迹图灰虚线)
     "pytorch_kernel_time_us": null,    // PyTorch 纯 kernel (Event 给不出拆解 → null)
     "pytorch_baseline": "pytorch_mlp_tflops.json",  // PyTorch 基准来源 json
-    "industrial_time_us": 43.0,        // 工业级基准端到端 us (各 mode Event 取 min 仅真执行; 轨迹图红虚线)
+    "industrial_time_us": 43.0,        // 工业级最优纯 kernel us (msprof 口径各 mode 取 min; 轨迹图红线)
+    "industrial_eager_kernel_us": 50.0,    // ★v4.6: 工业级 eager 纯 kernel 单独值 (迭代前自动测并记录)
+    "industrial_compile_kernel_us": 43.0,  // ★v4.6: 工业级 compile 纯 kernel 单独值 (迭代前自动测并记录)
     "industrial_kernel_time_us": null, // 工业级纯 kernel (Event 无 → null)
     "industrial_baseline": "industrial_matmul_compile_tflops.json",  // 最优来源 mode
 
@@ -870,7 +872,8 @@ outputs/<op>/
       "sweep_status": "ran_this_round",// sweep 状态 (ran/failed/skipped_no_free_params/reused)
 
       "error": "",                     // 报错文本 (空=正常; coder/verify 失败时记, 下轮 planner 可见)
-      "tflops": 8.7                    // 本轮真实 TFLOPS (cube_fops÷ns; kernel 结构变 FLOPs 也变, 图不失真)
+      "tflops": 8.7,                   // 本轮真实 TFLOPS (cube_fops÷ns; kernel 结构变 FLOPs 也变, 图不失真)
+      "our_kernel_us": 4100.0,         // ★v4.6: 优化成功轮的我们纯 kernel 设备侧耗时 us (msprof, 与工业级同尺; 仅 KEEP 轮有值)
     }
     // ... 每轮一条, 同上结构
   ]

@@ -502,6 +502,25 @@ def _load_industrial_best(op: str, modes: list) -> Optional[dict]:
     return best
 
 
+def _load_industrial_modes(op: str, modes: list) -> dict:
+    """★v4.6 按 mode 分别读工业级纯 kernel 耗时 (msprof 口径) → {mode: time_us}.
+    用户要求: eager 与 compile 各自单独记录 (不只取 min), 供逐 mode 对比;
+    非 msprof 口径的 json 跳过 (与 _load_industrial_best 同规则)."""
+    out = {}
+    for _m in modes:
+        _p = _PROJECT / "bench_910b3" / "outputs" / f"industrial_{op}_{_m}_tflops.json"
+        if not _p.exists():
+            continue
+        try:
+            _d = json.loads(_p.read_text(encoding='utf-8'))
+            _t = _d.get("time_us")
+            if _t and (_d.get("method") or "") == "msprof" and _d.get("actual_mode", _m) == _m:
+                out[_m] = _t
+        except Exception:
+            continue
+    return out
+
+
 def _auto_run_industrial(op: str, modes: list) -> None:
     """缺工业级基准 json 时自动跑 bench_industrial.py 生成 (★msprof 纯 kernel 口径,
     与我们 KEEP/REVERT 主依据同尺). env AUTO_RUN_IND_BENCH=0 关闭;
@@ -1703,9 +1722,15 @@ class Scheduler:
                 _best = _load_industrial_best(self.kernel_name, _ind_modes)
                 # ★2026-08-12: 缺工业级基准 → 自动跑 bench_industrial.py 生成 (不再只警告).
                 #   env AUTO_RUN_IND_BENCH=0 关闭 (与 AUTO_RUN_PT_BENCH 同款).
-                if not _best and os.environ.get("AUTO_RUN_IND_BENCH", "1") == "1":
+                # ★2026-08-18: 改为「逐 mode 补齐」(不只全缺才跑) — eager/compile 要各自单独有值.
+                if os.environ.get("AUTO_RUN_IND_BENCH", "1") == "1":
                     _auto_run_industrial(self.kernel_name, _ind_modes)
                     _best = _load_industrial_best(self.kernel_name, _ind_modes)
+                # ★v4.6 新增字段: eager / compile 工业级纯 kernel 设备侧耗时单独记录
+                #   (迭代开始前自动测得; 供 final_summary 逐 mode 对比, 不只取 min)
+                _modes_d = _load_industrial_modes(self.kernel_name, _ind_modes)
+                st["industrial_eager_kernel_us"] = _modes_d.get("eager")
+                st["industrial_compile_kernel_us"] = _modes_d.get("compile")
                 if _best:
                     st["industrial_time_us"] = _best["time_us"]
                     st["industrial_kernel_time_us"] = _best["kernel_time_us"]
@@ -2136,6 +2161,9 @@ class Scheduler:
                     "kernel_speedup": round(_be / ns, 4) if (_be and ns) else None,  # 纯 kernel 口径 (与 speedup 同源)
                     "prev_speedup": round(prev_speedup, 4),   # 上一轮已接受 kernel 的加速比 (保留判定用)
                     "ns": ns, "e2e_ns": _e2e, "e2e_event_ns": _evt_ns,   # ★e2e_event_ns = Event 设备侧 (参考)
+                    # ★v4.6: 优化成功轮记录我们的纯 kernel 设备侧耗时 (us, msprof 口径与工业级同尺);
+                    #   取本轮 verify 的 msprof 实测 (KEEP 后代码与被测代码同一份, 不重复烧 msprof)
+                    "our_kernel_us": (round(ns / 1000.0, 1) if (ns and kept) else None),
                     # ★口径提示 (2026-08-18): speedup/kernel_speedup = msprof 口径(仅显示, 欠采会假大);
                     #   event_speedup = Event 口径, 与 best_speedup 同源可直接对比。
                     #   REVERT 轮若 speedup 高而 event_speedup 低/缺失 = msprof 欠采假大或 Event 缺 → 属防护机制。
@@ -2197,6 +2225,7 @@ class Scheduler:
             if (ns and kept
                     and (st.get("best_kernel_ns") is None or ns < st["best_kernel_ns"])):
                 st["best_kernel_ns"] = ns
+                st["our_kernel_us"] = round(ns / 1000.0, 1)   # ★v4.6: 当前最优纯 kernel 设备侧耗时 (us)
                 if _be:
                     st["best_speedup"] = round(_be / ns, 4)   # 派生 (纯 kernel 口径)
                 st["best_kernel"] = str(round_kernel)
@@ -2297,6 +2326,14 @@ class Scheduler:
             if _our_best_evt_ns:
                 st["our_best_e2e_event_ns"] = _our_best_evt_ns
         print(f"\n══ 完成: best_speedup={st.get('best_speedup')}x (纯kernel口径) ══")
+        _ok_us = st.get("our_kernel_us")
+        _ie_us = st.get("industrial_eager_kernel_us")
+        _ic_us = st.get("industrial_compile_kernel_us")
+        if _ok_us:
+            _r_e = f"{_ok_us / _ie_us:.3f}" if _ie_us else "无"
+            _r_c = f"{_ok_us / _ic_us:.3f}" if _ic_us else "无"
+            print(f"  [纯kernel对比] 我们={_ok_us}us | 工业级 eager={_ie_us}us compile={_ic_us}us "
+                  f"| vs_eager={_r_e} vs_compile={_r_c} (<1=快于工业级)")
         print(f"  [产出] 总执行 {st.get('total_rounds', 0)} 轮 (含 {_prom} 次 promote, 有效优化 {_n_eff} 轮), "
               f"总耗时 {time.time()-total_start:.0f}s")
         print(f"  [产出] ★纯kernel: baseline {_bs}ns → 当前 {_cur_ns}ns, 加速比 {_cs}x (best {st.get('best_speedup')}x)")
@@ -2410,6 +2447,14 @@ class Scheduler:
                     "baseline_e2e_ns": _be2e, "final_e2e_ns": _cur_e2e, # 端到端 (msprof, 参考)
                     "our_best_kernel_ns": _our_best_kns,                # ★我们最优纯 kernel (vs工业级同尺)
                     "our_best_e2e_event_ns": _our_best_evt_ns,          # 我们最优 Event (参考口径)
+                    # ★v4.6 新增: 逐 mode 工业级纯 kernel 对比 (eager/compile 单独值 + 双向比值)
+                    "our_kernel_us": st.get("our_kernel_us"),             # 最优轮我们纯 kernel 设备侧耗时 (us, 与工业级同尺)
+                    "industrial_eager_kernel_us": st.get("industrial_eager_kernel_us"),       # 工业级 eager 纯 kernel (迭代前自动测)
+                    "industrial_compile_kernel_us": st.get("industrial_compile_kernel_us"),   # 工业级 compile 纯 kernel (迭代前自动测)
+                    "vs_eager_ratio": (round(st["our_kernel_us"] / st["industrial_eager_kernel_us"], 3)
+                                       if st.get("our_kernel_us") and st.get("industrial_eager_kernel_us") else None),
+                    "vs_compile_ratio": (round(st["our_kernel_us"] / st["industrial_compile_kernel_us"], 3)
+                                         if st.get("our_kernel_us") and st.get("industrial_compile_kernel_us") else None),
                     "industrial_time_us": st.get("industrial_time_us"), # 工业级基准 (msprof 纯kernel, 各 mode min)
                     "industrial_baseline": st.get("industrial_baseline"),
                     "industrial_modes": _ind_modes_list,                # ★各 mode 明细 (分析差在哪)

@@ -402,6 +402,10 @@ cat <round_dir>/06_diagnosis/diagnosis.json
   - 修 scheduler speedup 轮首未初始化（失败轮 UnboundLocalError）; 测试 fixture 补 KERNEL_LOOP 行
     + 新增"真丢循环"对照场景; P16 断言更新（欠采提示词）; 回归 32/32 + bugfix_verify 25 项全过
   - 文档全量同步（本 README + ARCHITECTURE_DESIGN.md 26 处）到 v4.6 口径
+  - ★v4.6 新增自动测量字段: 迭代前自动测工业级 **eager/compile 纯 kernel 各自单独值**
+    （state: industrial_eager/compile_kernel_us; 自动跑改为逐 mode 补齐）; 每轮优化成功 (KEEP) 后记录
+    我们纯 kernel 设备侧耗时（hist/state: our_kernel_us, 取本轮 verify 的 msprof 实测, 与工业级同尺）;
+    final_summary 新增 our_kernel_us + vs_eager_ratio + vs_compile_ratio + 逐 mode 单独值
 
 ---
 

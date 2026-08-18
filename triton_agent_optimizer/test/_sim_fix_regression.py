@@ -1017,8 +1017,10 @@ def test_fake_small_event():
         # ① 循环异常轮 (Event None) 永不 KEEP (r2 → REVERT, 方案A)
         ok1 = r2["decision"] == "REVERT" and all(
             h["decision"] != "KEEP" for h in hist if h.get("e2e_event_ns") is None)
-        # ② Event 缺失提示进 hist error (planner 可见)
-        ok2 = "Event 缺失" in (r2.get("error") or "")
+        # ② 回退原因进 hist error (planner 可见)
+        #   ★2026-08-18: 决策主口径改纯 kernel → r2(rows=3) 由"欠采硬门槛"拦截, 提示词为"欠采";
+        #   旧设计 (Event 主口径) 的提示词是 "Event 缺失" — 两者任一即算通过
+        ok2 = ("欠采" in (r2.get("error") or "")) or ("Event 缺失" in (r2.get("error") or ""))
         # ③ r3 真实 1.25x (循环完整) → KEEP + best 更新 (不误杀)
         ok3 = r3["decision"] == "KEEP" and abs((st.get("best_e2e_event_ns") or 0) - 4_000_000.0) < 1
         # ④ rebaseline (r2 前) cur 循环异常 → best 未被覆盖, current_speedup 未被毒 (msprof 修正后 ~1.04)

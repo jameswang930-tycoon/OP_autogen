@@ -1,11 +1,12 @@
 # Triton Agent Optimizer v4.5 — 架构设计（按当前实现）
 
-> **核心思路**: 不靠盲试（AutoKernel 300~400 轮），而是用 **真机 msprof 双源采集（通用 msprof + msprof op）** 精确诊断每个 kernel 的耗时/带宽/算力/瓶颈 → 6 层优化策略逐层推进 → 每轮**两段验证（段1 正确性+Event 快测秒级 → 不快于 best 直接 REVERT; 段2 过门才 msprof 全量确认）**，**严格最优 KEEP（Event 绝对延迟 < 历史最小才进链）**决定保留/回退，并以**工业级最优**（eager/compile/cann-fused/fa 各 mode Event 取 min）为对比天花板，最终算 **vs 工业级比值**看优化效果。
+> **核心思路**: 不靠盲试（AutoKernel 300~400 轮），而是用 **真机 msprof 双源采集（通用 msprof + msprof op）** 精确诊断每个 kernel 的耗时/带宽/算力/瓶颈 → 6 层优化策略逐层推进 → 每轮**两段验证（段1 正确性+Event 快测秒级 → 不快于 best 直接 REVERT; 段2 过门才 msprof 全量确认）**，**严格最优 KEEP（★v4.6: 纯 kernel 绝对延迟 < 历史最小 best_kernel_ns 才进链, msprof 设备侧）**决定保留/回退（Event 快测门只做粗筛省 msprof）, 并以**工业级最优**（各 mode msprof 纯 kernel 口径取 min）为对比天花板，最终算 **vs 工业级比值**（纯 kernel 同尺）看优化效果。
 >
 > **环境**: Ascend 910B3 (NPU) + CANN 8.5.1 + triton-ascend 3.2.0 + torch_npu 2.9.0 + nga (本地 LLM codeagent)
 >
 > **版本历史**:
 > - **v4.5 (2026-08-13)**: 失败案例库 (memory/failed_cases.py: 按 tier 分文件/指纹去重/两级检索/方案收敛守卫/stuck 黑名单, scheduler 轮内重试累积上下文, coder 检索注入+solved 回填) + 两段验证 (段1 正确性+Event 快测秒级, 不快于 best 直接 REVERT; 段2 过门才 msprof 全量) + Amdahl 显式编排 (planner 每轮看 per-kernel 占比排序) + 跨轮诊断快照 (hist 记 top2 kernel 关键指标 + 全量 JSONL) + v3 就地展开式讲演页
+> - **v4.6 (2026-08-18)**: ★口径统一 — KEEP/REVERT 决策主依据从 Event 端到端改为**纯 kernel 绝对延迟** (msprof Task Duration 求和÷遍数 = verify 的 ns) + 欠采硬门槛 (行数<loop 不采纳); speedup/best_speedup/vs_industrial 全部统一纯 kernel 口径 (history speedup 与 best_speedup 同源, 根治「显示 2.x vs best 1.x」矛盾); Event 降为参考 (快测门粗筛 + 报告, best_e2e_event_ns 独立维护不参与决策); 工业级对比只认 method=msprof json (`bench_industrial.py --msprof`); verifier Event 门控改 loop_ok (msprof 漏记不株连); 修 speedup 轮首未初始化崩溃; 回归 32/32
 > - **v4.4 (2026-08-12)**: 修复轮: sweep 回滚内容快照/promote 门前置+有效轮计数/rebaseline 同步 best Event/diff.patch 仅成功时写/coder Unicode 清洗 4 缺陷/bench 测量方法学对齐 do_bench (多窗口 median + 输入轮换破 L2); 回归测试 `_sim_fix_regression.py`
 > - **v4.3 (2026-08-11)**: bench 全切 Event 设备侧计时 + 每轮补 e2e_event_ns + 严格最优 KEEP (Event 绝对延迟) + best_kernel 绑定 + 失败回滚 + sweep 每 tier3 round 都跑 + 设备污染检测/重置 + vs_industrial 比值
 
@@ -59,7 +60,7 @@ Scheduler (agents/scheduler.py) — 状态机主循环 (tier 1~6 × round N)
    ├─⑤ 验证 — 两段验证 (TWO_PHASE_VERIFY=1 默认; 0 关闭退全量; stub 自动禁用)
    │    段1 verify_fast_gate (agents/verifier.py, 秒级, 无 msprof):
    │      正确性校验(_correctness_check) + Event 快测(_event_e2e_ns)
-   │      → Event ≥ best → 直接 REVERT (省 warmup×3+msprof 几分钟/轮; speedup 用 Event 口径派生)
+   │      → Event ≥ best → 直接 REVERT (省 warmup×3+msprof 几分钟/轮; speedup=None 不拿 Event 派生冒充)
    │    段2 verify_end_to_end (过门才跑, 全量确认+诊断字段):
    │      正确性校验(MATMUL_VERIFY) + warmup(3) + 一次 msprof 内循环 KERNEL_LOOP(30) 次
    │      读全部 op_summary*.csv 合并 → 同一次同算两种口径 ÷ 实测遍数:
@@ -68,8 +69,8 @@ Scheduler (agents/scheduler.py) — 状态机主循环 (tier 1~6 × round N)
    │        改写 kernel_op 注入 warmup + KERNEL_EVENT_REPS(5) 个独立窗口 → median → EVENT_E2E_US
    │      (源码无 KERNEL_LOOP 循环 → 自动改除实测遍数, 防虚高; msprof 轮 Event 缺失用段1快测值兜底)
    │
-   ├─⑥ 决策  严格最优 KEEP: 本轮 Event 绝对延迟 < 历史最小 best_e2e_event_ns 才进链
-   │    (设备侧无 profiler 扰动, 免 msprof 欠采毒 best; Event 缺则方案A: 不采纳)
+   ├─⑥ 决策  严格最优 KEEP (★v4.6): 本轮纯 kernel 耗时 ns (msprof) < 历史最小 best_kernel_ns 才进链
+   │    (欠采硬门槛: 行数<loop 不采纳防假快; 纯 kernel 缺失不保留; Event 快测门已粗筛)
    │    采纳时同步 best_kernel/best_round + 复制 outputs/<op>/best_kernel.py
    │    未采纳/失败 → current_kernel 回滚轮首快照 (内容快照恢复, 防 sweep 轮链污染; 失败代码另存 failed_kernel.py)
    │    记录 history[] {..., ns, e2e_ns(msprof), e2e_event_ns(Event), sweep_ran, sweep_adopted,
@@ -155,7 +156,7 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
 │                              ▼                                          │
 │  ┌──────────────────────────────────────────────────────────────┐       │
 │  │           Scheduler (Python 状态机 — 决策核心)                │       │
-│  │  严格最优 KEEP: Event 绝对延迟 < 历史最小才进链 (绑定 best)  │       │
+│  │  严格最优 KEEP: 纯 kernel ns < 历史最小才进链 (绑定 best)  │       │
 │  │  未采纳/失败 → current_kernel 内容快照回滚 (保 input 链)       │       │
 │  │  晋升门前置(无依据转正常轮)·有效轮计数(max_rounds 硬上限)      │       │
 │  │  设备污染检测: verify 崩 AICore → 下轮采集前 _reset_device     │       │
@@ -397,8 +398,8 @@ feedback/trajectory_chart.py → final_output/trajectory_chart.png
 ═══════════════════════════════════════════════════════════════════════
 执行:
   - 主加速比(显示) = baseline_e2e_ns / e2e_ns  (纯 kernel 兜底)
-  - 严格最优: e2e_event_ns < best_e2e_event_ns (历史最小 Event) → KEEP (current_kernel → 本轮 round_dir)
-    (Event 缺 → 方案A 不采纳; best_speedup = baseline_e2e_event_ns/best_e2e_event_ns 派生)
+  - 严格最优 (★v4.6): ns(纯 kernel, msprof) < best_kernel_ns (历史最小) → KEEP (current_kernel → 本轮 round_dir)
+    (欠采 行数<loop / 纯 kernel 缺失 → 不采纳; best_speedup = baseline_ns/best_kernel_ns 派生, 与 history speedup 同源)
     否则 → REVERT (内容快照回滚轮首 = 沿用历史最优 kernel)
   - 晋升/回退: planner.promote_to (需 promote_evidence, 可回退前层) + 连续 3 轮无改进兜底晋升
   - (晋升时) 写跳转手递: round_dir/10_tier_handoff.json
@@ -474,8 +475,8 @@ while (total_rounds - promote_budget) < max_rounds:      # 有效优化轮计数
             new_code = _code(plan, rn, round_dir, prev_err)   # → roundN/kernel_op.py (+diff.patch 仅成功时写)
             v = _verify(round_dir, baseline_ns)               # 正确性校验 + msprof 双口径 + Event 注入计时
             if v.ok: break
-    # KEEP 决策 = Event 绝对延迟 (主), msprof speedup 为显示口径:
-    if e2e_event_ns < best_e2e_event_ns: current_kernel = roundN/kernel_op.py; KEEP
+    # KEEP 决策 = 纯 kernel 绝对延迟 (msprof ns; ★v4.6 主口径, Event 为参考):
+    if ns < best_kernel_ns (且非欠采): current_kernel = roundN/kernel_op.py; KEEP
     else: REVERT (内容快照恢复轮首 = 沿用历史最优; 失败代码另存 failed_kernel.py)
     history.append(...); _save_traj()
     # 晋升/停止判定 → 下一轮/下一 tier/停止
@@ -504,7 +505,7 @@ triton_agent_optimizer/
 
 ├── agents/                        # ── Agent 层: 调度状态机 + 规划/改码/验证 + LLM 入口 ──
 │   ├── scheduler.py               # 调度状态机 (核心): 驱动每轮 采集→诊断→Planner→Coder→Verify→决策→晋升;
-│   │                              #   round1 设基准(纯kernel+端到端+Event+工业级); KEEP 决策=Event 绝对延迟(方案A: Event缺不采纳);
+│   │                              #   round1 设基准(纯kernel+端到端+Event+工业级); KEEP 决策=纯 kernel ns (欠采/缺失不采纳; Event 快测门粗筛);
 │   │                              #   晋升门前置(无依据转正常轮)+有效轮计数(max_rounds 硬上限); 回滚内容快照(failed_kernel 留证);
 │   │                              #   rebaseline 同步 best Event; extract_tier_fields 筛字段(+Amdahl 优先级行);
 │   │                              #   两段验证接入(段1 Event 快测门); 失败案例库接入(重试上下文+solved 回填+error_class);
@@ -633,10 +634,10 @@ triton_agent_optimizer/
 ## 4. 各组件详解
 
 ### 4.1 Scheduler — 状态机核心
-- **状态**: `traj["state"]` = {tier, round, total_rounds, promote_budget, best_speedup, **best_e2e_event_ns(KEEP 主依据: 历史最小 Event 延迟)**, baseline_ns(纯), baseline_e2e_ns(端到端 msprof), **baseline_e2e_event_ns(Event)**, num_kernels, num_launches, baseline_mnk, initial_tflops, pytorch基准, industrial_time_us(Event 各 mode min), current_speedup, current_kernel, **best_kernel, best_round, best_e2e_ns**, vs_industrial_ratio, last_sweep_result, handoff, tier_jumps, last_rebase_round}
-- **严格最优 KEEP**: 本轮 Event 绝对延迟 `e2e_event_ns < best_e2e_event_ns`（历史最小）才进链 — 设备侧无 profiler 扰动, 免 msprof 欠采毒 best; **Event 缺失(非晋升轮) → 方案A 不采纳**（不退化 msprof 兜底, 堵假值后门）
+- **状态**: `traj["state"]` = {tier, round, total_rounds, promote_budget, best_speedup, **best_kernel_ns(KEEP 主依据: 历史最小纯 kernel 耗时, msprof)**, best_e2e_event_ns(快测门粗筛+报告参考), baseline_ns(纯), baseline_e2e_ns(端到端 msprof), **baseline_e2e_event_ns(Event)**, num_kernels, num_launches, baseline_mnk, initial_tflops, pytorch基准, industrial_time_us(Event 各 mode min), current_speedup, current_kernel, **best_kernel, best_round, best_e2e_ns**, vs_industrial_ratio, last_sweep_result, handoff, tier_jumps, last_rebase_round}
+- **严格最优 KEEP (★v4.6 口径统一)**: 本轮纯 kernel 耗时 `ns < best_kernel_ns`（历史最小, msprof Task Duration 求和÷遍数）才进链 — 与优化对象 (triton.jit kernel) 同尺, host/框架成分不掺入; **欠采硬门槛**（行数 < loop → 求和偏小假快 → 不采纳）+ 纯 kernel 缺失不保留; speedup/best_speedup 全部 `baseline_ns/ns` 派生（与 history 同源, 根治「显示 2.x vs best 1.x」口径矛盾）
 - **假小 Event 防护 (2026-08-12, 用户报告 "加速比突然 200x → 真实优化轮永不 KEEP"; 同日简化)**: coder 改坏的代码在 KERNEL_EVENT_TIME 模式下窗口没跑满 (launch 被移走/条件包裹/循环改坏) → Event 假小 → 毒 best。防护原则（用户定版）: **Event 测对就保留, 初始代码差时几百上千倍加速比真实存在, 绝无比值拦截**:
-  - Event 真实性保证: verify 的 msprof 行数检测 — 循环异常 (行数 < loop) → **不测 Event (返回 None)** → KEEP 走"Event 缺失 → 方案A 不保留"（原因进 hist error）; 循环完整 → Event 是真实设备侧计时, **无论多大加速比都按绝对延迟比最小端到端保留**
+  - Event 真实性保证 (★2026-08-18 改为按 loop_ok 门控): 源码 KERNEL_LOOP 循环丢失 (loop_ok=False) → **不测 Event (返回 None)** → Event 参考值缺失（原因进 hist error）; msprof 漏记 (行数 < loop 但循环完整) → **Event 照测**（Event 注入独立于 op_summary 行数, 不受株连 — 旧行为误把漏记当循环改坏, 真实改进轮 Event=None 误 REVERT）; ★v4.6 起 Event 为**参考口径**（快测门粗筛 + 报告展示）, Event 缺失不再阻断 KEEP（主决策已换纯 kernel, 由欠采门槛防护）
   - best 更新: 只在 kept 时更新 (与 best_kernel/best_round 强绑定, 防 best_speedup 与代码脱钩)
   - rebaseline 同步: 复测 Event 同样由行数保证真实 (循环异常 → None → 不覆盖); `best_speedup` 是派生显示值 = baseline_e2e_event_ns / best_e2e_event_ns
 - **input 链不变量**: 未采纳/失败 → `current_kernel` 回滚轮首快照 — sweep 把 current 指向 round_dir 时 coder 会覆写同路径, 必须**内容快照恢复**（失败代码另存 failed_kernel.py 留证）
@@ -741,10 +742,10 @@ triton_agent_optimizer/
     计时方法完全一致（Event + 多窗口 median + 破 L2）; **kernel 数/gap/中间分配的差异 = 融合优化的真实收益,
     不是测量差异** — 对比公平。大算子 (ms 级) 差异可忽略; 小算子 (us 级) 我们天然占优（正是融合/单遍优化目标）→
     报告同时给 `time_us_min/mean`, 对比时声明。
-- **主加速比（显示口径）= baseline_e2e_ns / e2e_ns**（端到端, msprof）; **best_speedup = baseline_e2e_event_ns / best_e2e_event_ns**（Event 派生）
-- **严格最优保留判定 = Event 绝对延迟**: 本轮 `e2e_event_ns < best_e2e_event_ns`（历史最小）才 KEEP 进链 — 设备侧无 profiler 欠采, 免 msprof 小 kernel 假性 200x 毒 best; **Event 缺失(非晋升轮) → 方案A 不采纳**（不退化 msprof, 堵假值后门）
-- **工业级对比**: round1 读 `bench_910b3/outputs/industrial_<op>_<mode>_tflops.json`（Event 测），各 mode 取 time_us 最小者（**仅真正执行**, actual_mode==mode） = industrial_time_us
-- **vs 工业级比值**（优化效果终极指标）: `vs_industrial_ratio` = 我们最优 e2e_event_ns / 工业级 time_us×1000（<1=快于工业级）; 另有 `vs_industrial_speedup` = 工业级/我们
+- **主加速比 = baseline_ns / ns**（★v4.6 纯 kernel 口径, 与 KEEP 决策同源）; best_speedup = baseline_ns / best_kernel_ns 派生; e2e_ns/e2e_event_ns 为参考口径并列记录
+- **严格最优保留判定 (★v4.6) = 纯 kernel 绝对延迟**: 本轮 `ns < best_kernel_ns`（历史最小, msprof）才 KEEP 进链 — 与优化对象同尺 (纯 triton kernel), host 成分不掺; **欠采硬门槛**（行数 < loop → 不采纳）堵假快后门; Event 降为参考（快测门粗筛 + 报告）, best_e2e_event_ns 独立维护不参与决策
+- **工业级对比**: round1 读 `bench_910b3/outputs/industrial_<op>_<mode>_tflops.json`（★2026-08-18 起只认 **method=msprof 纯 kernel 口径**, 由 `bench_industrial.py --msprof` 产出; Event 版 json 跳过+提示重测）, 各 mode 取 time_us 最小者（**仅真正执行**, actual_mode==mode） = industrial_time_us
+- **vs 工业级比值**（优化效果终极指标, ★v4.6 纯 kernel 同尺）: `vs_industrial_ratio` = 我们最优纯 kernel ns（best_round 轮的 ns）/ 工业级 time_us×1000（<1=快于工业级）; 另有 `vs_industrial_speedup` = 工业级/我们
 - **baseline 复测**: round1 用 verify 机制（warmup+msprof+Event）重测源 kernel，与后续轮完全同口径（VERIFY_BASELINE=1）
 - **尺寸一致**: scheduler 传真实 M/N/K 给 run_optimize（防 512 默认覆盖 2048）
 - **每轮 tflops**: 用本轮诊断 cube_fops ÷ 本轮 ns（kernel 结构变化后 FLOPs 变 → 轨迹图不失真）
@@ -798,7 +799,8 @@ outputs/<op>/
     "total_rounds": 10,                // 总执行轮 (含 promote 轮; max_rounds 配额按「有效轮」= total−promote_budget 计)
     "promote_budget": 1,               // 已用 promote 额度 (真晋升轮才 +1; 被拒晋升不涨)
     "best_speedup": 17.793,            // 历史最高加速比 (Event 派生显示值 = baseline_e2e_event_ns/best_e2e_event_ns)
-    "best_e2e_event_ns": 355000.0,     // KEEP 主依据: 历史最小 Event 设备侧延迟 (只增不减; rebaseline 时随环境复测同步)
+    "best_kernel_ns": 355000.0,       // ★v4.6 KEEP 主依据: 历史最小纯 kernel 耗时 (msprof; rebaseline 随环境复测同步)
+    "best_e2e_event_ns": 361000.0,     // 历史最小 Event 设备侧延迟 (快测门粗筛+报告参考, 不参与决策)
     "current_speedup": 17.793,         // 当前已采纳 kernel 的加速比 (端到端口径, 保留判定的参考)
 
     "baseline_ns": 5900000.0,          // 纯 kernel 基线 ns (源 kernel 的 Σ非aclnn 耗时; 纯 kernel 加速比的分母, 参考口径)
@@ -860,7 +862,7 @@ outputs/<op>/
       "e2e_ns": 4210000.0,             // 本轮端到端耗时 ns (msprof Σ全部, 主加速比的实测值)
       "e2e_event_ns": 4100000.0,       // 本轮 Event 设备侧端到端 ns (工业级绝对值, 无 profiler 扰动)
 
-      "decision": "KEEP",              // 决策: KEEP(Event 绝对延迟<历史最小才采纳)/REVERT(未超越)/FAIL(coder或verify失败)
+      "decision": "KEEP",              // 决策: KEEP(纯kernel ns<历史最小才采纳, ★v4.6)/REVERT(未超越)/FAIL(coder或verify失败)
       "result": "OK",                  // 结果: OK/NOOP(coder没改动)/FAIL; NOOP 检测本轮输出==改前
 
       "sweep_ran": true,               // 本轮是否执行了分块 sweep
@@ -880,7 +882,7 @@ outputs/<op>/
 - `state.baseline_e2e_ns` / `current_speedup` = **主指标对**（端到端基线 + 当前加速比）；`baseline_e2e_event_ns` = 工业级 Event 口径基线
 - `state.best_kernel` / `best_round` = **最高加速比绑定**（与 best_speedup 同更新，防"最高和最优代码脱钩"）
 - `state.industrial_time_us` = 工业级天花板（Event 各 mode min，轨迹图红线）
-- `state.vs_industrial_ratio` = 优化效果终极指标（我们最优 Event / 工业级 Event，<1=快于工业级）
+- `state.vs_industrial_ratio` = 优化效果终极指标（★v4.6: 我们最优纯 kernel ns / 工业级 msprof 纯 kernel，<1=快于工业级）
 - `history[i]` = 每轮一行（策略+改动梗概+完整 changes+msprof/Event 双耗时+sweep 状态+决策+报错+TFLOPS）— planner 看前层试过什么、轨迹图打点、strategy_summary 出策略清单
 
 ---
@@ -1494,7 +1496,7 @@ cat outputs/<op>/optimization.log
 > **运行方法**: 每个算子跑 `LLM_CLI_COMMAND='nga run' python3 main.py input/<op> --fresh --max-rounds 30` 后，自动产出 `outputs/<op>/final_output/final_summary.json`（含双口径加速比 + Event 延迟 + vs_industrial_ratio）和 `trajectory_chart.png`。
 > **诚实说明**: 当前仓库 `outputs/` 内**无已完成的 v4 真实结果**（本地只有旧版弱数据/空轨迹），以下表格是讲述模板，务必在服务器跑完后用真实数据填充——**讲项目时数据是最有说服力的一页**。
 
-| 算子 | 形状 | 初始 Event(us) | 优化后 Event(us) | 加速比 | vs PyTorch | vs 工业级最优 | 命中策略层 |
+| 算子 | 形状 | 初始纯kernel(us) | 优化后纯kernel(us) | 加速比 | vs PyTorch | vs 工业级最优 | 命中策略层 |
 |---|---|---|---|---|---|---|---|
 | matmul (2层MLP) | 2048³ | | | | | | |
 | attention_mlp | 2048×2048 | | | | | | |
@@ -1506,7 +1508,7 @@ cat outputs/<op>/optimization.log
 
 **讲结果时的口径要点**（防止被追问翻车）:
 - 加速比口径: 端到端（含框架 kernel），同口径对比；**绝对延迟用 Event**（无 profiler 扰动）
-- vs 工业级: 我们最优 Event / CANN eager·compile·cann-fused·FA 各 mode 取 min（仅真执行）
+- vs 工业级: 我们最优纯 kernel ns / 工业级 msprof 纯 kernel 各 mode 取 min（仅真执行, ★v4.6 同尺）
 - 每轮可审计: `roundN/{plan.md, diff.patch, kernel_op.py}` + `optimization_trajectory.json` history 全留痕
 
 ---
@@ -1566,7 +1568,7 @@ cat outputs/matmul/optimization_trajectory.json            # 全局状态+全his
 | msprof | CANN 性能分析工具（任务级: 每 kernel 耗时/launch; `msprof op`: 单 kernel 深层 8 CSV） |
 | msprof op | 逐算子深度 profiling: PipeUtilization/ArithmeticUtilization/Memory/MemoryL0/MemoryUB/L2Cache/ResourceConflictRatio/OpBasicInfo |
 | HIVM | 华为中间表示 (Huawei Intermediate Representation), Triton→TTIR→HIVM→AscendC 编译链的一环; Tier2 用它的依赖分析找融合点 |
-| torch.npu.Event | NPU 设备侧事件计时（对标 CUDA Event），无 profiler 扰动，本项目 KEEP 决策与工业级对比的权威口径 |
+| torch.npu.Event | NPU 设备侧事件计时（对标 CUDA Event），无 profiler 扰动; ★v4.6 起为快测门粗筛 + 报告参考口径（主决策/工业级对比用 msprof 纯 kernel） |
 | MTE1/2/3 | 搬运引擎: MTE1(L1→L0A/B) / MTE2(GM→L1) / MTE3(写回 GM) |
 | Cube / Vec / Scalar / Fixpipe | 计算引擎: Cube(矩阵乘) / Vec(向量) / Scalar(标量) / Fixpipe(定标) |
 | L0A/L0B/L0C | cube 专用缓冲: A 片/B 片/累加器; 分块调参的硬件约束 |
@@ -1613,7 +1615,7 @@ flash_attention 只测 fa；其余算子测 eager+compile 两种。
    该 mode 的重复测量不参与选优，防止回退值顶替成最优
 4. 结果存 st["industrial_time_us"]（含来源文件 industrial_<op>_<mode>_tflops.json 供追溯）
 
-### 15.2 我们优化算子的端到端耗时（best Event）
+### 15.2 我们优化算子的耗时（best 纯 kernel; Event 参考）
 
 **测量工具**：torch.npu.Event（设备侧计时），被测对象 = kernel_op.py 里 KERNEL_LOOP 循环体
 （我们优化后的全部 kernel launch）。
@@ -1629,15 +1631,15 @@ flash_attention 只测 fa；其余算子测 eager+compile 两种。
 **计算步骤**：
 1. 每个窗口耗时 = 结束与开始 Event 之间的设备侧耗时（30 次循环内全部 kernel 执行，gap≈0，无中间分配）
 2. 单次端到端 us = median(5 窗口耗时) / 30
-3. 每轮得到该轮的端到端；**只保留小于历史最小的轮次**（KEEP），历史最小那轮的
-   端到端 = 我们最优（best_e2e_event_ns）
-4. 循环异常（msprof 实测行数 < LOOP，说明循环被改坏）→ 该轮不测 Event，直接不保留
+3. 每轮得到该轮耗时; **只保留纯 kernel 小于历史最小的轮次**（KEEP, ★v4.6）, 历史最小那轮的
+   纯 kernel = 我们最优（best_kernel_ns）; Event 端到端并列记录作参考
+4. 源码 KERNEL_LOOP 循环丢失（loop_ok=False，coder 改坏）→ 该轮不测 Event（参考值缺失）; msprof 行数 < LOOP → 欠采硬门槛不采纳（防假快; Event 漏测不影响 KEEP, 2026-08-18 修复口径）
 
 ### 15.3 验收计算
 
 ```
-验收 = 工业级最优(us) ÷ 我们最优(us)
-     = st["industrial_time_us"] ÷ (best_e2e_event_ns / 1000)
+验收 = 工业级最优(us) ÷ 我们最优(us)   (★v4.6 双方均为 msprof 纯 kernel 口径)
+     = st["industrial_time_us"] ÷ (our_best_kernel_ns / 1000)
 ```
 
 配套：feedback/acceptance_report.py 批量算全部算子；feedback/remeasure_best.py 重测单个算子。

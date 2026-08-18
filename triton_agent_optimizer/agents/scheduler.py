@@ -15,8 +15,11 @@ v4.5 流程 (每轮):
      → ★失败案例库 (memory/failed_cases.py): 失败时累积重试上下文 (前几次 方案+报错 全序列
        + 库检索注入 solved方案/stuck黑名单/已试方案 + 禁止原样重试), 成功轮 solved 回填
   ⑦ Verify — ★两段验证 (TWO_PHASE_VERIFY=1 默认, 0 关闭):
-     段1 verify_fast_gate: 正确性 + Event 快测 (秒级, 无 msprof) → Event 不快于 best → 直接 REVERT (省 msprof 分钟级)
+     段1 verify_fast_gate: 正确性 + Event 快测 (秒级, 无 msprof) → Event 不快于 best Event → 直接 REVERT (省 msprof 分钟级)
      段2 verify_end_to_end: 过门才跑 msprof 全量 (正确性+warmup+msprof 双口径+Event) → 确认 + 诊断字段
+     ★KEEP/REVERT 主依据 = 纯 kernel 设备侧耗时 (msprof Task Duration 求和/遍 = verify 的 ns;
+       优化对象=triton.jit kernel 本身, host/框架不在优化范围; 欠采轮行数<loop 硬门槛拦截不采纳);
+       Event 降参考 (快测门粗筛 + 报告展示), 不参与决策.
   ⑧ 记录 + 晋升/回退/停止:
      - 严格晋升 (需 promote_evidence)
      - 可回退 (防死循环: 同路径≥3次拒绝)
@@ -467,36 +470,52 @@ def _diag_compact(snap: dict) -> str:
 
 def _load_industrial_best(op: str, modes: list) -> Optional[dict]:
     """读每个 mode 的 industrial json → 各 mode 的 time_us(★median) 取最小 → 最优.
-    返回 {time_us, kernel_time_us, file, mode} 或 None (全部缺失)."""
+    返回 {time_us, kernel_time_us, file, mode} 或 None (全部缺失).
+    ★口径校验 (2026-08-18): 只接受 method=="msprof" (纯 kernel Task Duration 求和/N) —
+      我们侧 KEEP/REVERT 主依据已切纯 kernel 口径, Event 口径的工业 json 与我们不同尺
+      (含 kernel 间 gap), 混用会让 vs_industrial 失真. 非 msprof json 跳过+提示重测."""
     best = None
+    skipped = []
     for _m in modes:
         _p = _PROJECT / "bench_910b3" / "outputs" / f"industrial_{op}_{_m}_tflops.json"
         if not _p.exists():
             continue
         try:
-            _d = json.loads(_p.read_text(encoding="utf-8"))
+            _d = json.loads(_p.read_text(encoding='utf-8'))
             _t = _d.get("time_us")
             _actual = _d.get("actual_mode", _m)
+            _method = _d.get("method") or ""
+            if _t and _method != "msprof":
+                skipped.append(f"{_m}(method={_method})")
+                continue
             if _t and _actual == _m and (best is None or _t < best["time_us"]):
                 best = {"time_us": _t, "kernel_time_us": _d.get("kernel_time_us"),
                         "file": f"industrial_{op}_{_m}_tflops.json", "mode": _m}
         except Exception:
             continue
+    if skipped and best is None:
+        print(f"  ⚠ 工业级 json 口径不符 (需 msprof 纯 kernel): 跳过 {', '.join(skipped)} → "
+              f"重测: python3 bench_910b3/bench_all.py --op {op} --msprof")
+    elif skipped:
+        print(f"  ⚠ 部分工业级 json 口径不符 (需 msprof), 已跳过: {', '.join(skipped)} "
+              f"(重测: bench_all.py --op {op} --msprof)")
     return best
 
 
 def _auto_run_industrial(op: str, modes: list) -> None:
-    """缺工业级基准 json 时自动跑 bench_industrial.py 生成 (Event 设备侧, 与 verify 同口径).
-    env AUTO_RUN_IND_BENCH=0 关闭; 只跑缺失的 mode (多 mode 时 bench_all 全跑太重, 逐个补)."""
+    """缺工业级基准 json 时自动跑 bench_industrial.py 生成 (★msprof 纯 kernel 口径,
+    与我们 KEEP/REVERT 主依据同尺). env AUTO_RUN_IND_BENCH=0 关闭;
+    只跑缺失的 mode (多 mode 时 bench_all 全跑太重, 逐个补)."""
     script = _PROJECT / "bench_910b3" / "bench_industrial.py"
     for _m in modes:
         _f = f"industrial_{op}_{_m}_tflops.json"
         if (_PROJECT / "bench_910b3" / "outputs" / _f).exists():
             continue
-        print(f"  [工业级] 缺 {_f} → 自动跑 bench_industrial.py {op} --mode {_m} "
+        print(f"  [工业级] 缺 {_f} → 自动跑 bench_industrial.py {op} --mode {_m} --msprof "
               f"(AUTO_RUN_IND_BENCH=1, 需 NPU, 几分钟)")
         try:
-            _r = subprocess.run([sys.executable or "python3", str(script), op, "--mode", _m],
+            _r = subprocess.run([sys.executable or "python3", str(script), op, "--mode", _m,
+                                 "--msprof"],
                                 capture_output=True, text=True, timeout=7200,
                                 encoding="utf-8", errors="backslashreplace")
             if _r.returncode != 0:
@@ -699,9 +718,9 @@ class Scheduler:
         """初始化: 从头开始 (round1/tier1 读源文件)。"""
         self.traj = {"v": 4, "state": {"tier": 1, "round": 1, "best_speedup": 1.0,
                                        "baseline_ns": None, "num_kernels": None,
-                                       "current_speedup": 1.0,   # 当前已接受 kernel 的加速比 (★主=端到端口径)
-                                       # ★端到端口径 (优化效果主指标, 含框架 kernel):
-                                       #   baseline_ns = 纯 kernel 基线; baseline_e2e_ns = 端到端基线
+                                       "current_speedup": 1.0,   # 当前已接受 kernel 的加速比 (★主=纯kernel口径)
+                                       # ★纯kernel口径 (优化效果主指标, msprof Task Duration 求和/遍):
+                                       #   baseline_ns = 纯 kernel 基线; baseline_e2e_ns = 端到端基线(含框架, 参考)
                                        "baseline_e2e_ns": None,
                                        "current_kernel": str(self.op_dir / "kernel_op.py"),
                                        "total_rounds": 0,        # ★D7: 含 promote 轮的总执行数 (防 promote 白耗 max_rounds)
@@ -717,7 +736,10 @@ class Scheduler:
                                        #   current_kernel === best_kernel (KEEP 仅在严格 > best 时推进).
                                        "best_kernel": str(self.op_dir / "kernel_op.py"),
                                        "best_round": 0, "best_e2e_ns": None,
-                                       "best_e2e_event_ns": None},  # ★历史最小 Event 延迟 (KEEP 主依据)
+                                       # ★best_kernel_ns = 历史最优纯 kernel 耗时 (KEEP 主依据, msprof 设备侧);
+                                       #   best_e2e_event_ns = 历史最优 Event (快测门同口径粗筛用 + 报告参考)
+                                       "best_kernel_ns": None,
+                                       "best_e2e_event_ns": None},
                      "history": []}
         self.current_kernel = self.op_dir / "kernel_op.py"
         # ★D6: 保存原始 kernel 副本 → 环境漂移时重测 baseline 用它 (优化后 current_kernel 已不是原始版)
@@ -742,6 +764,7 @@ class Scheduler:
                                   "baseline_e2e_ns": None,
                                   "best_kernel": str(self.op_dir / "kernel_op.py"),
                                   "best_round": 0, "best_e2e_ns": None,
+                                  "best_kernel_ns": None,
                                   "handoff": None, "tier_jumps": [],
                                   "promote_budget": 0, "last_rebase_round": 0},
                 "history": []}
@@ -751,8 +774,9 @@ class Scheduler:
         st = self.traj.get("state", {})
         # ★把最优 Event 结果提到 state 最前 (方便打开 json 一眼看到优化效果):
         #   只重排「序列化副本」, 不动 self.traj["state"] (否则 run() 里的 st 引用会失效, 后续写丢失).
-        _best_keys = ["best_e2e_event_ns", "best_speedup", "best_round", "best_kernel",
-                      "best_e2e_ns", "vs_industrial_ratio", "our_best_e2e_event_ns",
+        _best_keys = ["best_kernel_ns", "best_speedup", "best_round", "best_kernel",
+                      "best_e2e_ns", "best_e2e_event_ns", "vs_industrial_ratio",
+                      "our_best_kernel_ns", "our_best_e2e_event_ns",
                       "industrial_time_us", "industrial_baseline"]
         _front = {k: st[k] for k in _best_keys if k in st}
         _rest = {k: v for k, v in st.items() if k not in _front}
@@ -764,7 +788,8 @@ class Scheduler:
         #   100 轮长跑会膨胀到 50k+ tokens, 逼近 140k 压缩线; compact 每轮一行梗概, 恒 ~10k tokens)
         try:
             _ck = ("tier", "round", "best_speedup", "current_speedup", "total_rounds",
-                   "baseline_e2e_ns", "baseline_e2e_event_ns", "best_e2e_event_ns",
+                   "baseline_ns", "baseline_e2e_ns", "baseline_e2e_event_ns",
+                   "best_kernel_ns", "best_e2e_event_ns",
                    "best_round", "current_kernel", "handoff")
             _compact = {
                 "state": {k: st.get(k) for k in _ck if k in st},
@@ -1293,54 +1318,47 @@ class Scheduler:
                 print(f"  [重基准] R{rn} 重测当前 kernel 失败 (跳过, 沿用旧 baseline)")
                 return
             new_speedup = new_base / cur["ns"] if cur["ns"] else None
-            # ★端到端基线/当前加速比 (主口径) — 两端 verify 都返回 e2e_ns
+            # ★纯 kernel 基线/当前加速比 (主口径) — new_speedup = new_base/cur.ns 已是纯 kernel
             _eb = vb.get("e2e_ns") or st.get("baseline_e2e_ns")
-            _ec = cur.get("e2e_ns")
-            _new_e2e_speedup = (_eb / _ec) if (_eb and _ec) else None
             drift = new_base / st["baseline_ns"] if st.get("baseline_ns") else 1.0
             st["baseline_ns"] = new_base
-            # ★2026-08-12 简化: cur 复测的 Event 真实性由 verify 行数保证 (循环异常 → Event None),
-            #   不再用 EVENT_MIN_RATIO 比值拦截 (曾误伤真实 >10x 优化轮). 有 Event 就按新基准确认.
             _cur_evt = cur.get("e2e_event_ns")
             _eb_evt0 = vb.get("e2e_event_ns") or st.get("baseline_e2e_event_ns")
             if _cur_evt and _eb_evt0:
                 print(f"  [重基准] cur Event {_cur_evt:.0f}ns (新基线 {_eb_evt0:.0f}ns, "
                       f"{(f'-> {_eb_evt0/_cur_evt:.1f}x' if _cur_evt else '')})")
-            st["current_speedup"] = (round(_new_e2e_speedup, 4) if _new_e2e_speedup
-                                     else (round(new_speedup, 4) if new_speedup else st.get("current_speedup", 1.0)))
+            st["current_speedup"] = (round(new_speedup, 4) if new_speedup
+                                     else st.get("current_speedup", 1.0))
             if _eb:
                 st["baseline_e2e_ns"] = _eb
             if vb.get("e2e_event_ns"):
                 st["baseline_e2e_event_ns"] = vb["e2e_event_ns"]
-            # ★bug 修复: 环境漂移后同步 best Event — 旧 best_e2e_event_ns 是旧环境的绝对最小值,
-            #   不重置则新环境下的改进轮 Event 恒 > 旧 best → 永远 REVERT (即使相对新基准是真实改进,
-            #   长时运行跨时段漂移会卡死优化).
-            #   用 best_kernel.py (历史最优) 在新环境复测; current==best (严格最优 KEEP 常态) 时用 cur 的 Event.
+            # ★bug 修复: 环境漂移后同步 best — 旧 best 是旧环境的绝对最小值,
+            #   不重置则新环境下的改进轮恒 > 旧 best → 永远 REVERT (长时漂移卡死优化).
+            #   用 best_kernel.py (历史最优) 在新环境复测; current==best 时用 cur 的值.
+            #   ★主 best = best_kernel_ns (纯 kernel); Event best 同步 (快测门粗筛用).
             _best_evt_new = None
+            _best_kns_new = None
             try:
                 _bk = self.kernel_dir / "best_kernel.py"
                 if _bk.exists() and _bk.resolve() != Path(self.current_kernel).resolve():
                     _vb2 = verify_end_to_end(_bk, rb_dir / "best", None,
                                              num_kernels=st.get("num_kernels"),
                                              num_launches=st.get("num_launches"))
-                    if _vb2.get("ok") and _vb2.get("e2e_event_ns"):
-                        _best_evt_new = _vb2["e2e_event_ns"]
+                    if _vb2.get("ok"):
+                        _best_evt_new = _vb2.get("e2e_event_ns")
+                        _best_kns_new = _vb2.get("ns")
             except Exception:
-                _best_evt_new = None
+                _best_evt_new = _best_kns_new = None
+            if _best_kns_new is None and cur.get("ns"):
+                _best_kns_new = cur["ns"]
             if _best_evt_new is None and cur.get("e2e_event_ns"):
                 _best_evt_new = cur["e2e_event_ns"]
-            # ★2026-08-12 简化: best 复测同步同样由 verify 行数保证 Event 真实 (循环异常 → None),
-            #   不再用 EVENT_MIN_RATIO 比值拦截 (曾误伤真实 >10x).
-            _eb_evt = vb.get("e2e_event_ns") or st.get("baseline_e2e_event_ns")
-            if _best_evt_new and _eb_evt:
+            if _best_kns_new:
+                st["best_kernel_ns"] = round(_best_kns_new, 1)
+                st["best_speedup"] = round(new_base / _best_kns_new, 4)   # 纯 kernel 口径派生
+            if _best_evt_new:
                 st["best_e2e_event_ns"] = round(_best_evt_new, 1)
-                if _eb_evt:
-                    st["best_speedup"] = round(_eb_evt / _best_evt_new, 4)
-            elif _best_evt_new and st.get("baseline_e2e_ns") and cur.get("e2e_ns"):
-                # ★bug 修复 (2026-08-13): Event 基线缺失时同样兜底用 msprof 口径派生 best_speedup
-                #   (否则 best_speedup 停留初始 1.0, 与 history 实际加速比矛盾)
-                st["best_e2e_event_ns"] = round(_best_evt_new, 1)
-                st["best_speedup"] = round(st["baseline_e2e_ns"] / cur["e2e_ns"], 4)
             st["last_rebase_round"] = rn
             # ★不进 history (避免与正常轮同 round 号, trajectory 图点重叠):
             #   REBASELINE 是测量事件不是优化轮, 只更新 state; 换基后后续轮 speedup 用新基准.
@@ -1371,9 +1389,10 @@ class Scheduler:
                 break
             if "采集失败" in (h.get("strategy") or h.get("error") or ""):
                 continue   # ★采集失败是环境问题, 不算优化轮, 跳过
-            if h.get("speedup", 0) > h.get("prev_speedup", 0) * floor:
+            _hsp = h.get("speedup")
+            if _hsp is not None and _hsp > (h.get("prev_speedup") or 0) * floor:
                 break
-            no_improve += 1
+            no_improve += 1   # ★speedup=None (快测门 REVERT, 未跑 msprof) 也算明确无改进
         # ★max_consecutive_reverts 接入: 连续 REVERT (全局, 不跨 tier 断) 超阈值 → 停止
         #   (config.optim.max_consecutive_reverts, 默认 5; 防"反复尝试均被回退"的空转)
         _max_rev = _max_consecutive_reverts()
@@ -1386,7 +1405,7 @@ class Scheduler:
         if _consec_rev >= _max_rev:
             print(f"  ⛔ 连续 {_consec_rev} 轮 REVERT ≥ {_max_rev} (max_consecutive_reverts) → 停止")
             return tier, True
-        if self.target_speedup > 0 and speedup >= self.target_speedup:
+        if self.target_speedup > 0 and (speedup or 0) >= self.target_speedup:
             # ★D3: 达标不硬停 — 继续探后续层确认无更大空间, 由 no_improve/max_rounds 收尾.
             print(f"  🎯 已达标 {speedup:.3f}x ≥ target {self.target_speedup}x — 继续探后续层找更大空间")
             self.target_speedup = -1
@@ -1691,8 +1710,8 @@ class Scheduler:
                     st["industrial_time_us"] = _best["time_us"]
                     st["industrial_kernel_time_us"] = _best["kernel_time_us"]
                     st["industrial_baseline"] = _best["file"]
-                    print(f"  [工业级] 基准 {_best['file']} ({'/'.join(_ind_modes)} 取 median 最小, 仅真执行): "
-                          f"e2e={_best['time_us']}us (Event) kernel={_best['kernel_time_us']}us")
+                    print(f"  [工业级] 基准 {_best['file']} ({'/'.join(_ind_modes)} 取最小, 仅真执行): "
+                          f"纯kernel={_best['time_us']}us (msprof 口径, 与我们决策同尺)")
                 else:
                     print(f"  ⚠ 缺工业级基准 (AUTO_RUN_IND_BENCH=1 已尝试自动生成仍失败/被关闭; 手工跑: "
                           f"python3 bench_910b3/bench_industrial.py {self.kernel_name} --mode "
@@ -1856,6 +1875,7 @@ class Scheduler:
             round_kernel = round_dir / "kernel_op.py"
             prev_speedup = st.get("current_speedup", 1.0)   # 上一轮已接受 kernel 的加速比 (基线=1.0)
             kept = False                                      # 本轮是否被采纳进 kernel 链
+            speedup = None                                    # ★轮首初始化: 失败轮不进 ok 块, L2084 引用会 UnboundLocalError
             # ★input 链不变量保护: 快照本轮开始时的 current_kernel (= 历史最优代码).
             #   sweep 可能在轮中把 current_kernel 指向 round_dir; coder 覆写同路径; verify 一失败
             #   current_kernel 就卡在坏代码 → 下一轮读坏代码 (input 链断). 失败/未采纳时回滚到此快照.
@@ -1930,11 +1950,10 @@ class Scheduler:
                             _best_evt0 = st.get("best_e2e_event_ns")
                             if _fast_evt and _best_evt0 and _fast_evt >= _best_evt0:
                                 # ★快测已证不快于 best → 直接 REVERT, 不跑 msprof (省整轮)
-                                #   speedup 用 Event 口径派生 (baseline/best 同源, 真实快慢)
-                                _evt_b0 = st.get("baseline_e2e_event_ns")
+                                #   speedup=None: 未跑 msprof 无纯 kernel 值, 不拿 Event 派生冒充
+                                #   (history speedup 主口径=纯kernel; Event 值留在 e2e_event_ns 参考)
                                 v = {"ok": True, "ns": None, "e2e_ns": None,
-                                     "speedup": (round(_evt_b0 / _fast_evt, 4)
-                                                 if _evt_b0 else 1.0),
+                                     "speedup": None,
                                      "e2e_event_ns": _fast_evt, "fast_gate": True}
                                 print(f"  [Verify] ⚡快测门: Event {_fast_evt:.0f}ns >= best "
                                       f"{_best_evt0:.0f}ns → 直接 REVERT (省 msprof)")
@@ -1947,51 +1966,52 @@ class Scheduler:
                         v = self._verify(round_dir, st.get("baseline_ns"))
                     t_verify += time.time() - _tv
                     if v.get("ok"):
-                        # msprof speedup (仅记录/显示用; 不再做 KEEP 主依据 — 见下 Event 决策)
-                        _e2e = v.get("e2e_ns")
-                        _be2e = st.get("baseline_e2e_ns")
-                        if _e2e and _be2e:
-                            speedup = _be2e / _e2e
-                        else:
-                            speedup = v.get("speedup", 1.0) or 1.0
-                        # ★决策主依据 = Event 绝对延迟 (更小=更快). 免 msprof 欠采毒 best:
-                        #   msprof 对小/短 kernel 会欠采 e2e_ns → 假性 speedup 200x → 毒 best_speedup
-                        #   → 真实轮(实际更快, Event 显示更小)永远比不过假 200x → 误 REVERT.
-                        #   Event 设备侧无欠采, 比绝对延迟最稳; Event 缺才退化 msprof speedup.
-                        _evt = v.get("e2e_event_ns")
-                        _best_evt = st.get("best_e2e_event_ns")
-                        # ★2026-08-12 假小防护简化: Event 真实性由 verify 保证 — 循环异常
-                        #   (msprof 行数 < loop = coder 改坏 KERNEL_LOOP) 时 verify 不测 Event (None),
-                        #   走下方"Event 缺失"分支不采纳. 循环完整 → Event 真实, **>10x 也是真优化**
-                        #   (naive→tl.dot 单轮可 >10x), 照常采纳 — 不再用 EVENT_MIN_RATIO 比值拦截
-                        #   (曾误伤真实大加速比轮).
-                        if _evt and _best_evt:
-                            _adopt = _evt < _best_evt
-                            _cmp = f"Event {_evt:.0f}ns {'<' if _adopt else '>='} best {_best_evt:.0f}ns"
-                        elif _evt:
-                            # ★bug 修复 (2026-08-13): 首次有 Event 必须与基线 Event 对比 (同口径),
-                            #   不得无条件采纳 — 否则 msprof 欠采假快轮 (Event 口径其实没快/更慢) 直接进链,
-                            #   best_speedup = 基线Event/该轮Event < 1 (如 0.953) 且永不更新, 与 history
-                            #   的假 14x 矛盾 (msprof 对短 kernel 欠采 e2e_ns → 假性大加速比).
-                            _evt_base0 = st.get("baseline_e2e_event_ns")
-                            if _evt_base0:
-                                _adopt = _evt < _evt_base0
-                                _cmp = f"Event {_evt:.0f}ns {'<' if _adopt else '>='} 基线 {_evt_base0:.0f}ns (首次对比基线)"
+                        # ★主口径 = 纯 kernel 设备侧 (msprof Task Duration 求和/遍 = verify 的 ns):
+                        #   KEEP/REVERT 权威依据 — 优化对象就是 triton.jit kernel 本身,
+                        #   host/框架不在优化范围, 端到端/Event 里的 host 成分是噪声.
+                        #   Event 降为参考 (快测门粗筛 + 报告展示), 不参与决策.
+                        _be = st.get("baseline_ns")            # 纯 kernel 基线
+                        _kns = v.get("ns")                     # 本轮纯 kernel (欠采假值 → 下方硬门槛拦截)
+                        speedup = (_be / _kns) if (_kns and _be) else (v.get("speedup") or None)
+                        # ★欠采硬门槛: msprof 行数 < loop → 求和偏小假快 → 不采纳 (防毒 best_kernel_ns)
+                        _rows = v.get("rows")
+                        _loop_n = v.get("loop")
+                        _undersampled = bool(_rows and _loop_n and _rows < _loop_n)
+                        _best_kns = st.get("best_kernel_ns")
+                        if v.get("fast_gate"):
+                            # 快测门已判 (Event 未快于 best Event, 未跑 msprof) → REVERT
+                            _adopt = False
+                            _cmp = (f"快测门: Event {v.get('e2e_event_ns')}ns 未快于 best Event "
+                                    f"{st.get('best_e2e_event_ns')}ns → REVERT (省 msprof)")
+                            _cmp_extra = _cmp
+                        elif _undersampled:
+                            _adopt = False
+                            _cmp = (f"msprof 欠采 (行数 {_rows} < loop {_loop_n}) → "
+                                    f"纯kernel 值不可信, 不采纳 (防假快毒 best)")
+                            _cmp_extra = _cmp   # ★进 hist error (planner 可见, 防下轮重复犯)
+                        elif _kns and _best_kns:
+                            _adopt = _kns < _best_kns
+                            _cmp = f"纯kernel {_kns:.0f}ns {'<' if _adopt else '>='} best {_best_kns:.0f}ns"
+                        elif _kns:
+                            # ★首次有纯 kernel: 必须与基线对比 (同口径), 不得无条件采纳 —
+                            #   否则"比基线还慢"的轮直接进链, best_speedup < 1 与 history 矛盾.
+                            if _be:
+                                _adopt = _kns < _be
+                                _cmp = f"纯kernel {_kns:.0f}ns {'<' if _adopt else '>='} 基线 {_be:.0f}ns (首次对比基线)"
                             else:
                                 _adopt = True
-                                _cmp = f"首次 Event {_evt:.0f}ns (建 best)"
-                        else:                           # ★方案A: Event 缺 (非晋升轮) → 不保留
-                            #   coder 改坏 KERNEL_LOOP 循环 / 注入失败 → Event 测不到 (verify 已按
-                            #   行数异常跳过 Event). 不退化 msprof (msprof 对坏循环的兜底测量不可信,
-                            #   假值会毒 best). 回退, 等下轮有 Event 再评判. (晋升轮不走这, 已在上游 kept=True)
+                                _cmp = f"首次纯kernel {_kns:.0f}ns (建 best)"
+                        else:
+                            # ★纯 kernel 缺失 (快测门 REVERT 轮 / verify 异常未给 ns) → 不保留
                             _adopt = False
-                            _cmp = ("Event 缺失 (循环异常或注入失败, verify 已跳过) → 方案A 不保留, "
-                                    "沿用 best, 等下轮有 Event 再评判")
-                            _cmp_extra = _cmp   # ★进 hist error (planner 可见, 防下轮重复犯同样错)
+                            _cmp = ("纯kernel 缺失 (verify 未返回 ns) → 不保留, 沿用 best, "
+                                    "等下轮有纯kernel 值再评判")
+                            _cmp_extra = _cmp
                         if _adopt:
                             self.current_kernel = round_kernel
                             st["current_kernel"] = str(round_kernel)
-                            st["current_speedup"] = round(speedup, 4)
+                            st["current_speedup"] = (round(speedup, 4) if speedup
+                                                     else st.get("current_speedup", 1.0))
                             kept = True
                             # ★D5: 场景泛化 sanity — 采纳后对相邻尺寸做正确性检查 (默认关 SANITY_VERIFY=1)
                             if os.environ.get("SANITY_VERIFY", "0") == "1":
@@ -2057,15 +2077,20 @@ class Scheduler:
             if not round_kernel.exists():
                 round_kernel.write_text(pre_code or "", encoding="utf-8")
 
-            # ★主加速比统一 = 端到端 (与 keep 块同口径); 兜底纯 kernel
+            # ★主加速比 = 纯 kernel 口径 (baseline_ns / ns, 与决策段/best 同源);
+            #   决策段已算的不重算 (promote/失败构造轮在此兜底: 用 v 里构造的 prev_speedup).
             _e2e = v.get("e2e_ns")
-            _be2e = st.get("baseline_e2e_ns")
-            speedup = (_be2e / _e2e) if (_e2e and _be2e) else (v.get("speedup", 1.0) or 1.0)
             ns = v.get("ns")
-            _evt_ns = v.get("e2e_event_ns")   # ★工业级 Event 设备侧端到端 (无 profiler 扰动)
             _be = st.get("baseline_ns")
+            if speedup is None and ns and _be:
+                speedup = _be / ns
+            if speedup is None:
+                speedup = v.get("speedup") or None   # promote/失败轮构造值 (prev_speedup; 快测门轮=None)
+            _be2e = st.get("baseline_e2e_ns")
+            _evt_ns = v.get("e2e_event_ns")   # ★Event 设备侧端到端 (参考口径, 不参与决策)
             _evt_s = f" Event={_evt_ns}ns" if _evt_ns else " Event=无"
-            print(f"  加速比: {speedup:.3f}x (端到端口径; 纯kernel基线 {_be}ns / 端到端基线 {_be2e}ns; "
+            _sp_s = f"{speedup:.3f}x" if speedup is not None else "?x(未测)"
+            print(f"  加速比: {_sp_s} (纯kernel口径; 纯kernel基线 {_be}ns / 端到端基线 {_be2e}ns; "
                   f"本轮 纯kernel={ns if ns is not None else '?'}ns "
                   f"e2e(msprof)={_e2e if _e2e is not None else '?'}ns{_evt_s}; 上一轮 {prev_speedup:.3f}x)"
                   + ("  ✅采纳" if kept else "  ↩未采纳"))
@@ -2106,11 +2131,16 @@ class Scheduler:
                     "change": _summarize_changes(plan),       # 例: "BLOCK_M,BLOCK_N,BLOCK_K=64,64,64"
                     # ★changes_full = 完整 changes[] 数组 (old_code/new_code 全文, 审计/复盘不丢信息)
                     "changes_full": _extract_changes_from_plan(plan.plan_text) or [],
-                    "speedup": round(speedup, 4),
-                    # ★主加速比 = 端到端口径 (初始端到端基线/本轮); Event 真实性由 verify 行数保证
-                    "kernel_speedup": round(_be / ns, 4) if (_be and ns) else None,  # 纯 kernel 口径参考
+                    "speedup": round(speedup, 4) if speedup is not None else None,
+                    # ★主加速比 = 纯 kernel 口径 (纯kernel基线/本轮); 欠采轮已被硬门槛拦截不进链
+                    "kernel_speedup": round(_be / ns, 4) if (_be and ns) else None,  # 纯 kernel 口径 (与 speedup 同源)
                     "prev_speedup": round(prev_speedup, 4),   # 上一轮已接受 kernel 的加速比 (保留判定用)
-                    "ns": ns, "e2e_ns": _e2e, "e2e_event_ns": _evt_ns,   # ★e2e_event_ns = 工业级 Event 设备侧
+                    "ns": ns, "e2e_ns": _e2e, "e2e_event_ns": _evt_ns,   # ★e2e_event_ns = Event 设备侧 (参考)
+                    # ★口径提示 (2026-08-18): speedup/kernel_speedup = msprof 口径(仅显示, 欠采会假大);
+                    #   event_speedup = Event 口径, 与 best_speedup 同源可直接对比。
+                    #   REVERT 轮若 speedup 高而 event_speedup 低/缺失 = msprof 欠采假大或 Event 缺 → 属防护机制。
+                    "event_speedup": (round(st.get("baseline_e2e_event_ns") / _evt_ns, 4)
+                                      if (st.get("baseline_e2e_event_ns") and _evt_ns) else None),
                     "decision": decision, "result": result,
                     # ★sweep 状态 (每轮记): 是否跑了 sweep / 是否采纳 sweep 测的最优块
                     "sweep_ran": _sweep_ran, "sweep_adopted": _sweep_adopted,
@@ -2133,6 +2163,7 @@ class Scheduler:
             try:
                 from memory.excellent_cases import EXCELLENT_THRESHOLD, is_excellent, record as _rec_excellent
                 if (kept and v.get("ok") and _best_before is not None
+                        and speedup is not None
                         and is_excellent(_best_before, speedup)):
                     _bn = "?"
                     try:
@@ -2158,24 +2189,16 @@ class Scheduler:
                           f"(>{EXCELLENT_THRESHOLD:.2f}) → memory/tier{tier}_cases.json")
             except Exception as _ec:
                 print(f"  ⚠ [优秀案例] 记录跳过: {str(_ec)[:120]}")
-            # ★best 以 Event 绝对延迟为准 (min, 免 msprof 欠采毒 best); best_speedup 派生自 Event 显示.
-            #   方案A: 无 Event 不更新 best (不退化 msprof, 堵假值后门).
-            #   ★2026-08-12 简化: ① best 只在 kept 时更新 (与 best_kernel/best_round 强绑定 —
-            #      REVERT 轮假小 Event 不得毒 best_speedup, 防"加速比 200x 假值"与真实代码脱钩);
-            #     ② Event 真实性由 verify 行数保证 (循环异常 → verify 不测 Event = None) —
-            #     不再用 EVENT_MIN_RATIO 比值拦截 (曾误伤真实 >10x 优化轮).
-            _bevt_base = st.get("baseline_e2e_event_ns")
-            if (_evt_ns and kept
-                    and (st.get("best_e2e_event_ns") is None or _evt_ns < st["best_e2e_event_ns"])):
-                st["best_e2e_event_ns"] = _evt_ns
-                if _bevt_base and _evt_ns:
-                    st["best_speedup"] = round(_bevt_base / _evt_ns, 4)   # 派生显示用 (Event 口径)
-                elif st.get("baseline_e2e_ns") and _e2e:
-                    # ★bug 修复 (2026-08-13): Event 基线缺失 (首轮 verify 未测到 Event: 失败走诊断兜底/
-                    #   注入失败/VERIFY_BASELINE=0) → 原逻辑 best_speedup 永远停留初始 1.0, 而 history
-                    #   每轮 speedup 都有实际值 → trajectory 最前 best 1.0 与后面数据矛盾.
-                    #   兜底用 msprof 端到端口径派生 (与 history speedup 同口径, 仅显示用).
-                    st["best_speedup"] = round(st["baseline_e2e_ns"] / _e2e, 4)
+            # ★best 以纯 kernel 设备侧耗时为准 (msprof Task Duration; 欠采轮已被上游硬门槛拦截):
+            #   优化对象=triton.jit kernel 本身 → best_kernel_ns 是 KEEP 主依据 (与决策段同口径);
+            #   best_speedup = baseline_ns / best_kernel_ns 派生 (与 history speedup 同源, 不再矛盾).
+            #   best 只在 kept 时更新 (与 best_kernel/best_round 强绑定 — REVERT 轮不得毒 best).
+            #   Event 口径 best (best_e2e_event_ns) 保留: 快测门同口径粗筛 + 报告参考, 不参与决策.
+            if (ns and kept
+                    and (st.get("best_kernel_ns") is None or ns < st["best_kernel_ns"])):
+                st["best_kernel_ns"] = ns
+                if _be:
+                    st["best_speedup"] = round(_be / ns, 4)   # 派生 (纯 kernel 口径)
                 st["best_kernel"] = str(round_kernel)
                 st["best_round"] = rn
                 st["best_e2e_ns"] = _e2e
@@ -2184,6 +2207,10 @@ class Scheduler:
                     _sh.copy2(round_kernel, self.kernel_dir / "best_kernel.py")
                 except Exception:
                     pass
+            # ★Event best 独立维护 (快测门粗筛用: Event 对 Event 同口径; 报告参考)
+            if (_evt_ns and kept
+                    and (st.get("best_e2e_event_ns") is None or _evt_ns < st["best_e2e_event_ns"])):
+                st["best_e2e_event_ns"] = _evt_ns
             self.traj["history"].append(hist)
             # ★全量诊断快照 → diag_snapshots.jsonl (JSONL 追加, 审计/讲演用; 不入 context)
             try:
@@ -2191,7 +2218,8 @@ class Scheduler:
                 if _snap:
                     with open(self.kernel_dir / "diag_snapshots.jsonl", "a", encoding="utf-8") as _sf:
                         _sf.write(json.dumps({"round": rn, "tier": tier,
-                                              "decision": decision, "speedup": round(speedup, 4),
+                                              "decision": decision,
+                                              "speedup": round(speedup, 4) if speedup is not None else None,
                                               "snapshot": _snap}, ensure_ascii=False) + "\n")
             except Exception:
                 pass
@@ -2224,53 +2252,63 @@ class Scheduler:
                     print(f"  ⚠ 策略摘要生成失败: {str(_e)[:100]}")
 
         self._write_timing_stats()   # ★各阶段耗时统计 (项目自身瓶颈)
-        # ★最后产出汇总: 总轮次/总耗时/两种口径 (端到端主 + 纯kernel参考)
+        # ★最后产出汇总: 总轮次/总耗时/两种口径 (★纯kernel主 + Event参考)
         _bs = st.get("baseline_ns")                    # 纯 kernel 基线 (ns)
-        _be2e = st.get("baseline_e2e_ns")              # 端到端基线 (ns)
-        _cs = st.get("current_speedup") or 1.0         # ★主加速比 (端到端口径)
-        _cur_e2e = round(_be2e / _cs, 1) if _be2e else None
-        # 纯 kernel 当前耗时: 从最近 hist 的 kernel_speedup 反推 (pure baseline / kernel_speedup)
-        _last_ks = next((h.get("kernel_speedup") for h in reversed(self.traj.get("history", []))
-                         if h.get("kernel_speedup")), None)
-        _cur_ns = round(_bs / _last_ks, 1) if (_bs and _last_ks) else None
+        _be2e = st.get("baseline_e2e_ns")              # 端到端基线 (ns, 参考)
+        _cs = st.get("current_speedup") or 1.0         # ★主加速比 (纯kernel口径)
+        # 端到端当前耗时(参考): 取最近一轮实测 e2e_ns (不可用纯kernel加速比反推, 口径不同)
+        _cur_e2e = next((h.get("e2e_ns") for h in reversed(self.traj.get("history", []))
+                         if h.get("e2e_ns")), None)
+        # 纯 kernel 当前耗时: baseline_ns / 主加速比 (同口径直接算)
+        _cur_ns = round(_bs / _cs, 1) if _bs else None
         _prom = st.get("promote_budget", 0)
         _n_eff = st.get("total_rounds", 0) - _prom
-        # ★vs 工业级比值: 我们最优 kernel 的端到端(Event) / 工业级最优端到端(Event).
-        #   取 best_round 那轮的 e2e_event_ns (历史最高加速比的代码的 Event 实测);
-        #   工业级 = st["industrial_time_us"] (bench_all 各 mode 取 min, Event).
+        # ★vs 工业级比值 (纯 kernel 同尺): 我们最优纯kernel (best_round 轮的 ns) vs
+        #   工业级最优纯kernel (industrial_time_us, _load_industrial_best 已校验 method=msprof).
         #   ratio < 1 → 我们比工业级快; > 1 → 慢. 这是"优化效果"的终极指标.
         _best_round = st.get("best_round")
-        _our_best_evt_ns = None
+        _our_best_kns = None
         if _best_round:
             _bh = next((h for h in self.traj.get("history", [])
                         if h.get("round") == _best_round), None)
             if _bh:
-                _our_best_evt_ns = _bh.get("e2e_event_ns")
-        # 兜底: 用 baseline_e2e_event_ns / best_speedup 反推
+                _our_best_kns = _bh.get("ns")
+        # 兜底: 用 baseline_ns / best_speedup 反推 (同口径)
+        if _our_best_kns is None and _bs and st.get("best_speedup"):
+            _our_best_kns = round(_bs / st["best_speedup"], 1)
+        # ★Event 参考值 (报告展示用): best_round 轮的 Event 实测
+        _our_best_evt_ns = None
+        if _best_round:
+            _bh2 = next((h for h in self.traj.get("history", [])
+                         if h.get("round") == _best_round), None)
+            if _bh2:
+                _our_best_evt_ns = _bh2.get("e2e_event_ns")
         if _our_best_evt_ns is None and st.get("baseline_e2e_event_ns") and st.get("best_speedup"):
             _our_best_evt_ns = round(st["baseline_e2e_event_ns"] / st["best_speedup"], 1)
         _ind_us = st.get("industrial_time_us")
         _vs_ind_ratio = None
         _vs_ind_speedup = None   # 工业级/我们 (>1 = 我们更快, 与 speedup 同方向, 更直观)
-        if _our_best_evt_ns and _ind_us:
+        if _our_best_kns and _ind_us:
             _ind_ns = _ind_us * 1000.0
-            _vs_ind_ratio = round(_our_best_evt_ns / _ind_ns, 3)          # 我们/工业级
-            _vs_ind_speedup = round(_ind_ns / _our_best_evt_ns, 3)        # 工业级/我们
+            _vs_ind_ratio = round(_our_best_kns / _ind_ns, 3)             # 我们/工业级
+            _vs_ind_speedup = round(_ind_ns / _our_best_kns, 3)           # 工业级/我们
             st["vs_industrial_ratio"] = _vs_ind_ratio
-            st["our_best_e2e_event_ns"] = _our_best_evt_ns
-        print(f"\n══ 完成: best_speedup={st.get('best_speedup')}x (端到端口径) ══")
+            st["our_best_kernel_ns"] = _our_best_kns
+            if _our_best_evt_ns:
+                st["our_best_e2e_event_ns"] = _our_best_evt_ns
+        print(f"\n══ 完成: best_speedup={st.get('best_speedup')}x (纯kernel口径) ══")
         print(f"  [产出] 总执行 {st.get('total_rounds', 0)} 轮 (含 {_prom} 次 promote, 有效优化 {_n_eff} 轮), "
               f"总耗时 {time.time()-total_start:.0f}s")
-        print(f"  [产出] ★端到端: baseline {_be2e}ns → 当前 {_cur_e2e}ns, 加速比 {_cs}x (best {st.get('best_speedup')}x)")
-        print(f"  [产出] 纯kernel: baseline {_bs}ns → 当前 {_cur_ns}ns, 加速比 {_last_ks if _last_ks is not None else '?'}x")
-        # ★vs 工业级比值 (优化效果终极指标, 两端都 Event 同口径)
+        print(f"  [产出] ★纯kernel: baseline {_bs}ns → 当前 {_cur_ns}ns, 加速比 {_cs}x (best {st.get('best_speedup')}x)")
+        print(f"  [产出] 端到端(参考): baseline {_be2e}ns → 当前 {_cur_e2e}ns")
+        # ★vs 工业级比值 (优化效果终极指标, 两端都 msprof 纯 kernel 同口径)
         if _vs_ind_ratio is not None:
             _verdict = ("✓ 快于工业级" if _vs_ind_speedup > 1 else "✗ 慢于工业级")
-            print(f"  [产出] ★vs工业级: 我们最优 {_our_best_evt_ns}ns / 工业级最优 {_ind_us}us "
-                  f"(Event) = {_vs_ind_ratio}x  → 工业级/我们 = {_vs_ind_speedup}x  {_verdict}")
+            print(f"  [产出] ★vs工业级: 我们最优 {_our_best_kns}ns / 工业级最优 {_ind_us}us "
+                  f"(msprof 纯kernel) = {_vs_ind_ratio}x  → 工业级/我们 = {_vs_ind_speedup}x  {_verdict}")
         else:
-            print(f"  [产出] vs工业级: 缺数据 (我们 Event={_our_best_evt_ns}, 工业级={_ind_us}us) — "
-                  f"AUTO_RUN_IND_BENCH=1 已自动跑过仍失败? 看上面 [工业级] 日志 / 手工跑 bench_all")
+            print(f"  [产出] vs工业级: 缺数据 (我们纯kernel={_our_best_kns}, 工业级={_ind_us}us) — "
+                  f"AUTO_RUN_IND_BENCH=1 已自动跑过仍失败? 看上面 [工业级] 日志 / 手工跑 bench_all --msprof")
         print(f"  [产出] 最终 kernel 文件 → {st.get('current_kernel')}")
 
         # ★自动生成轨迹图 (优化结束后; 失败/无 matplotlib 不阻断). env AUTO_CHART=0 关闭.
@@ -2367,14 +2405,15 @@ class Scheduler:
                     "total_rounds": st.get("total_rounds", 0),
                     "promote_rounds": _prom,
                     "effective_rounds": _n_eff,
-                    # ★两种口径: 端到端(主) + 纯kernel(参考)
-                    "baseline_ns": _bs, "final_ns": _cur_ns,            # 纯 kernel
-                    "baseline_e2e_ns": _be2e, "final_e2e_ns": _cur_e2e, # 端到端 (msprof)
-                    "our_best_e2e_event_ns": _our_best_evt_ns,          # ★我们最优 Event 端到端 (工业级口径)
-                    "industrial_time_us": st.get("industrial_time_us"), # 工业级基准 (Event, 各 mode min)
+                    # ★两种口径: 纯kernel(主, msprof Task Duration) + 端到端/Event(参考)
+                    "baseline_ns": _bs, "final_ns": _cur_ns,            # 纯 kernel (★主口径)
+                    "baseline_e2e_ns": _be2e, "final_e2e_ns": _cur_e2e, # 端到端 (msprof, 参考)
+                    "our_best_kernel_ns": _our_best_kns,                # ★我们最优纯 kernel (vs工业级同尺)
+                    "our_best_e2e_event_ns": _our_best_evt_ns,          # 我们最优 Event (参考口径)
+                    "industrial_time_us": st.get("industrial_time_us"), # 工业级基准 (msprof 纯kernel, 各 mode min)
                     "industrial_baseline": st.get("industrial_baseline"),
                     "industrial_modes": _ind_modes_list,                # ★各 mode 明细 (分析差在哪)
-                    # ★优化效果终极指标: 我们最优/工业级最优 (两端 Event 同口径)
+                    # ★优化效果终极指标: 我们最优/工业级最优 (两端 msprof 纯 kernel 同口径)
                     "vs_industrial_ratio": _vs_ind_ratio,               # 我们/工业级 (<1=快于工业级)
                     "vs_industrial_speedup": _vs_ind_speedup,           # 工业级/我们 (>1=快于工业级, 同 speedup 方向)
                     "current_speedup": _cs, "best_speedup": st.get("best_speedup"),

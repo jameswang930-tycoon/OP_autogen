@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
-"""V9: 首次 Event 必须对比基线 — msprof 欠采假快轮 (14x) 在 Event 口径下未变快/更慢时不得进链,
-   best_speedup 不得被毒成 <1 (复现用户场景: history 14.多 vs best_speedup 0.953)."""
+"""V9 (★2026-08-18 v4.6 口径更新): 欠采假快轮不得进链 — msprof 欠采 (行数 rows<loop) → 假快 ns
+   被欠采硬门槛拦截, best_kernel_ns/best_speedup 不被毒。
+   (v4.5 旧防护 = "首次 Event 对比基线"; v4.6 主口径改纯 kernel 后防护 = 欠采硬门槛 + loop_ok 门控;
+    现实中欠采必然表现为 rows<loop — 假快 ns + 行数足额的组合无真实产生机制, v4.6 按 msprof 纯 kernel 为权威)"""
 import json, os, re, sys, tempfile
 from pathlib import Path
 
@@ -65,10 +67,10 @@ def verify(kernel_op, round_dir, baseline_ns=None, num_kernels=None, num_launche
     m = re.search(r"round(\d+)", rd)
     rn = int(m.group(1)) if m else 0
     if rn == 1:
-        # ★复现用户场景: msprof 欠采 → 假快 14x; Event 真实口径反而慢 5% (105us vs 100us)
+        # ★欠采假快: rows=3 < loop=30 (op_summary 漏行 → 求和偏小 → 假快 14x)
         return {"ok": True, "ns": BASE_MS / 14.0, "e2e_ns": BASE_MS / 14.0,
                 "e2e_event_ns": BASE_EVT * 1.05,
-                "speedup": 14.0, "loop": 30, "rows": 90, "duration_us": 428.6}
+                "speedup": 14.0, "loop": 30, "rows": 3, "duration_us": 428.6}
     # round2: Event 真快 10%
     return {"ok": True, "ns": BASE_MS / 15.0, "e2e_ns": BASE_MS / 15.0,
             "e2e_event_ns": BASE_EVT * 0.9,
@@ -100,21 +102,21 @@ traj = json.loads((tmp / "outputs" / "matmul" / "optimization_trajectory.json")
                   .read_text(encoding="utf-8"))
 st, hist = traj["state"], traj["history"]
 
-check("V9: round1 (假14x但Event慢5%) 未被采纳",
+check("V9: round1 (欠采假快14x, rows=3<loop) 未被采纳",
       not any(h.get("decision") == "KEEP" and abs(h.get("speedup", 0) - 14.0) < 0.01
               for h in hist),
       [ (h.get("round"), h.get("speedup"), h.get("decision")) for h in hist ])
 check("V9: round2 (Event真快10%) 被采纳",
       any(h.get("decision") == "KEEP" and abs(h.get("speedup", 0) - 15.0) < 0.01
           for h in hist))
-check("V9: best_speedup 不被毒成 <1 (Event 口径真实值 1.11)",
-      abs(st["best_speedup"] - BASE_EVT / (BASE_EVT * 0.9)) < 0.01,
+check("V9: best_speedup 不被毒 (★v4.6 纯kernel口径 = 15.0)",
+      abs(st["best_speedup"] - 15.0) < 0.01,
       f"best_speedup={st.get('best_speedup')}")
 check("V9: best_speedup >= 1.0", st.get("best_speedup", 0) >= 1.0)
-check("V9: best_e2e_event_ns = round2 的 90us",
+check("V9: best_e2e_event_ns = round2 的 90us (Event 参考独立维护)",
       abs(st["best_e2e_event_ns"] - BASE_EVT * 0.9) < 1.0,
       st.get("best_e2e_event_ns"))
 print(f"  best_speedup={st.get('best_speedup')} best_round={st.get('best_round')} "
       f"best_e2e_event_ns={st.get('best_e2e_event_ns')}")
 
-print("\n═══ V9 (首次 Event 对比基线) 全部通过 ═══")
+print("\n═══ V9 (欠采硬门槛, v4.6 口径) 全部通过 ═══")

@@ -1,6 +1,6 @@
 # Triton Agent Optimizer — 完整架构设计 (v4.5)
 
-> **核心差异化优势**：不靠盲试（AutoKernel 300~400 轮），用 **真机 msprof + msprof op** 精确诊断瓶颈（真实带宽/L2/算力/冲突），6 层策略按「结构影响从大到小」逐轮优化，每轮只看**当前策略需要的字段**，Planner（笨 LLM）定方向、Coder **确定性改码**、**msprof 端到端验证加速比 + Event 设备侧计时**（工业级绝对端到端）。
+> **核心差异化优势**：不靠盲试（AutoKernel 300~400 轮），用 **真机 msprof + msprof op** 精确诊断瓶颈（真实带宽/L2/算力/冲突），6 层策略按「结构影响从大到小」逐轮优化，每轮只看**当前策略需要的字段**，Planner（笨 LLM）定方向、Coder **确定性改码**、**msprof 纯 kernel 验证 + 严格最优 KEEP（纯 kernel 绝对延迟; ★v4.6 口径统一, Event 只做快测门粗筛与报告参考）**。
 >
 > **数据源 = 真机双源**：① 通用 `msprof`（骨架：kernel 数/耗时/形状/launch/L2）+ ② 逐 kernel `msprof op`（深层：真实带宽/引擎利用率/算力/冲突）→ `integrate.py` 按 kernel 名合并 → `diagnosis.json`（roofline 核心）。
 >
@@ -10,6 +10,7 @@
 > **更新**：2026-08-12 — v4.4 修复轮: ①sweep 回滚内容快照(链污染) ②promote 门前置+有效轮计数(max_rounds 硬上限) ③rebaseline 同步 best Event ④diff.patch 仅成功时写 ⑤coder 清洗 4 缺陷(千分位/全角/markdown/引号两难)+报错带行内容 ⑥bench 测量方法学修复(do_bench 同款: 多窗口 median + 时间预算自适应 + 输入轮换破 L2) + FA 对齐 fp16; 全部有回归测试 `_sim_fix_regression.py` (31 项断言)。
 > **更新**：2026-08-11 — v4.3：① bench 全切 Event（工业级+PyTorch，不用 msprof）② 迭代每轮补 Event e2e_event_ns ③ 严格最优 KEEP（>best_speedup）+ best_kernel 绑定 + 失败回滚 ④ sweep 每 tier3 round 都跑 ⑤ 设备污染检测+重置 ⑥ vs_industrial 比值 + strategy_summary。
 > **更新**：2026-08-18 — 算子扩充 + 工程整理（细节见 §9 开发记录）：① 算子从 14 → **26 个**（08-13 复杂算子 3 个 + 08-14 工业界经典长链 9 个，与 bench_910b3 工业级基准一一对应）② batched_matmul kernel 变量复用 bug 修复（loop-carried 类型冲突，曾致新算子"采集不到 kernel"）③ 全部新算子过 **16 类禁令静态审计**（num_warps/autotune/gather 寻址/vsel 地址/mask 依赖 load/arange 非 constexpr/循环携带类型冲突等，依据 `docx/CODING_GUIDE.md`，检查器经阳性对照验证）④ 架构图定稿 `knowledge/architecture_mermaid_single_v3.html`（阶段 0-7 纵向总图，v2 式并列多箭头扇入/扇出）⑤ 文件归档：架构图 HTML/JS → `knowledge/`，调试脚本 → `test/`。
+> **更新**：2026-08-18 (下午) — ★v4.6 口径统一: KEEP/REVERT 主依据从 Event 端到端改为**纯 kernel 绝对延迟**（msprof Task Duration 求和÷遍数 = verify 的 ns）+ 欠采硬门槛（行数<loop 不采纳）; speedup/best_speedup/vs_industrial 全部统一纯 kernel 口径（history 与 best 同源, 根治「显示 2.x vs best 1.x」矛盾）; Event 降为参考（快测门粗筛+报告, best_e2e_event_ns 独立维护）; 工业级对比只认 method=msprof json（`bench_industrial.py --msprof`）; verifier Event 门控改 loop_ok（msprof 漏记不株连）; 修 speedup 轮首未初始化崩溃; 回归 32/32。
 
 ---
 
@@ -23,8 +24,8 @@
 | **每轮只看该策略字段** | 6 层策略各有自己的数据段（58 字段），Planner 只喂当前层要的 |
 | **确定性改码** | Planner 输出 `changes[]`（old_code→new_code 逐字符匹配），Coder 精确替换 + Unicode 清洗，找不到就报告不猜 |
 | **sweep 分块地基** | round1 + **每个 tier3 round** 自动枚举全部 L0 合法 BLOCK, 在 best_kernel.py 上实测选最优 → 每轮传 planner |
-| **验证 = 正确性 + msprof + Event** | MATMUL_VERIFY 校验 → msprof 端到端测速比 + Event 设备侧 e2e_event_ns (工业级绝对值) |
-| **严格最优 KEEP** | 本轮 speedup **> 历史最高 best_speedup** 才进链; 绑定 best_kernel/best_round + 复制 best_kernel.py; 失败/回退回滚轮首快照 |
+| **验证 = 正确性 + msprof 纯 kernel + Event 参考** | MATMUL_VERIFY 校验 → msprof 纯 kernel ns（★v4.6 KEEP 主口径）+ Event e2e_event_ns（快测门粗筛+报告参考） |
+| **严格最优 KEEP** | 本轮纯 kernel ns **< 历史最小 best_kernel_ns** 才进链（★v4.6; 欠采硬门槛 行数<loop 不采纳）; 绑定 best_kernel/best_round + 复制 best_kernel.py; 失败/回退回滚轮首快照 |
 | **设备污染恢复** | verify 崩 AICore (HIVM/OOM/575) → 下轮采集前自动重置设备 (修 msprof 采不到 kernel 级联) |
 | **严格晋升 + 可回退** | planner promote 必须给数据依据 (promote_evidence); 支持回退前层; 防死循环 (同路径≥3次拒绝) |
 | **跳转手递** | 跨 tier 跳转时, 当前 planner 写 10_tier_handoff.json (瓶颈+方向) → 目标 tier planner 读 |
@@ -58,8 +59,8 @@ main.py input/matmul [--fresh] [--resume] [--max-rounds N] [--target X]
              出: changes[] + promote(需evidence) + handoff(跳转给目标tier)
         ⑥ _code (coder 确定性替换 + Unicode 清洗 + ★失败库检索注入) → roundN/kernel_op.py + diff.patch
              失败 → 累积重试上下文(方案+报错全序列) + 失败库注入 → 回传 LLM 修复 (≤3 次)
-        ⑦ verify — ★两段验证: 段1 正确性+Event 快测(秒级) → 不快于 best 直接 REVERT;
-             过门才跑段2 msprof 全量 (正确性+warmup+msprof 双口径+Event) → ★严格最优 KEEP (>best_speedup)
+        ⑦ verify — ★两段验证: 段1 正确性+Event 快测(秒级) → 不快于 best 直接 REVERT (粗筛);
+             过门才跑段2 msprof 全量 (正确性+warmup+msprof 纯kernel+Event 参考) → ★严格最优 KEEP (纯kernel ns < best_kernel_ns)
         ⑧ 记录 + 决策: 严格最优/回滚/晋升(防死循环)/停止 + 优秀案例 + 失败案例 + error_class + 诊断快照 + 手递 + 设备污染检测
       每轮: strategy_summary → final_output/{all,successful}_strategies.md
       结束: 自动跑 PyTorch bench (Event) + 自动轨迹图 + vs_industrial_ratio
@@ -73,7 +74,7 @@ main.py input/matmul [--fresh] [--resume] [--max-rounds N] [--target X]
 |---|---|---|---|
 | **sweep 分块扫描** | `torch.npu.Event` | 单进程, 每候选预热+多窗口 median | 快速筛候选(几分钟); 只需相对排序 |
 | **PyTorch/工业级 bench** | `torch.npu.Event` | ★do_bench 同款: 时间预算自适应(warmup 25ms/rep 100ms) + 多窗口 median + **输入轮换破 L2 复用** | ★工业级设备侧绝对值(无 profiler 扰动, 无 L2 命中虚高) |
-| **verifier 每轮验证** | **msprof + Event (两段验证)** | ★段1 `verify_fast_gate`: 正确性+Event 快测(秒级, 无 msprof) → 不快于 best 直接 REVERT; 段2 过门才 msprof KERNEL_LOOP=30 遍(op_summary 求和÷30) 给 ns/e2e_ns + Event 给 e2e_event_ns (**★2026-08-12 加每窗口输入重建破 L2, 与工业级同口径**) | msprof 给纯kernel拆解+诊断; Event 给工业级绝对端到端; 快测门省 REVERT 轮 msprof 分钟级 |
+| **verifier 每轮验证** | **msprof + Event (两段验证)** | ★段1 `verify_fast_gate`: 正确性+Event 快测(秒级, 无 msprof) → 不快于 best 直接 REVERT; 段2 过门才 msprof KERNEL_LOOP=30 遍(op_summary 求和÷30) 给 ns/e2e_ns + Event 给 e2e_event_ns (**★2026-08-12 加每窗口输入重建破 L2, 与工业级同口径**) | msprof 纯 kernel = KEEP 主口径 (★v4.6); Event = 快测门粗筛+参考; 快测门省 REVERT 轮 msprof 分钟级 |
 
 **★bench 测量纪律 (2026-08-12, 对齐 triton testing.do_bench)**:
 - **多窗口 median**: 先 5 次估时长 → warmup/rep 次数按 ms 预算自适应 (快 kernel 自动加次) → n_rep 个**独立 Event 对** → 取 median (另报 min/mean)。旧"一次窗口包 30 次 ÷30"只有 1 个样本, 快 kernel 噪声大。
@@ -85,9 +86,9 @@ main.py input/matmul [--fresh] [--resume] [--max-rounds N] [--target X]
   不是测量差异**——对比公平。大算子 (ms 级) 差异可忽略; 小算子 (逐元素/归约, us 级) 我们天然占优（这正是
   融合/单遍优化的目标）→ 报告同时给 `time_us_min/mean` + 说明。
 
-**为什么 Event 是工业级主测?** msprof 带 profiler 挂载开销(绝对值偏高, 但跨轮一致→相对 speedup 用它); `torch.npu.Event` 是设备侧事件计时(无扰动, 官方/NVIDIA/vLLM-Ascend 标准), 最终报告绝对 latency 用它。两者并存: msprof 拆解, Event 权威。
+**★v4.6 口径反转**: 主决策/主加速比/工业级对比全部用 msprof 纯 kernel（Task Duration 求和÷遍数, 与优化对象同尺）; `torch.npu.Event`（设备侧事件计时, 无 profiler 扰动）降为参考——快测门粗筛 + 报告展示。两者并存: msprof 主, Event 参考。
 
-**口径**: 相对 speedup 用 msprof (`baseline_e2e_ns/e2e_ns`); 绝对 latency 用 Event (`e2e_event_ns`, 轨迹图/工业级对比都用 Event-Event 同口径)。
+**口径 (★v4.6 统一)**: 主加速比与 KEEP 决策都用 msprof 纯 kernel（`baseline_ns/ns`, history speedup 与 best_speedup 同源）; Event 为参考口径（`e2e_event_ns`, 快测门+报告）; 工业级对比 = 纯 kernel 同尺（只认 method=msprof json）。
 
 ---
 
@@ -95,7 +96,7 @@ main.py input/matmul [--fresh] [--resume] [--max-rounds N] [--target X]
 ┌─ kernel 链 (★严格最优 采纳/回退) ──────────────────────────────────┐
 │ round1: current_kernel = input/<op>/kernel_op.py (源, 永不改)       │
 │ roundN: current_kernel = 历史最高加速比那轮 (best_kernel, 严格最优)  │
-│  ★采纳 = 本轮 speedup > best_speedup (历史最高) — 优化必须超越最优   │
+│  ★采纳 = 本轮纯 kernel ns < best_kernel_ns (历史最小, ★v4.6)        │
 │  采纳时同步 best_kernel/best_round + 复制 best_kernel.py            │
 │  REVERT(不达最高)/FAIL(≤3次重试) : 回滚轮首快照, 沿用历史最优       │
 │  设备污染(verify 崩 AICore) → 下轮采集前 _reset_device              │
@@ -345,7 +346,7 @@ cat <round_dir>/06_diagnosis/diagnosis.json
   - 删死代码（_build_fn/_run_loop）；_sim_fix_regression.py 补 P15（bench 测量回归）+ P7 强化（Event 注入 compile 校验）
   - ★假小 Event 防毒（用户报告 "加速比突然 200x → 真实优化轮永不 KEEP"）: coder 改坏 KERNEL_LOOP 循环 → Event 窗口未跑满 → 假小值毒 best。
     ★2026-08-12 简化（用户原则: Event 测对就保留, 初始代码差几百上千倍加速比真实存在）: 防护改为
-    「循环异常(msprof 行数<loop) → verify 不测 Event(None) → 方案A 不保留; 循环完整 → Event 真实,
+    「源码 KERNEL_LOOP 循环丢失(loop_ok=False) → verify 不测 Event(None) → 方案A 不保留; msprof 漏记(行数<loop但循环完整) → Event 照测(独立注入, ★2026-08-18 修复, 不再株连误 REVERT); 循环完整 → Event 真实,
     按绝对延迟比最小端到端, 谁小留谁, 无任何比值拦截」; best 只在 kept 时更新; rebaseline 复测同样
     由行数保证; Event 缺失原因进 hist error; 回归 P16
 - **08-13 (v4.5 记忆+效率轮)**（提交 ac526da）：
@@ -388,6 +389,19 @@ cat <round_dir>/06_diagnosis/diagnosis.json
     launch 实参匹配 / Unicode——除已修的 batched_matmul 外全部干净; 检查器经阳性对照验证（注入 8 种违规全中）
   - 文件归档：architecture_mermaid*.html + mermaid.min.js → knowledge/；根目录 *_tmp.py 调试脚本 → test/；
     根目录只留入口与核心文档
+- **08-18 下午 (v4.6 口径统一)**：
+  - ★KEEP/REVERT 决策主依据从 Event 端到端改为**纯 kernel 绝对延迟**（msprof Task Duration 求和÷遍数
+    = verify 的 ns）+ 欠采硬门槛（行数<loop → 求和偏小假快 → 不采纳, 防毒 best_kernel_ns）
+  - speedup/best_speedup/vs_industrial 全部统一纯 kernel 口径 — history speedup 与 best_speedup 同源,
+    根治用户报告的「speedup 2.x 却 REVERT（best 1.x）」口径矛盾（排查: 显示值 msprof 口径 vs 决策
+    Event 口径不同源 + Event 缺失株连误 REVERT 两条路径)
+  - Event 降为参考: 快测门粗筛（Event ≥ best Event → 直接 REVERT 省 msprof）+ 报告展示;
+    best_e2e_event_ns 独立维护不参与决策; history 新增 event_speedup 参考字段
+  - 工业级对比只认 method=msprof json（bench_industrial.py --msprof 产; Event 版跳过+提示重测）
+  - verifier Event 门控改 loop_ok（源码循环在就测, msprof 漏记不再株连 → 修真实改进轮误 REVERT）
+  - 修 scheduler speedup 轮首未初始化（失败轮 UnboundLocalError）; 测试 fixture 补 KERNEL_LOOP 行
+    + 新增"真丢循环"对照场景; P16 断言更新（欠采提示词）; 回归 32/32 + bugfix_verify 25 项全过
+  - 文档全量同步（本 README + ARCHITECTURE_DESIGN.md 26 处）到 v4.6 口径
 
 ---
 

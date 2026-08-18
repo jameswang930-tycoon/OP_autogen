@@ -219,11 +219,13 @@ def verify_end_to_end(kernel_op: Path, round_dir: Path,
         print(f"    ⚠ 警告! 目标 kernel 行数 {n_rows} < loop({loop}) "
               f"(coder 丢掉了 KERNEL_LOOP 循环? 或 msprof 漏记) → 单次耗时可能不准, 加速比存疑!")
     # ★2026-08-12 假小防护简化: Event 真实性的唯一保证 = KERNEL_LOOP 循环完整.
-    #   循环异常 (行数 < loop = coder 改坏循环: launch 移出/条件包裹) → Event 窗口同样不可信,
-    #   直接不测 (返回 None) → scheduler 走"Event 缺失 → 方案A 不采纳", 防假小毒 best.
+    #   循环真被改没 (loop_ok=False) → Event 注入也找不到循环 → None → "Event 缺失 → 方案A 不采纳".
     #   循环完整 → Event 是真实设备侧计时, **即使 >10x 也是真优化** (naive→tl.dot 单轮可 >10x),
     #   照常采纳/记录 (不再用 EVENT_MIN_RATIO 比值误伤).
-    _evt_ns = _event_e2e_ns(kernel_op, round_dir, loop) if n_rows >= loop else None
+    # ★bug 修复 (2026-08-18): 测 Event 的前提用 loop_ok (源码循环在) 而非 n_rows>=loop —
+    #   msprof 漏记 (n_rows<loop 但循环完整) 时 Event 独立注入测量、不依赖 op_summary 行数,
+    #   原条件把"漏记"株连成"Event 不可信" → 真实改进轮 Event=None → 方案A 误 REVERT.
+    _evt_ns = _event_e2e_ns(kernel_op, round_dir, loop) if loop_ok else None
     return {"ok": True, "ns": round(ns, 1), "e2e_ns": round(e2e_ns, 1),
             "speedup": round(speedup, 4) if speedup is not None else None,
             "loop": loop, "rows": n_rows, "duration_us": round(per_pass_us, 1),

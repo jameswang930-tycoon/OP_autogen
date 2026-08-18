@@ -20,9 +20,21 @@ op_dir.mkdir(parents=True, exist_ok=True)
     "@triton.jit\ndef matmul_kernel(a, b, c, M, N, K, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):\n"
     "    pass\n"
     "def main():\n"
-    "    pass\n"
+    "    import os\n"
+    "    LOOP = int(os.environ.get('KERNEL_LOOP', '1'))\n"
+    "    for _ in range(LOOP):\n"
+    "        pass\n"
     "if __name__ == '__main__':\n"
     "    main()\n", encoding="utf-8")
+# ★无循环对照 fixture (coder 真把 KERNEL_LOOP 改丢 → loop_ok=False)
+op_dir2 = tmp / "matmul_noloop"
+op_dir2.mkdir(parents=True, exist_ok=True)
+(op_dir2 / "kernel_op.py").write_text(
+    "import triton, triton.language as tl\n"
+    "@triton.jit\ndef matmul_kernel(a, b, c, M, N, K):\n"
+    "    pass\n"
+    "def main():\n"
+    "    pass\n", encoding="utf-8")
 
 from agents.scheduler import Scheduler, build_planner_context
 
@@ -137,7 +149,7 @@ print("\n═══ V3 (vsel 分类) 验证全部通过 ═══")
 # ═══════════════════════════════════════════════════════════════
 import agents.verifier as V
 
-def _mk_verify(rows, loop, evt_calls):
+def _mk_verify(rows, loop, evt_calls, kdir="matmul"):
     """mock verify_end_to_end: 控制 msprof 行数 + 记录 _event_e2e_ns 是否被调."""
     from unittest import mock
     def _fake_durations(prof_out):
@@ -154,17 +166,23 @@ def _mk_verify(rows, loop, evt_calls):
     with mock.patch.object(V, "_read_durations", new=_fake_durations), \
          mock.patch.object(V, "_event_e2e_ns", new=_fake_event), \
          mock.patch("subprocess.run", new=_fake_run):
-        return V.verify_end_to_end(tmp / "matmul" / "kernel_op.py", tmp / "vchk", None)
+        return V.verify_end_to_end(tmp / kdir / "kernel_op.py", tmp / "vchk", None)
 
 # 场景 1: 循环完整 (rows=30 >= loop=30) → Event 照测
 _calls1 = []
 r1 = _mk_verify(30, 30, _calls1)
 check("V4: 循环完整 → Event 照测", len(_calls1) == 1 and r1.get("e2e_event_ns") == 100000.0, r1)
 
-# 场景 2: 循环异常 (rows=3 < loop=30, coder 改坏) → Event 不测 (None) → scheduler 方案A 不采纳
+# 场景 2 (★2026-08-18 更新): msprof 漏记 (rows=3 < loop=30 但源码循环完整 loop_ok=True)
+#   → Event 照测 (独立注入, 不依赖 op_summary 行数; 旧行为误株连 → 真实改进轮 Event=None 误 REVERT)
 _calls2 = []
 r2 = _mk_verify(3, 30, _calls2)
-check("V4: 循环异常 → Event 跳过 (None)", len(_calls2) == 0 and r2.get("e2e_event_ns") is None, r2)
+check("V4: msprof 漏记(循环完整) → Event 照测", len(_calls2) == 1 and r2.get("e2e_event_ns") == 100000.0, r2)
+
+# 场景 2b: coder 真丢循环 (源码无 for-range(LOOP) → loop_ok=False) → Event 不测 (None) → 方案A 不采纳
+_calls2b = []
+r2b = _mk_verify(3, 30, _calls2b, kdir="matmul_noloop")
+check("V4: 源码循环丢失 → Event 跳过 (None)", len(_calls2b) == 0 and r2b.get("e2e_event_ns") is None, r2b)
 
 # 场景 3: scheduler 侧 — Event >10x 且循环完整 → 采纳 (不再被比值拦截)
 #   模拟: 基线 Event 1000000ns, 本轮 Event 80000ns (=12.5x), rows 完整 → _adopt 应 True

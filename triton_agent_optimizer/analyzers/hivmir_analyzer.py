@@ -5,7 +5,7 @@ HIVMIR Analyzer v2.0 — 解析真实 AscendNPU-IR MLIR HIVM Dialect
 
 通过 bishengir-compile / bishengir-opt 获取 HIVM IR 并解析。
 
-真实 HIVM dialect 语法 (CANN 9.0 / ascendnpu-ir 1.1.0 验证):
+真实 HIVM dialect 语法 (CANN 8.5.1 / ascendnpu-ir 1.1.0 验证; 2026-08-18 由 CANN 9.0 统一修订):
   - alloc:   %buf = memref.alloc() : memref<1024xf16, #hivm.address_space<ub>>
   - load:    hivm.hir.load ins(%gm_buf : type) outs(%ub_buf : type)
   - store:   hivm.hir.store ins(%ub_buf : type) outs(%gm_buf : type)

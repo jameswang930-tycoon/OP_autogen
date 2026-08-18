@@ -1,0 +1,68 @@
+[
+ {
+  "tier": 1,
+  "op": "matmul",
+  "round": 1,
+  "strategy": "增大BLOCK",
+  "bottleneck": "compute_bound",
+  "solution": "1.1",
+  "changes": [
+   {
+    "old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
+    "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 128",
+    "reason": "t",
+    "section": "① config",
+    "tier": 1
+   }
+  ],
+  "speedup_before": 1.0,
+  "speedup_after": 14.0,
+  "improvement_x": 14.0,
+  "ns": 428571.4285714286,
+  "recorded_at": "2026-08-18T15:30:21.219092"
+ },
+ {
+  "tier": 1,
+  "op": "_sim_op",
+  "round": 2,
+  "strategy": "s",
+  "bottleneck": "compute_bound",
+  "solution": "s",
+  "changes": [
+   {
+    "old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
+    "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
+    "reason": "t",
+    "section": "① config",
+    "tier": 1
+   }
+  ],
+  "speedup_before": 1.0,
+  "speedup_after": 1.4,
+  "improvement_x": 1.4,
+  "ns": 3571428.571428572,
+  "recorded_at": "2026-08-18T15:32:45.477074"
+ },
+ {
+  "tier": 1,
+  "op": "matmul",
+  "round": 2,
+  "strategy": "增大BLOCK",
+  "bottleneck": "compute_bound",
+  "solution": "1.1",
+  "changes": [
+   {
+    "old_code": "BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
+    "new_code": "BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 128",
+    "reason": "t",
+    "section": "① config",
+    "tier": 1
+   }
+  ],
+  "speedup_before": 1.0,
+  "speedup_after": 15.0,
+  "improvement_x": 15.0,
+  "ns": 400000.0,
+  "recorded_at": "2026-08-18T15:33:27.334719"
+ }
+]

@@ -6,14 +6,17 @@ Triton Agent Optimizer — 全局配置中心
 所有模块通过 `from config import ...` 获取配置参数。
 不硬编码任何路径或阈值——全部集中在这里。
 
-硬件参数从 costModel/cost_emulator/simulator.py 动态读取，
-不在本文件中重复定义。
+硬件参数 (910B3 峰值/容量/频率) 在 `_load_hardware_params()` 中硬编码
+（来自华为官方文档 + bench_910b3 实测/推导，详见 HardwareParams docstring）。
+v3 曾从 costModel/cost_emulator/simulator.py 动态读取，costModel 已弃用，
+该动态加载已移除——v4 全部走硬编码验证值。
 
 使用方式:
     from config import Config
     cfg = Config()                          # 自动检测环境 (本地/服务器)
-    cfg.simulator_path                      # simulator.py 的路径
-    cfg.emulator_root                       # emulators/ 的路径
+    cfg.paths.triton_agent_root             # triton_agent_optimizer/ 目录
+    cfg.paths.output_dir                    # outputs/ 目录（活跃使用）
+    # 注：v3 残留 (simulator_path / emulator_root / rounds_dir 等) 已于 2026-08-18 清理
 """
 
 from __future__ import annotations
@@ -134,22 +137,22 @@ class PlatformPaths:
 
     @property
     def cost_model_root(self) -> Path:
-        """(deprecated) costModel/ 目录"""
+        """(deprecated, v3 残留) costModel/ 目录 — 不再使用，硬件参数已硬编码"""
         return self.repo_root / "costModel" / "cost_emulator"
 
     @property
     def simulator_path(self) -> Path:
-        """(deprecated) simulator.py 路径"""
+        """(deprecated, v3 残留) simulator.py 路径 — 不再使用"""
         return self.cost_model_root / "simulator.py"
 
     @property
     def emulator_root(self) -> Path:
-        """emulators/ 目录 (CPU Triton 模拟层)"""
+        """(deprecated, v3 残留) emulators/ 目录 (CPU Triton 模拟层) — v4 改用 msprof 真机"""
         return self.repo_root / "emulators"
 
     @property
     def emulator_common_path(self) -> Path:
-        """emulators/common/__init__.py (tl 类 + launch_kernel + verify)"""
+        """(deprecated, v3 残留) emulators/common/__init__.py — v4 已弃用 CPU 模拟层"""
         return self.emulator_root / "common" / "__init__.py"
 
     @property
@@ -159,7 +162,8 @@ class PlatformPaths:
 
     @property
     def memory_root(self) -> Path:
-        """memory/ 目录 (经验检索模块)"""
+        """(deprecated, 路径错误) memory/ 目录 — v3 设计应指向仓库根，但实际项目 memory/ 在
+        triton_agent_root 下（v4 实际用 paths.triton_agent_root / 'memory'），外部无引用。"""
         return self.repo_root / "memory"
 
     @property
@@ -179,29 +183,33 @@ class PlatformPaths:
 
     @property
     def rounds_dir(self) -> Path:
-        """每轮优化产物目录 (plan.md + diff.patch + msprof + hivmir)"""
+        """(deprecated, v3 残留) 每轮优化产物目录 — v4 实际用 outputs/<op>/<tier_name>/roundN/ 结构,
+        外部无引用，rounds/ 目录是空目录。"""
         d = self.output_dir / "rounds"
         d.mkdir(parents=True, exist_ok=True)
         return d
 
     @property
     def journal_path(self) -> Path:
-        """优化日志 JSONL 文件"""
+        """(deprecated, v3 残留) 优化日志 JSONL 文件 — v4 改用 optimization_trajectory.json，
+        外部无引用也无人写入。"""
         return self.output_dir / "optimization_journal.jsonl"
 
     @property
     def playbooks_dir(self) -> Path:
-        """优化指导手册目录"""
+        """(deprecated, v3 残留) 优化指导手册目录 — v4 改用 docx/playbook_tier*.md，
+        playbooks/ 目录从未创建。"""
         return self.triton_agent_root / "playbooks"
 
     @property
     def cases_dir(self) -> Path:
-        """优秀案例库目录"""
+        """(deprecated, v3 残留) 优秀案例库目录 — v4 改用 memory/excellent_cases.py
+        + memory/tierN_cases.json，cases/ 目录从未创建。"""
         return self.triton_agent_root / "cases"
 
     @property
     def example_output_dir(self) -> Path:
-        """Simulator 示例输出目录"""
+        """(deprecated, v3 残留) Simulator 示例输出目录 — simulator 已弃用，目录从未创建。"""
         return self.triton_agent_root / "example_output"
 
     # ── Python 环境 ───────────────────────────────────────────────────────────
@@ -462,7 +470,7 @@ class PlatformPaths:
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
-#  硬件参数 (从 simulator.py 动态读取, 不硬编码)
+#  硬件参数 (硬编码验证值, v3 曾从 simulator.py 动态读取, costModel 已弃用)
 # ═════════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -754,7 +762,8 @@ class OutputParams:
     """是否每轮都保存 Gantt 流水图。默认 False (太大, 只在最终报告/debug 时生成)。"""
 
     save_all_rounds_dir: bool = True
-    """是否保存每轮的 plan.md + diff.patch 到 rounds/ 目录。推荐 True。"""
+    """(deprecated, v3 残留) 是否保存每轮的 plan.md + diff.patch 到 rounds/ 目录 — 外部无引用。
+    v4 实际写到 outputs/<op>/<tier_name>/roundN/，配置项无效。"""
 
     trajectory_chart_dpi: int = 150
     """优化轨迹图 DPI。"""
@@ -786,12 +795,12 @@ class Config:
 
     用法:
         from config import config
-        print(config.paths.simulator_path)
+        print(config.paths.triton_agent_root)
         print(config.optim.max_rounds)
 
     首次实例化时会:
       1. 自动检测运行环境 (Windows / Linux / 910B3 服务器)
-      2. 从 simulator.py 动态加载硬件参数
+      2. 加载硬编码的 910B3 硬件参数（_load_hardware_params）
       3. 创建必要的输出目录
 
     本地环境 (无 NPU) 也能正常实例化——硬件相关路径为 None,
@@ -904,8 +913,8 @@ class Config:
         print(f"Environment:       {info['environment']}")
         print(f"Python:            {info['python']}")
         print(f"Repo root:         {info['repo_root']}")
-        print(f"Simulator:         {'[OK]' if info.get('simulator_available') else '[MISSING]'}")
-        print(f"Emulator:          {'[OK]' if info['emulator_available'] else '[MISSING]'}")
+        print(f"Simulator:         [{'v3 弃用'}]")  # v3 costModel/simulator 已弃用
+        print(f"Emulator:          [{'v3 弃用'}]")  # v3 CPU 模拟层已弃用
         print(f"Hardware params:   {'[OK]' if info['hardware_params_loaded'] else '[FAIL]'}")
 
         asc = info["ascend_env"]
@@ -931,8 +940,7 @@ class Config:
             "environment": self.paths.env,
             "paths": {
                 "repo_root": str(self.paths.repo_root),
-                "simulator": str(self.paths.simulator_path),
-                "emulator": str(self.paths.emulator_root),
+                "triton_agent_root": str(self.paths.triton_agent_root),
                 "output_dir": str(self.paths.output_dir),
             },
             "hardware_params_loaded": len(self.hardware.saturation_params) > 0,
@@ -960,14 +968,13 @@ config = Config()
 
 # ═════════════════════════════════════════════════════════════════════════════════
 #  便捷导出 (向后兼容 from config import XXX 的写法)
+#  仅保留活跃使用的便捷变量；v3 残留（simulator_path / emulator_root / rounds_dir）已删除
+#  （2026-08-18 硬证据确认：全项目 0 引用，可安全移除）。
 # ═════════════════════════════════════════════════════════════════════════════════
 
 # 路径
 paths   = config.paths
-simulator_path = config.paths.simulator_path
-emulator_root  = config.paths.emulator_root
 output_dir     = config.paths.output_dir
-rounds_dir     = config.paths.rounds_dir
 
 # 硬件
 hardware = config.hardware

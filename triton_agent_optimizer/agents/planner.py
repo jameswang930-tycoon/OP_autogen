@@ -108,7 +108,7 @@ def _load_playbook(tier: int, playbook_dir: Optional[Path] = None) -> str:
 
 def _build_system_prompt(tier: int, playbook: str) -> str:
     """构建 System Prompt。"""
-    return f"""You are a Triton kernel optimizer for Ascend 910B3 NPU (triton 3.4.0, CANN 9.0).
+    return f"""You are a Triton kernel optimizer for Ascend 910B3 NPU (triton 3.4.0, CANN 8.5.1, triton-ascend 3.2.0).
 Generate ONE concrete optimization change for Tier {tier}: {TIER_NAMES.get(tier, 'Unknown')}.
 
 ## Rules

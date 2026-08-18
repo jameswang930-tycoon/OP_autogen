@@ -1,5 +1,23 @@
 # Triton Agent Optimizer — 逐文件实现计划
 
+> ## ⚠️ 已废弃（2026-08-18 标记）
+>
+> **本文档是 v3 时期的逐文件实现计划，最后更新 2026-07-23**。
+> 自 v4 以来，目录结构、`agents/orchestrator.py` / `optimizers/*.py` /
+> `fusion_pipeline/*` / `feedback/round_logger.py` 等计划中的文件
+> **从未实际创建**——v4 改用 `agents/scheduler.py` + `analyzers/integrate.py` +
+> `memory/failed_cases.py` + `optimization_trajectory.json` 等替代方案。
+>
+> **请阅读**:
+> - 最新架构和完整数据流 → `ARCHITECTURE_DESIGN.md`
+> - 文件列表和用途 → `README.md` §4 + §6
+> - 6 层优化策略原理 → `docx/OPTIMIZATION_METHODOLOGY.md`
+>
+> ---
+>
+> **保留原因**：作为 v3 思路的历史快照，便于理解 v3→v4→v4.6 三轮迁移的背景。
+> **不要按本文档新建文件**——所有设计决定请走 `ARCHITECTURE_DESIGN.md` + `README.md`。
+
 > **状态: 实现阶段已完成，本文档作为架构参考保留。**
 > 最新架构和完整数据流见 `ARCHITECTURE_DESIGN.md`。
 > 实际文件列表和用途见 `README.md` §4。

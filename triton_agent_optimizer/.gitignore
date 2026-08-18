@@ -40,3 +40,7 @@ _cleanup_backup*/
 # ═══ 编辑器 ═══
 .vscode/
 .idea/
+
+# ═══ memory 运行数据 (服务器各自积累, 不入库 — 防本地/模拟数据覆盖服务器真实案例库) ═══
+memory/*.json
+memory/**/*.json

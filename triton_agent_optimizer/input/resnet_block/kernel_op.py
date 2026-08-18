@@ -34,7 +34,7 @@ EPS = 1e-5
 DTYPE = torch.float32
 BLOCK_K = 64                                  # 输出通道块 (≥K_OUT 的 2 幂)
 BLOCK_OW = 64                                 # 空间块
-BLOCK_CRS = 512                               # ≥CRS(576) 的 2 幂
+BLOCK_CRS = 1024                              # ≥CRS(576) 的 2 幂 (512<576 会丢 64 项规约 → 数值必错)
 BLOCK_EL = 1024                               # 逐元素分块
 # 注意: 不传 num_warps/num_stages — triton-ascend 禁止 tune 这两个参数, 自动管理 tiling/流水
 
@@ -45,7 +45,7 @@ BLOCK_EL = 1024                               # 逐元素分块
 
 # 标准 GEMM (host im2col): 每 program 算 (n, oh) 的 [K × OW] 块
 @triton.jit
-def conv2d_kernel(x_col_ptr, w_ptr, y_ptr,
+def conv2d_kernel(x_col_ptr, w_ptr, b_ptr, y_ptr,
                   N, K, LOUT, OW,
                   BLOCK_K: tl.constexpr, BLOCK_OW: tl.constexpr, BLOCK_CRS: tl.constexpr,
                   CRS: tl.constexpr):
@@ -58,24 +58,27 @@ def conv2d_kernel(x_col_ptr, w_ptr, y_ptr,
     offs_k = tl.arange(0, BLOCK_K)
     offs_crs = tl.arange(0, BLOCK_CRS)
     offs_l = oh * OW + owb * BLOCK_OW + tl.arange(0, BLOCK_OW)
+    l_ok = offs_l < (oh + 1) * OW    # 行界: OW 非 BLOCK_OW 整数倍时不越行 (env 改尺寸防串行)
     patch = tl.load(x_col_ptr + n * CRS * LOUT + offs_crs[:, None] * LOUT + offs_l[None, :],
-                    mask=offs_crs[:, None] < CRS, other=0.0)
+                    mask=(offs_crs[:, None] < CRS) & l_ok[None, :], other=0.0)
     wtile = tl.load(w_ptr + offs_k[:, None] * CRS + offs_crs[None, :],
                     mask=(offs_crs[None, :] < CRS) & (offs_k[:, None] < K),
                     other=0.0)
     acc = tl.zeros((BLOCK_K, BLOCK_OW), dtype=tl.float32)
     acc = tl.dot(wtile, patch, acc)
+    bias = tl.load(b_ptr + offs_k, mask=offs_k < K, other=0.0)
+    acc = acc + bias[:, None]
     y_ptrs = y_ptr + n * K * LOUT + offs_k[:, None] * LOUT + offs_l[None, :]
-    tl.store(y_ptrs, acc, mask=(offs_k[:, None] < K) & (offs_l[None, :] < LOUT))
+    tl.store(y_ptrs, acc, mask=(offs_k[:, None] < K) & l_ok[None, :])
 
 
 # BatchNorm 推理 (逐元素, 按通道): y = (x - rm) / sqrt(rv+eps) * g + b
 
 @triton.jit
-def conv2d_kernel2(x_col_ptr, w_ptr, y_ptr,
-                  N, K, LOUT, OW,
-                  BLOCK_K: tl.constexpr, BLOCK_OW: tl.constexpr, BLOCK_CRS: tl.constexpr,
-                  CRS: tl.constexpr):
+def conv2d_kernel2(x_col_ptr, w_ptr, b_ptr, y_ptr,
+                   N, K, LOUT, OW,
+                   BLOCK_K: tl.constexpr, BLOCK_OW: tl.constexpr, BLOCK_CRS: tl.constexpr,
+                   CRS: tl.constexpr):
     pid = tl.program_id(axis=0)
     total_ow = (OW + BLOCK_OW - 1) // BLOCK_OW
     owb = pid % total_ow
@@ -85,15 +88,18 @@ def conv2d_kernel2(x_col_ptr, w_ptr, y_ptr,
     offs_k = tl.arange(0, BLOCK_K)
     offs_crs = tl.arange(0, BLOCK_CRS)
     offs_l = oh * OW + owb * BLOCK_OW + tl.arange(0, BLOCK_OW)
+    l_ok = offs_l < (oh + 1) * OW
     patch = tl.load(x_col_ptr + n * CRS * LOUT + offs_crs[:, None] * LOUT + offs_l[None, :],
-                    mask=offs_crs[:, None] < CRS, other=0.0)
+                    mask=(offs_crs[:, None] < CRS) & l_ok[None, :], other=0.0)
     wtile = tl.load(w_ptr + offs_k[:, None] * CRS + offs_crs[None, :],
                     mask=(offs_crs[None, :] < CRS) & (offs_k[:, None] < K),
                     other=0.0)
     acc = tl.zeros((BLOCK_K, BLOCK_OW), dtype=tl.float32)
     acc = tl.dot(wtile, patch, acc)
+    bias = tl.load(b_ptr + offs_k, mask=offs_k < K, other=0.0)
+    acc = acc + bias[:, None]
     y_ptrs = y_ptr + n * K * LOUT + offs_k[:, None] * LOUT + offs_l[None, :]
-    tl.store(y_ptrs, acc, mask=(offs_k[:, None] < K) & (offs_l[None, :] < LOUT))
+    tl.store(y_ptrs, acc, mask=(offs_k[:, None] < K) & l_ok[None, :])
 
 
 # BatchNorm 推理 (逐元素, 按通道): y = (x - rm) / sqrt(rv+eps) * g + b
@@ -211,12 +217,14 @@ def main():
     # ★KERNEL_LOOP: verify/bench 用它 (一次 msprof 内循环 N 次, 求单次平均)
     LOOP = int(os.environ.get("KERNEL_LOOP", "1"))
     for _ in range(LOOP):
-        conv2d_kernel[grid_c](x_col, w1_flat, y1, N_B, K, LOUT, OW,
+        conv2d_kernel[grid_c](x_col, w1_flat, b1, y1, N_B, K, LOUT, OW,
                               BLOCK_K=BLOCK_K, BLOCK_OW=BLOCK_OW, BLOCK_CRS=BLOCK_CRS,
                               CRS=C_IN * R * S)
         bn_kernel[grid_el](y1, a1, rm1, rv1, g1, bn1, n_el, K, OH * OW, EPS, BLOCK=BLOCK_EL)
         relu_kernel[grid_el](a1, y1, n_el, BLOCK=BLOCK_EL)
-        conv2d_kernel2[grid_c](y1, w2_flat, y2, N_B, K, LOUT, OW,
+        # ★第二层 conv 的 im2col: 依赖 conv1+relu 的输出, 必须在循环内做 (传激活图本身会越界+语义错)
+        y1_col = F.unfold(y1, (R, S), padding=PAD).contiguous()
+        conv2d_kernel2[grid_c](y1_col, w2_flat, b2, y2, N_B, K, LOUT, OW,
                               BLOCK_K=BLOCK_K, BLOCK_OW=BLOCK_OW, BLOCK_CRS=BLOCK_CRS,
                               CRS=K * R * S)
         bn_kernel2[grid_el](y2, a2, rm2, rv2, g2, bn2, n_el, K, OH * OW, EPS, BLOCK=BLOCK_EL)

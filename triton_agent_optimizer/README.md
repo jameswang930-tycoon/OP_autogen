@@ -166,33 +166,45 @@ input/<op>/
 ## 4. 输出结构（每轮自包含）
 
 ```
-outputs/<op>/<tier>/roundN/
-  input/kernel_op.py      ← 本轮采集快照 (上一轮输出/源)
-  kernel_op.py            ← ★本轮 coder 输出的优化 kernel
-  diff.patch              ← 本轮改动
-  plan.md                 ← planner 计划 (含 changes[])
-  optimization_record     ← (hist 记入 trajectory)
-  04_board/               ← msprof op 8 CSV 原始
-  05_task/                ← 通用 msprof 原始
-  06_diagnosis/           ← diagnosis.json (+task/board json)
-  07_tier{N}_fields/      ← ★当前 tier 筛字段 (planner 读)
-  08_fusion/              ← (仅 Tier2) HIVM MLIR + 融合分析
-outputs/<op>/optimization_trajectory.json   ← ★全局状态 (tier/round/best/current_kernel/history)
-outputs/<op>/final_output/trajectory_chart.png  ← 轨迹图
+outputs/<op>/
+├── optimization.log              # 全流程运行日志 (Tee 双写: 终端 + 文件)
+├── best_kernel.py                # ★历史最优 kernel (KEEP 轮更新; sweep 的实验底座)
+├── baseline_verify/              # round1 基准复测产物 (与后续轮同口径)
+├── <tier_name>/roundN/           # 每轮一个自包含目录 (01_algorithmic_structure ~ 06_910b3_architecture)
+│   ├── input/kernel_op.py        # 本轮采集快照 (上一轮输出/源)
+│   ├── kernel_op.py              # ★本轮 coder 优化输出
+│   ├── diff.patch                # 本轮改动 (仅 coder 成功时写)
+│   ├── plan.md                   # planner 计划 (changes[] + promote)
+│   ├── event_kernel.py           # Event 计时注入版 (verify 生成)
+│   ├── failed_kernel.py          # (失败时) 崩掉的中间产物, 排查留证
+│   ├── 04_board/                 # msprof op 8 CSV 原始 → board_<i>.json
+│   ├── 05_task/                  # 通用 msprof 原始 → task.json
+│   ├── 06_diagnosis/             # diagnosis.json (骨架+deep+roofline)
+│   ├── 07_tier{N}_fields/        # ★当前 tier 筛字段 (planner 读)
+│   ├── 08_fusion/                # (仅 Tier2) HIVM 依赖分析 + 可融合候选
+│   ├── 09_tier3_sweep/           # (仅 sweep 轮) 分块扫描: sweep_result.json + runner
+│   └── msprof_0/                 # verify 阶段的 msprof 验证产物
+├── optimization_trajectory.json  # ★全局状态 (state + history; --resume 续跑用它)
+└── final_output/                 # 优化结束自动生成
+    ├── kernel_op.py              # 最优 kernel (取 best_kernel, 可直接用)
+    ├── baseline_kernel.py        # baseline 副本 (对照)
+    ├── final_summary.json        # 双口径加速比 + Event 延迟 + vs_industrial_ratio
+    ├── trajectory_chart.png      # 轨迹图 (加速比曲线 + tier 色带 + PyTorch 虚线 + 工业级红线)
+    └── {all,successful}_strategies.md   # 每轮策略摘要 (全部 / 仅成功)
 ```
 
 ---
 
-## 5. 6 层策略 × 每轮字段（审计定版 58 字段，2026-08-12 扩充）
+## 5. 6 层策略 × 读取字段 / 识别瓶颈 / 优化策略
 
-| Tier | 策略 | 字段数 | 主要字段 | 晋升条件 |
+| Tier | 策略 | 读取的字段 | 识别的瓶颈 | 主要优化策略 |
 |---|---|---|---|---|
-| 1 | 算法结构 | 13 | cube_fops/vec_fops/cube_ratio/fp16/int8占比/cube fp指令/vec fp16占比/算力利用率/算术强度/瓶颈类型/total_ns/num_kernels | 算法已最优 |
-| 2 | 算子融合 | 8(+08_fusion) | num_kernels/api_overhead/task_type/launch_count/multi_kernel/framework + HIVM 依赖分析(含每op耗时占比) | 无可融合 |
-| 3 | 分块配置 | 8 | block_dim/mte1/mte2/cube_ratio/l0a读写/l0b读写 | 3轮无改进 |
-| 4 | 访存 | 12 | main_mem读写/gm_to_ub/ub_to_gm/l2/mte2/3耗时/访存利用率 + **traffic_kb(实际搬运量)/bw_usage_rate(官方通路利用率)/traffic_redundancy(冗余倍数)** | 3轮无改进 |
-| 5 | 计算占用 | 8 | cube耗时/标量耗时/scalar/fixpipe占比/cube_ratio/冲突 | 3轮无改进 |
-| 6 | 架构专属 | 9 | engine_util/icache缺失率/cube_wait/vec_wait/mte2/3_wait/task_type/block_dim/瓶颈类型 | 3轮无改进→停 |
+| 1 | 算法结构 | 算力利用率/算术强度/瓶颈类型/cube fp16·int8 占比/cube·vec 计算量/算子数/launch 开销 | 算法选错（利用率<0.3）/精度没吃满 cube/冗余访存（巨大中间张量）/重复计算+launch 开销/归约多遍扫 | fp16 输入+fp32 累加、Flash Attention（online softmax）、多个同结构小 matmul 合并单 GEMM、online 单遍归约、split-K、persistent kernel、软件 im2col 走 cube、GQA 消组内复制、MoE topk 稀疏 |
+| 2 | 算子融合 | 算子数/launch 开销/每 kernel 引擎类型与次数/框架 kernel/瓶颈类型 + 08_fusion 依赖分析（含每 op 耗时占比） | matmul→逐元素→matmul 分离链有融合空间/launch 开销占比高/中间张量 GM 来回（读写带宽高但算力低） | 逐元素并入 matmul epilogue（bias/激活/残差）、同张量多次读→单次 load 复用/拼列、scale/mask/softmax 并入、UB 内直接消费；融合前先算收益（中间 kernel 耗时 > 2×launch 才融） |
+| 3 | 分块配置 | 核数 block_dim/mte1·mte2·cube 引擎占比/L0A·L0B 读写带宽贴合度 | 分块太小并行不足（核数<40）/BLOCK_K 太大 MTE1 搬运瓶颈/BLOCK_M·N 太小 GM 搬运频繁/块不够大喂不饱 cube | 减 BLOCK_M/N 提核数、增 BLOCK_K 降 MTE1、增 BLOCK_M/N 降 MTE2、tile+swizzle；round1+分块轮自动 sweep 穷举 L0 合法块实测选优 |
+| 4 | 访存 | GM 读写带宽/GM↔UB 通路/L2 命中率/MTE2·MTE3 耗时/访存利用率/算术强度/实际搬运量·通路利用率·冗余倍数 | GM 流量过大（memory_bound）/跨步非连续访问/L2 复用差/搬运无流水线/非 16B 对齐拆事务 | 连续化（最快维匹配布局）、128-bit 对齐+padding、L2 复用（访问序/权重预排/swizzle）、load 独立成步骤让编译器双缓冲、零散小 load 合并大块搬运、输出先 UB 内转再连续 store |
+| 5 | 计算占用 | cube·标量耗时/scalar·fixpipe 占比/向量计算量/冲突占比（bank/bankgroup/等待） | 标量降级（指针 div·mod/int64 索引）/逐元素未向量化/非原生数学指令（1÷sqrt·erf·除法）/UB bank 冲突/寄存器溢出（展开过度） | 消除标量降级（2D 索引/int32）、向量 load、rsqrt/tanh 近似/FMA 融合、倒数+乘法代除法、访问 swizzle+尾轴 32B/512B 对齐、控制展开与 ILP |
+| 6 | 架构专属 | 各引擎利用率分布/mte 冲突/vec·cube 等待占比/icache 缺失/核数 vs 物理核/多核耗时不均 | 跨引擎流水气泡/没走 cube（vector 模拟 matmul）/cube·vec 严重失衡/grid 远大于核数（调度开销）/尾核空转 | 回 Tier4 流水线/Tier3 分块、用 tl.dot 走 cube、grid 固定物理核数+核内 stride 循环、stride 切分消拖尾、K 循环分块+双缓冲、向量算子按引擎选核数 40/20 |
 
 > 2026-08-12 扩充（官方文档核实，见 `docx/msprof_fields_reference.md` 四节）：Memory.csv 的 `*_datas(KB)` 实际搬运量、`*_bw_usage_rate(%)` 官方通路利用率、PipeUtilization 的 `*_active_bw(GB/s)` 活跃带宽、`ai*_icache_miss_rate`、ResourceConflictRatio 的 `ai*_wait_ratio` 规范短名（`vec_wait_ratio` 等，消除 `_get` 子串歧义）、ArithmeticUtilization 的 vec 精度细分与 cube fp/int 指令条数、OpBasicInfo 的 `Rated Freq`/`Mix Block Dim`；roofline 新增 `traffic_redundancy_read`（实际读÷理论最小，>1.5=重复搬运）。hivm fusion view 现附每 op 估算耗时占比（Tier2 排融合优先级）。
 

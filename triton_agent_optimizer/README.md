@@ -9,6 +9,7 @@
 > **更新**：2026-08-13 — v4.5 记忆+效率轮（全部有回归测试守护）: ①失败案例库 `memory/failed_cases.py`（按 tier 分文件: 指纹去重/两级检索/attempted_solutions 方案收敛守卫/open→solved|stuck 状态机/负正闭环/LRU; coder 轮内重试累积上下文+库检索注入+成功 solved 回填; hist 记 error_class 四分类）②两段验证（段1 正确性+Event 快测秒级 → 不快于 best 直接 REVERT 省 msprof 分钟级; 段2 过门才全量）③Amdahl 显式编排（每轮 planner 注入 per-kernel 占比排序, 先打占比最大 kernel）④跨轮诊断快照（hist 记 top2 kernel 紧凑串: bn/cu/mu/l2/redun/引擎, planner 看"改法→指标变化→结果"; 全量写 diag_snapshots.jsonl）⑤v3 就地展开式讲演页 feedback/pipeline_diagrams_v3.html。
 > **更新**：2026-08-12 — v4.4 修复轮: ①sweep 回滚内容快照(链污染) ②promote 门前置+有效轮计数(max_rounds 硬上限) ③rebaseline 同步 best Event ④diff.patch 仅成功时写 ⑤coder 清洗 4 缺陷(千分位/全角/markdown/引号两难)+报错带行内容 ⑥bench 测量方法学修复(do_bench 同款: 多窗口 median + 时间预算自适应 + 输入轮换破 L2) + FA 对齐 fp16; 全部有回归测试 `_sim_fix_regression.py` (31 项断言)。
 > **更新**：2026-08-11 — v4.3：① bench 全切 Event（工业级+PyTorch，不用 msprof）② 迭代每轮补 Event e2e_event_ns ③ 严格最优 KEEP（>best_speedup）+ best_kernel 绑定 + 失败回滚 ④ sweep 每 tier3 round 都跑 ⑤ 设备污染检测+重置 ⑥ vs_industrial 比值 + strategy_summary。
+> **更新**：2026-08-18 — 算子扩充 + 工程整理（细节见 §9 开发记录）：① 算子从 14 → **26 个**（08-13 复杂算子 3 个 + 08-14 工业界经典长链 9 个，与 bench_910b3 工业级基准一一对应）② batched_matmul kernel 变量复用 bug 修复（loop-carried 类型冲突，曾致新算子"采集不到 kernel"）③ 全部新算子过 **16 类禁令静态审计**（num_warps/autotune/gather 寻址/vsel 地址/mask 依赖 load/arange 非 constexpr/循环携带类型冲突等，依据 `docx/CODING_GUIDE.md`，检查器经阳性对照验证）④ 架构图定稿 `knowledge/architecture_mermaid_single_v3.html`（阶段 0-7 纵向总图，v2 式并列多箭头扇入/扇出）⑤ 文件归档：架构图 HTML/JS → `knowledge/`，调试脚本 → `test/`。
 
 ---
 
@@ -148,6 +149,17 @@ input/<op>/
 
 - **kernel_op.py 是纯 triton 语法**（`@triton.jit`/`tl.dot`/BLOCK_M/N/K constexprs），跑在 **triton-ascend 后端**（910B3 NPU）。
 - 约束：`num_warps`/`num_stages` 由 triton-ascend 自动管理，**不能传**（传了报 `please do not tune args`）。
+- ⚠ kernel 内**同一变量名不得跨类型复用**（如 batched_matmul 曾用 `b` 既当 batch 序号 int32 又当循环内 fp32 张量块 → `CompilationError: loop-carried variable ... type stays consistent`，应用在 warmup 就崩 → msprof 采不到任何 kernel → "采集失败"）。新算子入库前建议过一遍 `docx/CODING_GUIDE.md` 禁令清单。
+
+**算子清单（26 个，2026-08-18）**：
+
+| 组 | 算子 |
+|---|---|
+| matmul 族 | `matmul`(两层MLP) / `matmul_relu` / `matmul_transpose` / `batched_matmul`(BMM) / `swiglu_mlp`(LLaMA FFN) |
+| attention 族 | `attention_mlp` / `flash_attention` / `gqa_attention`(GQA+RoPE) |
+| 归一化/逐元素 | `rms_norm` / `rms_norm_residual` / `layernorm` / `softmax` / `sigmoid` / `vector_add` / `fused_add_mul` |
+| 卷积/池化 | `conv2d` / `conv_bias_relu` / `conv1d` / `batchnorm2d` / `maxpool2d` |
+| 经典长链（08-14, 对应工业级基准） | `resnet_block` / `vit_block` / `bert_block` / `transformer_decoder_block` / `mamba_block` / `mixture_of_experts` |
 
 ---
 
@@ -192,98 +204,55 @@ outputs/<op>/final_output/trajectory_chart.png  ← 轨迹图
 
 ---
 
-## 6. 关键技术细节
+## 6. 文件架构（核心执行链路）
 
-### 6.1 确定性改码（changes[]）
-```json
-{"strategy":"增大BLOCK_K","changes":[
-  {"old_code":"BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32",
-   "new_code":"BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64",
-   "reason":"Tier3: mte1_ratio高","section":"① config"}]}
 ```
-- Planner 必须输出 old_code 逐字符匹配当前 kernel
-- Coder 精确替换**全部出现处**（old_code 须为整行）；找不到 → 报告（NOOP 标记）；绝不猜测
-- 只走 LLM 的情形：有 previous_error（验证报错）需修报错
-
-### 6.2 nga run 调用（3 个 skill）
-```bash
-echo "你是 Triton 优化 Planner。先调用 skill: skills/triton-op-planner/SKILL.md, 完全按 skill 指导执行。
-+ 07字段 + 读 playbook_tier{N}.md + 读 current_kernel + 输出 changes[]" | nga run
+triton_agent_optimizer/
+├── main.py                     # 入口: 解析参数 → 启动 Scheduler (--fresh/--resume/--max-rounds/--target/--stub)
+├── config.py                   # 全局配置中心: 路径/阈值/.env 加载 (全链路 import)
+│
+├── agents/                     # ── 智能体层 (每轮调度执行) ──
+│   ├── scheduler.py            # 调度状态机: 采集→诊断→规划→改码→两段验证→KEEP/REVERT 决策→晋升
+│   ├── planner.py              # 规划器 (LLM): 读字段/轨迹/案例 → plan.md (changes[] + promote)
+│   ├── coder.py                # 编码器: 确定性替换 changes[] + Unicode 清洗 + 失败库注入修复
+│   ├── verifier.py             # 验证器: 两段验证 (快测门 + msprof 双口径 + Event 设备侧计时)
+│   └── llm_client.py           # LLM 统一入口: nga run CLI / API / stub
+│
+├── analyzers/                  # ── 采集解析层 (每轮真机执行) ──
+│   ├── run_optimize.sh         # 采集驱动: warmup → 通用 msprof → msprof op → integrate → 07 字段
+│   ├── pipeline_parse_task.py  # 通用 msprof → task.json (骨架: 每算子耗时/launch/形状)
+│   ├── pipeline_parse_board.py # msprof op → board_<i>.json (深层: 带宽/引擎利用率/冲突)
+│   ├── integrate.py            # 骨架+深层合并 → diagnosis.json (roofline 诊断中枢)
+│   ├── sweep_blocks.py         # Tier3 分块扫描: 程序化枚举 L0 合法 BLOCK + Event 实测
+│   └── run_hivm_fusion.py      # Tier2 融合分析: HIVM 依赖 → 可融合候选
+│
+├── bench_910b3/                # ── 基准层 (Event 设备侧计时; 主循环缺基准时自动执行) ──
+│   ├── bench_industrial.py     # 工业级基准 (eager/compile/cann-fused/fa 各 mode)
+│   ├── bench_pytorch*.py       # PyTorch 基准 (按算子变体一组脚本)
+│   └── run_bench.py            # 硬件峰值校准 → hardware_peak.json (roofline 分母)
+│
+├── input/                      # ── 算子源 (26 个算子, 每算子一目录) ──
+│   └── <op>/kernel_op.py       #   单文件三合一: ① 场景 config(尺寸/精度/分块) ② 算子 kernel ③ 测试 main
+│
+├── memory/                     # ── 记忆层 (调度器/编码器调用) ──
+│   ├── excellent_cases.py      # 优秀案例记录/检索 (>1.3× 轮次, planner 优化前参考)
+│   └── failed_cases.py         # 失败案例库: 指纹去重/两级检索/solved 回填 (coder 修复注入)
+│
+├── feedback/                   # ── 结果产出 (每轮/结束时执行) ──
+│   ├── strategy_summary.py     # 每轮策略摘要 → final_output/{all,successful}_strategies.md
+│   └── trajectory_chart.py     # 结束轨迹图: 加速比曲线 + tier 色带 + 工业级红线
+│
+├── skills/                     # LLM 技能: planner/coder/fusion 三个 SKILL.md (prompt 铁律, 只读)
+├── docx/                       # 知识库: 6 层 playbook + 编码规范 + 字段参考 (LLM 每轮读)
+├── knowledge/                  # 技术细节文档 + 架构图 (定稿 architecture_mermaid_single_v3.html)
+├── test/                       # 回归测试 (_sim_* 系列) + 归档调试脚本
+├── outputs/                    # 运行产物 (运行时生成: outputs/<op>/ 轨迹 + tier/roundN/ + final_output/)
+└── paper_reference/            # 论文参考资料 (只读)
 ```
-- `skills/triton-op-planner`：判瓶颈属不属本层 + 输出 changes[]
-- `skills/triton-op-coder`：确定性替换 changes[] + 报错修
-- `skills/triton-op-fusion`：Tier2 读 HIVM MLIR 分析 RAW/WAR/WAW
-- 调用实现：`shlex.quote(full_prompt)` 构造 `echo '<prompt>' | nga run`，`["bash","-c",...]` 执行，**实时流式打印**输出
-
-### 6.3 历史梗概（防重复优化）
-每轮 hist 记：`change`(改了啥) + `speedup`(vs初始, 累计) + `prev_speedup`(上一被采纳版) + `decision`(KEEP/REVERT/FAIL) + `result`(OK/FAIL/NOOP) + `error`(短)。Planner 读最近 5 轮 1 行梗概（REVERT 轮标「↩回退」）。
-
-### 6.4 超时设置
-| env | 默认 | 作用 |
-|---|---|---|
-| `LLM_CLI_TIMEOUT` | 3600 | nga run 调用 (超时自动兜底不崩循环) |
-| `OPTIMIZE_TIMEOUT` | 3600 | run_optimize 采集 |
-| `VERIFY_WARMUP` | 3 | 验证热身裸跑次数 |
-| `VERIFY_LOOP` | 30 | 一次 msprof 内 kernel 内部循环次数 (÷N 取单次) |
-
-### 6.5 加速比
-- **加速比 = 时间比**：`baseline_time / current_time`（msprof 端到端口径）
-- **端到端耗时 = 目标 kernel (非 aclnn) Task Duration 之和**（多 kernel 如 MLP: fc1+bias_gelu+fc2 求和才是总耗时; 单 kernel 即本身; baseline 与 verify 同口径）
-- baseline = round1 采集的原始 kernel 端到端; current = 本轮验证 msprof 端到端
-- **★严格最优 KEEP**：本轮 `speedup > best_speedup`（历史最高）才进链；`best_speedup` 绑定 `best_kernel`/`best_round` + 复制 `best_kernel.py`
-- **Event 绝对端到端**：每轮另测 `e2e_event_ns`（`torch.npu.Event` 设备侧），与 msprof 并列；工业级基准对比用它
-- **vs_industrial_ratio**：我们最优 Event / 工业级最优 Event（<1=快于工业级）
-- 图上 TFLOPS = 诊断 cube_fops 总和 / baseline_ns（多 matmul 正确, 非 2MNK 单算）
-- vs PyTorch = 我们算力 / torch.matmul 算力
 
 ---
 
-## 7. 文件介绍
-
-### 入口
-| 文件 | 作用 |
-|---|---|
-| `main.py` | v4 入口。`--fresh`(清旧产物重置) / `--resume`(续跑) / `--stub`(本地) / `--max-rounds` / `--target` |
-
-### agents（智能体层）
-| 文件 | 作用 |
-|---|---|
-| `scheduler.py` | 状态机：kernel 链（严格最优 KEEP + best_kernel 绑定 + 失败回滚）、tier 字段提取（+Amdahl 优先级行）、两段验证接入、失败案例库接入（重试上下文累积+solved 回填）、hist 记录（error_class + diag 诊断快照 + JSONL 全量）、NOOP 检测、晋升决策、设备污染检测+重置、vs_industrial 比值 |
-| `planner.py` | `generate_v4`：读文件路径(不嵌入内容)，输出 changes[] + promote |
-| `coder.py` | 确定性 changes[] 替换 + Unicode 清洗（含制表符）+ 保 header + failed_kernel.py 留证 + 失败案例库检索注入（两级检索, 只读参考严禁抄写）+ 修复成功 mark_solved 回填 |
-| `verifier.py` | `verify_fast_gate`（两段验证段1: 正确性+Event 快测, 秒级）+ `verify_end_to_end`：正确性校验 + msprof 双口径 + ★Event e2e_event_ns（注入 KERNEL_LOOP）；公共 `_correctness_check` |
-| `llm_client.py` | `echo '<prompt>' | nga run` + 实时流式输出（API/CLI/stub 三模式，CLI 优先） |
-
-### analyzers（采集解析层）
-| 文件 | 作用 |
-|---|---|
-| `run_optimize.sh` | `<input_dir> <output_dir>` 采集+解析+07 产出；自包含拷贝；绝对路径 msprof |
-| `pipeline_parse_task.py` | 通用 msprof → task.json（kernel_slots 去重 + 框架过滤 + pipe 归一化） |
-| `pipeline_parse_board.py` | msprof op → board_<i>.json（8 CSV 全字段） |
-| `integrate.py` | 按 kernel 名合并骨架+deep → diagnosis.json |
-| `check_fields.py` | 缺字段精准指路（工具/文件/列名），区分「列名不匹配/合法缺」 |
-| `sweep_blocks.py` | Tier3 分块扫描：程序化枚举 L0 合法 BLOCK + 真机实测 |
-| `run_hivm_fusion.py` | Tier2：HIVM MLIR + nga 融合分析 |
-| `merge_single_file.py` | 旧式三文件→单文件兜底 |
-
-### skills（agent 教学）
-`skills/triton-op-{planner,coder,fusion}/SKILL.md` — 每个 agent 的完整指令（读来源、输出格式、铁律）。
-
-### docx（知识库）
-`OPTIMIZATION_METHODOLOGY.md`（6层方法论）/ `msprof_fields_reference.md`（字段来源）/ `aggregation_rules.md`（聚合规则）/ `final_product_spec.md`（产物规格）/ `field_extraction_checklist.md`（缺字段核对）/ `playbook_tier1~6.md`（改码教程）。
-
-### bench_910b3（硬件基准套件，★全 Event 设备侧计时，do_bench 同款测量）
-`bench_industrial.py`（工业级基准 eager/compile/cann-fused/fa，多窗口 median + 输入轮换破 L2）/ `bench_all.py`（全算子取最优，仅真执行）/ `bench_pytorch*.py`（PyTorch 基准线，同款测量）/ `bench_common.py`（测量工具: msprof 双模式 + ★measure_event）/ `run_bench.py`（硬件峰值校准）/ `bench_kernels.py`（6个测速 kernel）。
-
-### 其他
-`feedback/trajectory_chart.py`（v4 轨迹图）/ `feedback/strategy_summary.py`（每轮策略摘要，final_output/{all,successful}_strategies.md）/ `feedback/pipeline_diagrams*.html`（讲演页 v1 静态 SVG / v2 弹出下钻 / v3 就地展开式）/ `input/matmul/kernel_op.py`（单文件源）。
-
-### memory（记忆层）
-`excellent_cases.py`（优秀案例: 阈值 1.3×, planner 参考）/ `failed_cases.py`（★失败案例库: 按 tier 分文件, 指纹去重+两级检索+attempted_solutions 方案收敛守卫+open/solved/stuck 状态机+负正闭环+LRU, coder/scheduler 共用）/ `codeerror/`（早期实现, 已废弃）。
-
----
-
-## 8. 运行命令（服务器）
+## 7. 运行命令（服务器）
 
 ```bash
 # 环境 (一次性)
@@ -294,6 +263,14 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 LLM_CLI_COMMAND='nga run' python3 main.py input/matmul --fresh --max-rounds 15 --target 2.0
 LLM_CLI_COMMAND='nga run' python3 main.py input/matmul --fresh --max-rounds 15   # 无目标, 跑满15轮
 LLM_CLI_COMMAND='nga run' python3 main.py input/attention_mlp --fresh --max-rounds 15   # 复杂算子: 自注意力+MLP (5 kernel)
+# 新算子 (08-14 经典长链, 与工业级基准一一对应; 全部 26 算子的命令见 main.py 头部注释)
+LLM_CLI_COMMAND='nga run' python3 main.py input/batched_matmul --fresh --max-rounds 30   # BMM (★08-18 修复后可跑)
+LLM_CLI_COMMAND='nga run' python3 main.py input/swiglu_mlp --fresh --max-rounds 30       # LLaMA FFN
+LLM_CLI_COMMAND='nga run' python3 main.py input/transformer_decoder_block --fresh --max-rounds 30  # 17 kernel 大融合
+LLM_CLI_COMMAND='nga run' python3 main.py input/mixture_of_experts --fresh --max-rounds 30         # MoE topk 路由
+
+# ①.2 新算子入库前自检 (秒级; 裸跑不过 = 采集必失败, trace 会指到具体行)
+for op in batched_matmul swiglu_mlp resnet_block; do timeout 180 python3 input/$op/kernel_op.py 2>&1 | tail -2; done
 
 # ①.5 单文件能跑 + 数值校验 (跑优化前先确认 kernel_op.py 能跑)
 python3 input/matmul/kernel_op.py && MATMUL_VERIFY=1 python3 input/matmul/kernel_op.py
@@ -319,7 +296,7 @@ cat <round_dir>/06_diagnosis/diagnosis.json
 
 ---
 
-## 9. 910B3 硬件参数
+## 8. 910B3 硬件参数
 
 **✅ 准确**：20 AI + 40 Vec cores @1.8GHz；UB=192KB、L1=512KB、L0A/L0B=64KB、L0C=128KB、L2=192MB、HBM=64GB；GM 峰值 **1638.4 GB/s**（HBM2e 4×409.6，联网核实 2026-08）；cube 峰值 **294.9** TFLOPS(fp16 标称) / **313**（官方）/ fp32 **73.7**。理论峰值由 `bench_910b3/bench_theory.py` 公式推导。
 
@@ -327,7 +304,7 @@ cat <round_dir>/06_diagnosis/diagnosis.json
 
 ---
 
-## 10. 开发记录
+## 9. 开发记录
 
 - **07-23~07-31 (v3)**：Triton→HIVM→simulator 三源 + 29 字段 dsl_merger + agents 循环。
 - **08-03**：HIVM 获取打通 + msprof op 字段核实（OpBasicInfo/PipeUtilization/Memory）。
@@ -379,6 +356,26 @@ cat <round_dir>/06_diagnosis/diagnosis.json
   - verifier 抽公共 _correctness_check + 新增 verify_fast_gate
   - feedback/pipeline_diagrams_v3.html：就地展开式讲演页（点击块内 + 就地展开, CSS grid 固定主链一行, 零依赖）
   - 全部测试通过: 11 个回归脚本 + 失败案例库 7 项单测 + 诊断快照单测
+- **08-14 (算子扩充)**：
+  - 新增工业界经典长链 9 算子：batched_matmul / swiglu_mlp / resnet_block / vit_block / bert_block /
+    gqa_attention / transformer_decoder_block / mamba_block / mixture_of_experts（与 bench_910b3 工业级基准一一对应）
+  - 连同 08-13 的 batchnorm2d / maxpool2d / conv1d，算子总数 14 → 26；main.py 头部注释补齐全部运行命令
+- **08-17~18 (架构图定稿 + 新算子排障 + 工程整理)**：
+  - 架构图系列制作与定稿：`knowledge/architecture_mermaid_single_v3.html`（图 4 = 阶段 0-7 从上到下
+    一整张纵向总图; 并列表达 = v2 式多箭头扇入/扇出 + 同级左右并排; 内置缩放控件; 阶段顺序经浏览器实测
+    y 坐标逐级递增验证; 保留 v2 八张分阶段图版）
+  - ★新算子"采集不到 kernel"排障定案：batched_matmul `bmm_kernel` 变量 `b` 跨类型复用
+    （batch 序号 int32 ↔ 循环内 fp32 张量块）→ `CompilationError: loop-carried variable` →
+    应用 warmup 即崩 → msprof op_summary 无目标 kernel 行 → run_optimize"未检测到任何目标 kernel"退出。
+    修复：循环内改名 `b_tile`（顺带修了 L66 batch 偏移被覆盖的隐藏逻辑 bug）。裸跑成功 + 采集失败
+    = 问题在 kernel 编译层而非环境（磁盘/缓存/设备污染假设逐一排除）
+  - ★全部 12 个新算子过 16 类禁令静态审计（依据 docx/CODING_GUIDE.md + skills/triton-op-coder/SKILL.md
+    "明写禁止"清单）：循环携带类型冲突 / num_warps·num_stages / autotune / TMA·erf 等禁用 API /
+    tl.dot 禁参 / arange 非 constexpr·非 2 幂 / load·store 地址含 where·条件（vsel）/ gather 数据依赖寻址 /
+    mask 依赖 load / kernel 内 try·dict·import·print·math.* / 非 range 循环 / BLOCK 2 幂且 ≥16 /
+    launch 实参匹配 / Unicode——除已修的 batched_matmul 外全部干净; 检查器经阳性对照验证（注入 8 种违规全中）
+  - 文件归档：architecture_mermaid*.html + mermaid.min.js → knowledge/；根目录 *_tmp.py 调试脚本 → test/；
+    根目录只留入口与核心文档
 
 ---
 
@@ -390,6 +387,8 @@ cat <round_dir>/06_diagnosis/diagnosis.json
   ⚠ 每个候选=一次真机 msprof（分钟级），8 候选约半小时+，一次性成本。
 - **A1 修复**：attention_mlp 的 `matmul_kernel` 被 5 种形状复用 → msprof 同名聚合 deep 画像混合，
   应拆独立函数名（对齐 matmul 算子 matmul_kernel2 的纪律）；D4 已在 coder 加同名多匹配警告。
+- **新算子入库门禁**：把 08-18 的 16 类禁令静态审计固化为 `test/` 下的入库前检查脚本
+  （裸跑 + 禁令扫描双门，防止 batched_matmul 类"采集失败"再入库）。
 - **测量完整性**：verify 增加 per-kernel 期望 launch 校验（防漏记虚高）；
   双次 msprof 稳定性门控（成本高，待定）。
 - **项目自身瓶颈分析**：`outputs/<op>/stats/timing_stats.json` 已输出各阶段耗时，

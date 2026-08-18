@@ -130,7 +130,7 @@ flowchart TD
 </div>
 
 <h2>4. 完整数据流总图 — 阶段 0 → 7 从上到下一张长图（严格自上而下的纯前向流程）</h2>
-<p class="note">图例: 蓝块 = 数据 · 橙块 = 执行 · 黄块 = 判定 · 绿块 = 最终产出 · 虚线 = 条件/回路。阶段 0 在顶、阶段 7 在底，一条主链贯穿; 循环回路（下一轮迭代、失败回传修复、案例库反馈、层间交接）以块内文字标注表达，避免连线回头打乱布局。专业名词保留原文（msprof / Event / LLM / kernel 等）。图较长，框内可滚动，右上按钮可缩放。</p>
+<p class="note">图例: 蓝块 = 数据 · 橙块 = 执行 · 黄块 = 判定 · 绿块 = 最终产出 · 实线箭头 = 先后/派生 · 虚线箭头 = 条件分支。并列 = 同级块左右并排: 一个步骤产出多个 → 多箭头扇出; 多个输入汇入一个 → 多箭头扇入; 有箭头才表示先后或派生。阶段 0 在顶、阶段 7 在底，一条主链贯穿; 循环回路（下一轮迭代、失败回传修复、案例库反馈、层间交接）以块内文字标注表达，避免连线回头打乱布局。专业名词保留原文（msprof / Event / LLM / kernel 等）。图较长，框内可滚动，右上按钮可缩放。</p>
 
 <style>
   .bigmap-tools { margin: 6px 0; }
@@ -186,9 +186,7 @@ flowchart TD
         aB1["PyTorch 参考耗时"]:::d
         aB2["工业级参考耗时<br/>4 种模式取最优"]:::d
         aST["全局轨迹状态<br/>层数 / 轮次 / 历史最优"]:::d
-        aC1 -.- aC2 -.- aC3
         aC1 & aC2 & aC3 --> aV --> aW
-        aW -.- aB1 -.- aB2
         aB1 & aB2 -.->|"仅首轮读入"| aST
     end
 
@@ -233,27 +231,19 @@ flowchart TD
             bG1["全部分块实测结果<br/>→ 供阶段3"]:::d
             bG2["最优分块写回代码<br/>（作本轮改动底座）"]:::d
         end
-        bKIN --> SG1A
-        bKIN --> SG1B
-        SG1A -.- SG1B -.- SG1C -.- SG1D -.- SG1E -.- SG1F -.- SG1G
+        bKIN --> bA1
+        bKIN --> bB0
         bA1 --> bA2
-        bB0 --> bB1
-        bB1 -.- bB2 -.- bB3 -.- bB4
+        bB0 --> bB1 & bB2 & bB3 & bB4
         bB1 & bB2 --> bBN
-        SG1B -->|"去重名单 · 逐个精采"| SG1C
-        bC0 --> bC1
-        bC1 -.- bC2 -.- bC3 -.- bC4
-        SG1B --> SG1D
-        SG1C --> SG1D
-        bD0 --> bD1
-        bD1 -.- bD2
-        SG1D --> SG1E
-        bE1 -.- bE2
-        bKIN -.->|"仅融合层"| SG1F
-        bF0 --> bF1 -.- bF2
-        bBEST --> bG0
-        bG0 --> bG1
-        bG1 -.- bG2
+        bBN -->|"逐个精采"| bC0
+        bC0 --> bC1 & bC2 & bC3 & bC4
+        bB1 & bB2 & bB3 & bB4 & bC1 & bC2 & bC3 & bC4 --> bD0
+        bD0 --> bD1 & bD2
+        bD1 & bD2 --> bE1 & bE2
+        bKIN -.->|"仅融合层"| bF0
+        bF0 --> bF1 --> bF2
+        bBEST --> bG0 --> bG1 & bG2
     end
 
     subgraph SG2["阶段 2 · 设基准（仅首轮）"]
@@ -264,15 +254,13 @@ flowchart TD
         cO2["算子数与矩阵规模"]:::d
         cO3["初始算力"]:::d
         cST2["写入全局状态<br/>基准+参考线（供阶段6决策 / 阶段7产物）"]:::p
-        cIn1 -.- cIn2
         cIn1 & cIn2 --> cV0
-        cV0 --> cO1
-        cO1 -.- cO2 -.- cO3
+        cV0 --> cO1 & cO2 & cO3
         cO1 & cO2 & cO3 --> cST2
     end
 
     subgraph SG3["阶段 3 · 规划器（Planner · LLM 定策略）"]
-        subgraph SG3R["读入（十项，自上而下）"]
+        subgraph SG3R["读入 · 十项并列"]
             dR1["输出格式与铁律"]:::d
             dR2["本层策略手册<br/>问题→方案→代码"]:::d
             dR3["筛好的诊断字段（←阶段1）"]:::d
@@ -288,10 +276,8 @@ flowchart TD
         dO1["优化方案<br/>改哪句 → 改成什么"]:::o
         dO2["预期收益"]:::o
         dO3["晋升 / 回退建议<br/>附数据依据"]:::o
-        dR1 -.- dR2 -.- dR3 -.- dR4 -.- dR5 -.- dR6 -.- dR7 -.- dR8 -.- dR9 -.- dR10
-        SG3R --> dP
-        dP --> dO1
-        dO1 -.- dO2 -.- dO3
+        dR1 & dR2 & dR3 & dR4 & dR5 & dR6 & dR7 & dR8 & dR9 & dR10 --> dP
+        dP --> dO1 & dO2 & dO3
     end
 
     subgraph SG4["阶段 4 · 编码器（Coder · 确定性改码）"]
@@ -308,12 +294,9 @@ flowchart TD
         eW1["本轮新代码"]:::o
         eW2["改动差异（审计）"]:::o
         eW3["失败中间产物（留证）"]:::o
-        eJ1 -.- eJ2 -.- eJ3 -.- eJ4 -.- eJ5
-        SG4R --> eE1
-        eE1 -.- eE2
+        eJ1 & eJ2 & eJ3 --> eE1
         eE1 & eE2 --> eE3
-        eE3 --> eW1
-        eW1 -.- eW2
+        eE3 --> eW1 & eW2
         eE3 -.->|"失败时另存"| eW3
     end
 
@@ -339,11 +322,9 @@ flowchart TD
         fG -->|"否 → 省分钟级全量"| fRVT
         fG -->|"是 / 无法快测"| fV1
         fV1 --> fV2 --> fV3 --> fV4
-        fV3 --> fO1
-        fO1 -.- fO2 -.- fO3 -.- fO4
-        fV3 -.-> fO2
-        fV4 -.-> fO3
-        fV2 -.-> fO4
+        fV3 --> fO1 & fO2
+        fV4 --> fO3
+        fV2 --> fO4
     end
 
     subgraph SG6["阶段 6 · 决策与记录"]
@@ -362,16 +343,15 @@ flowchart TD
             gT4["优秀案例（回传阶段3参考）"]:::o
             gT6["层间交接单（回传目标层规划）"]:::o
         end
-        gT1 -.- gT2 -.- gT5
-        gT3 -.- gT4 -.- gT6
-        SG6Ta -.- SG6Tb
         gD0 --> gK1
         gK1 -->|"否"| gK2
+        gK1 -->|"是"| gT2
+        gK1 --> gT1
+        gD0 -.->|"失败轮"| gT3
+        gK1 -.->|"显著提速"| gT4
+        gD0 --> gT5
         gK1 --> gK3
-        gK1 --> SG6Ta
-        gD0 -.-> gT5
-        gD0 --> SG6Tb
-        gK3 --> SG6Tb
+        gK3 --> gT6
     end
 
     subgraph SG7["阶段 7 · 最终产物"]
@@ -388,13 +368,8 @@ flowchart TD
             hP5["全部策略清单"]:::o
             hP6["成功策略清单"]:::o
         end
-        hIn1 -.- hIn2
         hIn1 & hIn2 --> hFIN
-        SG7A -.- SG7B
-        hFIN --> SG7A
-        hFIN --> SG7B
-        hP1 -.- hP2
-        hP3 -.- hP4 -.- hP5 -.- hP6
+        hFIN --> hP1 & hP2 & hP3 & hP4 & hP5 & hP6
     end
 
     %% ── 主链: 阶段 0 → 7 自上而下 ──
@@ -406,7 +381,7 @@ flowchart TD
     SG1G -.->|"分块轮"| SG3
     dO1 -->|"改动清单"| eJ1
     eW1 --> fK
-    fO4 -.-> gD0
+    fO1 & fO2 & fO3 & fO4 --> gD0
     fRVT -.->|"直接记回退"| gK2
     gK3 -.->|"轮次跑满 / 底层无改进"| hFIN
     gT1 -->|"结束后汇总"| hIn1

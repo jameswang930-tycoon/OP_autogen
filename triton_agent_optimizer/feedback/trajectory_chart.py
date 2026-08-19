@@ -91,8 +91,17 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
     decisions = [r.get("decision", "?") for r in history]
     strategies = [r.get("change") or r.get("strategy", "") for r in history]
     reasons = [r.get("error", "") for r in history]
-    speeds = [r.get("speedup", 1.0) for r in history]           # 每轮 vs baseline
-    cum_speeds = list(np.maximum.accumulate(np.array(speeds)))  # running best
+    # ★v4.6: 快测门 REVERT/未测轮 hist 诚实记 speedup=null (未跑 msprof 不编数) —
+    #   .get 默认值只在 key 缺失时生效, 值为 null 时拿到 None → np 比较直接 TypeError.
+    #   画图回退 prev_speedup (= 当前已接受水平, 与 scheduler 失败轮同口径, 防假掉点);
+    #   连 prev_speedup 都没有的脏行 → NaN (点不画, fmax 累积忽略).
+    def _speed(r):
+        v = r.get("speedup")
+        if not isinstance(v, (int, float)):
+            v = r.get("prev_speedup")
+        return float(v) if isinstance(v, (int, float)) else float("nan")
+    speeds = [_speed(r) for r in history]                       # 每轮 vs baseline
+    cum_speeds = list(np.fmax.accumulate(np.array(speeds, dtype=float)))  # running best (fmax 忽略 NaN)
     # 基准点: 第 0 轮前 speedup=1.0 (初始)
     rounds = [0] + rounds
     cum_speeds = [1.0] + cum_speeds
@@ -234,7 +243,8 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
                     bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
 
     # ═══ Running Best ═══
-    running_best = np.maximum.accumulate(np.array(cum_speeds))
+    # ★fmax: 未测轮 (NaN) 不毒化后续累积 (np.maximum 会传播 NaN)
+    running_best = np.fmax.accumulate(np.array(cum_speeds))
     ax.plot(rounds, running_best, color="#1565c0", linewidth=3, alpha=0.85, zorder=2)
     ax.fill_between(rounds, 1.0, running_best, alpha=0.06, color="#1565c0")
 
@@ -293,7 +303,7 @@ def generate(kernel_dir: Path, output_path: Optional[Path] = None) -> Path:
                 arrowprops=dict(arrowstyle="->", color="#c62828", lw=0.7, alpha=0.5),
                 bbox=dict(boxstyle="round,pad=0.22", fc="white", alpha=0.85, ec="#c62828", lw=0.6),
                 zorder=9)
-        if decisions[i]=="FAIL":
+        if decisions[i]=="FAIL" and np.isfinite(speeds[i]):
             ax.annotate("×失败",
                 xy=(rounds[i], speeds[i]),
                 xytext=(rounds[i]+0.3, _free_y(rounds[i], speeds[i]-0.05)),

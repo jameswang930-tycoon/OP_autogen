@@ -1,0 +1,313 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════════════════════════
+#  优化流程主脚本 — 判断算子数 → 分流 (多算子融合 / 单算子 roofline)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  流程:
+#    ① 采集 msprof + msprof op (真机, 快/真) → 判断 kernel 数
+#    ② 多算子 (>1 kernel)?
+#        ├─ 是 → 编译+HIVM → filter_hivm_for_fusion → 融合视图 (给 LLM 做算法+融合)
+#        └─ 否 → msprof+op → diagnosis.json (roofline) → Tier3-6 逐级优化
+#    ③ 输出:
+#        - diagnosis.json  (始终有, roofline 核心, 单算子优化用)
+#        - 08_fusion/hivm_fusion_view.txt (多算子时有, 融合用)
+#
+#  用法: bash run_optimize.sh <input_dir> [output_dir] [M] [N] [K]
+#    input_dir  算子目录 (含 kernel_op.py 单文件 或 test_matmul.py + triton_kernel.py)
+#    output_dir 输出目录 (调度器每轮指向不同 round_dir; 默认 input_dir/e2e_run)
+#  产物: <output_dir>/
+#    05_task/    通用 msprof op_summary (骨架: 每kernel耗时/核数/形状) → task.json
+#    04_board/   逐 kernel 的 msprof op 8 CSV (真实带宽/L2/cube) → board_<i>.json
+#    06_diagnosis/  task.json + board_*.json + diagnosis.json (骨架+deep 合并) (+ hivm, 多算子时)
+#    08_fusion/     (多算子时) hivm_try.txt + hivm_fusion_view.txt (融合专用)
+#  流程: 通用 msprof → 骨架 → 逐 distinct kernel 采 msprof op → 按名合并 (见 docx/aggregation_rules.md)
+#  单文件: 优先跑 input_dir/kernel_op.py (v4 单文件), 否则 test_matmul.py
+#  环境: ENABLE_HIVM=1 强制跑 hivm (多算子融合需要); 默认自动判断
+#
+#  ═══════════════ 服务器运行步骤 (从 clone 到出诊断) ═══════════════
+#   1. 环境:
+#      conda activate triton-npu
+#      source /usr/local/Ascend/ascend-toolkit/set_env.sh
+#      cd triton_agent_optimizer
+#   2. 单文件能不能跑 (自包含, 无 import 依赖):
+#      cd input/matmul && python3 kernel_op.py && cd ../..
+#      # 预期: [info] launch grid=... ; [info] kernel launched & synced OK
+#   3. 采集+解析 (参数是 <input_dir> <output_dir>):
+#      bash analyzers/run_optimize.sh input/matmul input/matmul/e2e_run
+#      # 预期: run=kernel_op.py; ✅ op_summary; ✅ msprof op [matmul_kernel] 8 CSV;
+#      #        ✅ diagnosis.json ✓; 字段校验: 列名不匹配 0 个
+#   4. 看诊断:
+#      cat input/matmul/e2e_run/06_diagnosis/diagnosis.json   # summary + kernel task/deep + roofline
+#   5. 完整优化循环 (一键, 每轮: 采集→提取当前tier字段→planner→coder→msprof端到端→加速比):
+#      LLM_CLI_COMMAND="agent-cli run" python3 main.py input/matmul
+#      # 本地无 LLM 先试流程: python3 main.py input/matmul --max-rounds 3 --stub
+#   6. 核对当前策略筛字段 (解析完 07 已自动产出): 看 <out_dir>/07_tier<N>_fields/tier<N>_fields.txt
+#   ★ 07 产物: 解析完自动产出 <out_dir>/07_tier<N>_fields/{tier<N>_fields.txt,.json}
+#      = 当前优化阶段筛选后的字段 (planner 只读这个; TIER 环境变量指定阶段, 默认 1)
+#
+#  ⚠ 参数变化: 原来 `bash run_optimize.sh 512 512 512` (M/N/K) 已改成
+#    `bash run_optimize.sh input/matmul <out_dir> 512 512 512` (input/output 在前)
+#  ⚠ 单文件 kernel_op.py 是源文件 (config+kernel+test 一体), coder 只改它; 已入库 (不在 .gitignore)
+# ═══════════════════════════════════════════════════════════════════════════════
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+START_DIR="$(pwd)"    # 调用时 cwd — 相对路径参数归一化为绝对 (msprof/拷贝依赖绝对路径)
+INPUT_DIR="${1:-$REPO_ROOT/input/matmul}"
+OUT="${2:-$INPUT_DIR/e2e_run}"
+M=${3:-}; N=${4:-}; K=${5:-}
+# ★bug 修复: 旧默认 512 会覆盖 kernel 源码尺寸 — 调度器提取不到 M/N/K (如 coder 改了 config 格式)
+#   时, 采集跑 512³ 而 verify 跑源码默认 2048³ → 加速比虚高 (2048/512)³=64×, 静默无 guard.
+#   现在只在显式传 M/N/K 时才导出 MATMUL_*; 否则 kernel 用自己的 config 默认尺寸, 与 verify 同口径.
+if [ -n "$M" ] && [ -n "$N" ] && [ -n "$K" ]; then
+    export MATMUL_M=$M MATMUL_N=$N MATMUL_K=$K
+    echo "  [尺寸] 显式 M/N/K=$M/$N/$K → 导出 MATMUL_* (覆盖 kernel 默认)"
+    echo "  ★注: M/N/K 只映射 matmul 族 (MATMUL_* env); 其余算子读各自 env"
+    echo "       (FA_SEQ/FA_HEADS/FA_DIM, RMS_M/RMS_N, CONV_*), 用 config 默认值 —"
+    echo "       需改尺寸请设对应 env, 不要指望 M/N/K 参数生效"
+else
+    echo "  [尺寸] 未指定 M/N/K → 用 kernel 源码 config 默认尺寸 (与 verify 同口径)"
+fi
+TIER=${TIER:-2}    # 当前优化阶段 1~6 (调度器传; 决定 07 筛哪层字段)
+# ★修复: 旧默认 1 让 L222 的 "${TIER:-2}" 成为死代码 — 手工跑(不设 TIER)永远不会进 Tier2 融合.
+#   默认 2 才匹配 H3 注释"TIER 未设(=独立手工跑)默认走 2, 保持旧行为". 调度器路径总是显式传 TIER, 不受影响.
+# ★相对路径→绝对路径 (脚本内部 cd 换目录后, 相对路径会解析错位)
+case "$INPUT_DIR" in /*) ;; *) INPUT_DIR="$START_DIR/$INPUT_DIR";; esac
+case "$OUT" in /*) ;; *) OUT="$START_DIR/$OUT";; esac
+
+# 要运行的文件: 优先单文件 kernel_op.py (v4), 否则 test_matmul.py
+RUN_PY="test_matmul.py"
+[ -f "$INPUT_DIR/kernel_op.py" ] && RUN_PY="kernel_op.py"
+[ -f "$INPUT_DIR/$RUN_PY" ] || { echo "❌ 找不到 $INPUT_DIR/{kernel_op.py,test_matmul.py}"; exit 1; }
+if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
+
+PASS=0; FAIL=0
+pass(){ echo "  ✅ $1"; PASS=$((PASS+1)); }
+fail(){ echo "  ❌ $1"; FAIL=$((FAIL+1)); }
+
+# ── 环境 + 清理旧产物 ──
+echo "══════ 环境 ══════"
+echo "input=$INPUT_DIR  run=$RUN_PY  M=$M N=$N K=$K  输出=$OUT  (ENABLE_HIVM=${ENABLE_HIVM:-auto})"
+echo "  → 清理旧产物"
+rm -rf "$OUT"
+mkdir -p "$OUT"/04_board "$OUT"/05_task "$OUT"/06_diagnosis
+# 自包含: 本轮运行的源快照 → $OUT/input/, 从那里跑 (每轮独立可复现, 输入在 outputs 里)
+mkdir -p "$OUT/input"
+cp "$INPUT_DIR/$RUN_PY" "$OUT/input/$RUN_PY"
+RUN_DIR="$OUT/input"
+if command -v conda >/dev/null 2>&1; then
+  CB=$(conda info --base 2>/dev/null || echo ""); [ -n "$CB" ] && source "$CB/etc/profile.d/conda.sh" 2>/dev/null
+  conda activate triton-npu 2>/dev/null && echo "  ✅ conda triton-npu" || echo "  ⚠ 手动 activate"
+fi
+source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null && echo "  ✅ set_env.sh" || echo "  ⚠ 手动 source"
+cd "$RUN_DIR"
+
+# ═══════════ 阶段 1/3: 通用 msprof(骨架) → 逐 kernel 采 msprof op ═══════════
+echo ""; echo "══ 阶段 1/3: 通用 msprof(骨架) + 逐 kernel msprof op ══"
+D="$OUT/06_diagnosis"
+
+# 0. 预热: 先裸跑一次 (Triton JIT 编译 + 设备初始化), 避免冷启动污染基准
+#    msprof 首次 attach 可能漏掉前几个 kernel; 且首 launch 含 JIT 编译(秒级)。
+#    verify (verify_end_to_end) 已热身 → baseline 必须同口径, 否则 speedup 失真
+APP_ABS="$RUN_DIR/$RUN_PY"    # 绝对路径, 避免 msprof 从别的 cwd 解析不到
+$PY "$APP_ABS" > "$OUT/05_task/warmup.txt" 2>&1 || true
+echo "  ⚡ warmup 裸跑 (JIT 编译/设备初始化) done"
+
+# 1a. 通用 msprof 先跑 (任务级 op_summary → distinct kernel 名 → 骨架)
+TASK_OUT="$OUT/05_task/task_prof"; rm -rf "$TASK_OUT"; mkdir -p "$TASK_OUT"
+msprof --output="$TASK_OUT" \
+  --application="$PY $APP_ABS" --ai-core=on > "$OUT/05_task/task_run.txt" 2>&1
+MSPROF_RC=$?
+# ★bug 修复: 旧代码 `echo 退出码=$?` 在 find|wc 之后 → $? 是 find 的(恒0), 不是 msprof 的.
+OPSUM=$(find "$OUT/05_task" -name 'op_summary*.csv' 2>/dev/null | wc -l)
+echo "  通用 msprof 退出码=$MSPROF_RC op_summary x$OPSUM (app=$APP_ABS)"
+if [ "$MSPROF_RC" -ne 0 ]; then
+  fail "msprof 非零退出，拒绝使用可能不完整的 CSV (看 $OUT/05_task/task_run.txt)"
+  exit 1
+fi
+[ "$OPSUM" -gt 0 ] && pass "op_summary (骨架/kernel 数)" || fail "无 op_summary (看 $OUT/05_task/task_run.txt)"
+"$PY" "$SCRIPT_DIR/pipeline_parse_task.py" "$TASK_OUT" "$D/task.json" || true
+[ -f "$D/task.json" ] || echo '{}' > "$D/task.json"
+
+# 1b. 从 task.json 取 distinct kernel 名 → 逐 kernel 跑 msprof op → board_<i>.json
+#     默认跳过 torch 框架 kernel (aclnn* 数据准备), 除非 FORCE_ALL_KERNELS=1
+echo "  → 读取 kernel 名, 逐 kernel 采 msprof op (规则 O6, 默认跳过 aclnn* 框架 kernel)"
+KERNELS=()
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  case "$line" in
+    aclnn*) [ "${FORCE_ALL_KERNELS:-0}" = "1" ] && KERNELS+=("$line") || echo "  ⏭ 跳过框架 kernel: $line";;
+    *) KERNELS+=("$line");;
+  esac
+done < <(
+  "$PY" - "$D/task.json" <<'PYEOF'
+import json, sys
+from pathlib import Path
+try:
+    tk = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+    for s in tk.get('normalized', {}).get('kernel_slots', []):
+        n = s.get('kernel_name')
+        if n:
+            print(n)
+except Exception:
+    pass
+PYEOF
+)
+if [ "${#KERNELS[@]}" -eq 0 ]; then
+  # ★修复: 不再静默回退 matmul_kernel — 无 kernel 名 = 应用没启动任何目标 kernel (最可能是
+  #   coder 改出的代码 triton 编译/运行失败). 静默回退会掩盖真因(崩溃 trace), 让下游 msprof op
+  #   按错误名采不到 → "找不到算子名"假象, 所有分析跟着失败.
+  #   直接打错退出 → scheduler 走采集失败重试/跳过, 真因留在 warmup.txt / task_run.txt 可查.
+  echo "  ❌ 未检测到任何目标 kernel (kernel 未启动: 应用崩溃或全部被框架过滤)"
+  echo "  ── warmup 输出尾部 (找崩溃原因) ──"
+  tail -20 "$OUT/05_task/warmup.txt" 2>/dev/null || true
+  echo "  ── 通用 msprof 输出尾部 ──"
+  tail -20 "$OUT/05_task/task_run.txt" 2>/dev/null || true
+  exit 1
+fi
+echo "  待采 kernel: ${KERNELS[*]}"
+
+IDX=0; BOARD_OK=0
+for KNAME in "${KERNELS[@]}"; do
+  IDX=$((IDX+1))
+  BOUT="$OUT/04_board/op_${IDX}"
+  rm -rf "$BOUT"; mkdir -p "$BOUT"
+  msprof op --kernel-name="$KNAME" \
+    --output="$BOUT" --warm-up=10 $PY "$APP_ABS" > "$OUT/04_board/board_${IDX}.txt" 2>&1
+  BOARD_RC=$?
+  MC=$(find "$BOUT" -name 'Memory.csv' 2>/dev/null | head -1)
+  if [ "$BOARD_RC" -eq 0 ] && [ -n "$MC" ]; then
+    pass "msprof op [$KNAME] Memory.csv 存在 (各指标完整性见 board.json notes)"
+    "$PY" "$SCRIPT_DIR/pipeline_parse_board.py" "$BOUT" "$D/board_${IDX}.json" || true
+    [ -f "$D/board_${IDX}.json" ] && BOARD_OK=$((BOARD_OK+1))
+  else
+    fail "msprof op [$KNAME] 缺 Memory.csv (kernel 名不匹配? 或 gather/非连续寻址崩 AICore?)"
+    # ★检测 msprof op 是否崩了 AICore (gather/非连续寻址 kernel 会让深度 profiling 崩)
+    #   → 后续 kernel 的 msprof op 也会因设备污染失败, 直接跳出循环 (别在死设备上浪费)
+    if grep -qEi "aclrt|575|npu function|device error|internal error" "$OUT/04_board/board_${IDX}.txt" 2>/dev/null; then
+      echo "  ⛔ [$KNAME] msprof op 崩了 AICore (设备级错误) → 跳过剩余 kernel (设备已污染)"
+      break
+    fi
+  fi
+done
+
+# 失败后的轻量清理；synchronize/empty_cache 不是硬件设备复位。
+if [ "$BOARD_OK" -lt "${#KERNELS[@]}" ]; then
+  echo "  ⚠ 有 $(( ${#KERNELS[@]} - BOARD_OK )) 个 kernel 的 msprof op 失败 → 尝试同步与缓存清理 (不是硬件复位)..."
+  $PY -c "import torch,torch_npu;torch.npu.synchronize();torch.npu.empty_cache();print('synchronize/cache cleanup OK (not hardware reset)')" 2>/dev/null || echo "  ⚠ 清理子进程失败，需检查服务器设备状态"
+fi
+
+# ═══════════ 阶段 2/3: 整合 → diagnosis.json (骨架 + deep 按 kernel 名合并) ═══════════
+echo ""; echo "══ 阶段 2/3: 整合骨架 + deep → diagnosis.json ══"
+BOARDS=( "$D"/board_*.json )
+if [ "${#BOARDS[@]}" -ge 1 ] && [ -f "${BOARDS[0]}" ]; then
+  "$PY" "$SCRIPT_DIR/integrate.py" "$D/task.json" "$D/diagnosis.json" "${BOARDS[@]}"
+else
+  echo "  ⚠ 无 board.json → 骨架保留 (filled=0)"
+  "$PY" "$SCRIPT_DIR/integrate.py" "$D/task.json" "$D/diagnosis.json"
+fi
+[ -f "$D/diagnosis.json" ] && pass "diagnosis.json ✓ (骨架+deep, 规则M11)" || fail "diagnosis.json 未生成"
+
+# 07: 解析完 → 按当前阶段筛字段, 产出到 07 (planner 读这个)
+if [ -f "$D/diagnosis.json" ]; then
+  "$PY" - "$REPO_ROOT" "$D/diagnosis.json" "$OUT" "$TIER" <<'PYEOF'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from agents.scheduler import extract_tier_fields, TIER_FIELDS, _get
+d = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+tier = int(sys.argv[4]); out = Path(sys.argv[3])
+txt = extract_tier_fields(d, tier)
+d7 = out / f"07_tier{tier}_fields"
+d7.mkdir(parents=True, exist_ok=True)
+(d7 / f"tier{tier}_fields.txt").write_text(txt, encoding="utf-8")
+vals = {desc: _get(d, path) for path, desc in TIER_FIELDS.get(tier, [])}
+(d7 / f"tier{tier}_fields.json").write_text(
+    json.dumps(vals, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+print(f"  ✅ 07_tier{tier}_fields: {sum(1 for l in txt.splitlines() if l.startswith('-'))} 字段 → {d7}")
+PYEOF
+fi
+
+# ═══════════ 阶段 3/3: 判断算子数 → 分流 ═══════════
+echo ""; echo "══ 阶段 3/3: 判断算子数 → 分流 ══"
+N_KERNELS=$("$PY" - "$D/task.json" <<'PYEOF'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+try:
+    tk = json.loads(p.read_text(encoding='utf-8'))
+    print(tk.get('execution_summary', {}).get('num_kernels', 0))
+except Exception:
+    print(0)
+PYEOF
+)
+echo "  检测到 kernel 数: $N_KERNELS"
+MULTI=0
+# ★H3: HIVM 融合编译只有 Tier2 需要 (多算子融合分析) — 其余 tier 多 kernel 也跳过, 省分钟级编译.
+#   TIER 未设(=独立手工跑) 默认走 2, 保持旧行为; 调度器每轮传 TIER, 自动只在本层放行.
+if [ "${ENABLE_HIVM:-auto}" = "1" ]; then MULTI=1; echo "  (ENABLE_HIVM=1 强制走多算子路径)"
+elif [ "$N_KERNELS" -gt 1 ] && [ "${TIER:-2}" = "2" ]; then MULTI=1; echo "  (多个 kernel + Tier2 → 多算子融合分析)"
+elif [ "$N_KERNELS" -gt 1 ]; then echo "  (多个 kernel 但 TIER!=2 → 跳过 HIVM 融合编译, 只有 Tier2 需要)"
+else echo "  (单个 kernel → 单算子: roofline 诊断够用, 走 Tier3-6)"; fi
+
+if [ "$MULTI" = "1" ]; then
+  echo ""; echo "══ 多算子路径: 编译 HIVM → 融合视图 ══"
+  FUSION_DIR="$OUT/08_fusion"     # ★融合产物集中到本轮目录, 不污染源/上轮目录 (自包含原则)
+  mkdir -p "$FUSION_DIR"
+  rm -rf ~/.triton
+  export TRITON_DEBUG=1 TRITON_DISABLE_CACHE=1
+  (cd "$RUN_DIR" && $PY "$APP_ABS" > "$OUT/04_board/compile.txt" 2>&1)
+  cp ~/.triton/dump/*/kernel.ttadapter.mlir "$FUSION_DIR/" 2>/dev/null || \
+    cp ~/.triton/dump/*/kernel.*.mlir "$FUSION_DIR/" 2>/dev/null || true
+  HIVM_OK=0
+  for P in hivm-inject-sync hivm-graph-sync-solver; do
+    (cd "$FUSION_DIR" && bishengir-compile --target=Ascend910B3 \
+      --enable-auto-multi-buffer=True --enable-auto-bind-sub-block=True \
+      --enable-hfusion-compile=true --enable-hivm-compile=true \
+      --enable-triton-kernel-compile=true \
+      --bishengir-print-ir-after=$P kernel.ttadapter.mlir -o /tmp/k.o > hivm_try.txt 2>&1)
+    CNT=$(grep -c 'hivm.hir' "$FUSION_DIR/hivm_try.txt" 2>/dev/null || echo 0)
+    if [ "$CNT" -gt 0 ]; then echo "  pass=$P → hivm.hir x$CNT"; HIVM_OK=1; break; fi
+  done
+  if [ "$HIVM_OK" -eq 1 ]; then
+    pass "hivm_try.txt 生成"
+    # ★P3: 传 board.json 给融合视图 → 每 op 附实测 pipe 耗时占比 (planner 排融合优先级)
+    BOARDLIST=$(ls "$D"/board_*.json 2>/dev/null | paste -sd, -)
+    if [ -n "$BOARDLIST" ]; then
+      "$PY" "$SCRIPT_DIR/filter_hivm_for_fusion.py" "$FUSION_DIR/hivm_try.txt" --out "$FUSION_DIR/hivm_fusion_view.txt" --boards "$BOARDLIST"
+    else
+      "$PY" "$SCRIPT_DIR/filter_hivm_for_fusion.py" "$FUSION_DIR/hivm_try.txt" --out "$FUSION_DIR/hivm_fusion_view.txt"
+    fi
+    pass "hivm_fusion_view.txt ✓ → $FUSION_DIR (融合专用: op+同步+依赖+每op耗时占比)"
+    echo "  → LLM 读 $FUSION_DIR/hivm_fusion_view.txt: 找 RAW 链相邻逐元素 op → 融合; WAR → 换 buffer; ★先融合耗时占比最高的链"
+  else
+    fail "hivm 生成失败 (看 $FUSION_DIR/hivm_try.txt)"
+  fi
+fi
+
+# ═══════════ 字段校验 (check_fields.py: OK / 列名不匹配 / 源无) ═══════════
+# ★check_fields 的"列名不匹配/缺字段"调试明细不打印终端, 重定向到 field_check.log (终端只留 pass/fail 摘要)
+echo ""; echo "══════════ 字段校验 ══════════"
+CF_RC=0
+FCHK="$OUT/05_task/field_check.log"; : > "$FCHK"
+if [ -f "$D/task.json" ]; then
+  DGN=""
+  [ -f "$D/diagnosis.json" ] && DGN="$D/diagnosis.json"
+  if ls "$D"/board_*.json >/dev/null 2>&1; then
+    for b in "$D"/board_*.json; do
+      echo "── 校验 $(basename "$b") (明细→$FCHK) ──"
+      "$PY" "$SCRIPT_DIR/check_fields.py" "$b" "$D/task.json" $DGN >> "$FCHK" 2>&1 || CF_RC=1
+    done
+  else
+    echo "── 校验 task.json (无 board, 明细→$FCHK) ──"
+    "$PY" "$SCRIPT_DIR/check_fields.py" "$D/task.json" "$D/task.json" $DGN >> "$FCHK" 2>&1 || CF_RC=1
+  fi
+  [ "$CF_RC" -eq 0 ] && pass "字段校验: 无列名不匹配 (合法缺属正常)" || fail "字段校验: 有列名不匹配 (看 $FCHK)"
+else
+  fail "字段校验: task.json 缺失"
+fi
+
+echo ""; echo "══════════ 完成 (PASS=$PASS FAIL=$FAIL) ══════════"
+echo "  diagnosis.json     : $D/diagnosis.json  (单算子优化用)"
+echo "  hivm_fusion_view   : $OUT/08_fusion/hivm_fusion_view.txt  (多算子融合用, 若生成)"
+echo "  看诊断: cat $D/diagnosis.json"

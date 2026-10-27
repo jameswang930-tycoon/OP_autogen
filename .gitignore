@@ -1,16 +1,153 @@
-.claude/settings.local.json
-.claude/settings.json
+# ═══════════════════════════════════════════════════════════════════════════
+#  Python
+# ═══════════════════════════════════════════════════════════════════════════
 __pycache__/
-*.pyc
-.DS_Store
-*.swp
-.vscode/
-tmp/
-models/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.so
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Virtual environment
+# ═══════════════════════════════════════════════════════════════════════════
 .venv/
-costModel/archaludon/
+venv/
+env/
+*.venv
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  IDE & Editor
+# ═══════════════════════════════════════════════════════════════════════════
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Secrets — .env contains API keys, NEVER commit
+#  .env.template IS committed (no secrets, just field names)
+# ═══════════════════════════════════════════════════════════════════════════
+.env
+.env.*
+!.env.template
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Generated outputs — all runtime artifacts
+# ═══════════════════════════════════════════════════════════════════════════
+outputs/
+output/
+rounds/
+triton_agent_optimizer/output/
+triton_agent_optimizer/outputs/
+triton_agent_optimizer/rounds/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Emulator — generated per-op plan files
+# ═══════════════════════════════════════════════════════════════════════════
 emulators/test/**/.plan.json
 
-# memory 运行产物(经验库/日志,首次运行自动生成)
+# ═══════════════════════════════════════════════════════════════════════════
+#  msprof simulator test — external clone + generated data
+# ═══════════════════════════════════════════════════════════════════════════
+msprof_simulator_test/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Paper reference — external repo copy, not our code
+# ═══════════════════════════════════════════════════════════════════════════
+paper_reference/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Local dev notes — session summaries, not needed on server
+# ═══════════════════════════════════════════════════════════════════════════
+claude_resume_summary/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CMake / ASC build artifacts (accidental builds at repo root)
+# ═══════════════════════════════════════════════════════════════════════════
+CMakeCache.txt
+CMakeFiles/
+autogen/
+*.exe
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  msprof / profiling outputs (OPPROF_xxx dirs, board/sim prof dirs)
+# ═══════════════════════════════════════════════════════════════════════════
+OPPROF_*/
+*_prof/
+*_profiles/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Triton cache & IR dump
+# ═══════════════════════════════════════════════════════════════════════════
+.triton/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Temp & logs
+# ═══════════════════════════════════════════════════════════════════════════
+tmp/
+temp/
+*.tmp
+*.log
+*.bak
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Large binaries
+# ═══════════════════════════════════════════════════════════════════════════
+*.o
+*.run
+*.bin
+*.png
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Claude Code — per-machine settings
+# ═══════════════════════════════════════════════════════════════════════════
+.claude/settings.local.json
+.claude/worktrees/
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Jupyter
+# ═══════════════════════════════════════════════════════════════════════════
+.ipynb_checkpoints/
+*.ipynb
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Coverage & profiling
+# ═══════════════════════════════════════════════════════════════════════════
+htmlcov/
+.coverage
+.coverage.*
+*.prof
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  OS junk
+# ═══════════════════════════════════════════════════════════════════════════
+__MACOSX/
+
+# Machine-local configuration and development state
+.claude/settings.json
+.agents/
+.codex/
+AGENTS.md
+_cleanup_backup*/
+
+# Runtime memory and profiler data
 memory/experience/
 memory/runlog/
+*.csv
+*.trace
+*.jsonl
+triton_agent_optimizer/--mode/
+triton_agent_optimizer/bench_910b3/out/
+triton_agent_optimizer/cleanup_garbage.ps1
+triton_agent_optimizer/test/screenshots/
+triton_agent_optimizer/test/offline/REPORT.md
+triton_agent_optimizer/knowledge/measurement_fixes_*.md
+triton_agent_optimizer/hardware_profile.local.json

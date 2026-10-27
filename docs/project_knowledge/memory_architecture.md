@@ -1,5 +1,11 @@
 # Memory 模块架构
 
+> ★2026-08-13 说明: 本文档描述项目根 `memory/` 包（模拟器时代的经验/日志骨架, 未接入真机流水线）。
+> **真机流水线的记忆已实现在 `triton_agent_optimizer/memory/`**:
+>   - `excellent_cases.py` — 优秀案例 (成功轮 >1.3×, planner 参考)
+>   - `failed_cases.py` — 失败案例库 (按 tier 分文件, 指纹去重/两级检索/方案收敛守卫/stuck 黑名单,
+>     coder 修复注入 + scheduler 重试上下文累积; 详见该文件头注释)
+
 纯标准库、文件后端,不依赖任何外部服务,也不碰 cost model 仓库。本文档描述 `memory/`
 包的内部结构与设计;接入流水线的方式见 `memory_integration.md`。
 
